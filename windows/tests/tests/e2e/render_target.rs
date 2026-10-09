@@ -3791,24 +3791,25 @@ fn two_lockable_render_targets_written_in_one_frame_keep_their_own_writes() {
 ///
 /// The draw fills the target red, then a `D3DLOCK_DISCARD` lock, which reads
 /// nothing back, writes it green with no flush between them. D3D9 orders the
-/// write after the draw, so the target reads green.
+/// write after the draw, so the target reads green. The target is the back
+/// buffer's size, so a `render.scale` leg takes the resampled write.
 #[test]
 fn a_lock_write_into_a_lockable_render_target_lands_over_an_earlier_draw() {
-    const SIZE: u32 = 64;
     let h = Harness::new();
+    let (w, height) = h.dims();
     let bb = h.render_target(0);
-    let rt = h.create_lockable_render_target(SIZE, SIZE, D3DFMT_A8R8G8B8);
+    let rt = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
     assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
     draw_fill(&h, RED);
     assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
     {
         let mut locked = rt.lock_rect(D3DLOCK_DISCARD);
-        locked.write_u32(&[GREEN; (SIZE * SIZE) as usize]);
+        locked.write_u32(&vec![GREEN; (w * height) as usize]);
     }
-    let pixels = read_back(&h, &rt, (SIZE, SIZE), D3DFMT_A8R8G8B8);
-    for (x, y) in [(0, 0), (SIZE / 2, SIZE / 2), (SIZE - 1, SIZE - 1)] {
+    let pixels = read_back(&h, &rt, (w, height), D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (w / 2, height / 2), (w - 1, height - 1)] {
         assert_eq!(
-            pixels[(y * SIZE + x) as usize],
+            pixels[(y * w + x) as usize],
             GREEN,
             "texel ({x}, {y}): the write over the draw"
         );

@@ -9615,7 +9615,7 @@ fn resolve_stretch_surface(
             tex.inner().render_scale(),
             (width, height),
             tex.inner().render_extent(),
-            level,
+            tex.inner().metal_level(lvl_idx),
         )
         .texture();
         return Some(StretchSurfaceInfo {

@@ -1154,6 +1154,71 @@ fn get_dc_drawing_into_a_back_buffer_sized_render_target_texture_reaches_it() {
     }
 }
 
+/// A scaled render-target texture written on one device keeps the write on the next to sample it.
+///
+/// Both devices pin `render.scale=0.75`. The first writes the texture green
+/// through `UpdateSurface`; the second binds it, which moves the texture to
+/// that device and uploads every level written so far there, and samples it
+/// across its frame.
+#[test]
+fn a_scaled_target_written_on_one_device_reaches_the_device_that_samples_it() {
+    let config = HarnessConfig {
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    };
+    let first = Harness::create(&config);
+    let second = Harness::create(&config);
+    let (width, height) = first.dims();
+    let target = backbuffer_sized_target(&first, 1);
+    let source =
+        first.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&vec![GREEN; (width * height) as usize]);
+    assert_eq!(
+        first.update_surface_hr(&source, &target.surface_level(0)),
+        D3D_OK,
+        "UpdateSurface on the first device"
+    );
+    assert_eq!(
+        second.set_render_state(D3DRS_LIGHTING, 0),
+        0,
+        "lighting off"
+    );
+    assert_eq!(
+        second.set_texture(0, &target),
+        0,
+        "bind on the second device"
+    );
+    second.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(
+            second.set_sampler_state(0, state, value),
+            0,
+            "sampler state"
+        );
+    }
+    assert_eq!(second.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    second.render_once(BLACK, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &FULLSCREEN_TEXTURED_QUAD),
+            0,
+            "sample the texture over the whole frame",
+        );
+    });
+    assert_pixel_eq(
+        second.read_pixel(width / 2, height / 2),
+        GREEN,
+        "the second device samples the first device's write",
+    );
+    assert_eq!(second.clear_texture(0), 0, "unbind");
+}
+
 /// A full-chain render-target texture at the back-buffer size draws into and reads its levels.
 ///
 /// The texture reports the chain of the reported size, ten levels for

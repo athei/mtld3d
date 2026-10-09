@@ -5436,6 +5436,12 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
     if !ti.is_cpu_only() {
         dev.push_texture_warmup(&ti.texture_info());
     }
+    // A texture rasterized at a `render.scale` uploads only through the
+    // ordered, resampled region update, which the bind-time flush never sends,
+    // so the levels re-marked above go out here, ahead of the bind.
+    if !ti.render_scale.is_identity() {
+        flush_converted_mips(ti, dev);
+    }
     let adopted = if pinned {
         tex.device_forward_target()
     } else {
