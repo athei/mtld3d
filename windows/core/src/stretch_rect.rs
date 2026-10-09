@@ -98,6 +98,8 @@ pub enum RejectReason {
     DestinationClass,
     /// An offscreen-plain destination with a source that is no offscreen plain.
     SourceIntoOffscreenPlain,
+    /// Source and destination are one surface and the two rects differ in size.
+    SameSurfaceStretch,
 }
 
 impl RejectReason {
@@ -126,6 +128,7 @@ impl RejectReason {
             Self::SourceIntoOffscreenPlain => {
                 "an offscreen-plain destination takes only an offscreen-plain source"
             }
+            Self::SameSurfaceStretch => "a stretch between two rects of one surface",
         }
     }
 }
@@ -174,11 +177,15 @@ pub fn extended_whole_surface_copy(
 
 /// How a `StretchRect` whose two endpoints are one Metal texture is carried out.
 ///
-/// D3D9 performs a copy between two rectangles of the same surface; only an
-/// overlapping pair is undefined. Metal's blit encoder copies within a single
-/// texture as long as the two regions do not overlap, and the render quad
-/// cannot sample the texture it draws into at all, so the cases split three
-/// ways.
+/// D3D9 performs a 1:1 copy between two rectangles of the same surface and
+/// refuses a stretch there, which the API thread answers before it gets here.
+/// A size change still reaches this between two levels or two faces of one
+/// texture, between two surfaces that alias one texture (an additional swap
+/// chain's back buffer and the device's), and between two equal rects of one
+/// surface that `render.scale` rounds to two extents. Metal's blit encoder
+/// copies within a single texture as long as the two regions do not overlap,
+/// and the render quad cannot sample the texture it draws into at all, so the
+/// cases split three ways.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SameSurfaceRoute {
     /// The two regions name the same texels, so the copy writes what is there.

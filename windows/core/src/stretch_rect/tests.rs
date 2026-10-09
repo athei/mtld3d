@@ -114,6 +114,7 @@ fn reject_keys_are_distinct() {
         RejectReason::RectOutsideSurface,
         RejectReason::DestinationClass,
         RejectReason::SourceIntoOffscreenPlain,
+        RejectReason::SameSurfaceStretch,
     ]
     .iter()
     .map(|r| r.key())

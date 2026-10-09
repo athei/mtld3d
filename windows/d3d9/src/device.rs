@@ -9027,7 +9027,7 @@ extern "system" fn device_stretch_rect(
     if let Some(reason) = mtld3d_core::stretch_rect::class_reject(src_info.flags, dst_info.flags)
         && !extended_copy
     {
-        log_class_reject(
+        log_pair_reject(
             reason,
             (src, &src_info, src_rect),
             (dst, &dst_info, dst_rect),
@@ -9055,6 +9055,20 @@ extern "system" fn device_stretch_rect(
     };
 
     let scaling = src_region.w != dst_region.w || src_region.h != dst_region.h;
+    // D3D9 copies between two rects of one surface only 1:1. A surface is one
+    // COM object per subresource, so two levels or two faces of one texture are
+    // two surfaces and may stretch. So may an additional swap chain's back
+    // buffer and the device's, which alias one texture here but are two
+    // surfaces to the application.
+    if scaling && core::ptr::eq(src, dst) {
+        log_pair_reject(
+            RejectReason::SameSurfaceStretch,
+            (src, &src_info, src_rect),
+            (dst, &dst_info, dst_rect),
+            dev.is_extended(),
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // A planar source decodes through the render quad into a render target and
     // through the CPU converter, 1:1, into an offscreen plain; both are the
     // cross-format branches below. Everything else with a planar endpoint is
@@ -9187,15 +9201,16 @@ extern "system" fn device_stretch_rect(
     D3D_OK
 }
 
-/// Warn once per rule that a `StretchRect` pair broke the surface-class matrix.
+/// Warn once per rule that a `StretchRect` pair broke a rule on its two surfaces.
 ///
-/// The line names the rule, then for each endpoint its class, usage, format,
-/// level extent, mip level and the rect the call passed, and whether the
-/// device is extended, so a game log alone says which pair the application
-/// asked for and why an extended device's whole-surface copy did not take it.
-/// The arguments are formatted only when the line fires, so each rule names
-/// the first pair that broke it.
-fn log_class_reject(
+/// The rules are the surface-class matrix and the refusal of a stretch inside
+/// one surface. The line names the rule, then for each endpoint its class,
+/// usage, format, level extent, mip level and the rect the call passed, and
+/// whether the device is extended, so a game log alone says which pair the
+/// application asked for and why an extended device's whole-surface copy did
+/// not take it. The arguments are formatted only when the line fires, so each
+/// rule names the first pair that broke it.
+fn log_pair_reject(
     reason: mtld3d_core::stretch_rect::RejectReason,
     src: (*mut c_void, &StretchSurfaceInfo, *const c_void),
     dst: (*mut c_void, &StretchSurfaceInfo, *const c_void),

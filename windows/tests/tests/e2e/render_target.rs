@@ -1177,6 +1177,116 @@ fn stretch_rect_copies_between_disjoint_rects_of_one_surface() {
 }
 
 #[test]
+fn stretch_rect_refuses_a_stretch_inside_one_surface() {
+    // D3D9 copies between two rects of one surface only 1:1: a stretch or a
+    // shrink there is INVALIDCALL and leaves the surface as it was, also when
+    // one side reaches the back buffer through the implicit swap chain. Two
+    // faces of one cube are two surfaces, so a stretch between them is still
+    // accepted.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let chain = h.implicit_swapchain();
+    let chain_bb = chain.back_buffer();
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 64, 64)]),
+        0,
+        "paint the source block"
+    );
+
+    for (destination, what) in [
+        (rect(256, 128, 384, 256), "a stretch"),
+        (rect(256, 128, 288, 160), "a shrink"),
+    ] {
+        assert_eq!(
+            h.stretch_rect_regions(&bb, &rect(0, 0, 64, 64), &bb, &destination, D3DTEXF_LINEAR),
+            D3DERR_INVALIDCALL,
+            "{what} inside the back buffer",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &chain_bb,
+            &rect(256, 128, 384, 256),
+            D3DTEXF_LINEAR,
+        ),
+        D3DERR_INVALIDCALL,
+        "a stretch into the back buffer reached through the implicit swap chain",
+    );
+    assert_eq!(
+        h.read_pixel(272, 144),
+        BLACK,
+        "no refused call wrote the back buffer"
+    );
+    assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
+
+    let texture = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.stretch_rect_regions(
+            &level,
+            &rect(0, 0, 16, 16),
+            &level,
+            &rect(32, 32, 64, 64),
+            D3DTEXF_POINT,
+        ),
+        D3DERR_INVALIDCALL,
+        "a stretch inside one render-target texture level",
+    );
+    assert_eq!(
+        h.stretch_rect_regions(
+            &level,
+            &rect(0, 0, 16, 16),
+            &level,
+            &rect(32, 32, 48, 48),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "a 1:1 copy inside the same level",
+    );
+
+    let cube = h.create_cube_texture_owned(
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let (face1, face3) = (cube.surface(1, 0), cube.surface(3, 0));
+    assert_eq!(
+        h.stretch_rect_regions(
+            &face1,
+            &rect(0, 0, 64, 64),
+            &face1,
+            &rect(0, 0, 32, 32),
+            D3DTEXF_LINEAR,
+        ),
+        D3DERR_INVALIDCALL,
+        "a shrink inside one cube face",
+    );
+    assert_eq!(
+        h.stretch_rect_regions(
+            &face1,
+            &rect(0, 0, 64, 64),
+            &face3,
+            &rect(0, 0, 32, 32),
+            D3DTEXF_LINEAR,
+        ),
+        D3D_OK,
+        "a shrink between two faces of one cube",
+    );
+}
+
+#[test]
 fn stretch_rect_shifts_an_overlapping_rect_of_one_surface() {
     // An overlapping copy reads the whole source region before it writes any
     // of the destination, so both halves of the source land shifted rather
