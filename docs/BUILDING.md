@@ -108,6 +108,14 @@ mechanism.
 unit tests and the end-to-end suite; both are green before every commit.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gates) lists what each one runs.
 
+`make check` also lints and unit-tests a `PERF=1` build, the only build of a
+gate that compiles the perf telemetry and its tests. It goes into `target/perf`
+of each workspace rather than into the default target directory, since every
+crate whose build script reads the setting rebuilds whenever it changes. The
+first `make check` in a checkout builds it from scratch, which takes a few
+minutes and about 5.6 GB of disk (3.3 GB under `windows`, 2.3 GB under
+`unix`). The Makefile says which legs it runs beside `clippy-perf`.
+
 The test legs run with Apple's Metal validation layer on and the Metal HUD
 off; the Makefile says why beside `MTL_HUD_ENABLED`. Setting
 `MTL_HUD_ENABLED=1` on the command line or in the environment turns the HUD

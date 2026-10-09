@@ -11,6 +11,19 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 
+/// Convert cycles of the tests' fixed 1 GHz clock to milliseconds.
+///
+/// The summary renders through this instead of the calibrated
+/// `mtld3d_shared::tsc::cycles_to_ms`, so a fixture's cycles are nanoseconds
+/// on every host and the goldens below hold on a 24 MHz counter as on a 1 GHz
+/// one. Only rendering uses this clock: a value converted on the ingest side
+/// through `ns_to_cycles` or `secs_to_cycles` is in host ticks, not test
+/// nanoseconds, so a test that feeds nanoseconds through ingest and checks the
+/// rendered milliseconds depends on the host's counter rate.
+pub(super) fn cycles_to_ms(cycles: u64) -> f64 {
+    mtld3d_shared::tsc::u64_to_f64_exact(cycles) / 1e6
+}
+
 pub(super) const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {
     FrameSample {
         counters: FrameCounters::new(),
@@ -1142,8 +1155,7 @@ fn sample_window() -> PerfWindow {
     // calls[Device] = 123.
     let mut dsub = [0u64; DeviceSubCategory::COUNT];
     let mut dcalls = [0u32; DeviceSubCategory::COUNT];
-    // Values picked so `cycles / tsc_hz * 1e3` rounds cleanly at
-    // `{:.2}` even with the small jitter in runtime calibration —
+    // Values picked so the milliseconds round cleanly at `{:.2}`:
     // multiples of 10_000 cycles only. Sum = 300_000 to match
     // `cats[Device]`.
     dsub[DeviceSubCategory::Frame as usize] = 40_000;
@@ -1168,7 +1180,7 @@ fn sample_window() -> PerfWindow {
     // BindSubCategory rows. Sums must match the parent exactly —
     // every BindSubCategory site uses `bind_timer`, no escape.
     // Values are multiples of 1_000 cycles to round cleanly at
-    // `{:.2}` under runtime tsc_hz calibration.
+    // `{:.2}`.
     let mut bsub = [0u64; BindSubCategory::COUNT];
     let mut bcalls = [0u32; BindSubCategory::COUNT];
     bsub[BindSubCategory::Texture as usize] = 4_000;
@@ -1187,7 +1199,7 @@ fn sample_window() -> PerfWindow {
     // SurfaceSubCategory rows. Sums must match `cats[Surface]` exactly —
     // every surface thunk tags a variant via `surf_timer`, with `Misc`
     // as the catch-all. Multiples of 10_000 cycles round cleanly at
-    // `{:.2}` under runtime tsc_hz calibration.
+    // `{:.2}`.
     let mut ssub = [0u64; SurfaceSubCategory::COUNT];
     let mut scalls = [0u32; SurfaceSubCategory::COUNT];
     ssub[SurfaceSubCategory::LockRect as usize] = 20_000;
@@ -1280,11 +1292,9 @@ fn sample_window() -> PerfWindow {
             // snapshot dominates the Draws bucket; split inside it
             // is stages 20 + c_ff 20 + c_pr 10 + keys 20 + bumps 10
             // + leftover 10 = 90. push_op trails. Every component is
-            // a multiple of 10_000 so `cycles / tsc_hz * 1e3` rounds
-            // identically across calibration jitter (the underlying
-            // tsc_hz wobble of ±few ppm only flips rounding for
-            // values like 5_000 or 25_000 that fall on the {:.2}
-            // boundary).
+            // a multiple of 10_000 so its milliseconds stay off the
+            // {:.2} rounding boundary that values like 5_000 or 25_000
+            // fall on.
             draw_snapshot_cycles: 90_000,
             draw_snapshot_stages_cycles: 20_000,
             draw_snapshot_c_ff_cycles: 20_000,
@@ -1343,7 +1353,7 @@ fn sample_window() -> PerfWindow {
             // Decompose op_cyc 1.40M into the nine phases (six draw phases sum
             // 1.35M + three non-draw phases sum 0.03M = 1.38M) so the golden
             // pins each "Closures (op)" sub-row; resid = 0.02M. Multiples of
-            // 10_000 cyc round cleanly at {:.2} under tsc jitter.
+            // 10_000 cyc round cleanly at {:.2}.
             op_sub_cycles: [
                 300_000, 400_000, 100_000, 200_000, 150_000, 200_000, 10_000, 10_000, 10_000,
             ],
@@ -2005,10 +2015,10 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         frame.counters.timed = 1;
         frame.counters.api_call_counts_by_category[device] = 10;
         frame.counters.device_sub_calls[render_state] = 10;
-        frame.counters.device_sub_cycles[render_state] = ns_to_cycles(1_000);
+        frame.counters.device_sub_cycles[render_state] = 1_000;
         frame.enc.slot_waits = 1;
-        frame.timing.frame_total_cycles = ns_to_cycles(1_000_000);
-        frame.timing.present_block_cycles = ns_to_cycles(100_000);
+        frame.timing.frame_total_cycles = 1_000_000;
+        frame.timing.present_block_cycles = 100_000;
         frame
     };
     let untimed_frame = {
@@ -2016,8 +2026,8 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         frame.counters.api_call_counts_by_category[device] = 30;
         frame.counters.device_sub_calls[render_state] = 30;
         frame.enc.slot_waits = 4;
-        frame.timing.frame_total_cycles = ns_to_cycles(9_000_000);
-        frame.timing.present_block_cycles = ns_to_cycles(7_000_000);
+        frame.timing.frame_total_cycles = 9_000_000;
+        frame.timing.present_block_cycles = 7_000_000;
         frame
     };
     let mut enc = EncoderPerfState::new();
@@ -2043,7 +2053,7 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         row("│  │  ├─ RenderState").contains("( 100 ns/call)"),
         "the ratio divides the timed frame's time by its own calls: {grid}"
     );
-    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns_to_cycles(ns)));
+    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns));
     assert!(row("API thread").contains(&peak(9_000_000)), "{grid}");
     assert!(row("Frame total").contains(&peak(9_000_000)), "{grid}");
     assert!(
@@ -2054,7 +2064,7 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
     let line = render_kv(&enc.perf_window, &enc.count_window, &sample_caches(), 2.0).finish();
     assert!(line.contains(" api_calls_total=40 "), "{line}");
     assert!(line.contains(" slot_waits_total=5 "), "{line}");
-    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns_to_cycles(ns)));
+    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns));
     assert!(
         line.contains(&format!(" frame_peak_ms={} ", kv_peak(9_000_000))),
         "{line}"
