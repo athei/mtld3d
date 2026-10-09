@@ -1050,10 +1050,9 @@ target (an `UpdateSurface` into a render-target surface or the back buffer, or
 any CPU write into a level of a render-target texture) converts its rect the
 same way and resamples only the rows inside it, so a render texel the rect's
 reported edge cuts takes the written colour or keeps the old one whole: the
-written edge moves by under half a render texel, and a probe on it is the same
-boundary case. A site whose values do
-not fit that mechanism is `real`, exactly as on any other leg; the legs carry
-none today.
+written edge moves by at most half a render texel, and a probe on it is the
+same boundary case. A site whose values do not fit that mechanism is `real`,
+exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 

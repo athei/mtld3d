@@ -7820,7 +7820,7 @@ impl FrameEncoder {
             return;
         }
         self.flush_pending_clears();
-        self.end_current_pass("update_surface");
+        self.end_current_pass("update_color_region");
         let Some((buffer_handle, bytes_per_row)) =
             self.stage_color_rows("update_color_region", rows, height, region.bytes_per_row)
         else {
@@ -7851,8 +7851,8 @@ impl FrameEncoder {
         else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "UpdateSurface: no {width}x{height} {:?} scratch to resample a region into a \
-                 scaled surface through; the region is dropped",
+                "a CPU write: no {width}x{height} {:?} scratch to resample a region into a \
+                 scaled surface or texture level through; the region is dropped",
                 region.format
             );
             return;

@@ -37,11 +37,12 @@ use mtld3d_types::{
     D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
     D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
     D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET,
     D3DVIEWPORT9,
 };
 
-use super::render_target::read_back;
+use super::render_target::{draw_fill, read_back, sample_mip_level_4};
 
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
@@ -1152,6 +1153,64 @@ fn get_dc_drawing_into_a_back_buffer_sized_render_target_texture_reaches_it() {
             "texel ({x}, {y}): {what}"
         );
     }
+}
+
+/// An autogen render-target texture at the back-buffer size regenerates its chain from a write.
+///
+/// The chain is seeded red by a draw into level 0, an `UpdateSurface` writes
+/// level 0 green, and a sample pinned to level 4 reads green: the chain follows
+/// the resampled write rather than the level 0 from before it. Pins an 800x600
+/// frame at `render.scale=0.75`, so the scaled write runs on every leg, and
+/// because the 600x450 texture that rasterizes has as many levels as the
+/// reported size; a scale whose base has fewer, such as 640x480 at 0.75, has
+/// no Metal level for the reported chain's last one.
+#[test]
+fn an_autogen_back_buffer_sized_render_target_texture_regenerates_from_a_write() {
+    let config = "render.scale=0.75";
+    let (width, height) = (800, 600);
+    let h = Harness::create(&HarnessConfig {
+        width,
+        height,
+        config_entries: config,
+        ..HarnessConfig::default()
+    });
+    let back = h.render_target(0);
+    let target = h.create_texture(
+        width,
+        height,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = target.surface_level(0);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.set_render_target(0, &level), D3D_OK, "bind the target");
+    assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
+    draw_fill(&h, RED);
+    assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+    assert_eq!(
+        h.set_render_target(0, &back),
+        D3D_OK,
+        "restore the back buffer"
+    );
+    let source =
+        h.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&vec![GREEN; (width * height) as usize]);
+    assert_eq!(
+        h.update_surface_hr(&source, &level),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+    sample_mip_level_4(&h, &target);
+    assert_eq!(h.present(), D3D_OK, "Present");
+    assert_pixel_eq(
+        h.read_pixel(width / 2, height / 2),
+        GREEN,
+        "the small level carries the write",
+    );
 }
 
 #[test]
