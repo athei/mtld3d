@@ -13,7 +13,7 @@ use std::{
 };
 
 use mtld3d_types::{
-    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
+    D3D_OK, D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
     D3DDEVTYPE_HAL, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT,
     D3DSDK_VERSION, D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl,
@@ -3052,8 +3052,18 @@ impl Harness {
     /// # Panics
     /// Panics if `CreateAdditionalSwapChain` fails.
     pub fn additional_swapchain_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> SwapChain<'_> {
+        let (hr, chain) = self.try_additional_swapchain(pp);
+        expect_ok(hr, "CreateAdditionalSwapChain");
+        chain.expect("a created swap chain")
+    }
+
+    /// `CreateAdditionalSwapChain` with `pp`: the hr, and the chain when one was made.
+    pub fn try_additional_swapchain(
+        &self,
+        pp: &mut D3DPRESENT_PARAMETERS,
+    ) -> (i32, Option<SwapChain<'_>>) {
         let mut chain = core::ptr::null_mut();
-        // SAFETY: live device, valid presentation parameters and writable output.
+        // SAFETY: live device, readable presentation parameters and writable output.
         let hr = unsafe {
             (self.dev_vtbl().create_additional_swap_chain)(
                 self.device,
@@ -3061,9 +3071,11 @@ impl Harness {
                 &raw mut chain,
             )
         };
-        expect_ok(hr, "CreateAdditionalSwapChain");
+        if hr != D3D_OK || chain.is_null() {
+            return (hr, None);
+        }
         // SAFETY: successful creation returned one owned reference, tied to self.
-        unsafe { SwapChain::from_raw(chain) }
+        (hr, Some(unsafe { SwapChain::from_raw(chain) }))
     }
 
     /// `CreateAdditionalSwapChain` with a window-sized request and a null `ppSwapChain`.

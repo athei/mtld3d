@@ -4864,6 +4864,17 @@ extern "system" fn device_create_additional_swap_chain(
         );
         return D3DERR_INVALIDCALL;
     }
+    // The swap effect, back-buffer count and interval follow the rules
+    // `CreateDevice` and `Reset` apply for this kind of device.
+    if !mtld3d_core::present::present_params_are_valid(&pp, dev.is_extended()) {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain: invalid present params (swap_effect={}, \
+             bb_count={}, interval={:#x}) → INVALIDCALL",
+            pp.swap_effect, pp.back_buffer_count, pp.presentation_interval,
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // Resolve a zero-dimension windowed request against the target window's
     // client rect (the device window when device_window is NULL), and clamp a
     // zero back-buffer count to one — then report both back to the caller.

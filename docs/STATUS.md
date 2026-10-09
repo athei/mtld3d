@@ -142,11 +142,13 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
-- Additional swap chains: `CreateAdditionalSwapChain` succeeds and its
-  object carries its own present parameters, but its `GetBackBuffer` hands
-  back a surface object of its own over the device's back-buffer texture and
-  its `Present` presents the device frame into the device window, warned
-  once. There is no back buffer or window per chain, so a title that renders
+- Additional swap chains: `CreateAdditionalSwapChain` checks the swap
+  effect, the back-buffer count and the presentation interval as
+  `CreateDevice` and `Reset` do, for the kind of device it is called on, and
+  its object carries its own present parameters, but its `GetBackBuffer`
+  hands back a surface object of its own over the device's back-buffer
+  texture and its `Present` presents the device frame into the device window,
+  warned once. There is no back buffer or window per chain, so a title that renders
   a second view through one sees it alias the first. Within any one swap
   chain, the implicit one included, every back-buffer index hands back the
   same surface object over one texture, so a `StretchRect` that stretches
