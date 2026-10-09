@@ -229,7 +229,7 @@ impl EncoderThread {
     /// Every lease notification and every packet's replay completion lands on the
     /// device's completion queue, so an empty queue means the last pass left nothing
     /// to do, and this returns without taking a lock.
-    fn maintain_pending(&self) {
+    pub fn maintain_pending(&self) {
         if !self.completions.has_ready() {
             return;
         }

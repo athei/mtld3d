@@ -2070,7 +2070,8 @@ impl DeviceInner {
 
     /// Allocate a rename backing under the VB/IB retention cap.
     ///
-    /// Recycle-pool hit, else enforce the cap, else allocate. The cap is
+    /// Recycle-pool hit (popped again after a lease retirement pass when the
+    /// first pop misses), else enforce the cap, else allocate. The cap is
     /// the only mechanism bounding retained bytes: allocation itself is
     /// infallible (see `PageBox::new_uninit`), because on the 32-bit game
     /// process the allocator never fails cleanly: the process thrashes or
@@ -2083,8 +2084,11 @@ impl DeviceInner {
         // Recycle-pool fast path: a hit is a warm, still-committed box of
         // the same padded size, allocates nothing, and therefore skips the
         // retention-cap check below (which exists to bound allocations).
+        // A miss first retires what native code has finished with, which
+        // parks it in the pool, and pops again (`acquire_or_retire`).
         let pool = &*crate::page_box_pool::PAGEBOX_POOL;
-        if let Some(b) = pool.acquire(logical_len) {
+        let encoder = &self.encoder;
+        if let Some(b) = pool.acquire_or_retire(logical_len, || encoder.maintain_pending()) {
             self.perf.state_mut().bump_vbib_pool_hit();
             return Ok(b);
         }

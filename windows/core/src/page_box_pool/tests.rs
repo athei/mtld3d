@@ -3,10 +3,12 @@
 //! The tests cover one rule each: exact padded-size class matching (a hit keeps the same backing
 //! pages and is retargeted to the new logical length), LIFO order within a class, the largest
 //! accepted class, and the three refusal paths (disabled pool, oversize class, byte cap) handing
-//! the box back for a plain drop. The exact round trip and the mixed-class case also walk
-//! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set. The cap
-//! moves after construction: a pool built disabled parks once it is given a budget, and stops
-//! again when the budget is taken away.
+//! the box back for a plain drop. A miss through `acquire_or_retire` runs the retirement and pops
+//! what it parked; a hit, a disabled pool, an oversize class and a pool with no room under its
+//! cap for the class never run it. The exact round trip and the mixed-class case also walk
+//! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set. The cap moves
+//! after construction: a pool built disabled parks once it is given a budget, and stops again
+//! when the budget is taken away.
 //!
 //! The texture staging lane is covered the same way: a same-size box comes back with its pages
 //! and generation, the two lanes never serve each other, the staging share and the shared cap
@@ -61,6 +63,96 @@ fn exact_class_round_trip() {
     assert_eq!(hit.len(), 3 * PAGE_SIZE);
     assert_eq!(hit.logical_len(), 2 * PAGE_SIZE + 1);
     assert_eq!(pool.pooled_bytes(), 0);
+}
+
+#[test]
+fn miss_retires_then_pops_what_the_retirement_parked() {
+    let pool = PageBoxPool::new(1024 * 1024);
+    let finished = PageBox::new_uninit(2 * PAGE_SIZE);
+    let ptr = finished.as_ptr();
+    let mut finished = Some(finished);
+    let hit = pool
+        .acquire_or_retire(2 * PAGE_SIZE, || {
+            let pb = finished.take().expect("retire runs once");
+            assert!(pool.recycle(pb).is_none(), "the retirement parks the box");
+        })
+        .expect("the retry pops the box the retirement parked");
+    assert!(finished.is_none(), "an empty pool runs the retirement");
+    assert_eq!(hit.as_ptr(), ptr);
+    assert_eq!(pool.pooled_bytes(), 0);
+}
+
+#[test]
+fn hit_does_not_retire() {
+    let pool = PageBoxPool::new(1024 * 1024);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    let mut retired = false;
+    assert!(
+        pool.acquire_or_retire(PAGE_SIZE, || retired = true)
+            .is_some()
+    );
+    assert!(!retired, "a hit returns before the retirement");
+}
+
+#[test]
+fn retire_is_skipped_where_no_retry_can_hit() {
+    let mut retired = false;
+    let disabled = PageBoxPool::new(0);
+    assert!(
+        disabled
+            .acquire_or_retire(PAGE_SIZE, || retired = true)
+            .is_none()
+    );
+    let pool = PageBoxPool::new(usize::MAX);
+    let oversize = (MAX_POOL_CLASSES + 1) * PAGE_SIZE;
+    assert!(
+        pool.acquire_or_retire(oversize, || retired = true)
+            .is_none()
+    );
+    assert!(
+        !retired,
+        "a disabled pool or an oversize class never retires"
+    );
+    // A retirement that parks nothing of the class still misses.
+    assert!(
+        pool.acquire_or_retire(PAGE_SIZE, || retired = true)
+            .is_none()
+    );
+    assert!(retired);
+}
+
+#[test]
+fn full_pool_does_not_retire() {
+    let pool = PageBoxPool::new(2 * PAGE_SIZE);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    // The cap holds two pages, both parked in another class than the one asked for.
+    let mut retired = false;
+    assert!(
+        pool.acquire_or_retire(2 * PAGE_SIZE, || retired = true)
+            .is_none()
+    );
+    assert!(
+        !retired,
+        "with no room for the class, the miss falls through to allocate"
+    );
+    assert_eq!(pool.pooled_bytes(), 2 * PAGE_SIZE);
+}
+
+#[test]
+fn room_for_exactly_the_class_still_retires() {
+    let pool = PageBoxPool::new(3 * PAGE_SIZE);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    // One page parked, two pages of room: a two-page box still fits under the cap.
+    let mut retired = false;
+    assert!(
+        pool.acquire_or_retire(2 * PAGE_SIZE, || retired = true)
+            .is_none()
+    );
+    assert!(
+        retired,
+        "a box that fits under the cap exactly is worth a retirement"
+    );
 }
 
 #[test]
