@@ -1181,7 +1181,8 @@ fn stretch_rect_refuses_a_stretch_inside_one_surface() {
     // D3D9 copies between two rects of one surface only 1:1: a stretch or a
     // shrink there is INVALIDCALL and leaves the surface as it was, also when
     // one side reaches the back buffer through the implicit swap chain. Two
-    // faces of one cube are two surfaces, so a stretch between them is still
+    // faces of one cube are two surfaces, and so are an additional swap chain's
+    // back buffer and the device's, so a stretch between either pair is still
     // accepted.
     let h = Harness::new();
     let bb = h.render_target(0);
@@ -1221,6 +1222,24 @@ fn stretch_rect_refuses_a_stretch_inside_one_surface() {
         "no refused call wrote the back buffer"
     );
     assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
+
+    // An additional swap chain's back buffer aliases the device's texture here
+    // but is another surface to the application, so a stretch from it into the
+    // device's back buffer is accepted and lands as one between two surfaces.
+    let extra = h.additional_swapchain();
+    let extra_bb = extra.back_buffer();
+    assert_eq!(
+        h.stretch_rect_regions(
+            &extra_bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(256, 128, 384, 256),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "a stretch from an additional swap chain's back buffer into the device's",
+    );
+    assert_eq!(h.read_pixel(320, 192), RED, "the stretched block landed");
 
     let texture = h.create_texture(
         64,

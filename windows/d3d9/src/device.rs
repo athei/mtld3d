@@ -9059,7 +9059,10 @@ extern "system" fn device_stretch_rect(
     // COM object per subresource, so two levels or two faces of one texture are
     // two surfaces and may stretch. So may an additional swap chain's back
     // buffer and the device's, which alias one texture here but are two
-    // surfaces to the application.
+    // surfaces to the application. The back-buffer indices of one swap chain
+    // are the exception: this layer hands every index the same surface object
+    // over one texture, so a stretch between two of them, which D3D9 allows,
+    // is refused here as a stretch inside one surface.
     if scaling && core::ptr::eq(src, dst) {
         log_pair_reject(
             RejectReason::SameSurfaceStretch,

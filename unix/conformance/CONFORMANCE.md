@@ -536,6 +536,17 @@ record. A knob, where one makes sense, is named with its default.
   872, the ten of `test_reset`, the ten of `test_reset_ex`,
   `test_backbuffer_resize` 3925/3926 and the three of `test_sysmem_draw`. No
   knob.
+- **Every back-buffer index of a swap chain is one surface.** With
+  `BackBufferCount` above one, D3D9 keeps a chain of back buffers that
+  `Present` rotates, and `GetBackBuffer` hands back a distinct surface for
+  each index. Here every index of a swap chain, the implicit one included,
+  hands back the same surface object over the one texture the device
+  presents from, so a game that writes one index sees it in all of them, and
+  a `StretchRect` that stretches between two indices is refused with
+  `D3DERR_INVALIDCALL` as a stretch inside one surface, where D3D9 copies it.
+  A chain of real buffers would cost a texture per index and a rotation at
+  every `Present` that no tested game needs: they draw into the current back
+  buffer and present it. No conformance site is known to observe it. No knob.
 
 ## Range-fog coverage
 
