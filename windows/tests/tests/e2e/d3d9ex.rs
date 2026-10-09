@@ -8,11 +8,16 @@
 //! the base `CreateDevice` on an extended factory is extended too. The
 //! factory's extended mode list matches the base one, the adapter identifier
 //! reports WHQL level 1, and the adapter has one stable non-zero LUID. The
-//! extended stubs answer what a device with nothing to do there answers.
+//! extended stubs answer what a device with nothing to do there answers, and
+//! `GetPresentStats` writes the struct's own size on each architecture and
+//! nothing past it.
 
 use core::ffi::{c_char, c_void};
 
-use mtld3d_tests::{Factory, Harness, HarnessConfig, assert_pixel_eq};
+use mtld3d_tests::{
+    Factory, Harness, HarnessConfig, PRESENT_STATS_GUARD, PRESENT_STATS_PROBE_BYTES,
+    assert_pixel_eq,
+};
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER,
     D3DDISPLAYROTATION_IDENTITY, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5,
@@ -31,6 +36,13 @@ unsafe extern "system" {
 }
 
 type CreateExFn = unsafe extern "system" fn(u32, *mut *mut c_void) -> i32;
+
+/// The bytes `D3DPRESENTSTATS` takes in this process, by the SDK header's layout.
+///
+/// `d3d9types.h` packs its structs to 4 bytes on x86, so the two
+/// `LARGE_INTEGER` times follow the three counts at offset 12 there and the
+/// struct is 28 bytes; elsewhere they sit at 16 and it is 32.
+const PRESENT_STATS_BYTES: usize = if cfg!(target_arch = "x86") { 28 } else { 32 };
 
 fn extended(factory: Factory) -> Harness {
     Harness::create(&HarnessConfig {
@@ -367,6 +379,23 @@ fn the_extended_stubs_answer_what_a_device_with_nothing_to_do_answers() {
         ),
         (0, 0, 0, [0; 2], [0; 2]),
         "zeroed statistics"
+    );
+}
+
+#[test]
+fn present_stats_fill_the_struct_and_nothing_past_it() {
+    let h = extended(Factory::Extended);
+    let (hr, bytes) = h.implicit_swapchain().present_stats_guarded();
+    assert_eq!(hr, D3D_OK, "GetPresentStats");
+    assert!(
+        bytes[..PRESENT_STATS_BYTES].iter().all(|&b| b == 0),
+        "the {PRESENT_STATS_BYTES} bytes of the struct are zeroed: {bytes:02x?}"
+    );
+    assert!(
+        bytes[PRESENT_STATS_BYTES..PRESENT_STATS_PROBE_BYTES]
+            .iter()
+            .all(|&b| b == PRESENT_STATS_GUARD),
+        "nothing is written past the struct: {bytes:02x?}"
     );
 }
 

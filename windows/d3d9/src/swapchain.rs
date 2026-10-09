@@ -549,7 +549,7 @@ extern "system" fn swapchain_get_present_stats(
                 present_count: 0,
                 present_refresh_count: 0,
                 sync_refresh_count: 0,
-                pad0: 0,
+                pad: [0; mtld3d_types::D3DPRESENTSTATS_PAD_WORDS],
                 sync_qpc_time: [0; 2],
                 sync_gpu_time: [0; 2],
             },

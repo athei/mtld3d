@@ -22,6 +22,12 @@ use crate::{
     vtbl::deref_vtbl,
 };
 
+/// The byte a guarded `GetPresentStats` buffer starts filled with.
+pub const PRESENT_STATS_GUARD: u8 = 0xAA;
+
+/// The bytes a guarded `GetPresentStats` buffer holds, more than any `D3DPRESENTSTATS` layout.
+pub const PRESENT_STATS_PROBE_BYTES: usize = 40;
+
 #[repr(C)]
 struct IUnknownHeadVtbl {
     _query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
@@ -192,13 +198,34 @@ impl SwapChain<'_> {
             present_count: u32::MAX,
             present_refresh_count: u32::MAX,
             sync_refresh_count: u32::MAX,
-            pad0: u32::MAX,
+            pad: [u32::MAX; mtld3d_types::D3DPRESENTSTATS_PAD_WORDS],
             sync_qpc_time: [u32::MAX; 2],
             sync_gpu_time: [u32::MAX; 2],
         };
         // SAFETY: extended vtable thunk; `stats` is writable.
         let hr = unsafe { (self.ex_vtbl().get_present_stats)(self.ptr, &raw mut stats) };
         (hr, stats)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats` into a guarded buffer: hr and every byte of it.
+    ///
+    /// The buffer is wider than any layout of `D3DPRESENTSTATS` and starts
+    /// filled with [`PRESENT_STATS_GUARD`], so the bytes show both what the
+    /// call wrote and whether it wrote past the caller's struct.
+    #[must_use]
+    pub fn present_stats_guarded(&self) -> (i32, [u8; PRESENT_STATS_PROBE_BYTES]) {
+        let mut buffer = GuardedPresentStats {
+            bytes: [PRESENT_STATS_GUARD; PRESENT_STATS_PROBE_BYTES],
+        };
+        // SAFETY: extended vtable thunk; `buffer` is writable for more bytes
+        // than any `D3DPRESENTSTATS` layout and aligned for one.
+        let hr = unsafe {
+            (self.ex_vtbl().get_present_stats)(
+                self.ptr,
+                (&raw mut buffer).cast::<D3DPRESENTSTATS>(),
+            )
+        };
+        (hr, buffer.bytes)
     }
 
     /// `IDirect3DSwapChain9Ex::GetDisplayModeEx` with `mode.Size = size`.
@@ -2415,4 +2442,10 @@ const fn zeroed_surface_desc() -> D3DSURFACE_DESC {
         width: 0,
         height: 0,
     }
+}
+
+/// A `GetPresentStats` destination with room past the struct, aligned as the struct is.
+#[repr(C, align(8))]
+struct GuardedPresentStats {
+    bytes: [u8; PRESENT_STATS_PROBE_BYTES],
 }

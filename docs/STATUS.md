@@ -116,8 +116,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   through the extended calls. `ComposeRects`, `WaitForVBlank`,
   `CheckResourceResidency`, the GPU thread priority pair,
   `GetLastPresentCount` and `GetPresentStats` succeed without doing
-  anything, each logged once, and `SetConvolutionMonoKernel` answers
-  `D3DERR_INVALIDCALL`.
+  anything, each logged once, `GetPresentStats` filling the 28 bytes the
+  structure has in a 32-bit process and the 32 it has in a 64-bit one, and
+  `SetConvolutionMonoKernel` answers `D3DERR_INVALIDCALL`.
 
 ## Not implemented yet
 

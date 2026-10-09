@@ -1641,23 +1641,37 @@ const _: () = assert!(
 );
 const _: () = assert!(core::mem::size_of::<IDirect3DSwapChain9ExVtbl>() == 13 * VTBL_SLOT);
 
+/// The 32-bit words of padding `D3DPRESENTSTATS` carries before its first time.
+///
+/// `d3d9types.h` packs its structs to 4 bytes on x86 alone, so there the two
+/// `LARGE_INTEGER` times follow the three counts directly; every other target
+/// aligns them to 8, one word past the counts.
+pub const D3DPRESENTSTATS_PAD_WORDS: usize = if cfg!(target_arch = "x86") { 0 } else { 1 };
+
 /// `D3DPRESENTSTATS`, what `IDirect3DSwapChain9Ex::GetPresentStats` fills.
 ///
 /// The two Win32 `LARGE_INTEGER` times are `[u32; 2]` halves (`LowPart`,
-/// `HighPart`) after an explicit pad: the ABI places them at offset 16 on both
-/// architectures, but a 32-bit caller's struct may sit only 4-aligned on its
-/// stack, so the fields carry 4-byte alignment and the padding is spelled out.
+/// `HighPart`), so every field is 4-aligned as the 32-bit layout needs, and
+/// the 8-byte alignment the 64-bit layout gives them is spelled out as
+/// [`D3DPRESENTSTATS_PAD_WORDS`] of padding. The struct is 28 bytes with the
+/// times at offset 12 on x86 and 32 bytes with them at 16 everywhere else.
 #[repr(C)]
 pub struct D3DPRESENTSTATS {
     pub present_count: u32,
     pub present_refresh_count: u32,
     pub sync_refresh_count: u32,
-    pub pad0: u32,
+    pub pad: [u32; D3DPRESENTSTATS_PAD_WORDS],
     pub sync_qpc_time: [u32; 2],
     pub sync_gpu_time: [u32; 2],
 }
 
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::size_of::<D3DPRESENTSTATS>() == 28);
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::offset_of!(D3DPRESENTSTATS, sync_qpc_time) == 12);
+#[cfg(not(target_arch = "x86"))]
 const _: () = assert!(core::mem::size_of::<D3DPRESENTSTATS>() == 32);
+#[cfg(not(target_arch = "x86"))]
 const _: () = assert!(core::mem::offset_of!(D3DPRESENTSTATS, sync_qpc_time) == 16);
 
 // ── D3D9 query constants ──
