@@ -2457,14 +2457,17 @@ impl FrameEncoder {
         }
     }
 
-    /// The process footprint, the device's allocated size and the cached wrappers' bytes.
+    /// The process footprint, the device's allocated size, our heap and the cached wrappers' bytes.
     ///
-    /// Two system queries and a walk of every cached texture's level slots, so
-    /// it runs once per summary window, never per frame.
+    /// Two system queries, snmalloc's two atomic loads and a walk of every
+    /// cached texture's level slots, so it runs once per summary window,
+    /// never per frame.
     fn memory_gauges(&self) -> MemoryGauges {
         MemoryGauges {
             process_footprint: crate::handlers::process_footprint(),
             metal_allocated: u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
+            unix_heap: u64::try_from(snmalloc_rs::SnMalloc::memory_stats().current_memory_usage)
+                .unwrap_or(u64::MAX),
             staging_wrapped: staging_wrapped_bytes(&self.texture_cache),
         }
     }

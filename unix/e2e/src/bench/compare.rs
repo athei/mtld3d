@@ -36,7 +36,7 @@
 //! like an exact change unless it is accepted by name. One only the
 //! candidate has (the `perf.*` metrics against a base without the `perf-kv`
 //! line) is listed as added. A metric some rounds of a leg carry and others
-//! do not is an error, except the six the `perf-kv` line may leave out of a
+//! do not is an error, except the seven the `perf-kv` line may leave out of a
 //! window ([`OPTIONAL_METRICS`]: the fault counts without a fault sample,
 //! the pool's GPU copies without any, the memory gauges without their
 //! sample): with one window a round those come and go, and are reported as
@@ -216,18 +216,19 @@ const SPAN_META: &str = "window_s";
 
 /// The metrics a round may lack, from the keys the `perf-kv` line may leave out of a window.
 ///
-/// `docs/ARCHITECTURE.md` names the six keys: the fault counts, absent
+/// `docs/ARCHITECTURE.md` names the seven keys: the fault counts, absent
 /// from a window without a fault sample, the GPU copies of the vertex and
-/// index buffer pool, absent when it has none to count, and the three
+/// index buffer pool, absent when it has none to count, and the four
 /// memory gauges, absent from a window that closed before their sample
 /// arrived. A benchmark reads one window a round, so a round lacks them now
 /// and then. Any other metric a round lacks is an error.
-const OPTIONAL_METRICS: [&str; 6] = [
+const OPTIONAL_METRICS: [&str; 7] = [
     "perf.faults_minor_pf",
     "perf.faults_major_pf",
     "perf.vbib_gpu_copy_pf",
     "perf.process_footprint_bytes",
     "perf.metal_allocated_bytes",
+    "perf.unix_heap_bytes",
     "perf.tex_staging_wrapped_bytes",
 ];
 

@@ -2349,6 +2349,14 @@ pub struct MemoryGauges {
     pub process_footprint: u64,
     /// Bytes the `MTLDevice` reports as allocated (`currentAllocatedSize`).
     pub metal_allocated: u64,
+    /// Bytes `mtld3d.so`'s snmalloc holds committed and handed to its allocators.
+    ///
+    /// Every Rust heap block of the native runtime and what its per-thread
+    /// caches keep for reuse, for the whole process (every device's encoder,
+    /// submit and worker threads). Objects the system frameworks allocate
+    /// through `malloc`, Metal's pipelines and libraries among them, are not
+    /// in it.
+    pub unix_heap: u64,
     /// Padded staging bytes under the encoder's cached per-level `bytesNoCopy` wrappers.
     ///
     /// Each wrapper keeps its guest pages alive, so this is staging the PE
@@ -6423,6 +6431,13 @@ impl<'a> Summary<'a> {
         );
         self.res_row(
             out,
+            "unix heap",
+            &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.unix_heap)),
+            None,
+            "mtld3d.so's snmalloc committed at the summary (its Rust heap; framework malloc not included)",
+        );
+        self.res_row(
+            out,
             "metal alloc",
             &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.metal_allocated)),
             None,
@@ -6869,6 +6884,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     }
     if let Some(memory) = &caches.memory {
         kv.bytes("process_footprint", memory.process_footprint);
+        kv.bytes("unix_heap", memory.unix_heap);
     }
     kv
 }

@@ -900,13 +900,13 @@ aggregation changes gets a new name and the old one goes away rather than
 changing under a tool that compares builds across it. The `v1` tag changes only
 when the line's own format does (the separators, the value syntax, the header).
 A consumer ignores keys it does not know and treats a missing key as not
-measured. Six keys can be missing: `vbib_gpu_copy_total` is left out when one
+measured. Seven keys can be missing: `vbib_gpu_copy_total` is left out when one
 of its inputs saturated, where the grid prints `saturated`;
 `faults_minor_total` and `faults_major_total` are left out of a window that
 sampled no faults (the first window, which has no baseline, or one closed
-before a sample arrived), where the grid prints 0; and the three memory
-gauges, `process_footprint_bytes`, `metal_allocated_bytes` and
-`tex_staging_wrapped_bytes`, are left out of a window closed before their
+before a sample arrived), where the grid prints 0; and the four memory
+gauges, `process_footprint_bytes`, `unix_heap_bytes`, `metal_allocated_bytes`
+and `tex_staging_wrapped_bytes`, are left out of a window closed before their
 sample arrived, where the grid prints `n/a`.
 
 Every key, with the grid row it mirrors. A `<x>` stands for each name listed
@@ -956,6 +956,7 @@ in its row, and every family carries the suffixes its row names.
 | `pe_pagebox_alloc_total`, `pe_pagebox_alloc_bytes_total`, `pe_pagebox_free_total`, `pe_pagebox_free_bytes_total`, `pe_pagebox_uncached_total`, `pe_pagebox_pool_recycled_total`, `pe_pagebox_pool_recycled_bytes_total`, `pe_pagebox_pool_parked_bytes` | `d3d9.dll`'s share of `pagebox`, `uncached`, the pool's `recycled` and `parked` (peak), carried in the frame payload. The grid adds it to the encoder runtime's, which the `pagebox_*` keys hold alone. |
 | `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
 | `process_footprint_bytes` | `footprint`: the process's physical footprint (`ri_phys_footprint` of `proc_pid_rusage`, the ledger value `TASK_VM_INFO` reports as `phys_footprint`), sampled at the summary. It is what the Metal HUD shows as app memory and covers the whole process: Wine, the game and both runtimes of this layer. |
+| `unix_heap_bytes` | `unix heap`: what `mtld3d.so`'s snmalloc has committed and handed to its allocators, sampled at the summary with two atomic loads, the same figure the address-space watch reports for `d3d9.dll`. It is every Rust allocation of the native runtime, for every device of the process, and what its per-thread caches keep for reuse. What the system frameworks allocate through `malloc`, Metal's libraries and pipeline states among them, is not in it, so a footprint that grows while this stays flat grew in Wine, the translator, the game, the frameworks or the driver. |
 | `comp_<x>_ms`, `_peak_ms`, `comp_<x>_calls_total`, `comp_<x>_failed_total` | The `Compilation` rows: `vs_miss`, `ps_miss`, `emit_vs`, `emit_ps`, `shader_setup`, `metal_library`, `function_lookup`, `shader_cache_persist`, `pso_primary`, `pso_sibling`, `pso_setup`, `pso_build`, `pso_cache_persist`, `depth_state`; and `resolve_remainder`, `pipeline_remainder` with `_ms` and `_peak_ms` only, since they are computed rather than counted. Written in every window, idle or not. |
 | `comp_async_skipped_draws_total`, `comp_async_pending_peak_count`, `comp_async_installs_total`, `comp_async_latency_avg_ms`, `comp_async_latency_peak_ms` | The first `async:` row: skipped draws, most builds in flight, installs, and the average and longest enqueue-to-install latency. |
 | `comp_async_deferred_draws_total`, `comp_async_urgent_waits_total`, `comp_async_urgent_wait_ms`, `comp_async_stolen_total`, `comp_async_misses_total`, `comp_async_miss_ms` | The second `async:` row: deferred draws, urgent waits and their time, stolen jobs, misses and the encoder time they cost. Unlike that row, which prints the wait as a window total and the miss cost per miss, both `_ms` keys are per-frame averages. |
