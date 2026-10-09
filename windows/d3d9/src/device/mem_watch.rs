@@ -114,9 +114,9 @@ impl DeviceInner {
     /// Count, total mip bytes, and resident staging bytes of every live texture.
     ///
     /// The staging split names who still holds a system copy: default-pool
-    /// static (droppable after upload), default-pool render targets (staging
-    /// only for a level a CPU path has used), default-pool dynamic, and the
-    /// lockable pools.
+    /// static (droppable after upload), default-pool render targets (a 2D
+    /// level holds staging only once a CPU path has used it, a cube face
+    /// always), default-pool dynamic, and the lockable pools.
     fn live_texture_footprint(&self) -> TextureFootprint {
         let live = self
             .live_textures

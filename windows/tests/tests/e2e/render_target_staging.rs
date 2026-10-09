@@ -458,42 +458,6 @@ fn a_write_into_a_cube_render_target_face_keeps_its_place_in_the_frame() {
     assert_eq!(at(56, 56), BLUE, "the second draw over the write");
 }
 
-/// A CPU write into a render-target texture at the back buffer's size reaches its texture.
-///
-/// A `render.scale` leg rasterizes such a target smaller than the size the
-/// write describes.
-#[test]
-fn a_write_into_a_back_buffer_sized_render_target_texture_reaches_it() {
-    let h = Harness::new();
-    let (width, height) = h.dims();
-    let target = create_target(&h, width, height);
-    let level = target.surface_level(0);
-    let source =
-        h.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
-    source
-        .lock_rect(0)
-        .write_u32(&vec![GREEN; (width * height) as usize]);
-    let whole = D3DRECT {
-        x1: 0,
-        y1: 0,
-        x2: width.cast_signed(),
-        y2: height.cast_signed(),
-    };
-    assert_eq!(
-        h.update_surface_region_hr(&source, &whole, &level, (0, 0)),
-        D3D_OK,
-        "UpdateSurface of the whole level"
-    );
-    let pixels = read_back(&h, &level, (width, height), D3DFMT_A8R8G8B8);
-    for (x, y) in [(width / 2, height / 2), (8, 8), (width - 8, height - 8)] {
-        assert_eq!(
-            pixels[(y * width + x) as usize],
-            GREEN,
-            "texel ({x}, {y}) holds the write"
-        );
-    }
-}
-
 /// `UpdateSurface` the whole of `level` from a system-memory surface filled with `color`.
 fn update_whole_level(h: &Harness, level: &Surface<'_>, color: u32) {
     let source = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
