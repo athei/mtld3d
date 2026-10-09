@@ -3861,7 +3861,7 @@ fn rejected_reset_regenerates_a_bound_autogen_render_target() {
 ///
 /// MAXMIPLEVEL is the most detailed level the sampler may use, so the draw
 /// cannot read a more detailed level instead. Leaves the scene ended.
-fn sample_mip_level_4(h: &Harness, rt: &Texture<'_>) {
+pub fn sample_mip_level_4(h: &Harness, rt: &Texture<'_>) {
     assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
     assert_eq!(h.set_texture(0, rt), 0, "bind the filled texture");
     for (state, value) in [

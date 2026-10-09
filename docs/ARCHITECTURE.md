@@ -280,7 +280,7 @@ box, and a texture detached from its device drops its staging instead of
 parking it. The textures `pool` row of the `PERF=1` summary counts the lane's
 hits and misses.
 
-A default-pool render-target texture keeps no staging at rest: its levels are
+A default-pool 2D render-target texture keeps no staging at rest: its levels are
 released at creation and claimed for the GPU, and the first CPU path that needs
 a level (a `LockRect`, a `GetDC`, a CPU copy into or out of it) reads it back
 into fresh pages, which the level then keeps (`staging_lazy_class` in

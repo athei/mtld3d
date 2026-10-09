@@ -16,12 +16,13 @@ use mtld3d_types::{
     D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
     D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 use super::{
     device::{await_logged_lines, run_in_private_log_child, running_as},
-    render_target::{draw_fill, read_back, textured_fullscreen_quad},
+    render_target::{draw_fill, read_back, sample_mip_level_4, textured_fullscreen_quad},
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -381,6 +382,137 @@ fn a_lock_write_into_a_bound_target_lands_under_the_draws_after_it() {
     assert_update_under_draw(&h, &target, &level, GREEN, BLUE);
 }
 
+/// A `Clear` still waiting for a pass stays under a write into the bound target.
+///
+/// The target is bound and cleared red with no draw after it, so the clear
+/// waits to become the next pass's load action. A whole-level `UpdateSurface`
+/// then writes green and a draw covers the bottom-right quarter in blue: the
+/// clear lands before the write, not over it.
+#[test]
+fn a_pending_clear_stays_under_a_write_into_the_bound_target() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    assert_eq!(h.set_render_target(0, &level), D3D_OK, "bind the target");
+    assert_eq!(h.clear_target(RED), D3D_OK, "clear it red, no draw after");
+    update_whole_level(&h, &level, GREEN);
+    draw_quarter(&h, &level, &back, BLUE);
+    assert_update_under_draw(&h, &target, &level, GREEN, BLUE);
+}
+
+/// An autogen render-target texture regenerates its chain from a CPU write into level 0.
+///
+/// The chain is seeded red by a draw, an `UpdateSurface` writes level 0 green
+/// with the texture unbound, and a sample pinned to a small level reads green:
+/// the chain follows the write rather than the level 0 from before it.
+#[test]
+fn an_autogen_render_target_regenerates_its_chain_from_an_update_surface() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = target.surface_level(0);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
+    draw_into(&h, &level, &back, RED);
+    assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+    update_whole_level(&h, &level, GREEN);
+    sample_mip_level_4(&h, &target);
+    assert_eq!(h.present(), D3D_OK, "Present");
+    let (width, height) = h.dims();
+    let centre = h.read_pixel(width / 2, height / 2);
+    assert_eq!(centre, GREEN, "the small level carries the write");
+}
+
+/// A write into a cube render-target face lands after a draw into it earlier in the frame.
+///
+/// The face is drawn red, written green by `UpdateSurface` and drawn blue over
+/// its bottom-right quarter, all in one frame.
+#[test]
+fn a_write_into_a_cube_render_target_face_keeps_its_place_in_the_frame() {
+    const FACE: u32 = 4;
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let cube = h.create_cube_texture_owned(
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face = cube.surface(FACE, 0);
+    draw_into(&h, &face, &back, RED);
+    update_whole_level(&h, &face, GREEN);
+    draw_quarter(&h, &face, &back, BLUE);
+    assert_eq!(h.present(), D3D_OK, "submit the frame");
+    let pixels = read_back(&h, &face, (SIZE, SIZE), D3DFMT_A8R8G8B8);
+    let at = |x: u32, y: u32| pixels[(y * SIZE + x) as usize];
+    assert_eq!(at(8, 8), GREEN, "the write over the first draw");
+    assert_eq!(at(56, 56), BLUE, "the second draw over the write");
+}
+
+/// A CPU write into a render-target texture at the back buffer's size reaches its texture.
+///
+/// A `render.scale` leg rasterizes such a target smaller than the size the
+/// write describes.
+#[test]
+fn a_write_into_a_back_buffer_sized_render_target_texture_reaches_it() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let target = create_target(&h, width, height);
+    let level = target.surface_level(0);
+    let source =
+        h.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&vec![GREEN; (width * height) as usize]);
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: width.cast_signed(),
+        y2: height.cast_signed(),
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&source, &whole, &level, (0, 0)),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+    let pixels = read_back(&h, &level, (width, height), D3DFMT_A8R8G8B8);
+    for (x, y) in [(width / 2, height / 2), (8, 8), (width - 8, height - 8)] {
+        assert_eq!(
+            pixels[(y * width + x) as usize],
+            GREEN,
+            "texel ({x}, {y}) holds the write"
+        );
+    }
+}
+
+/// `UpdateSurface` the whole of `level` from a system-memory surface filled with `color`.
+fn update_whole_level(h: &Harness, level: &Surface<'_>, color: u32) {
+    let source = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&[color; (SIZE * SIZE) as usize]);
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: SIZE.cast_signed(),
+        y2: SIZE.cast_signed(),
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&source, &whole, level, (0, 0)),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+}
+
 /// Draw `color` over the bottom-right quarter of `target`, then restore `back`.
 fn draw_quarter(h: &Harness, target: &Surface<'_>, back: &Surface<'_>, color: u32) {
     assert_eq!(h.set_render_target(0, target), D3D_OK, "bind the target");
@@ -440,10 +572,9 @@ fn assert_update_under_draw(
 
 /// A lock after an `UpdateSurface` with no draw between them reads the update.
 ///
-/// The update lands in the staging and uploads at the next bind, so the
-/// level's Metal texture still holds the draw from before it. The lock reads
-/// the staging, which holds the newer pixels, rather than reading the older
-/// ones back over them. The bind after it uploads the update as it would have.
+/// The update is uploaded in application order as it is made, so the lock
+/// that reads the level back afterwards returns it, not the draw from before
+/// it, and a draw that samples the level then sees it too.
 #[test]
 fn a_lock_after_update_surface_before_any_draw_reads_the_update() {
     let h = Harness::new();

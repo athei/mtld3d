@@ -7846,8 +7846,8 @@ fn publish_staging_write(tex: &mut crate::texture::Direct3DTexture9) {
 /// `dst_parent` are distinct, live `Direct3DTexture9` pointers; `copy` runs the
 /// per-mip staging copies once pool and format are validated. Validates source
 /// `D3DPOOL_SYSTEMMEM`, destination `D3DPOOL_DEFAULT`, and a format pair that is
-/// either identical or one the CPU converter covers, then schedules the upload
-/// at the next bind.
+/// either identical or one the CPU converter covers, then publishes the write
+/// ([`publish_staging_write`]).
 fn copy_systemmem_to_default(
     dst_parent: *mut crate::texture::Direct3DTexture9,
     src_parent: *mut crate::texture::Direct3DTexture9,
@@ -7880,8 +7880,7 @@ fn copy_systemmem_to_default(
     let src_inner = unsafe { &*core::ptr::from_ref(src_tex.inner()) };
     let hr = copy(dst_tex.inner_mut(), src_inner);
     // A copy that failed partway has still written the levels before the one
-    // that failed, and those owe their upload like any other: the re-walk is
-    // what flushes them at the next draw.
+    // that failed, and those owe their upload like any other.
     publish_staging_write(dst_tex);
     hr
 }

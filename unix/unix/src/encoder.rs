@@ -6832,7 +6832,15 @@ impl FrameEncoder {
                 .push(record.texture.id, self.current_submit_seq, job);
         }
         if flags.contains(UploadTextureOpFlags::REGENERATE_MIPMAPS) {
-            self.run_generate_mipmaps(TextureId::from_raw(record.mip_texture));
+            // An ordered upload lands between application passes, so the
+            // chain it regenerates follows it there rather than leading the
+            // frame from the level 0 it replaces.
+            let mip_texture = TextureId::from_raw(record.mip_texture);
+            if ordered {
+                self.run_generate_mipmaps_ordered(mip_texture);
+            } else {
+                self.run_generate_mipmaps(mip_texture);
+            }
         }
         Ok(())
     }
@@ -7249,10 +7257,14 @@ impl FrameEncoder {
             ..info
         };
         let command = BlitCommand::copy_buffer_to_texture(&info);
-        // CPU conversions obey API order relative to earlier reads and writes.
-        // Ordinary uploads retain the frame-leading path.
+        // CPU conversions and writes into render targets obey API order
+        // relative to earlier reads and writes, clears included: a clear still
+        // waiting for a pass would otherwise land on top of the copy as the
+        // next pass's load action. Ordinary uploads retain the frame-leading
+        // path.
         if ORDERED {
-            self.end_current_pass("stretch_conversion_upload");
+            self.flush_pending_clears();
+            self.end_current_pass("ordered_upload");
             for notify in self.frame_blit_commands.drain(notify_start..) {
                 self.pass_state.push_pending_leading_blit(notify);
             }
@@ -7583,7 +7595,8 @@ impl FrameEncoder {
             rect,
         };
         if ORDERED {
-            self.end_current_pass("stretch_conversion_upload_pass");
+            self.flush_pending_clears();
+            self.end_current_pass("ordered_upload_pass");
         }
         let leading_blits = if ORDERED {
             let mut blits = self.pass_state.take_pending_leading_blits();
