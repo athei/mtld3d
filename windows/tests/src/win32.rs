@@ -49,6 +49,7 @@ unsafe extern "system" {
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetClientRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
+    fn SetWindowLongA(hwnd: usize, index: i32, new_long: i32) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
@@ -395,6 +396,12 @@ pub struct Msg {
 }
 
 const WM_DESTROY: u32 = 0x0002;
+/// `WM_DISPLAYCHANGE`: the display mode changed, sent to every top-level window.
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+/// `GWL_USERDATA`: the long a window keeps for its application.
+///
+/// Here the top edge [`move_window_on_next_display_change`] arms.
+const GWL_USERDATA: i32 = -21;
 const WM_QUIT: u32 = 0x0012;
 /// `PM_NOREMOVE`: `PeekMessageA` leaves the message it finds in the queue.
 const PM_NOREMOVE: u32 = 0;
@@ -430,6 +437,9 @@ pub enum WindowStyle {
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_HARNESS_PROBE {
         return HARNESS_PROBE_REPLY;
+    }
+    if msg == WM_DISPLAYCHANGE {
+        move_to_armed_top(hwnd);
     }
     if msg == WM_DESTROY {
         // A window that `destroy_window` destroys takes this quit back out, so
@@ -714,6 +724,58 @@ pub fn window_proc(hwnd: usize) -> usize {
             unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) }.cast_unsigned(),
         )
         .expect("a 32-bit procedure address fits usize")
+    }
+}
+
+/// Have the window's own procedure move its top edge to `top` on the next `WM_DISPLAYCHANGE`.
+///
+/// The move a game makes answering a mode change, from inside the procedure
+/// the mode change calls: to a place of its own, keeping the window's left
+/// edge and size, whatever moved the window before the message arrived. One
+/// move per call; `top` lives in the window's `GWL_USERDATA`, which the
+/// harness uses for nothing else.
+///
+/// # Panics
+///
+/// Panics if `top` is not positive: zero is the disarmed value.
+pub fn move_window_on_next_display_change(hwnd: usize, top: i32) {
+    assert!(top > 0, "an armed top edge is positive, zero disarms");
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is the documented `GWL_USERDATA`.
+    unsafe { SetWindowLongA(hwnd, GWL_USERDATA, top) };
+}
+
+/// Make the move [`move_window_on_next_display_change`] armed, once.
+fn move_to_armed_top(hwnd: usize) {
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for and
+    // the index is the documented `GWL_USERDATA`.
+    let top = unsafe { SetWindowLongA(hwnd, GWL_USERDATA, 0) };
+    if top == 0 {
+        return;
+    }
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and `rect` is an owned out-param.
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) } == 0 {
+        return;
+    }
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and the geometry is plain scalars.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            rect.left,
+            top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 

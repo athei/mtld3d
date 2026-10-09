@@ -39,5 +39,6 @@ pub use win32::{
     GuardedSlice, HARNESS_PROBE_REPLY, MemorySample, Rect, WM_ACTIVATEAPP, WM_HARNESS_PROBE,
     WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, create_window, cursor_is_live,
     cursor_mask_bits, destroy_window, enumerate_display_sizes, harness_window_proc,
-    post_quit_message, send_message, set_window_pos, window_proc, window_rect,
+    move_window_on_next_display_change, post_quit_message, send_message, set_window_pos,
+    window_proc, window_rect,
 };

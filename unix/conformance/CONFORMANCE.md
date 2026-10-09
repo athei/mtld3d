@@ -552,6 +552,27 @@ record. A knob, where one makes sense, is named with its default.
   buffer and present it. `visual.c/test_flip` 22053 and 22064 observe it:
   that test creates three back buffers and reads the shared backing rather
   than a rotating chain (see its cluster below). No knob.
+- **An extended device's leave undoes a move another thread makes during the
+  mode restore.** Leaving fullscreen, D3D9Ex restores the display mode, then
+  the window's style and visibility, and leaves its position and size alone;
+  wined3d and DXVK do the same with `SWP_NOMOVE | SWP_NOSIZE`. Under Wine on
+  macOS the restore can move the window: AppKit keeps a window it still shows
+  below the menu bar when the screen changes, and Wine applies that move to
+  the Win32 rect whenever the leaving thread processes driver events, which
+  it does while the mode change's `WM_DISPLAYCHANGE` broadcast waits for
+  other threads' windows. So the rect is read before the mode restore and
+  passed to the final `SetWindowPos`, which on Windows is the same rect,
+  unless the window's own procedure moved the window during the restore (a
+  game answering `WM_DISPLAYCHANGE`, or the driver's move, by placing its
+  window): the device's window subclass sees that move arrive inside a call
+  to the application's procedure, and the window stays where the application
+  put it. What differs from D3D9 is a move the application makes from
+  another thread during the restore, which arrives as the driver's does and
+  is undone with it. A driver move the thread applies while the
+  application's procedure is itself waiting is kept, as before. No
+  conformance site observes either; the end-to-end `d3d9ex_reset` tests pin
+  the undone move on a hidden and a shown window and the kept move of the
+  window's own procedure. No knob.
 
 ## Range-fog coverage
 

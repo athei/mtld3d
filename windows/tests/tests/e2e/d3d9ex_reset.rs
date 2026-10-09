@@ -12,11 +12,22 @@
 //! or `ResetEx` changes nothing and leaves no `Reset` owed, and `ResetEx`
 //! names a display mode of the back buffer's size exactly when fullscreen.
 //! Leaving fullscreen leaves the window where fullscreen put it and gives it
-//! back the style, visibility included, it had before.
+//! back the style, visibility included, it had before, also when the driver
+//! or another thread moved the window while the display mode was restored,
+//! shown or hidden; a move the window's own procedure made then stays.
+
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use mtld3d_tests::{
     Factory, Harness, HarnessConfig, Rect, Texture, TexturedVertex, WS_VISIBLE, WindowStyle,
-    assert_pixel_eq, enumerate_display_sizes,
+    assert_pixel_eq, create_window, destroy_window, enumerate_display_sizes,
+    move_window_on_next_display_change, set_window_pos, spawn_scoped,
 };
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODEEX, D3DDISPLAYMODEEX_SIZE, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
@@ -632,5 +643,184 @@ fn leaving_fullscreen_on_a_plain_device_restores_the_rect_and_keeps_the_window_s
         (trip.left_rect, trip.left_style),
         (trip.windowed_rect, trip.windowed_style | WS_VISIBLE),
         "the window gets its old rect and style back, still shown"
+    );
+}
+
+/// How far another thread moves the window while a leave restores the display mode.
+///
+/// Small enough that the window still overlaps the menu bar, where `AppKit`
+/// moves it further, to the top of the work area, as it does in the field.
+const MOVED_DURING_THE_RESTORE: i32 = 40;
+
+/// Where the window's own procedure puts the window's top edge while a leave restores the mode.
+///
+/// Well inside the work area, below the menu bar, so `AppKit` leaves a shown
+/// window there; and a place rather than an offset, so a driver move that
+/// lands before the procedure runs does not change where the window ends.
+const APP_TOP_DURING_THE_RESTORE: i32 = 200;
+
+/// The longest a helper thread waits for the display mode or for the test thread.
+const HELPER_WAIT: Duration = Duration::from_secs(10);
+
+/// An extended device on a framed 640x480 window, taken fullscreen at 640x480 through `Reset`.
+///
+/// Returns the harness, holding the display mode, and the fullscreen rect;
+/// `None` when the display lists no 640x480 mode to take.
+fn extended_fullscreen_at_640x480(shown: bool) -> Option<(Harness, Rect)> {
+    if !enumerate_display_sizes().contains(&(640, 480)) {
+        return None;
+    }
+    let h = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        window_style: WindowStyle::Framed,
+        visible: shown,
+        ..HarnessConfig::default()
+    });
+    h.hold_display_mode();
+    let mut pp = h.windowed_present_params(640, 480);
+    pp.windowed = 0;
+    pp.device_window = h.hwnd();
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+    assert_eq!(
+        Harness::current_display_mode(),
+        (640, 480),
+        "the fullscreen Reset set the 640x480 mode"
+    );
+    let fullscreen_rect = h.window_rect();
+    Some((h, fullscreen_rect))
+}
+
+/// `rect` moved `down` pixels.
+const fn moved_down(rect: Rect, down: i32) -> Rect {
+    Rect {
+        left: rect.left,
+        top: rect.top + down,
+        right: rect.right,
+        bottom: rect.bottom + down,
+    }
+}
+
+/// Leave fullscreen while another thread moves the window during the mode restore.
+///
+/// One thread owns a window it never pumps, created after the fullscreen
+/// mode-set, so the leave's `WM_DISPLAYCHANGE` broadcast waits on it for the
+/// broadcast's timeout. Another moves the device window as soon as the mode
+/// is back, and the leaving thread applies that move inside the wait, as it
+/// applies the move `AppKit` makes when it keeps a window it still shows
+/// below the menu bar. Returns the rect after the windowed `Reset`.
+fn leave_while_another_thread_moves_the_window(h: &Harness, fullscreen_rect: Rect) -> Rect {
+    let device_window = h.hwnd();
+    let done = AtomicBool::new(false);
+    let moved = AtomicBool::new(false);
+    let (ready, ready_receiver) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let (done, moved) = (&done, &moved);
+        spawn_scoped(scope, move || {
+            let silent = create_window(160, 120, false);
+            ready
+                .send(())
+                .expect("the test waits for the silent window");
+            let deadline = Instant::now() + HELPER_WAIT;
+            while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            destroy_window(silent);
+        });
+        spawn_scoped(scope, move || {
+            let deadline = Instant::now() + HELPER_WAIT;
+            while Harness::current_display_mode() == (640, 480) {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let target = moved_down(fullscreen_rect, MOVED_DURING_THE_RESTORE);
+            set_window_pos(
+                device_window,
+                target.left,
+                target.top,
+                target.right - target.left,
+                target.bottom - target.top,
+            );
+            moved.store(true, Ordering::Release);
+        });
+        ready_receiver
+            .recv()
+            .expect("the silent window's thread made its window");
+        assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+        // The move is a message to this thread, which it answers only while
+        // it waits on another thread: before `Reset` returned, or in the
+        // pump below.
+        let landed_in_the_leave = moved.load(Ordering::Acquire);
+        let left_rect = h.window_rect();
+        done.store(true, Ordering::Release);
+        let deadline = Instant::now() + HELPER_WAIT;
+        while !moved.load(Ordering::Acquire) && Instant::now() < deadline {
+            let _ = h.pump();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            landed_in_the_leave,
+            "the other thread's move landed inside the leave"
+        );
+        left_rect
+    })
+}
+
+/// A window another thread moves during the mode restore still ends at the fullscreen rect.
+///
+/// The move stands in for the one `AppKit` makes under Wine on macOS, which
+/// the leaving thread applies while it waits on the mode change's broadcast.
+/// On Windows a move another thread of the application made in that span
+/// would stay, where the layer puts back the rect the window had before the
+/// restore: the two cannot be told apart there, and `AppKit`'s move is the
+/// one that happens.
+#[test]
+fn leaving_fullscreen_puts_back_the_fullscreen_rect_after_a_move_during_the_mode_restore() {
+    let Some((h, fullscreen_rect)) = extended_fullscreen_at_640x480(false) else {
+        return;
+    };
+    let left_rect = leave_while_another_thread_moves_the_window(&h, fullscreen_rect);
+    assert_eq!(
+        left_rect, fullscreen_rect,
+        "the window ends at the fullscreen rect it had before the mode restore"
+    );
+}
+
+/// A shown window another thread moves during the mode restore ends there too, still shown.
+#[test]
+fn leaving_fullscreen_puts_back_a_shown_window_moved_during_the_mode_restore() {
+    let Some((h, fullscreen_rect)) = extended_fullscreen_at_640x480(true) else {
+        return;
+    };
+    let left_rect = leave_while_another_thread_moves_the_window(&h, fullscreen_rect);
+    assert_eq!(
+        (left_rect, h.window_style() & WS_VISIBLE),
+        (fullscreen_rect, WS_VISIBLE),
+        "the shown window ends at the fullscreen rect it had before the mode restore, still shown"
+    );
+}
+
+/// A move the window's own procedure makes answering the mode restore stays.
+///
+/// The procedure puts the window at a place of its own, as a game does: the
+/// driver may already have moved the still-shown window below the menu bar
+/// while the broadcast waited on another thread's window, before the message
+/// reached this one, and the window ends where the procedure put it either
+/// way. That place is inside the work area, where `AppKit` leaves it.
+#[test]
+fn leaving_fullscreen_keeps_a_move_the_window_procedure_makes_during_the_mode_restore() {
+    let Some((h, fullscreen_rect)) = extended_fullscreen_at_640x480(false) else {
+        return;
+    };
+    move_window_on_next_display_change(h.hwnd(), APP_TOP_DURING_THE_RESTORE);
+    assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+    assert_eq!(
+        h.window_rect(),
+        moved_down(
+            fullscreen_rect,
+            APP_TOP_DURING_THE_RESTORE - fullscreen_rect.top
+        ),
+        "the window stays where its procedure moved it"
     );
 }

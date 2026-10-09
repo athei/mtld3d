@@ -501,6 +501,7 @@ const GWL_STYLE: i32 = -16;
 const GWL_EXSTYLE: i32 = -20;
 
 const WS_POPUP: u32 = 0x8000_0000;
+const WS_CHILD: u32 = 0x4000_0000;
 const WS_SYSMENU: u32 = 0x0008_0000;
 const WS_CAPTION: u32 = 0x00C0_0000;
 const WS_THICKFRAME: u32 = 0x0004_0000;
@@ -628,6 +629,14 @@ impl Rect {
         self.bottom.saturating_sub(self.top)
     }
 
+    /// Whether `other` has the same four edges.
+    const fn same_as(&self, other: &Self) -> bool {
+        self.left == other.left
+            && self.top == other.top
+            && self.right == other.right
+            && self.bottom == other.bottom
+    }
+
     /// The rect as a log line names it.
     const fn label(&self) -> RectLabel {
         RectLabel::new(self.left, self.top, self.right, self.bottom)
@@ -700,6 +709,119 @@ impl Drop for DrivingGuard {
                 driving.remove(&self.hwnd);
             }
         }
+    }
+}
+
+// ── Moves during an extended leave ──
+
+/// What a window's own procedure did while an extended device's leave restored the mode.
+#[derive(Default)]
+struct LeaveWatch {
+    /// How many calls into the application's procedure for the window are on the stack.
+    app_calls: u32,
+    /// Whether the window moved or resized inside one of those calls.
+    app_moved: bool,
+}
+
+/// The extended leaves in flight, per window (`HWND` as `usize`).
+///
+/// Read by the cursor subclass, which is the one place that sees a window's
+/// messages and knows whether a move happened inside the application's own
+/// procedure, as it does when a game answers the mode restore's
+/// `WM_DISPLAYCHANGE` by moving its window. It is keyed by the window for the
+/// reason [`DRIVING_WINDOWS`] is: the subclass that sees the messages belongs
+/// to whichever device is subclassed on the window, not necessarily the one
+/// leaving. And it is a static because the leave runs inside the device it
+/// would otherwise live on, while that device's subclass re-enters on the same
+/// thread. An entry exists exactly while an extended leave of its window
+/// restores the display mode.
+static LEAVE_WATCHES: LazyLock<Mutex<FxHashMap<usize, LeaveWatch>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// Holds the [`LEAVE_WATCHES`] entry of one window for the span of a mode restore.
+struct LeaveWatchGuard {
+    hwnd: usize,
+}
+
+impl LeaveWatchGuard {
+    fn new(hwnd: *mut c_void) -> Self {
+        let hwnd = hwnd as usize;
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .insert(hwnd, LeaveWatch::default());
+        Self { hwnd }
+    }
+
+    /// Whether the application's own procedure moved or resized the window so far.
+    fn app_moved(&self) -> bool {
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .get(&self.hwnd)
+            .is_some_and(|watch| watch.app_moved)
+    }
+}
+
+impl Drop for LeaveWatchGuard {
+    fn drop(&mut self) {
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .remove(&self.hwnd);
+    }
+}
+
+/// Counts one call into the application's procedure for a watched window while it lives.
+pub struct AppProcedureCall {
+    hwnd: usize,
+}
+
+/// Mark a call into the application's procedure for `hwnd`, if an extended leave watches it.
+///
+/// The cursor subclass holds the returned value across its call to the
+/// procedure it replaced, so a move the procedure makes is told apart from
+/// one the driver applies while the thread waits.
+pub fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
+    let hwnd = hwnd as usize;
+    LEAVE_WATCHES
+        .lock()
+        .expect("leave-watches mutex poisoned")
+        .get_mut(&hwnd)?
+        .app_calls += 1;
+    Some(AppProcedureCall { hwnd })
+}
+
+impl Drop for AppProcedureCall {
+    fn drop(&mut self) {
+        if let Some(watch) = LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .get_mut(&self.hwnd)
+        {
+            watch.app_calls = watch.app_calls.saturating_sub(1);
+        }
+    }
+}
+
+/// Note a `WM_WINDOWPOSCHANGED` of `hwnd` whose `WINDOWPOS` carries `flags`.
+///
+/// A move or resize that arrives while the application's procedure for the
+/// window is running is the application's own, and an extended leave keeps
+/// it. Any other is the driver's or another thread's. A driver move the
+/// thread applies while that procedure is itself waiting counts as the
+/// application's, so the leave keeps it, as it kept every move before.
+pub fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
+    if flags & (SWP_NOMOVE | SWP_NOSIZE) == SWP_NOMOVE | SWP_NOSIZE {
+        return;
+    }
+    if let Some(watch) = LEAVE_WATCHES
+        .lock()
+        .expect("leave-watches mutex poisoned")
+        .get_mut(&(hwnd as usize))
+        && watch.app_calls > 0
+    {
+        watch.app_moved = true;
     }
 }
 
@@ -1075,8 +1197,37 @@ pub fn leave(saved: &SavedWindow, kind: LeaveKind, reason: &LeaveReason) {
     // registry display mode back first, matching native D3D9's order (mode
     // restore, then window restore), so the saved rect lands in the space it
     // was captured in. No-op when the mode is already the desktop's.
+    //
+    // An extended device keeps the window where it is, which is where it
+    // stands before the mode restore. D3D9Ex leaves its position and size
+    // alone; this passes the rect read here to the final `SetWindowPos`
+    // instead, which on Windows is the same rect. Under Wine on macOS the
+    // restore can move the window: AppKit keeps a window it still shows
+    // below the menu bar when the screen changes, and Wine applies that move
+    // to the Win32 rect whenever the thread processes driver events, as it
+    // does while the mode change's `WM_DISPLAYCHANGE` broadcast waits for
+    // other threads' windows. The explicit rect undoes that move. A move the
+    // application's own procedure makes during the restore, answering the
+    // broadcast or the driver's move, is the application's, and the window
+    // stays where it put it. A move another thread makes in that span is
+    // undone with the driver's, which on Windows would stay;
+    // `CONFORMANCE.md` keeps that as a divergence. A child window's rect is
+    // in its parent's space, not the screen's, so it is left alone.
+    let kept = match kind {
+        LeaveKind::Extended if window_long(saved.hwnd, GWL_STYLE) & WS_CHILD == 0 => {
+            window_rect(saved.hwnd)
+        }
+        LeaveKind::Extended | LeaveKind::Plain => None,
+    };
+    let watch = kept.map(|_| LeaveWatchGuard::new(saved.hwnd));
     let restore = restore_registry_mode();
-    let placement = restore_window(saved, kind);
+    let kept = match (kept, watch.as_ref().is_some_and(LeaveWatchGuard::app_moved)) {
+        (Some(_), true) => KeptRect::AppMoved,
+        (Some(rect), false) => KeptRect::Read(rect),
+        (None, _) => KeptRect::Unread,
+    };
+    drop(watch);
+    let placement = restore_window(saved, kind, &kept);
     log!(
         target: LOG_TARGET,
         if restore.failed() { Level::Warn } else { Level::Info },
@@ -1085,8 +1236,22 @@ pub fn leave(saved: &SavedWindow, kind: LeaveKind, reason: &LeaveReason) {
     );
 }
 
+/// Where an extended device's leave puts the window, as [`leave`] decided it.
+enum KeptRect {
+    /// The rect read before the mode restore, put back explicitly.
+    Read(Rect),
+    /// The application moved the window during the restore; it stays there.
+    AppMoved,
+    /// No rect was read (a plain device, a child window, or an unreadable rect).
+    Unread,
+}
+
 /// Put the window back as [`enter`] found it and `kind` says, saying where it went.
-fn restore_window(saved: &SavedWindow, kind: LeaveKind) -> WindowPlacement {
+///
+/// `kept` is used by an extended device alone: the rect it leaves the window
+/// at, or the position and size it leaves alone when the application moved
+/// the window during the restore or the rect could not be read.
+fn restore_window(saved: &SavedWindow, kind: LeaveKind, kept: &KeptRect) -> WindowPlacement {
     if window_changes_suppressed(saved) {
         return WindowPlacement::AppOwned;
     }
@@ -1129,24 +1294,41 @@ fn restore_window(saved: &SavedWindow, kind: LeaveKind) -> WindowPlacement {
         (LeaveKind::Extended, false) => SWP_HIDEWINDOW,
         (LeaveKind::Plain, false) => 0,
     };
-    // An extended device leaves the window where fullscreen put it. A window
-    // whose rect we never managed to read stays where it is too, rather than
-    // being teleported to a zero rect at the desktop origin.
+    // An extended device leaves the window where fullscreen put it, at the
+    // rect read before the mode restore. A window whose rect we never managed
+    // to read stays where it is too, rather than being teleported to a zero
+    // rect at the desktop origin.
     let unknown_rect = saved.rect.width() == 0 || saved.rect.height() == 0;
-    let geometry = if kind == LeaveKind::Extended || unknown_rect {
-        SWP_NOMOVE | SWP_NOSIZE
-    } else {
-        0
+    let (rect, geometry) = match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::Read(kept)) => (*kept, 0),
+        (LeaveKind::Extended, KeptRect::AppMoved | KeptRect::Unread) => {
+            (saved.rect, SWP_NOMOVE | SWP_NOSIZE)
+        }
+        (LeaveKind::Plain, _) if unknown_rect => (saved.rect, SWP_NOMOVE | SWP_NOSIZE),
+        (LeaveKind::Plain, _) => (saved.rect, 0),
+    };
+    // Where the restore left the window, named when the leave puts it back.
+    let put_back = match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::Read(kept)) => window_rect(hwnd)
+            .filter(|now| !now.same_as(kept))
+            .map(|now| now.label()),
+        _ => None,
     };
     set_window_pos(
         hwnd,
         core::ptr::null_mut(),
-        saved.rect,
+        rect,
         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | show | geometry,
     );
-    match kind {
-        LeaveKind::Extended => WindowPlacement::KeptFullscreen { shown: visible },
-        LeaveKind::Plain if unknown_rect => WindowPlacement::Unmoved,
-        LeaveKind::Plain => WindowPlacement::Placed(saved.rect.label()),
+    match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::AppMoved) => {
+            WindowPlacement::KeptAppMove { shown: visible }
+        }
+        (LeaveKind::Extended, _) => WindowPlacement::KeptFullscreen {
+            shown: visible,
+            put_back,
+        },
+        (LeaveKind::Plain, _) if unknown_rect => WindowPlacement::Unmoved,
+        (LeaveKind::Plain, _) => WindowPlacement::Placed(saved.rect.label()),
     }
 }
