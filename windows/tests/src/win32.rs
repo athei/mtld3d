@@ -4,7 +4,10 @@
 //! dependency); only the calls the tests exercise are declared.
 
 use core::ffi::{c_char, c_void};
-use std::sync::{Mutex, Once, PoisonError};
+use std::{
+    sync::{Mutex, Once, PoisonError},
+    time::{Duration, Instant},
+};
 
 use mtld3d_types::ICONINFO;
 
@@ -34,6 +37,13 @@ unsafe extern "system" {
         filter_max: u32,
         remove: u32,
     ) -> i32;
+    fn MsgWaitForMultipleObjectsEx(
+        count: u32,
+        handles: *const usize,
+        millis: u32,
+        wake_mask: u32,
+        flags: u32,
+    ) -> u32;
     fn TranslateMessage(msg: *const Msg) -> i32;
     fn DispatchMessageA(msg: *const Msg) -> isize;
     fn PostQuitMessage(exit_code: i32);
@@ -407,6 +417,12 @@ const WM_QUIT: u32 = 0x0012;
 const PM_NOREMOVE: u32 = 0;
 /// `PM_REMOVE`: `PeekMessageA` takes the message it finds out of the queue.
 const PM_REMOVE: u32 = 1;
+/// `QS_SENDMESSAGE`: a message another thread sent is waiting in the queue.
+const QS_SENDMESSAGE: u32 = 0x0040;
+/// `PM_QS_SENDMESSAGE`: `PeekMessageA` handles sent messages and returns no other.
+const PM_QS_SENDMESSAGE: u32 = QS_SENDMESSAGE << 16;
+/// `MWMO_INPUTAVAILABLE`: the wait also returns for a message that was already waiting.
+const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 const CW_USEDEFAULT: i32 = 0x8000_0000_u32.cast_signed();
 /// `WS_OVERLAPPEDWINDOW` — a normal framed window, initially hidden.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -1068,6 +1084,62 @@ pub fn capture_mouse(hwnd: usize, captured: bool) -> usize {
 pub fn foreground_window(hwnd: usize) -> bool {
     // SAFETY: the harness owns the live window handle.
     unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Wait up to `timeout` for a message another thread sends to this thread's windows, and answer it.
+///
+/// For a thread that owns a window and waits for something it cannot wait
+/// on together with its queue: it waits in steps of this, answering
+/// between them, and looks at what it waits for after each. A message that
+/// was already waiting ends the wait at once. A display mode change sends
+/// `WM_DISPLAYCHANGE` to every top-level window and waits up to two seconds
+/// for each to answer, so a window whose thread blocks without answering
+/// holds up every mode change of the session for that long.
+///
+/// # Panics
+///
+/// Panics when `timeout` does not fit the wait's milliseconds.
+pub fn wait_answering_sent_messages(timeout: Duration) {
+    let millis = u32::try_from(timeout.as_micros().div_ceil(1000))
+        .expect("a wait between answers fits u32 milliseconds");
+    // SAFETY: Win32 thunk; no handles, so the wait is on the thread's own
+    // queue alone, for at most `millis`.
+    unsafe {
+        MsgWaitForMultipleObjectsEx(
+            0,
+            core::ptr::null(),
+            millis,
+            QS_SENDMESSAGE,
+            MWMO_INPUTAVAILABLE,
+        )
+    };
+    answer_sent_messages();
+}
+
+/// Let `duration` pass, answering the messages other threads send to this thread's windows.
+///
+/// The wait of [`wait_answering_sent_messages`] for a pause of a known length.
+pub fn answer_sent_messages_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        wait_answering_sent_messages(left);
+    }
+}
+
+/// Answer the messages other threads have sent to this thread's windows, leaving its queue alone.
+///
+/// A peek limited to sent messages calls the window procedure for each one
+/// that is waiting and returns no posted message, so what a test posted to
+/// itself, and a `WM_QUIT`, stay queued for its own pump.
+fn answer_sent_messages() {
+    let mut msg = zeroed_msg();
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with
+    // `PM_QS_SENDMESSAGE` handles the thread's sent messages alone.
+    unsafe { PeekMessageA(&raw mut msg, 0, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE) };
 }
 
 /// Whether the calling thread's queue holds a `WM_QUIT`, taken out when `remove` is `PM_REMOVE`.

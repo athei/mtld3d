@@ -37,11 +37,16 @@ fullscreen; the harness keeps it, through a windowed `Reset` too, until it
 is dropped. The take is a lock in the process and, inside it, an exclusive
 lock on `~/Library/Caches/mtld3d/e2e-display-mode.lock`, so tests that
 change or read the mode run one at a time across every test process on the
-machine while the others run beside them. A process that gives the mode
-back waits 150 ms before it takes it again, longer than the interval at
-which Wine retries a lock another wineserver holds, so two runs alternate
-test by test rather than one waiting for all of the other's. A new test that
-changes or reads the display mode goes through one of those three, never
+machine while the others run beside them. A test waiting for its turn
+looks at both locks every 10 ms and answers the messages other threads send
+to its windows between looks, because every mode change sends
+`WM_DISPLAYCHANGE` to each top-level window and waits up to two seconds for
+a window whose thread answers nothing. A process that gives the mode back
+waits 150 ms before it takes it again, longer than the interval at which a
+waiting process asks again (10 ms here, 100 ms for a harness that still
+waits in Wine's blocking `LockFileEx`), so two runs alternate test by test
+rather than one waiting for all of the other's. A new test that changes or
+reads the display mode goes through one of those three, never
 through a device or a `ChangeDisplaySettings` call of its own. The file
 lock ends with its handle, so a test process that panics, crashes or is
 killed gives it up as it exits. A test that has to wait for another
