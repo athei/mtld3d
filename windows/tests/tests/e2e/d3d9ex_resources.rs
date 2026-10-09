@@ -1,7 +1,10 @@
 //! The resource rules an extended device answers differently.
 //!
 //! An extended device refuses `D3DPOOL_MANAGED` for every kind of resource a
-//! plain device creates there. A `pSharedHandle` on a single-level
+//! plain device creates there, and both kinds of device take
+//! `D3DPOOL_MANAGED_EX` as the managed pool: a texture and a vertex buffer
+//! created there report `D3DPOOL_MANAGED`, lock, and give back what was
+//! written. A `pSharedHandle` on a single-level
 //! system-memory texture or offscreen plain surface is user memory, copied
 //! into the level once at its row pitch; any other shape is an invalid call,
 //! a system-memory buffer takes none, and a shared default-pool resource is
@@ -24,9 +27,9 @@ use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATI2, D3DFMT_D24S8,
     D3DFMT_D32_LOCKABLE, D3DFMT_DXT1, D3DFMT_INDEX16, D3DFMT_L8, D3DFMT_S8_LOCKABLE,
     D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_LIGHTING,
-    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSWAPEFFECT_FLIPEX, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DUSAGE_RESTRICT_SHARED_RESOURCE,
+    D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRS_LIGHTING, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSWAPEFFECT_FLIPEX, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DUSAGE_RESTRICT_SHARED_RESOURCE,
     D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL,
 };
 
@@ -123,6 +126,44 @@ fn an_extended_device_refuses_the_managed_pool_for_every_kind() {
         if !ib.is_null() {
             drop(IndexBuffer::from_raw(ib));
         }
+    }
+}
+
+#[test]
+fn the_managed_ex_pool_is_the_managed_pool_on_either_kind_of_device() {
+    for h in [extended(), Harness::new()] {
+        let (hr, texture) = h.try_create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED_EX);
+        assert_eq!(hr, D3D_OK, "a texture in D3DPOOL_MANAGED_EX");
+        let texture = Texture::from_raw(texture);
+        let (hr, desc) = texture.level_desc(0);
+        assert_eq!(hr, D3D_OK, "GetLevelDesc");
+        assert_eq!(desc.pool, D3DPOOL_MANAGED, "the texture is a managed one");
+        let mut lock = texture.lock_rect(0, 0);
+        lock.write_u32_rect(4, 4, &[RED; 16]);
+        drop(lock);
+        assert_pixel_eq(
+            sample_center(&h, &texture),
+            RED,
+            "the locked write is what the texture samples",
+        );
+
+        let (hr, vb) = h.try_create_vertex_buffer(64, 0, 0, D3DPOOL_MANAGED_EX);
+        assert_eq!(hr, D3D_OK, "a vertex buffer in D3DPOOL_MANAGED_EX");
+        let vb = VertexBuffer::from_raw(vb);
+        let (hr, desc) = vb.desc();
+        assert_eq!(hr, D3D_OK, "GetDesc");
+        assert_eq!(desc.pool, D3DPOOL_MANAGED, "the buffer is a managed one");
+        let words: [u32; 16] =
+            core::array::from_fn(|i| 0xC0DE_0000 | u32::try_from(i).expect("small"));
+        let mut lock = vb.lock(0, 64, 0);
+        lock.write(&words);
+        drop(lock);
+        let lock = vb.lock(0, 64, D3DLOCK_READONLY);
+        assert_eq!(
+            lock.read::<u32>(16),
+            words,
+            "the buffer gives back what was written"
+        );
     }
 }
 

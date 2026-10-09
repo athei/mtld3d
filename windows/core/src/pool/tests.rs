@@ -1,6 +1,6 @@
 use mtld3d_types::{
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DYNAMIC,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC,
 };
 
 use super::*;
@@ -111,4 +111,24 @@ fn priority_follows_the_pool_a_device_pages() {
         assert!(!priority_settable(D3DPOOL_SYSTEMMEM, extended));
         assert!(!priority_settable(D3DPOOL_SCRATCH, extended));
     }
+}
+
+#[test]
+fn the_managed_ex_pool_resolves_to_the_managed_pool() {
+    assert_eq!(resolve(D3DPOOL_MANAGED_EX), D3DPOOL_MANAGED);
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        D3DPOOL_SCRATCH,
+    ] {
+        assert_eq!(resolve(pool), pool, "pool {pool} is itself");
+    }
+}
+
+#[test]
+fn an_extended_device_takes_the_managed_ex_pool() {
+    assert!(refused_on_extended(D3DPOOL_MANAGED, true));
+    assert!(!refused_on_extended(D3DPOOL_MANAGED_EX, true));
+    assert!(!refused_on_extended(D3DPOOL_MANAGED_EX, false));
 }

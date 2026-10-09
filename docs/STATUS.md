@@ -118,7 +118,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   `GetLastPresentCount` and `GetPresentStats` succeed without doing
   anything, each logged once, `GetPresentStats` filling the 28 bytes the
   structure has in a 32-bit process and the 32 it has in a 64-bit one, and
-  `SetConvolutionMonoKernel` answers `D3DERR_INVALIDCALL`.
+  `SetConvolutionMonoKernel` answers `D3DERR_INVALIDCALL`. Both kinds of
+  device take `D3DPOOL_MANAGED_EX` (pool 6) as `D3DPOOL_MANAGED`, and an
+  extended device, which refuses `D3DPOOL_MANAGED`, accepts it; such a
+  resource reports `D3DPOOL_MANAGED`.
 
 ## Not implemented yet
 

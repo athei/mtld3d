@@ -229,6 +229,12 @@ pub const D3DPOOL_DEFAULT: u32 = 0;
 pub const D3DPOOL_MANAGED: u32 = 1;
 pub const D3DPOOL_SYSTEMMEM: u32 = 2;
 pub const D3DPOOL_SCRATCH: u32 = 3;
+/// `D3DPOOL_MANAGED_EX`, the managed pool under a value an extended device also accepts.
+///
+/// Absent from the public SDK headers. Every device treats it as
+/// `D3DPOOL_MANAGED`, and an extended device, which refuses
+/// `D3DPOOL_MANAGED` itself, accepts it.
+pub const D3DPOOL_MANAGED_EX: u32 = 6;
 
 // ── D3D9 device types (`D3DDEVTYPE`) ──
 

@@ -8,7 +8,8 @@
 //! `UpdateSurface`, and `GetRenderTargetData`.
 
 use mtld3d_types::{
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DUSAGE_DYNAMIC,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DUSAGE_DYNAMIC,
 };
 
 /// Whether a resource created in `pool` is system memory with no GPU allocation.
@@ -51,12 +52,29 @@ pub const fn usage_conflicts_with_pool(usage: u32, pool: u32) -> bool {
     usage & D3DUSAGE_DYNAMIC != 0 && matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SCRATCH)
 }
 
+/// The pool a create that names `pool` makes its resource in.
+///
+/// `D3DPOOL_MANAGED_EX` is the managed pool under another value, on either
+/// kind of device; every other value is the pool it names. A create resolves
+/// its pool after [`refused_on_extended`] has seen the value the caller
+/// passed, since an extended device refuses `D3DPOOL_MANAGED` and takes
+/// `D3DPOOL_MANAGED_EX`.
+#[must_use]
+pub const fn resolve(pool: u32) -> u32 {
+    if pool == D3DPOOL_MANAGED_EX {
+        D3DPOOL_MANAGED
+    } else {
+        pool
+    }
+}
+
 /// Whether an extended device refuses a create in `pool`.
 ///
 /// An extended device has no runtime-managed pool: it keeps its default-pool
 /// resources across `Reset`, so the copy `D3DPOOL_MANAGED` exists to restore
 /// is never needed, and every create naming that pool is
-/// `D3DERR_INVALIDCALL`. A plain device refuses nothing here.
+/// `D3DERR_INVALIDCALL`. `D3DPOOL_MANAGED_EX` names the same pool and is
+/// taken. A plain device refuses nothing here.
 #[must_use]
 pub const fn refused_on_extended(pool: u32, extended: bool) -> bool {
     extended && pool == D3DPOOL_MANAGED
