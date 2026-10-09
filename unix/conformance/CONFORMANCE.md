@@ -138,6 +138,17 @@ with `conformance_repeat=<n>` runs it on every conformance job, under
 make a subtest that dies one run in a few die in one sitting, on the machine
 where it does.
 
+In CI the raw artifact of every conformance job also carries `system/`: the
+system log of the job's span (the job budget plus five minutes), with the
+kernel and GPU lines the e2e legs collect and every line of the `wine`
+processes that is an error or fault or names an exception, and
+`collection-status.txt` saying what was collected and how. A sample shows
+where a hung process waits; when it waits on a main-thread request after
+AppKit swallowed an Objective-C exception (the sample then has a thread
+named `SOME_OTHER_THREAD_SWALLOWED_AT_LEAST_ONE_EXCEPTION`), the system log
+is where AppKit reports the exception, if it logs it there and does not
+redact it.
+
 There is no conformance-specific input to set. The test binaries ship inside the
 Wine SDK bundle (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
 published by the [wine-build](https://github.com/athei/wine-build) bundle step),
