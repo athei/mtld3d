@@ -435,8 +435,9 @@ processes, as they turn the Metal validation layer and HUD off: Metal's
 capture layer sits under every Metal call, and
 [`ARCHITECTURE.md`](docs/ARCHITECTURE.md#ctrlshiftp-three-frame-dump-and-gpu-capture)
 gives its measured cost. A deliberate comparison with the capture layer
-runs the benchmark binary through the runner directly; every perf window says whether it was on
-(`metal_capture_layer_count`, judged exact, so legs that differ in it fail).
+runs the benchmark binary through the runner directly; every perf window
+says whether it was on (`metal_capture_layer_count`, judged exact, so legs
+that differ in it fail).
 `BASE=HEAD` is an A/A run of one commit against itself (or of your
 uncommitted changes against the commit they sit on) and shows how far the
 machine moves the numbers by itself; run it when a verdict looks surprising.
