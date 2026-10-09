@@ -60,6 +60,7 @@ mod render_scale;
 mod render_states;
 mod render_target;
 mod resource_misc;
+mod same_size_reset;
 mod samplers;
 mod sampling_views;
 mod shaders;
