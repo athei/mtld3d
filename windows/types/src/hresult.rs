@@ -47,3 +47,9 @@ pub const E_OUTOFMEMORY: i32 = 0x8007_000e_u32.cast_signed();
 
 /// `D3DERR_DEVICELOST`: native device work failed and rendering cannot continue.
 pub const D3DERR_DEVICELOST: i32 = 0x8876_0868_u32.cast_signed();
+
+/// `D3DERR_OUTOFVIDEOMEMORY`: the device ran out of the memory it renders from.
+///
+/// The out-of-memory code `IDirect3DDevice9Ex::PresentEx` and
+/// `CheckDeviceState` document. `MAKE_D3DHRESULT(380)`.
+pub const D3DERR_OUTOFVIDEOMEMORY: i32 = 0x8876_017C_u32.cast_signed();

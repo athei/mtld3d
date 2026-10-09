@@ -4644,14 +4644,17 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     // DEVICENOTRESET a failed implicit-resource rebuild leaves.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let object = unsafe { InPtr::<Direct3DDevice9>::opt(this) };
+    // D3D9Ex answers `TestCooperativeLevel` with `D3D_OK` on an extended
+    // device, which reports its state through `CheckDeviceState` and
+    // `PresentEx` instead.
+    if object.as_ref().is_some_and(|obj| obj.inner().is_extended()) {
+        return D3D_OK;
+    }
     if let Some(obj) = &object
         && let Err(hr) = obj.inner().encoder_status()
     {
         return hr;
     }
-    // An extended device is never left owing a `Reset` by a rejected one, so
-    // on it DEVICENOTRESET only reports a back buffer the layer could not
-    // rebuild.
     let not_reset = object.is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET

@@ -238,7 +238,15 @@ unless its entry says otherwise.
   the step that failed first. A failed device drops its open frame at each
   `Present`, and its final `Release` destroys the render targets and depth
   surfaces released after the failure. There is no recovery short of
-  creating a new device.
+  creating a new device. An extended device keeps the same latch with the
+  answers D3D9Ex documents: `TestCooperativeLevel` answers `D3D_OK` whatever
+  the latch holds, `PresentEx` and `CheckDeviceState` return the latched code,
+  with `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, the
+  out-of-memory code those two document, and `ResetEx` returns it without
+  clearing it. `D3DERR_DEVICEREMOVED`, which tells a D3D9Ex application to
+  create a new device, is not used: one latch serves both kinds of device,
+  and `D3DERR_DEVICELOST` is the code D3D9Ex gives for a device whose work
+  the GPU did not complete.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

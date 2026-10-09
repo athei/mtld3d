@@ -10,7 +10,7 @@
 use core::ffi::c_void;
 
 use mtld3d_core::{
-    extended::{ex_create_usage_valid, frame_latency},
+    extended::{ex_create_usage_valid, extended_state_code, frame_latency},
     perf::DeviceSubCategory,
 };
 use mtld3d_shared::{InPtr, InPtrMut, OutPtr};
@@ -62,6 +62,9 @@ pub extern "system" fn compose_rects(
 }
 
 /// `PresentEx`: `Present` with flags, which are logged and not honoured.
+///
+/// A latched `E_OUTOFMEMORY` answers as `D3DERR_OUTOFVIDEOMEMORY`, the code
+/// `PresentEx` documents for it.
 pub extern "system" fn present_ex(
     this: *mut c_void,
     src_rect: *const c_void,
@@ -72,14 +75,14 @@ pub extern "system" fn present_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Frame);
-    present_impl(
+    extended_state_code(present_impl(
         this,
         src_rect,
         dst_rect,
         dst_window_override,
         dirty_region,
         flags,
-    )
+    ))
 }
 
 /// `GetGPUThreadPriority`: a stub that reports the normal priority, 0.
@@ -198,7 +201,8 @@ pub extern "system" fn get_maximum_frame_latency(this: *mut c_void, latency: *mu
 /// `CheckDeviceState`: the device's failure latch, `D3D_OK` without one.
 ///
 /// No exclusive mode is taken and no window can occlude a present, so the
-/// occlusion and mode-change codes never arise.
+/// occlusion and mode-change codes never arise. A latched `E_OUTOFMEMORY`
+/// answers as `D3DERR_OUTOFVIDEOMEMORY`, the code the call documents for it.
 pub extern "system" fn check_device_state(this: *mut c_void, _window: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
@@ -213,7 +217,7 @@ pub extern "system" fn check_device_state(this: *mut c_void, _window: *mut c_voi
     );
     match obj.inner().encoder_status() {
         Ok(()) => D3D_OK,
-        Err(hr) => hr,
+        Err(hr) => extended_state_code(hr),
     }
 }
 

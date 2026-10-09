@@ -10,7 +10,9 @@
 //! reports WHQL level 1, and the adapter has one stable non-zero LUID. The
 //! extended stubs answer what a device with nothing to do there answers, and
 //! `GetPresentStats` writes the struct's own size on each architecture and
-//! nothing past it.
+//! nothing past it. `TestCooperativeLevel` answers `D3D_OK` on an extended
+//! device, after a failed submission too, while `PresentEx`,
+//! `CheckDeviceState` and `ResetEx` report the failure.
 
 use core::ffi::{c_char, c_void};
 
@@ -20,8 +22,8 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER,
-    D3DDISPLAYROTATION_IDENTITY, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5,
-    D3DFMT_X8R8G8B8, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE,
+    D3DDISPLAYROTATION_IDENTITY, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8,
+    D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE,
     D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE, D3DSCANLINEORDERING_UNKNOWN,
     D3DSDK_VERSION, E_NOINTERFACE, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3D9EX,
     IID_IDIRECT3DDEVICE9, IID_IDIRECT3DDEVICE9EX, IID_IDIRECT3DSWAPCHAIN9,
@@ -396,6 +398,48 @@ fn present_stats_fill_the_struct_and_nothing_past_it() {
             .iter()
             .all(|&b| b == PRESENT_STATS_GUARD),
         "nothing is written past the struct: {bytes:02x?}"
+    );
+}
+
+#[test]
+fn an_extended_device_answers_test_cooperative_level_with_ok_after_a_failure() {
+    let h = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        config_entries: "debug.failNextSubmit=true",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.test_cooperative_level(), D3D_OK, "before any failure");
+    assert_eq!(
+        h.present_ex(0),
+        D3DERR_DEVICELOST,
+        "the first submission is refused"
+    );
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3D_OK,
+        "an extended device's TestCooperativeLevel always answers D3D_OK"
+    );
+    assert_eq!(
+        h.check_device_state(),
+        D3DERR_DEVICELOST,
+        "CheckDeviceState reports the failure"
+    );
+    assert_eq!(
+        h.present_ex(0),
+        D3DERR_DEVICELOST,
+        "PresentEx reports it again"
+    );
+    let (width, height) = h.dims();
+    let mut pp = h.windowed_present_params(width, height);
+    assert_eq!(
+        h.reset_ex(&mut pp, None),
+        D3DERR_DEVICELOST,
+        "ResetEx does not clear it"
+    );
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3D_OK,
+        "TestCooperativeLevel still answers D3D_OK"
     );
 }
 
