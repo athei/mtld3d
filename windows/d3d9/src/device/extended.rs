@@ -10,17 +10,17 @@
 use core::ffi::c_void;
 
 use mtld3d_core::{
-    extended::{ex_create_usage_valid, frame_latency, reset_ex_mode_valid},
+    extended::{ex_create_usage_valid, frame_latency},
     perf::DeviceSubCategory,
 };
 use mtld3d_shared::{InPtr, InPtrMut, OutPtr};
 use mtld3d_types::{
-    D3DDISPLAYMODEEX, D3DPRESENT_PARAMETERS, D3DUSAGE_RESTRICT_SHARED_RESOURCE,
-    D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER, D3DUSAGE_RESTRICTED_CONTENT,
+    D3DDISPLAYMODEEX, D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
+    D3DUSAGE_RESTRICTED_CONTENT,
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, Direct3DDevice9, LOG_TARGET, device_api_lock,
+    D3D_OK, D3DERR_INVALIDCALL, Direct3DDevice9, LOG_TARGET, ResetCall, device_api_lock,
     device_create_depth_stencil_surface, device_create_offscreen_plain_surface,
     device_create_render_target, device_timer, present_impl, reset_impl,
 };
@@ -321,29 +321,17 @@ pub extern "system" fn reset_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // SAFETY: vtable in-param; `present_params` is null or a readable
-    // `D3DPRESENT_PARAMETERS` per the IDirect3DDevice9Ex ABI.
-    let Some(pp) = (unsafe { InPtr::<D3DPRESENT_PARAMETERS>::opt(present_params) }) else {
+    if present_params.is_null() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject ResetEx: null present parameters → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
-    };
+    }
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
     // per the IDirect3DDevice9Ex ABI.
-    let mode_size = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode) }.map(|m| (m.width, m.height));
-    let back_buffer = (pp.back_buffer_width, pp.back_buffer_height);
-    if !reset_ex_mode_valid(pp.windowed != 0, mode_size, back_buffer) {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "reject ResetEx: display mode {mode_size:?} does not agree with windowed={} and back \
-             buffer {back_buffer:?} → INVALIDCALL",
-            pp.windowed
-        );
-        return D3DERR_INVALIDCALL;
-    }
-    reset_impl(this, present_params)
+    let mode = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode) }.map(|m| (m.width, m.height));
+    reset_impl(this, present_params, ResetCall::ResetEx { mode })
 }
 
 /// `GetDisplayModeEx`: the mode `GetDisplayMode` reports, progressive, with the identity rotation.

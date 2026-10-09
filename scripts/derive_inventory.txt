@@ -199,6 +199,8 @@ windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/present.rs LayerPacing Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/readback.rs ReadbackReject Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/reset_summary.rs ResetDone Clone,Copy,PartialEq,Eq
+windows/core/src/reset_summary.rs ResetMethod Clone,Copy
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerKey Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/shader_cache.rs CacheEntry Clone,Debug,PartialEq,Eq
@@ -222,6 +224,7 @@ windows/core/src/visibility.rs QueryStatus Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/cursor.rs CursorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/device.rs DepthTextureCreateInfo Clone,Copy
 windows/d3d9/src/device.rs DeviceFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/d3d9/src/device.rs ResetCall Clone,Copy
 windows/d3d9/src/device.rs SnapshotDirty Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/device.rs TextureCreateArgs Clone,Copy
 windows/d3d9/src/fullscreen.rs DisplayModeInfo Clone,Copy

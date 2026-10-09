@@ -52,7 +52,10 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
-    reset_summary::{ResetSummary, changes_presentation},
+    reset_summary::{
+        ResetDone, ResetFailed, ResetFailureEffect, ResetMethod, ResetSummary,
+        changes_presentation, failure_warns, success_logs_at_info,
+    },
     sampler_state::TEXTURE_LOD_SLOT,
     shader_constants::{int_bool_rows, window_in_range},
     snapshot::SnapshotSection,
@@ -149,9 +152,6 @@ const TEX_TRACE_TARGET: &str = "mtld3d::d3d9::tex";
 /// `RUST_LOG=mtld3d::d3d9::depth=trace` without flipping the rest of the
 /// d3d9 logger. Mirrored as `encoder.rs::DEPTH_TRACE_TARGET`.
 const DEPTH_TRACE_TARGET: &str = "mtld3d::d3d9::depth";
-
-/// The interface the `Reset` log line names: this device is the plain one.
-const RESET_INTERFACE: &str = "IDirect3DDevice9";
 
 /// The vtable every device carries, extended or not.
 ///
@@ -348,6 +348,14 @@ bitflags::bitflags! {
         /// as user memory, keeps its state and its default-pool resources
         /// across `Reset`, and answers `IID_IDirect3DDevice9Ex`.
         const EXTENDED = 1 << 5;
+        /// Set on an extended device once a failed `Reset` has warned, until one succeeds.
+        ///
+        /// A plain device's rejected or failed `Reset` leaves it waiting for
+        /// another (`NOT_RESET`), which is what keeps a game's per-frame
+        /// retries at debug. An extended device's rejected `Reset` changes
+        /// nothing and owes nothing, so this is what quiets its retries; the
+        /// next success clears it and says so at info.
+        const RESET_FAILURE_LOGGED = 1 << 6;
     }
 }
 
@@ -4919,7 +4927,38 @@ extern "system" fn device_get_number_of_swap_chains(this: *mut c_void) -> u32 {
 extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    reset_impl(this, present_params)
+    reset_impl(this, present_params, ResetCall::Reset)
+}
+
+/// Which entry point a `Reset` came through.
+#[derive(Clone, Copy)]
+pub enum ResetCall {
+    /// The base `Reset` slot, on either kind of device.
+    Reset,
+    /// `ResetEx`, with the size of the display mode it named, if any.
+    ResetEx { mode: Option<(u32, u32)> },
+}
+
+/// What every line one `Reset` writes shares.
+struct ResetLog {
+    /// `IDirect3DDevice9` on a plain device, `IDirect3DDevice9Ex` on an extended one.
+    interface: &'static str,
+    method: ResetMethod,
+    /// The back-buffer size before the call.
+    old_size: (u32, u32),
+    /// The device was waiting for a successful `Reset` when the call came.
+    recovering: bool,
+}
+
+impl ResetLog {
+    /// The line for this call with `pp` as resolved so far and its `outcome`.
+    const fn summary<'a, O: core::fmt::Display>(
+        &self,
+        pp: &'a mtld3d_types::D3DPRESENT_PARAMETERS,
+        outcome: O,
+    ) -> ResetSummary<'a, O> {
+        ResetSummary::new(self.interface, self.old_size, pp, outcome).via(self.method)
+    }
 }
 
 /// The body `Reset` and `ResetEx` share; the caller holds the API lock.
@@ -4930,7 +4969,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
 /// An extended device's skips the reference check, keeps its state, its
 /// default-pool resources and an open scene, rebinds only its targets and the
 /// viewport extent, and answers a rejected request without changing anything.
-fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
+fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -> i32 {
     // SAFETY: vtable in/out-param; per the D3D9 ABI `present_params` points to a
     // readable+writable `D3DPRESENT_PARAMETERS` owned by the caller — Reset
     // resolves and reports the effective geometry back through it.
@@ -4944,15 +4983,56 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    if let Err(hr) = dev.encoder_status() {
-        return hr;
-    }
     // What the line a Reset writes compares against, and whether the device
     // already waits for a successful Reset: a game retries a failing one
     // every frame, and a success then is a recovery.
-    let old_size = (dev.backbuffer_width, dev.backbuffer_height);
+    let log = ResetLog {
+        interface: if dev.is_extended() {
+            "IDirect3DDevice9Ex"
+        } else {
+            "IDirect3DDevice9"
+        },
+        method: match call {
+            ResetCall::Reset => ResetMethod::Reset,
+            ResetCall::ResetEx { .. } => ResetMethod::ResetEx,
+        },
+        old_size: (dev.backbuffer_width, dev.backbuffer_height),
+        recovering: dev.needs_reset(),
+    };
     let previous = *dev.present_params();
-    let recovering = dev.needs_reset();
+    // `ResetEx` names a display mode exactly when it asks for fullscreen, of
+    // the back buffer's size; one that disagrees is refused before anything
+    // else is looked at.
+    if let ResetCall::ResetEx { mode } = call
+        && !mtld3d_core::extended::reset_ex_mode_valid(
+            pp_in.windowed != 0,
+            mode,
+            (pp_in.back_buffer_width, pp_in.back_buffer_height),
+        )
+    {
+        let pp = *pp_in;
+        let reason = match mode {
+            Some((width, height)) if pp.windowed != 0 => {
+                format!("a windowed request names display mode {width}x{height}")
+            }
+            Some((width, height)) => format!(
+                "display mode {width}x{height} is not the back buffer's {}x{}",
+                pp.back_buffer_width, pp.back_buffer_height
+            ),
+            None => String::from("a fullscreen request names no display mode"),
+        };
+        log_failed_reset(
+            dev,
+            &log,
+            &pp,
+            format_args!("rejected, {reason}"),
+            ResetFailureEffect::Unchanged,
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    if let Err(hr) = dev.encoder_status() {
+        return hr;
+    }
 
     // Resolve the request on a local copy. A windowed Reset may pass zero
     // dimensions ("use the device window's client rect") and
@@ -4965,12 +5045,13 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let extended = dev.is_extended();
     if !mtld3d_core::present::present_params_are_valid(&pp, extended) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the swap effect, back buffer count or presentation interval is invalid"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return D3DERR_INVALIDCALL;
     }
@@ -4989,10 +5070,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     // window moves, so a rejected Reset leaves the window as it was.
     if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!("rejected, a fullscreen request may not carry zero dimensions"),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -5007,13 +5089,14 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 && !extended {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still \
                  referenced"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -5032,13 +5115,14 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     )
     .map(|count| u8::try_from(count).expect("sample count ≤ 16 fits u8")) else {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the multisample type and quality are not available on this back-buffer \
                  format"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     };
@@ -5054,13 +5138,14 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         )
     {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the auto depth-stencil format at this multisample type is no \
                  depth-stencil the device offers"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -5072,10 +5157,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let retargeted = target_window != dev.window();
     if !resolve_reset_window_mode(dev, target_window, &mut pp) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!("rejected, no usable windowed client area"),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -5092,6 +5178,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     // Captured before the configuration below changes what the held
     // surfaces resolve to.
     let held = dev.hold_implicit_surfaces();
+    let detached = (held.back_buffer.is_some(), held.depth.is_some());
     let multi_sample_changed = new_sample_count != dev.backbuffer_sample_count;
     dev.set_backbuffer_multi_sample(
         pp.multi_sample_type,
@@ -5104,12 +5191,13 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     // An extended device's `Reset` with an implicit surface the application
     // still holds makes the swap chain new textures at any size: the held
     // surface keeps the old ones (`detach_held_implicit_surfaces`).
-    let resized = pp.back_buffer_width != dev.backbuffer_width
+    // Only the first four are a change in what the device presents with,
+    // which the line's level keys on; a held surface alone is not.
+    let recreated_for_a_change = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
         || multi_sample_changed
-        || dev.backbuffer_handle.is_null()
-        || held.back_buffer.is_some()
-        || held.depth.is_some();
+        || dev.backbuffer_handle.is_null();
+    let resized = recreated_for_a_change || held.back_buffer.is_some() || held.depth.is_some();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -5130,10 +5218,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         dev.pending_pacing = None;
         if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed retargeting the device window ({hr:#010x})"),
+                ResetFailureEffect::Unstated,
             );
             return hr;
         }
@@ -5145,10 +5234,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp, held) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed recreating the back buffer ({hr:#010x})"),
+                ResetFailureEffect::StateKeptResetOwed,
             );
             return fail_reset(dev, hr);
         }
@@ -5165,10 +5255,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed recreating the auto depth-stencil ({hr:#010x})"),
+                ResetFailureEffect::StateKeptResetOwed,
             );
             return fail_reset(dev, hr);
         }
@@ -5184,10 +5275,11 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         // `reset_recreate_resources`.
         if let Err(hr) = dev.flush_current_frame_blocking() {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed delivering the pending frame ({hr:#010x})"),
+                ResetFailureEffect::Unstated,
             );
             return hr;
         }
@@ -5242,60 +5334,71 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         dev.queue_pacing_change(resolve_layer_pacing(&pp, &dev.config));
     }
 
-    // Info only for a Reset that changed what the device presents with, or
-    // that recovered it. A game may call Reset on every step of a window
-    // drag after `apply_auto_resize` already followed the client area, and
-    // those same-size calls stay at debug.
-    let level = if resized || recovering || changes_presentation(&previous, &stored) {
+    // Info only for a Reset that changed what the device presents with, that
+    // recovered it, or that ends an extended device's run of failed Resets
+    // (`success_logs_at_info`). A game may call Reset on every step of a
+    // window drag after `apply_auto_resize` already followed the client area,
+    // and those same-size calls stay at debug, held surfaces or not.
+    let mut done = ResetDone::empty();
+    done.set(ResetDone::RESIZED, resized);
+    done.set(ResetDone::RECOVERED, log.recovering);
+    done.set(ResetDone::EXTENDED, extended);
+    done.set(ResetDone::BACK_BUFFER_DETACHED, detached.0);
+    done.set(ResetDone::DEPTH_DETACHED, detached.1);
+    // A device that was waiting for this Reset says it recovered; one that
+    // owed nothing, an extended device past a rejection, says the run ended.
+    done.set(
+        ResetDone::FAILURES_ENDED,
+        !log.recovering && dev.flags.contains(DeviceFlags::RESET_FAILURE_LOGGED),
+    );
+    dev.flags.remove(DeviceFlags::RESET_FAILURE_LOGGED);
+    let changed = recreated_for_a_change || changes_presentation(&previous, &stored);
+    let level = if success_logs_at_info(changed, done) {
         log::Level::Info
     } else {
         log::Level::Debug
     };
-    log::log!(
-        target: LOG_TARGET,
-        level,
-        "{}",
-        ResetSummary::new(
-            RESET_INTERFACE,
-            old_size,
-            &pp,
-            format_args!(
-                "ok, {}{}",
-                if resized {
-                    "back buffer recreated"
-                } else {
-                    "same size, back buffer kept"
-                },
-                if recovering { ", device recovered" } else { "" },
-            ),
-        ),
-    );
+    log::log!(target: LOG_TARGET, level, "{}", log.summary(&pp, done));
     D3D_OK
 }
 
 /// Log a `Reset` that did not complete, with the request as far as it was resolved.
 ///
 /// At warn for the first failure since the device last reset successfully,
-/// and at debug while `recovering`: a game retries a failing `Reset` every
-/// frame, and the first line already said why it fails. A rejection of
-/// malformed present parameters leaves the device as it was, so it warns
-/// each time unless an earlier failure is still pending.
+/// and at debug after it: a game retries a failing `Reset` every frame, and
+/// the first line already said why it fails. A plain device is past its
+/// first failure while it waits for a successful `Reset`; a rejection of
+/// malformed present parameters leaves it as it was, so that one warns each
+/// time unless an earlier failure is still pending. An extended device owes
+/// no `Reset` after a rejection, so it marks its first warning instead and
+/// keeps later rejections at debug, but a failure that leaves it needing a
+/// `Reset` warns regardless (`failure_warns`). Its line ends with `effect`,
+/// what the failure left behind.
 fn log_failed_reset(
-    recovering: bool,
-    old_size: (u32, u32),
+    dev: &mut DeviceInner,
+    log: &ResetLog,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
-    outcome: core::fmt::Arguments<'_>,
+    reason: core::fmt::Arguments<'_>,
+    effect: ResetFailureEffect,
 ) {
-    let level = if recovering {
-        log::Level::Debug
-    } else {
+    let extended = dev.is_extended();
+    let failure_logged = dev.flags.contains(DeviceFlags::RESET_FAILURE_LOGGED);
+    let level = if failure_warns(log.recovering, failure_logged, &effect) {
         log::Level::Warn
+    } else {
+        log::Level::Debug
+    };
+    let effect = if extended {
+        dev.flags.insert(DeviceFlags::RESET_FAILURE_LOGGED);
+        effect
+    } else {
+        ResetFailureEffect::Unstated
     };
     log::log!(
         target: LOG_TARGET,
         level,
         "{}",
-        ResetSummary::new(RESET_INTERFACE, old_size, pp, outcome),
+        log.summary(pp, ResetFailed::new(reason, effect)),
     );
 }
 
