@@ -290,6 +290,13 @@ const WM_ACTIVATE: u32 = 0x0006;
 const WM_ACTIVATEAPP: u32 = 0x001C;
 const WM_SIZE: u32 = 0x0005;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
+const WM_WINDOWPOSCHANGED: u32 = 0x0047;
+
+/// Byte offset of `flags` in the Win32 `WINDOWPOS` a `WM_WINDOWPOSCHANGED` points at.
+///
+/// Two window handles, then `x`, `y`, `cx` and `cy` as 32-bit ints, on both
+/// PE arches; only `flags` is read, so the struct is not declared.
+const WINDOWPOS_FLAGS_OFFSET: usize = 2 * size_of::<*mut c_void>() + 4 * size_of::<i32>();
 const WA_INACTIVE: u32 = 0;
 const HTCLIENT: usize = 1;
 
@@ -1471,6 +1478,20 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
     let dev_ptr = device as *mut DeviceInner;
     let original_wndproc = original_wndproc as *mut c_void;
 
+    // Seen before the routing below, which sends a move the device makes
+    // itself to the default procedure: an extended leave tells the
+    // application's own moves of the window from the driver's.
+    if msg == WM_WINDOWPOSCHANGED && lp != 0 {
+        // SAFETY: a `WM_WINDOWPOSCHANGED` carries a pointer to the
+        // `WINDOWPOS` the move describes, valid for the call, and `flags` is
+        // the `UINT` at `WINDOWPOS_FLAGS_OFFSET` in it.
+        let flags_at = unsafe { (lp as *const u8).add(WINDOWPOS_FLAGS_OFFSET) };
+        // SAFETY: `flags_at` points at the `WINDOWPOS`'s `UINT` `flags`, read
+        // unaligned since the pointer came through an integer.
+        let flags = unsafe { flags_at.cast::<u32>().read_unaligned() };
+        crate::fullscreen::note_window_pos_changed(hwnd, flags);
+    }
+
     // While the device itself is moving the window through a fullscreen
     // transition (mode-set, cover, restore), every message but the mode
     // change goes to the default proc instead of the game, as native D3D9
@@ -1666,6 +1687,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         return 0;
     }
 
+    let _app_call = crate::fullscreen::app_procedure_call(hwnd);
     call_window_proc(original_wndproc, hwnd, msg, wp, lp)
 }
 

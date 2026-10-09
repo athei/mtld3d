@@ -360,6 +360,10 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   fullscreen one. Wine's `d3d9ex.c` tests and a few `device.c` tests
   maximize their windows, so the `device.c/test_scissor_size` sites and 26
   of the `d3d9ex.c` sites read the window's size. No knob.
+- An extended device leaving fullscreen puts its window back at the rect it
+  had before the display mode was restored when anything but the window's
+  own procedure moved it during the restore, so a move the application makes
+  from another thread in that span is undone, where D3D9 keeps it. No knob.
 - `GetRenderTargetData` from an X render target into a system-memory
   surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
   A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,

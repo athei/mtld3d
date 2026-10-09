@@ -75,11 +75,37 @@ fn the_session_mode_names_the_mode_or_its_absence() {
 #[test]
 fn an_extended_leave_says_the_window_kept_its_rect_and_which_visibility_it_got_back() {
     assert_eq!(
-        WindowPlacement::KeptFullscreen { shown: true }.to_string(),
+        WindowPlacement::KeptFullscreen {
+            shown: true,
+            put_back: None
+        }
+        .to_string(),
         "window kept at its fullscreen rect, shown as before fullscreen"
     );
     assert_eq!(
-        WindowPlacement::KeptFullscreen { shown: false }.to_string(),
+        WindowPlacement::KeptFullscreen {
+            shown: false,
+            put_back: None
+        }
+        .to_string(),
         "window kept at its fullscreen rect, hidden again as before fullscreen"
+    );
+}
+
+#[test]
+fn an_extended_leave_names_a_move_it_undid_and_one_the_application_kept() {
+    assert_eq!(
+        WindowPlacement::KeptFullscreen {
+            shown: false,
+            put_back: Some(RectLabel::new(0, 66, 640, 546))
+        }
+        .to_string(),
+        "window kept at its fullscreen rect, put back from 640x480 at (0, 66) where the mode \
+         restore moved it, hidden again as before fullscreen"
+    );
+    assert_eq!(
+        WindowPlacement::KeptAppMove { shown: true }.to_string(),
+        "window left where the application moved it during the mode restore, shown as before \
+         fullscreen"
     );
 }

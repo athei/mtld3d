@@ -85,8 +85,17 @@ pub enum WindowPlacement {
     /// An extended device's leave: the window stays at its fullscreen rect.
     ///
     /// `shown` is the visibility it was given back, the one it had before
-    /// fullscreen showed it.
-    KeptFullscreen { shown: bool },
+    /// fullscreen showed it. `put_back` names where the mode restore had
+    /// moved the window when the leave put it back.
+    KeptFullscreen {
+        shown: bool,
+        put_back: Option<RectLabel>,
+    },
+    /// An extended device's leave after the application moved its window during the mode restore.
+    ///
+    /// The window stays where the application put it; `shown` is as for
+    /// [`Self::KeptFullscreen`].
+    KeptAppMove { shown: bool },
 }
 
 impl fmt::Display for WindowPlacement {
@@ -97,13 +106,27 @@ impl fmt::Display for WindowPlacement {
             Self::AppOwned => f.write_str("window left to the app (D3DCREATE_NOWINDOWCHANGES)"),
             Self::Gone => f.write_str("window already destroyed"),
             Self::Unmoved => f.write_str("window not moved, its windowed rect was never read"),
-            Self::KeptFullscreen { shown: true } => {
-                f.write_str("window kept at its fullscreen rect, shown as before fullscreen")
+            Self::KeptFullscreen { shown, put_back } => {
+                f.write_str("window kept at its fullscreen rect")?;
+                if let Some(moved) = put_back {
+                    write!(f, ", put back from {moved} where the mode restore moved it")?;
+                }
+                f.write_str(visibility(*shown))
             }
-            Self::KeptFullscreen { shown: false } => {
-                f.write_str("window kept at its fullscreen rect, hidden again as before fullscreen")
+            Self::KeptAppMove { shown } => {
+                f.write_str("window left where the application moved it during the mode restore")?;
+                f.write_str(visibility(*shown))
             }
         }
+    }
+}
+
+/// How an extended leave's line ends: the visibility the window was given back.
+const fn visibility(shown: bool) -> &'static str {
+    if shown {
+        ", shown as before fullscreen"
+    } else {
+        ", hidden again as before fullscreen"
     }
 }
 
