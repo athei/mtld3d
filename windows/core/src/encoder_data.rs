@@ -463,6 +463,18 @@ pub struct TextureInfo {
     pub usage_flags: TextureUsage,
 }
 
+impl TextureInfo {
+    /// The level of this Metal texture a reported mip `level` addresses.
+    ///
+    /// `levels` is the Metal chain, which a texture rasterized at a
+    /// `render.scale` may hold shorter than the chain D3D9 reports; see
+    /// [`crate::render_scale::rasterized_level`].
+    #[must_use]
+    pub const fn rasterized_level(&self, level: u32) -> u32 {
+        crate::render_scale::rasterized_level(level, self.levels)
+    }
+}
+
 /// The Metal textures a standalone colour surface owns, for retirement.
 ///
 /// A surface can carry up to four: the single-sample texture the D3D9

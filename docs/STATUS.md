@@ -273,6 +273,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 
 - `LockRect` serves a level of a non-dynamic DEFAULT-pool 2D texture, which
   D3D9 rejects. No knob.
+- Under a `render.scale` below one, the last reported mip levels of a
+  render-target texture at the back-buffer size can share one rasterized
+  level, so a write into one is seen by the others. No knob.
 - `GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once
   instead of waiting for the GPU. `query.flushImmediate`, off by default.
 - EVENT query polls queue the open frame even without `D3DGETDATA_FLUSH`,

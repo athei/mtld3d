@@ -8666,6 +8666,9 @@ fn readback_from_texture_rt(
     // The texture's own logical extent, which the mip extent above is measured
     // against. Taken here because the flush below reborrows the texture.
     let full_extent = (ti.mip_width(0), ti.mip_height(0));
+    // The Metal level the surface's level reads from, which differs only in
+    // a scaled texture's shortened tail.
+    let metal_level = ti.metal_level(level as usize);
     // Past every gate that rejects the call, so the uploads scheduled here are
     // work this read will use. A level of a non-dynamic DEFAULT-pool texture is
     // lockable here, so the source can carry a CPU write no bind has uploaded
@@ -8701,7 +8704,7 @@ fn readback_from_texture_rt(
             // SAFETY: `h` is non-zero (checked above) and a live retained
             // MTLTexture handle from the encoder texture cache.
             unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-            (level, slice),
+            (metal_level, slice),
             full_extent,
             dst,
         ),

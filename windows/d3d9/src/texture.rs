@@ -1070,7 +1070,7 @@ impl TextureInner {
                 tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
                 dst_ptr: read_ptr,
                 dst_len: read_len,
-                level: u32::try_from(level).expect("D3D9 mip level fits u32"),
+                level: self.metal_level(level),
                 // Only a class that can release its staging reaches here, and a
                 // cube never does, so the read is always slice zero.
                 slice: 0,
@@ -1137,6 +1137,33 @@ impl TextureInner {
         )
     }
 
+    /// Mip levels the backing Metal texture holds.
+    ///
+    /// The chain D3D9 reports, `levels`, unless the texture is rasterized at
+    /// a `render.scale` whose smaller base holds fewer
+    /// ([`mtld3d_core::render_scale::rasterized_level_count`]).
+    pub fn metal_levels(&self) -> u32 {
+        mtld3d_core::render_scale::rasterized_level_count(
+            self.render_scale,
+            (self.width, self.height),
+            self.levels,
+        )
+    }
+
+    /// The Metal level a reported mip `level` addresses.
+    ///
+    /// Every level but the reported tail of a shortened chain is itself; that
+    /// tail shares the Metal chain's last level
+    /// ([`mtld3d_core::render_scale::rasterized_level`]). Every read-back
+    /// thunk that names a level of this texture asks here; the encoder
+    /// records map theirs through [`TextureInfo::rasterized_level`].
+    pub fn metal_level(&self, level: usize) -> u32 {
+        mtld3d_core::render_scale::rasterized_level(
+            u32::try_from(level).expect("a D3D9 mip level fits u32"),
+            self.metal_levels(),
+        )
+    }
+
     pub fn mip_bytes_per_row(&self, level: usize) -> u32 {
         self.mip_bytes_per_row[level]
     }
@@ -1180,6 +1207,11 @@ impl TextureInner {
         }
         if self.render_scale.is_identity() {
             return (self.mip_bytes_per_row[level], self.mip_heights[level]);
+        }
+        // A reported tail level past a shortened Metal chain shares the
+        // chain's last level, which the level before it is charged for.
+        if self.metal_level(level) as usize != level {
+            return (0, 0);
         }
         let (width, height) = TargetExtent::mip_level(
             self.render_scale,
@@ -2384,7 +2416,7 @@ impl TextureInner {
             width,
             height,
             depth: self.depth,
-            levels: self.levels,
+            levels: self.metal_levels(),
             pixel_format: self.metal_pixel_format,
             create_flags: {
                 let mut flags = mtld3d_shared::mtl::TextureCreateFlags::empty();
@@ -3508,6 +3540,19 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
             boxed.mark_subresource_gpu_authoritative(0, level);
         }
     }
+    let metal_levels = boxed.metal_levels();
+    if metal_levels < boxed.levels {
+        let (width, height) = boxed.render_extent();
+        mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+            "texture {:#x}: {} levels at {}x{} rasterize at {width}x{height}, which holds {metal_levels}; \
+             the last {} share its last level",
+            boxed.texture_id.raw(),
+            boxed.levels,
+            boxed.width,
+            boxed.height,
+            boxed.levels - metal_levels + 1
+        );
+    }
     let inner = Box::into_raw(boxed);
     DeviceInner::from_ptr(dev_ptr).register_texture(inner);
     inner
@@ -4320,7 +4365,7 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
         dst_ptr: read_ptr,
         dst_len: read_len as u64,
-        mip_level: u32::try_from(level).unwrap_or(0),
+        mip_level: ti.metal_level(level),
         slice: face,
         origin_x: 0,
         origin_y: 0,
@@ -4471,7 +4516,7 @@ fn materialize_depth_planes(
         tex_handle: unsafe { MetalHandle::new(handle) },
         dst_ptr: planes.as_mut_ptr() as u64,
         dst_len: planes.len() as u64,
-        mip_level: u32::try_from(level).expect("D3D mip index fits u32"),
+        mip_level: ti.metal_level(level),
         slice: 0,
         origin_x: 0,
         origin_y: 0,
@@ -5068,8 +5113,13 @@ fn schedule_resampled_upload(
         return;
     }
     let logical = (ti.mip_width(level_u), ti.mip_height(level_u));
-    let texture =
-        TargetExtent::mip_level(ti.render_scale, logical, ti.render_extent(), level).texture();
+    let texture = TargetExtent::mip_level(
+        ti.render_scale,
+        logical,
+        ti.render_extent(),
+        ti.metal_level(level_u),
+    )
+    .texture();
     mtld3d_shared::log_once_trace_by!(
         target: TEX_TRACE_TARGET,
         key: (texture_id.raw() << 8) | (level_u as u64 & 0xff),

@@ -57,6 +57,14 @@ const fn identity(value: &StretchKind) -> SurfaceIdentityRecord {
     }
 }
 
+/// The Metal level a reported `level` of `kind` addresses, which only a texture can shorten.
+const fn rasterized_level(kind: &StretchKind, level: u32) -> u32 {
+    match kind {
+        StretchKind::Texture(info) => info.rasterized_level(level),
+        StretchKind::Backbuffer(_) | StretchKind::DepthStencil(_) => level,
+    }
+}
+
 fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
     SurfaceRecord {
         identity: identity(&value.kind),
@@ -71,7 +79,7 @@ fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
         texture_height: value.texture_size.1,
         scale: value.scale.percent(),
         format: value.format,
-        mip_level: value.mip_level,
+        mip_level: rasterized_level(&value.kind, value.mip_level),
         slice: value.slice.unwrap_or(0),
         pool: value.pool,
         flags: u32::from(value.flags.bits()),
@@ -353,7 +361,7 @@ capture_control!(BindDepthOp, BindDepth, v, recorder, scratch, tag, {
             2,
             BindDepthLazyRecord {
                 texture: TextureRecord::capture(info),
-                level: *level,
+                level: info.rasterized_level(*level),
                 scale: scale.percent(),
                 sample_count: u32::from(v.sample_count),
                 flags: u32::from(v.flags.bits())
@@ -436,7 +444,7 @@ capture_control!(BindColorOp, BindColor, v, recorder, scratch, tag, {
                 slot: u32::from(v.slot),
                 scale: v.scale.percent(),
                 slice: *slice,
-                level: *level,
+                level: info.rasterized_level(*level),
                 has_alpha: u32::from(*has_alpha),
                 reserved: 0
             }
@@ -518,7 +526,7 @@ capture_control!(StretchBlitOp, StretchBlit, v, recorder, scratch, tag, {
             destination: surface(&v.dst_info),
             source_region: region(&v.src_region),
             destination_region: region(&v.dst_region),
-            mip_level: v.mip_level,
+            mip_level: rasterized_level(&v.src_info.kind, v.mip_level),
             render_quad: u32::from(v.render_quad),
             filter: v.filter,
             reserved: 0
@@ -542,7 +550,7 @@ capture_control!(ColorFillOp, ColorFill, v, recorder, scratch, tag, {
             format: v.fill.format as u32,
             scale: v.fill.scale.percent(),
             slice: v.fill.subresource.0,
-            level: v.fill.subresource.1,
+            level: rasterized_level(&v.kind, v.fill.subresource.1),
             rect: [v.fill.rect.0, v.fill.rect.1, v.fill.rect.2, v.fill.rect.3],
             rgba: [v.fill.rgba.0, v.fill.rgba.1, v.fill.rgba.2, v.fill.rgba.3],
             sample_count: u32::from(v.fill.sample_count),
@@ -751,7 +759,7 @@ capture_control!(
                 texture_height: v.target.texture.1,
                 scale: v.target.scale.percent(),
                 stride: v.target.bytes_per_row,
-                level: v.target.level
+                level: rasterized_level(&v.kind, v.target.level)
             }
         );
     }

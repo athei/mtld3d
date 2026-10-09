@@ -1176,8 +1176,8 @@ fn a_full_chain_target_at_the_backbuffer_size_draws_and_reads_its_levels() {
     let levels = target.level_count();
     let full_chain = 32 - width.max(height).leading_zeros();
     assert_eq!(levels, full_chain, "the reported size's whole chain");
-    let level0 = target.surface_level(0);
-    assert_eq!(h.set_render_target(0, &level0), D3D_OK, "bind level 0");
+    let base = target.surface_level(0);
+    assert_eq!(h.set_render_target(0, &base), D3D_OK, "bind level 0");
     assert_eq!(h.clear_target(RED), D3D_OK, "clear level 0 red");
     assert_eq!(
         h.set_render_target(0, &back),
@@ -1188,7 +1188,7 @@ fn a_full_chain_target_at_the_backbuffer_size_draws_and_reads_its_levels() {
     let (hr, desc) = last.desc();
     assert_eq!(hr, D3D_OK, "GetDesc on the last level");
     assert_eq!(h.color_fill_hr(&last, GREEN), D3D_OK, "fill the last level");
-    let pixels = read_back(&h, &level0, (width, height), D3DFMT_A8R8G8B8);
+    let pixels = read_back(&h, &base, (width, height), D3DFMT_A8R8G8B8);
     assert_eq!(
         pixels[(height / 2 * width + width / 2) as usize],
         RED,

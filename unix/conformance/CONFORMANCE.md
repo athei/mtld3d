@@ -234,6 +234,21 @@ record. A knob, where one makes sense, is named with its default.
   holds no staging until a CPU path first needs a level, and every lock of a
   level reads it back from the GPU first, unless the level holds a CPU write
   no upload has carried yet. No knob.
+- **The last reported mip levels of a scaled render-target texture can share
+  one rasterized level.** A render-target or depth texture at the reported
+  back-buffer size reports the chain of that size, but rasterizes at
+  `render.scale` of it, and a smaller base can hold a shorter chain: 640x480
+  has ten levels, its 480x360 at 0.75 nine. The Metal texture holds the
+  shorter chain (`rasterized_level_count` in `windows/core/src/render_scale.rs`)
+  and every reported level past it lands on its last level (`rasterized_level`),
+  so a draw, fill, copy or write into one of those tail levels is seen by the
+  others, and a read back of one returns the shared level's texels. Only
+  levels of a texel or two on a side share, at a scale of one half or more a
+  single pair of them, and what such a texture holds at the scale is already
+  a resample of what D3D9 would. Giving every reported level its own Metal
+  level would need a chain longer than its base allows; declining the scale
+  for such a texture would pair it with a scaled depth-stencil of a different
+  size. A texture created with a shared tail logs it once at info. No knob.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without
