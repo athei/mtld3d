@@ -26,7 +26,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, TexturedVertex,
+    Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, Texture, TexturedVertex,
     assert_pixel_eq, spawn_scoped,
 };
 use mtld3d_types::{
@@ -41,6 +41,8 @@ use mtld3d_types::{
     D3DVIEWPORT9,
 };
 
+use super::render_target::read_back;
+
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
@@ -48,6 +50,8 @@ const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
 /// A colour whose alpha is neither zero nor opaque, so either mistake shows.
 const TRANSLUCENT: u32 = 0x4000_FF00;
+/// Red as GDI's `COLORREF` (`0x00BBGGRR`) reports it.
+const RED_COLORREF: u32 = 0x0000_00FF;
 
 /// The sub-rect every viewport-bound test narrows to, in reported coordinates.
 ///
@@ -953,6 +957,191 @@ fn color_fill_of_a_scaled_targets_mip_level_addresses_that_level() {
         "just past the filled quarter on both axes",
     );
     assert_pixel_eq(h.read_pixel(560, 400), BLUE, "the opposite corner");
+}
+
+/// An A8R8G8B8 render-target texture of `levels` levels at the reported back-buffer size.
+fn backbuffer_sized_target(h: &Harness, levels: u32) -> Texture<'_> {
+    let (width, height) = h.dims();
+    h.create_texture(
+        width,
+        height,
+        levels,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    )
+}
+
+/// A whole-level `UpdateSurface` into a render-target texture at the back-buffer size reaches it.
+///
+/// Such a texture is rasterized at the scale, so the rows the update carries
+/// describe a larger extent than the level's Metal texture has, and the write
+/// resamples on its way in.
+#[test]
+fn a_write_into_a_back_buffer_sized_render_target_texture_reaches_it() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let target = backbuffer_sized_target(&h, 1);
+    let level = target.surface_level(0);
+    let source =
+        h.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&vec![GREEN; (width * height) as usize]);
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: width.cast_signed(),
+        y2: height.cast_signed(),
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&source, &whole, &level, (0, 0)),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+    let pixels = read_back(&h, &level, (width, height), D3DFMT_A8R8G8B8);
+    for (x, y) in [(width / 2, height / 2), (8, 8), (width - 8, height - 8)] {
+        assert_eq!(
+            pixels[(y * width + x) as usize],
+            GREEN,
+            "texel ({x}, {y}) holds the write"
+        );
+    }
+}
+
+/// A `LockRect` of a sub-rect of such a texture writes that rect and leaves the rest.
+///
+/// A whole-level lock seeds the level blue first, so the resample of the
+/// smaller red rect after it reads rows staged where the blue ones were. The
+/// probes one reported pixel inside each edge of the rect read back through
+/// the rect's outermost rasterized texels, at 0.5, 0.67 and 0.75 as at the
+/// identity, so they hold red only if the resample took nothing from beyond
+/// the rect's own rows.
+#[test]
+fn a_partial_lock_of_a_back_buffer_sized_render_target_texture_writes_only_its_rect() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let target = backbuffer_sized_target(&h, 1);
+    let level = target.surface_level(0);
+    {
+        let mut locked = target.lock_rect(0, 0);
+        locked.write_u32_rect(
+            width as usize,
+            height as usize,
+            &vec![BLUE; (width * height) as usize],
+        );
+    }
+    let (x1, y1, x2, y2) = (128u32, 96u32, 512u32, 384u32);
+    {
+        let rect = [
+            x1.cast_signed(),
+            y1.cast_signed(),
+            x2.cast_signed(),
+            y2.cast_signed(),
+        ];
+        let mut locked = target.lock_rect_partial(0, &rect, 0);
+        let (w, ht) = ((x2 - x1) as usize, (y2 - y1) as usize);
+        locked.write_u32_rect(w, ht, &vec![RED; w * ht]);
+    }
+    let pixels = read_back(&h, &level, (width, height), D3DFMT_A8R8G8B8);
+    for (x, y, expected, what) in [
+        (320, 240, RED, "the middle of the locked rect"),
+        (x1 + 1, 240, RED, "the rect's second column"),
+        (320, y1 + 1, RED, "the rect's second row"),
+        (x2 - 2, 240, RED, "the rect's second-to-last column"),
+        (320, y2 - 2, RED, "the rect's second-to-last row"),
+        (40, 40, BLUE, "outside, above and left"),
+        (600, 440, BLUE, "outside, below and right"),
+    ] {
+        assert_eq!(
+            pixels[(y * width + x) as usize],
+            expected,
+            "texel ({x}, {y}): {what}"
+        );
+    }
+}
+
+/// `UpdateTexture` into such a texture writes its mip level 1 as well as level 0.
+///
+/// Level 1 is rasterized at the scale too, at Metal's halving of the scaled
+/// base. The source's level 1 is red in its top-left quarter and blue
+/// elsewhere, read back at the level's reported extent.
+#[test]
+fn update_texture_into_a_back_buffer_sized_render_target_texture_writes_mip_level_1() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let target = backbuffer_sized_target(&h, 2);
+    let source = h.create_texture(width, height, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let (w1, h1) = (width / 2, height / 2);
+    {
+        let mut locked = source.lock_rect(0, 0);
+        locked.write_u32_rect(
+            width as usize,
+            height as usize,
+            &vec![GREEN; (width * height) as usize],
+        );
+    }
+    {
+        let texels: Vec<u32> = (0..h1)
+            .flat_map(|y| (0..w1).map(move |x| if x < w1 / 2 && y < h1 / 2 { RED } else { BLUE }))
+            .collect();
+        let mut locked = source.lock_rect(1, 0);
+        locked.write_u32_rect(w1 as usize, h1 as usize, &texels);
+    }
+    assert_eq!(
+        h.update_texture_hr(&source, &target),
+        D3D_OK,
+        "UpdateTexture of both levels"
+    );
+    let level0 = read_back(&h, &target.surface_level(0), (width, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        level0[(height / 2 * width + width / 2) as usize],
+        GREEN,
+        "level 0 holds its write"
+    );
+    let level1 = read_back(&h, &target.surface_level(1), (w1, h1), D3DFMT_A8R8G8B8);
+    for (x, y, expected, what) in [
+        (w1 / 4, h1 / 4, RED, "inside the red quarter"),
+        (w1 * 3 / 4, h1 / 4, BLUE, "right of the red quarter"),
+        (w1 / 4, h1 * 3 / 4, BLUE, "below the red quarter"),
+        (w1 * 3 / 4, h1 * 3 / 4, BLUE, "the opposite quarter"),
+    ] {
+        assert_eq!(
+            level1[(y * w1 + x) as usize],
+            expected,
+            "level 1 texel ({x}, {y}): {what}"
+        );
+    }
+}
+
+/// What GDI draws into such a texture through `GetDC` reaches it at `ReleaseDC`.
+///
+/// The level is seeded blue by a `ColorFill`; GDI paints a red block at its
+/// top-left corner. GDI writes a zero alpha byte into the A8R8G8B8 texels it
+/// paints, so the colour channels are what the probes compare.
+#[test]
+fn get_dc_drawing_into_a_back_buffer_sized_render_target_texture_reaches_it() {
+    const BLOCK: u32 = 64;
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let target = backbuffer_sized_target(&h, 1);
+    let level = target.surface_level(0);
+    assert_eq!(h.color_fill_hr(&level, BLUE), D3D_OK, "seed the whole level");
+    let dc = level.dc();
+    dc.fill_block(BLOCK.cast_signed(), RED_COLORREF);
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+    let pixels = read_back(&h, &level, (width, height), D3DFMT_A8R8G8B8);
+    for (x, y, expected, what) in [
+        (BLOCK / 2, BLOCK / 2, RED, "inside GDI's block"),
+        (BLOCK * 2, BLOCK / 2, BLUE, "right of the block"),
+        (width / 2, height / 2, BLUE, "far from the block"),
+    ] {
+        assert_eq!(
+            pixels[(y * width + x) as usize] & 0x00FF_FFFF,
+            expected & 0x00FF_FFFF,
+            "texel ({x}, {y}): {what}"
+        );
+    }
 }
 
 #[test]
