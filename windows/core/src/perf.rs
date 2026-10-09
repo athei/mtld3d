@@ -45,10 +45,16 @@ use log::{info, trace};
 pub use mtld3d_shared::perf::{
     CycleAddTimer, CycleSetTimer, init_tracking_enabled, pair_stats_enabled, perf_enabled,
 };
+// The summary renders cycles with the host's calibrated rate. Its tests render
+// at a fixed 1 GHz instead, so their goldens read the same on a host whose
+// counter runs at 24 MHz, where a calibration jitter of a few ppm and the
+// 41.7 ns tick move the cells they pin.
+#[cfg(all(perf_tracking, not(test)))]
+use mtld3d_shared::tsc::cycles_to_ms;
 #[cfg(perf_tracking)]
 use mtld3d_shared::{
     CommandType,
-    tsc::{cycles_to_ms, rdtsc, secs_to_cycles},
+    tsc::{rdtsc, secs_to_cycles},
 };
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind, perf::SubmitTimings};
 #[cfg(perf_tracking)]
@@ -60,6 +66,8 @@ use rustc_hash::FxHashMap;
 // perf-tracking code, so the import is elided under `not(perf_tracking)`.
 #[cfg(perf_tracking)]
 use strum::EnumCount;
+#[cfg(all(perf_tracking, test))]
+use tests::cycles_to_ms;
 
 #[cfg(perf_tracking)]
 use super::page_box::{PageBoxVolume, pagebox_volume};
