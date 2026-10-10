@@ -49,8 +49,9 @@
 //!
 //! A terminal report goes to the process's log file. Before `Direct3DCreate9`
 //! has named it, the report opens the early location `InitLogger` named,
-//! with the lines logged so far ahead of it, since the process will never
-//! get as far as naming one (see `log_file::crash_fd`). A fault handed back
+//! with the backlog ahead of it (this side's lines and the d3d9.dll lines
+//! already forwarded), since the process will never get as far as naming one
+//! (see `log_file::crash_fd`). A fault handed back
 //! is not known to be terminal, so its report goes to stderr until a file is
 //! open, and opens nothing; a game fault Wine then finds unhandled ends the
 //! process through `_exit(2)`, and that stderr line is what remains of it.
