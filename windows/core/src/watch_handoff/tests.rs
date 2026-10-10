@@ -11,6 +11,9 @@ const LONG_WAIT: Duration = Duration::from_secs(60);
 /// How long a test waits for an event before it fails.
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// The figure wait of the timeout test: short, since that test waits it out on purpose.
+const SHORT_WAIT: Duration = Duration::from_millis(50);
+
 /// What the mock watch reports, in order.
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
@@ -177,8 +180,8 @@ fn an_offer_after_the_sampler_ended_says_so() {
 }
 
 #[test]
-fn each_answer_pairs_with_its_own_request_and_a_late_one_is_thrown_away() {
-    let (api, worker) = link(Duration::from_millis(50));
+fn an_unanswered_request_logs_without_figures_and_is_withdrawn() {
+    let (api, worker) = link(SHORT_WAIT);
     let (events, event_rx) = mpsc::channel();
     let sampler = start(
         worker,
@@ -200,9 +203,29 @@ fn each_answer_pairs_with_its_own_request_and_a_late_one_is_thrown_away() {
         None,
         "the sampler withdrew the request it gave up on"
     );
-    // A present that took the request just before the withdrawal answers late.
-    assert!(api.answer(0, "late"));
+    drop(api);
+    sampler.join().expect("the sampler ends cleanly");
+}
 
+/// A late answer to an earlier sample is thrown away, and the sample waited for logs its own.
+///
+/// The late answer is queued before sample 1 is offered, so the sampler
+/// reads it first while it waits for sample 1's answer, whatever the timing.
+#[test]
+fn each_answer_pairs_with_its_own_request_and_a_late_one_is_thrown_away() {
+    let (api, worker) = link(LONG_WAIT);
+    let (events, event_rx) = mpsc::channel();
+    let sampler = start(
+        worker,
+        MockWatch {
+            events,
+            gate: None,
+            lines_due: true,
+        },
+    );
+    // A present that took sample 0's request just before the sampler gave
+    // up on it answers late.
+    assert!(api.answer(0, "late"));
     assert_eq!(api.offer(1), Offer::Queued);
     assert_eq!(next(&event_rx), Event::Taking(1));
     let deadline = Instant::now() + DEADLINE;
@@ -223,13 +246,4 @@ fn each_answer_pairs_with_its_own_request_and_a_late_one_is_thrown_away() {
     assert_eq!(api.take_request(), None, "an answered request is gone");
     drop(api);
     sampler.join().expect("the sampler ends cleanly");
-}
-
-#[test]
-fn a_newer_request_replaces_one_never_taken() {
-    let (api, worker) = link::<&'static str>(LONG_WAIT);
-    worker.request.store(3, Ordering::Relaxed);
-    worker.request.store(4, Ordering::Relaxed);
-    assert_eq!(api.take_request(), Some(4));
-    assert_eq!(api.take_request(), None);
 }

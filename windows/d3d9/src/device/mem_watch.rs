@@ -259,9 +259,10 @@ impl Watch for AddressSpaceWatch {
 
     /// Log the breakdown, then the threshold lines, with the device's figures if they came.
     ///
-    /// Without them a crossing still warns, with a clause saying the device's
-    /// figures were not answered in place of them, and the breakdown, which is
-    /// mostly those figures, is dropped with a debug note. One region map
+    /// Without them a crossing still warns, with a clause naming the device
+    /// figures that went unanswered in place of them and the page boxes the
+    /// thread reads itself, and the breakdown, which is mostly the device's
+    /// figures, is dropped with a debug note. One region map
     /// follows the warnings of a sample, however many thresholds it crossed.
     fn log(&mut self, sample: &Sample, figures: Option<&DeviceFigures>) {
         match (sample.breakdown, figures) {
@@ -269,8 +270,8 @@ impl Watch for AddressSpaceWatch {
             (true, Some(figures)) => log_breakdown(&sample.walk.describe(), figures),
             (true, None) => debug!(
                 target: LOG_TARGET,
-                "address space breakdown of sample {} dropped: no present answered for the \
-                 device figures in the {} s after the walk",
+                "address space breakdown of sample {} dropped: no present answered within {} s \
+                 of the walk",
                 sample.index,
                 FIGURES_WAIT.as_secs()
             ),
@@ -294,9 +295,11 @@ impl Watch for AddressSpaceWatch {
                     let device = figures.map_or_else(
                         || {
                             format!(
-                                "the device's texture and page-box figures were not answered, \
-                                 no present came in the {} s after the walk",
-                                FIGURES_WAIT.as_secs()
+                                "no present answered within {} s of the walk, so the device's \
+                                 textures, mip data, texture staging and upload leases are not \
+                                 counted; {}",
+                                FIGURES_WAIT.as_secs(),
+                                process_page_boxes()
                             )
                         },
                         |figures| {
@@ -509,6 +512,23 @@ fn page_box_holders(figures: &DeviceFigures) -> PageBoxHolders {
         upload_leases: figures.upload_leases,
         pool_parked: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
     }
+}
+
+/// The page-box clause the watch thread can give without the device's figures.
+///
+/// The process-wide holders only: with the device's texture staging and
+/// upload leases unknown, an `other` figure would count them, so the clause
+/// names no `other` and says the rest is not split.
+fn process_page_boxes() -> String {
+    format!(
+        "page boxes {} MiB: surfaces {}, vertex/index backing {}, encoder leases {}, pool \
+         parked {}, the rest not split",
+        mtld3d_core::page_box::live_bytes() >> 20,
+        mtld3d_core::held_pages::live_surface_bytes() >> 20,
+        mtld3d_core::buffer_backing::live_backing_bytes().total() >> 20,
+        mtld3d_core::held_pages::live_encoder_lease_bytes() >> 20,
+        crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() >> 20
+    )
 }
 
 /// The periodic debug line: the free space as `space` gives it, and every holder.

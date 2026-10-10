@@ -12,9 +12,10 @@
 //! Nothing on the presenting side waits. The offer is a `try_send` into a
 //! one-deep queue, so an offer made while the sampler is still on an earlier
 //! sample with one queued behind it is skipped. A request is one index in an
-//! atomic slot that the sampler overwrites and the presenting side swaps out,
-//! so a stale request never stands in the way of a newer one and asking costs
-//! the presenting side one load per present. Answers go into an unbounded
+//! atomic slot that the sampler sets and the presenting side swaps out, and
+//! the sampler withdraws a request it gives up on, so the slot holds at most
+//! the one request the sampler waits for, and checking for it costs the
+//! presenting side one load per present. Answers go into an unbounded
 //! queue, so an answer never blocks and is never refused; there is at most one
 //! per request, and the sampler requests at most once per sample.
 //!
@@ -147,8 +148,8 @@ impl<F> WorkerLink<F> {
             if !watch.lines_due(&sample) {
                 continue;
             }
-            // Overwrites a request the presenting side never took, which can
-            // only be one this thread already gave up on.
+            // The slot is empty here: every wait before this one ended with
+            // its request taken by a present or withdrawn on timeout.
             self.request.store(index, Ordering::Relaxed);
             match self.await_answer(index) {
                 Waited::Answered(figures) => watch.log(&sample, Some(&figures)),
