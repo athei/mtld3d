@@ -7,11 +7,13 @@
 //! skips the hook. The layer pins the first bytes of each export to one
 //! prologue per arch that such decoders know, so this reads them through
 //! `GetProcAddress`, the address a hook engine patches, and compares them
-//! byte for byte.
+//! byte for byte. The list of exports is read from `d3d9.def`, so an export
+//! added there as a plain function fails here.
 //!
 //! No shared harness: the point is the export table, as in `d3dperf.rs`.
 
 use core::ffi::{CStr, c_char, c_void};
+use std::ffi::CString;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -20,19 +22,8 @@ unsafe extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
-/// Every export `d3d9.def` lists.
-const EXPORTS: [&CStr; 10] = [
-    c"Direct3DCreate9",
-    c"Direct3DCreate9Ex",
-    c"Direct3DShaderValidatorCreate9",
-    c"D3DPERF_BeginEvent",
-    c"D3DPERF_EndEvent",
-    c"D3DPERF_GetStatus",
-    c"D3DPERF_QueryRepeatFrame",
-    c"D3DPERF_SetMarker",
-    c"D3DPERF_SetOptions",
-    c"D3DPERF_SetRegion",
-];
+/// The `.def` file `d3d9.dll` links with: its `EXPORTS` section names every export.
+const D3D9_DEF: &str = include_str!("../../../d3d9/d3d9.def");
 
 /// `mov edi, edi; push ebp; mov ebp, esp; pop ebp`, in the encodings MSVC emits.
 #[cfg(target_arch = "x86")]
@@ -53,7 +44,14 @@ fn every_api_export_starts_with_the_hook_prologue() {
         // engine cannot decode whatever its first bytes are.
         eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64EC code, not checked");
     } else {
-        let wrong: Vec<String> = EXPORTS
+        let exports = def_exports();
+        assert!(
+            exports
+                .iter()
+                .any(|name| name.as_c_str() == c"Direct3DCreate9"),
+            "d3d9.def lists Direct3DCreate9: {exports:?}"
+        );
+        let wrong: Vec<String> = exports
             .iter()
             .filter_map(|name| {
                 let found = first_bytes(lib, name);
@@ -70,6 +68,18 @@ fn every_api_export_starts_with_the_hook_prologue() {
 
     // SAFETY: balancing the LoadLibrary above.
     assert_ne!(unsafe { FreeLibrary(lib) }, 0, "FreeLibrary(d3d9.dll)");
+}
+
+/// Every name the `EXPORTS` section of `d3d9.def` lists, the first word of each line.
+fn def_exports() -> Vec<CString> {
+    let (_, exports) = D3D9_DEF
+        .split_once("EXPORTS")
+        .expect("d3d9.def has an EXPORTS section");
+    exports
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|name| CString::new(name).expect("an export name has no NUL"))
+        .collect()
 }
 
 /// The first bytes of the export `name`, as many as the prologue has.

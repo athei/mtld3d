@@ -11,7 +11,7 @@
 //! of its own and jumps to the Rust function that does the work:
 //!
 //! - i386: `8B FF 55 8B EC 5D` (`mov edi, edi; push ebp; mov ebp, esp; pop
-//!   ebp`), the hot-patch prologue every system DLL export starts with. A hook
+//!   ebp`), whose first five bytes are the Windows hot-patch prologue. A hook
 //!   engine copies the first three instructions, exactly five bytes.
 //! - `x86_64`: `0F 1F 44 00 00`, the five-byte NOP. One whole instruction
 //!   covers the five bytes, the entry leaves `rsp` untouched, so it needs no
@@ -22,6 +22,11 @@
 //! the bytes a hook engine displaces. The entry does not touch the arguments
 //! or the stack the body sees, so the body runs with the caller's frame as if
 //! it had been called directly.
+//!
+//! The five bytes before an entry are not guaranteed to be padding: the
+//! linker places the entries, and one can start its section. A hook engine
+//! that writes the hot-patch long jump in front of the entry has to check
+//! those bytes itself; a plain detour never touches them.
 //!
 //! The ARM64X build exports the body through a plain wrapper: its code is
 //! ARM64EC or ARM64, which no x86 hook engine decodes either way.
@@ -44,6 +49,11 @@ macro_rules! hookable_export {
         $(#[$attr:meta])*
         $export:literal => fn $entry:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? = $body:path;
     ) => {
+        // The `sym` operands below accept any function, so this makes a body
+        // whose signature or calling convention differs from the entry's a
+        // compile error on every arch.
+        const _: extern "system" fn($($ty),*) $(-> $ret)? = $body;
+
         $(#[$attr])*
         #[cfg(target_arch = "x86")]
         #[unsafe(export_name = $export)]

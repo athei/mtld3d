@@ -115,7 +115,7 @@ Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `_
 
 On MSVC i386, `raw-dylib` imports add stdcall decoration (`_Name@N`), but DLL exports use undecorated names (matching real Windows DLLs).
 
-- **Export side**: `#[unsafe(no_mangle)]` + list exports in `d3d9.def` (linked via `/DEF:` in `build.rs`).
+- **Export side**: every export is listed in `d3d9.def` (linked via `/DEF:` in `build.rs`). The d3d9 API exports are declared through `hookable_export!` (`windows/d3d9/src/hookable.rs`), never as a plain `#[unsafe(no_mangle)]` or `export_name` function: on i386 and x86_64 the macro emits a naked entry that starts with a fixed prologue inline-hook engines (overlays, capture tools) decode and relocate, then jumps to the Rust body, whose signature it checks against the entry's. What a compiler emits for a short function is not something a hook engine's length decoder is guaranteed to know. The end-to-end test `export_prologues.rs` reads the export list from `d3d9.def` and fails on any export that does not start with the prologue.
 - **Import side**: `import_name_type = "undecorated"` on i386:
 
 ```rust
