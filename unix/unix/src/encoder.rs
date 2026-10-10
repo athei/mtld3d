@@ -7192,9 +7192,12 @@ impl FrameEncoder {
         let texture_id = info.texture_id();
         let desc = self.texture_desc_from_view(&info);
         let records = records_every_write(&desc, info.usage_flags());
-        let (spare, discarded) =
-            self.texture_versions
-                .take_spare(texture_id, VersionShape::of(&desc), records);
+        let (spare, discarded) = self.texture_versions.take_spare(
+            texture_id,
+            VersionShape::of(&desc),
+            records,
+            self.current_submit_seq,
+        );
         for stale in discarded {
             self.retire_texture_views(&stale, MetalHandle::NULL);
         }

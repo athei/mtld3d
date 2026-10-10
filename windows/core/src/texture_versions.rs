@@ -16,7 +16,9 @@
 //! submission the caller pops it, forgets every handle-keyed record of it
 //! exactly as a destroy does, and parks it as a spare of its texture, or
 //! destroys it when the texture is gone or the pool is at its cap. A spare
-//! nobody takes for [`SPARE_MAX_AGE_SUBMITS`] submissions is trimmed.
+//! nobody takes for [`SPARE_MAX_AGE_SUBMITS`] submissions is trimmed, and a
+//! texture with no spares that no rename touched for as long stops being
+//! tracked: its next rename starts it over, write history included.
 //!
 //! A reused version still has to receive the texels the texture changed
 //! since it retired, and only those, when the texture's GPU writes are all
@@ -40,7 +42,7 @@ use mtld3d_shared::{
     TextureCreateDesc,
     mtl::{BlockLayout, PixelFormat, StorageMode, Swizzle, TextureCreateFlags, TextureUsage},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{format::FormatMapping, ids::TextureId};
 
@@ -345,6 +347,16 @@ pub struct TextureVersions<V> {
     /// `TextureId` comes back (an `EvictManagedResources`, a texture moving
     /// between devices) while that version is still retiring.
     next_epoch: u64,
+    /// The textures with at least one spare, the only ones [`Self::trim`] visits for spares.
+    with_spares: FxHashSet<TextureId>,
+    /// One `(submission, texture, epoch)` per tracked state, oldest first.
+    ///
+    /// [`Self::trim`] looks at a state when its entry is
+    /// [`SPARE_MAX_AGE_SUBMITS`] old, drops it when it has no spares and no
+    /// rename since, and queues it again otherwise, so a drain visits only
+    /// the states whose age came due. An entry whose epoch no longer
+    /// matches its texture's state belongs to a state that is gone.
+    idle: VecDeque<(u64, TextureId, u64)>,
 }
 
 impl<V> TextureVersions<V> {
@@ -355,6 +367,8 @@ impl<V> TextureVersions<V> {
             retiring: VecDeque::new(),
             parked_bytes: 0,
             next_epoch: 1,
+            with_spares: FxHashSet::default(),
+            idle: VecDeque::new(),
         }
     }
 
@@ -382,18 +396,22 @@ impl<V> TextureVersions<V> {
     /// were made for, those spares come back in the second value for the
     /// caller to destroy behind the current submission, and the texture
     /// starts over under the new shape; versions of the old shape still
-    /// retiring are destroyed when they are popped.
+    /// retiring are destroyed when they are popped. `seq` is the submission
+    /// the rename belongs to, which keeps the texture tracked for another
+    /// [`SPARE_MAX_AGE_SUBMITS`] submissions.
     pub fn take_spare(
         &mut self,
         id: TextureId,
         shape: VersionShape,
         records_writes: bool,
+        seq: u64,
     ) -> (Option<Spare<V>>, Vec<V>) {
         let mut discarded = Vec::new();
         let epoch = self.next_epoch;
         let state = match self.textures.entry(id) {
             Entry::Vacant(slot) => {
                 self.next_epoch += 1;
+                self.idle.push_back((seq, id, epoch));
                 slot.insert(VersionState::new(shape, epoch, records_writes))
             }
             Entry::Occupied(slot) => {
@@ -402,14 +420,19 @@ impl<V> TextureVersions<V> {
                     self.parked_bytes -= state.bytes * state.spares.len() as u64;
                     discarded.extend(state.spares.drain(..).map(Spare::into_views));
                     self.next_epoch += 1;
+                    self.idle.push_back((seq, id, epoch));
                     *state = VersionState::new(shape, epoch, records_writes);
                 }
                 state
             }
         };
+        state.last_rename_seq = seq;
         let spare = state.spares.pop();
         if spare.is_some() {
             self.parked_bytes -= state.bytes;
+        }
+        if state.spares.is_empty() {
+            self.with_spares.remove(&id);
         }
         (spare, discarded)
     }
@@ -602,6 +625,9 @@ impl<V> TextureVersions<V> {
         }
         self.parked_bytes += state.bytes;
         let aborted = failed != 0 && entry.birth_seq <= failed;
+        if state.spares.is_empty() {
+            self.with_spares.insert(entry.id);
+        }
         state.spares.push(Spare {
             views: entry.views,
             held_writes: (!aborted).then_some(entry.held_writes),
@@ -614,23 +640,51 @@ impl<V> TextureVersions<V> {
     ///
     /// A spare's age counts from the submission it last served in. Spares
     /// park in submission order and renames take the newest, so each
-    /// texture's oldest spares sit at the bottom of its stack.
+    /// texture's oldest spares sit at the bottom of its stack. Only the
+    /// textures holding spares are visited for that. Then every texture
+    /// left without spares and without a rename for as long stops being
+    /// tracked, its write history with it; only the states whose age came
+    /// due are looked at.
     pub fn trim(&mut self, now: u64) -> Vec<V> {
         let mut aged = Vec::new();
-        if self.parked_bytes == 0 {
-            return aged;
-        }
-        for state in self.textures.values_mut() {
+        let aged_at = |seq: u64| seq + SPARE_MAX_AGE_SUBMITS < now;
+        let (textures, parked_bytes) = (&mut self.textures, &mut self.parked_bytes);
+        self.with_spares.retain(|id| {
+            let Some(state) = textures.get_mut(id) else {
+                return false;
+            };
             let old = state
                 .spares
                 .iter()
-                .take_while(|spare| spare.last_seq + SPARE_MAX_AGE_SUBMITS < now)
+                .take_while(|spare| aged_at(spare.last_seq))
                 .count();
-            if old == 0 {
+            *parked_bytes -= state.bytes * old as u64;
+            aged.extend(state.spares.drain(..old).map(Spare::into_views));
+            !state.spares.is_empty()
+        });
+        while let Some(&(seq, id, epoch)) = self.idle.front() {
+            if !aged_at(seq) {
+                break;
+            }
+            self.idle.pop_front();
+            let Some(state) = self.textures.get(&id) else {
+                continue;
+            };
+            if state.epoch != epoch {
                 continue;
             }
-            self.parked_bytes -= state.bytes * old as u64;
-            aged.extend(state.spares.drain(..old).map(Spare::into_views));
+            if aged_at(state.last_rename_seq) && state.spares.is_empty() {
+                self.textures.remove(&id);
+                continue;
+            }
+            // Renamed since, or holding a spare that parked late: look again
+            // once the newer of the two has aged.
+            let again = if aged_at(state.last_rename_seq) {
+                now
+            } else {
+                state.last_rename_seq
+            };
+            self.idle.push_back((again, id, epoch));
         }
         aged
     }
@@ -644,6 +698,7 @@ impl<V> TextureVersions<V> {
         let Some(state) = self.textures.remove(&id) else {
             return Vec::new();
         };
+        self.with_spares.remove(&id);
         self.parked_bytes -= state.bytes * state.spares.len() as u64;
         state.spares.into_iter().map(Spare::into_views).collect()
     }
@@ -654,11 +709,25 @@ impl<V> TextureVersions<V> {
     /// before it destroys what this returns.
     pub fn drain_versions(&mut self) -> Vec<V> {
         let mut all: Vec<V> = self.retiring.drain(..).map(|entry| entry.views).collect();
-        for state in self.textures.values_mut() {
-            all.extend(state.spares.drain(..).map(Spare::into_views));
+        for id in self.with_spares.drain() {
+            if let Some(state) = self.textures.get_mut(&id) {
+                all.extend(state.spares.drain(..).map(Spare::into_views));
+            }
         }
         self.parked_bytes = 0;
         all
+    }
+
+    /// Textures tracked, with or without spares.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.textures.len()
+    }
+
+    /// Textures holding at least one spare.
+    #[cfg(test)]
+    fn holding_spares(&self) -> usize {
+        self.with_spares.len()
     }
 }
 
@@ -672,13 +741,15 @@ impl<V> Default for TextureVersions<V> {
 ///
 /// `live_birth_seq` is the submission the live version became live in, 0
 /// for the version that was live when tracking started (it may have lived
-/// through any earlier failure).
+/// through any earlier failure). `last_rename_seq` is the submission of
+/// the texture's latest rename.
 struct VersionState<V> {
     shape: VersionShape,
     epoch: u64,
     bytes: u64,
     history: Option<WriteHistory>,
     live_birth_seq: u64,
+    last_rename_seq: u64,
     spares: Vec<Spare<V>>,
 }
 
@@ -690,6 +761,7 @@ impl<V> VersionState<V> {
             shape,
             epoch,
             live_birth_seq: 0,
+            last_rename_seq: 0,
             spares: Vec::new(),
         }
     }
