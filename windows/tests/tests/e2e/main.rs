@@ -73,6 +73,7 @@ mod streams;
 mod subresource_identity;
 mod table_fog;
 mod texture_stages;
+mod texture_versions;
 mod textures;
 mod transforms_ff;
 mod unix_encoder;
