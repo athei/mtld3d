@@ -547,10 +547,11 @@ pub struct DeviceInner {
     /// `alloc_pagebox_capped` to cap retention before a rename burst
     /// balloons PE-heap usage into 32-bit OOM territory.
     vbib_retained_bytes: Arc<AtomicU64>,
-    /// Address-space watch state: this device's present-sampling counter.
+    /// Address-space watch state: this device's present-sampling counter and its watch thread.
     ///
     /// See `mem_watch::MemWatchState`; the thresholds it reports against stay
-    /// process-wide because the address space is.
+    /// process-wide because the address space is. Dropping it waits for the
+    /// thread, which a 32-bit build starts with the device.
     mem_watch: mem_watch::MemWatchState,
     /// Running total of bytes occupied by live `D3DPOOL_DEFAULT` resources.
     ///
@@ -2162,7 +2163,8 @@ impl DeviceInner {
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
         drop(stall);
-        // Outside the stall, so the address-space walk is not charged to it.
+        // Outside the stall. The address-space walk runs on the watch thread;
+        // this only hands it a sample and answers its request for figures.
         self.mem_watch_present();
         mtld3d_types::D3D_OK
     }

@@ -334,7 +334,7 @@ fn stop(worker: &mut Worker) {
 }
 
 /// Whether the calling thread holds the loader lock, read off the process's PEB.
-fn caller_holds_loader_lock() -> bool {
+pub fn caller_holds_loader_lock() -> bool {
     // SAFETY: ntdll export; answers this process's PEB, which lives as long as
     // the process.
     let peb = unsafe { RtlGetCurrentPeb() };
