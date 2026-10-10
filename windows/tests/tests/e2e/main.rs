@@ -37,6 +37,7 @@ mod draw;
 mod dxt_volume;
 mod dynamic_depth;
 mod expand16;
+mod export_prologues;
 mod failure_exits;
 mod ff_vertex_pipeline;
 mod float_filter;
