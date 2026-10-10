@@ -680,8 +680,8 @@ fn summary_golden_layout() {
         "Resources (textures)  — same layout as VB/IB; n/a rows omitted\n",
         "rename      2                                                   API: fresh staging Arc on contended LockRect\n",
         "  discards  1                                                   API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)\n",
-        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
-        "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
+        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level Lock over a reader, partial over a seen or older upload)\n",
+        "in-place    0                                                   API: partial Lock over an upload of this frame no GPU use has seen, handed back live\n",
         "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
         "snapshot    2 6 KB                  full=1                      API: partial uploads copying their box, for levels a partial Lock renamed (full = arena declined)\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
@@ -1266,7 +1266,7 @@ fn sample_window() -> PerfWindow {
             texture_renames: 2,
             texture_discards: 1,
             texture_preserve_cpu: 1,
-            texture_write_in_place_contended: 0,
+            texture_write_in_place_unseen: 0,
             // Staging pool fixture: 7 of 8 staging allocations served
             // warm (87.5%), one fell through to the allocator.
             texture_pool_hits: 7,

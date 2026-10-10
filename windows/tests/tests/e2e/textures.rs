@@ -2825,6 +2825,496 @@ fn partial_locks_publish_their_own_rect_on_every_upload_path() {
     assert_eq!(h.clear_texture(0), 0, "unbind the cube");
 }
 
+/// The sprite sizes a 2D game writes into one scratch texture between draws, largest first.
+///
+/// Each one is locked at the texture's origin, written whole and drawn before
+/// the texture is locked for the next sprite, so every lock lands while the
+/// upload of the sprite before it is still queued.
+const SPRITE_SIZES: [(usize, usize); 6] =
+    [(129, 112), (79, 75), (71, 76), (45, 36), (24, 31), (10, 20)];
+
+/// The colour of each sprite version, rotated by one per frame.
+const SPRITE_COLORS: [u32; 6] = [
+    0xFFFF_0000,
+    0xFF00_FF00,
+    0xFF00_00FF,
+    0xFFFF_FF00,
+    0xFFFF_00FF,
+    0xFF00_FFFF,
+];
+
+/// What every texel holds before the first sprite lands.
+const SPRITE_FILL: u32 = 0xFFFF_FFFF;
+
+/// The back-buffer pixels one sprite version's draw covers, from the top left.
+const SPRITE_COLUMN: (usize, usize) = (100, 120);
+
+/// Frames of sprite rewrites per case: the first renames, the later ones reuse its pages.
+const SPRITE_FRAMES: usize = 3;
+
+/// One texture rewritten sprite by sprite between the draws of a frame.
+struct SpriteCase {
+    format: u32,
+    /// Width and height of the texture, or edge of the cube.
+    edge: u32,
+    /// Top-left texel every sprite of the case is locked at.
+    origin: (usize, usize),
+    sizes: &'static [(usize, usize)],
+    /// The texels from the top left each draw spreads over its column.
+    view: (usize, usize),
+    /// Whether every lock after the first rename hands back the same pages.
+    stable_pointer: bool,
+}
+
+/// A rectangle of texels, right and bottom exclusive.
+struct TexelRegion {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+impl TexelRegion {
+    const fn center(&self) -> (usize, usize) {
+        (
+            self.left.midpoint(self.right),
+            self.top.midpoint(self.bottom),
+        )
+    }
+}
+
+/// The texture a sprite case locks and draws: a 2D level or the `+X` face of a cube.
+enum SpriteTarget<'a, 'h> {
+    Flat(&'a Texture<'h>),
+    CubeFace(&'a mtld3d_tests::CubeTexture<'h>),
+}
+
+impl SpriteTarget<'_, '_> {
+    fn lock(&self, rect: Option<&[i32; 4]>) -> LockedRect<'_> {
+        match (self, rect) {
+            (Self::Flat(tex), Some(rect)) => tex.lock_rect_partial(0, rect, 0),
+            (Self::Flat(tex), None) => tex.lock_rect(0, 0),
+            (Self::CubeFace(cube), Some(rect)) => cube.lock_rect_partial(0, 0, rect, 0),
+            (Self::CubeFace(cube), None) => cube.lock_rect(0, 0, 0),
+        }
+    }
+
+    fn bind(&self, h: &Harness) {
+        match self {
+            Self::Flat(tex) => {
+                bind_for_quadrant_draws(h, tex);
+            }
+            Self::CubeFace(cube) => {
+                bind_cube_for_face_draws(h, cube);
+            }
+        }
+    }
+
+    /// Draw `column` of the back buffer from the case's view of the texture.
+    fn draw(&self, d: &Harness, column: usize, case: &SpriteCase) -> i32 {
+        let (left, right) = sprite_column_x(column);
+        let s_end = sprite_ratio(case.view.0, case.edge);
+        let t_end = sprite_ratio(case.view.1, case.edge);
+        // The column spans the top quarter of the back buffer: 120 of 480 rows.
+        let bottom = 0.5;
+        match self {
+            Self::Flat(_) => {
+                let vertex = |x: f32, y: f32, u: f32, v: f32| TexturedVertex {
+                    x,
+                    y,
+                    z: 0.5,
+                    color: 0xFFFF_FFFF,
+                    u,
+                    v,
+                };
+                let quad = [
+                    vertex(left, 1.0, 0.0, 0.0),
+                    vertex(right, 1.0, s_end, 0.0),
+                    vertex(left, bottom, 0.0, t_end),
+                    vertex(right, 1.0, s_end, 0.0),
+                    vertex(right, bottom, s_end, t_end),
+                    vertex(left, bottom, 0.0, t_end),
+                ];
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad)
+            }
+            Self::CubeFace(_) => {
+                // `+X` reads `s = (1 - z) / 2` and `t = (1 - y) / 2`.
+                let vertex = |x: f32, y: f32, s: f32, t: f32| CubeVertex {
+                    x,
+                    y,
+                    z: 0.5,
+                    color: 0xFFFF_FFFF,
+                    u: 1.0,
+                    v: 2.0f32.mul_add(-t, 1.0),
+                    w: 2.0f32.mul_add(-s, 1.0),
+                };
+                let quad = [
+                    vertex(left, 1.0, 0.0, 0.0),
+                    vertex(right, 1.0, s_end, 0.0),
+                    vertex(left, bottom, 0.0, t_end),
+                    vertex(right, 1.0, s_end, 0.0),
+                    vertex(right, bottom, s_end, t_end),
+                    vertex(left, bottom, 0.0, t_end),
+                ];
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad)
+            }
+        }
+    }
+}
+
+/// `count / edge` as a texture coordinate; both are small enough to be exact in an `f32`.
+fn sprite_ratio(count: usize, edge: u32) -> f32 {
+    let count = u16::try_from(count).expect("sprite view fits u16");
+    let edge = u16::try_from(edge).expect("sprite texture edge fits u16");
+    f32::from(count) / f32::from(edge)
+}
+
+/// The NDC left and right edges of back-buffer column `column`.
+fn sprite_column_x(column: usize) -> (f32, f32) {
+    // 100 of 640 pixels is 0.3125 of the NDC range of two.
+    let index = f32::from(u8::try_from(column).expect("six columns"));
+    let left = 0.3125f32.mul_add(index, -1.0);
+    (left, left + 0.3125)
+}
+
+/// Block edge of a sprite format: four for DXT1, one for the uncompressed formats.
+const fn sprite_block(format: u32) -> usize {
+    if format == D3DFMT_DXT1 { 4 } else { 1 }
+}
+
+/// The bytes of one texel, or one 4x4 block for DXT1, of a solid `color`.
+fn sprite_unit(format: u32, color: u32) -> Vec<u8> {
+    let [b, g, r, a] = color.to_le_bytes();
+    match format {
+        D3DFMT_A8R8G8B8 => color.to_le_bytes().to_vec(),
+        D3DFMT_R8G8B8 => vec![b, g, r],
+        D3DFMT_A4R4G4B4 => {
+            let packed = (u16::from(a >> 4) << 12)
+                | (u16::from(r >> 4) << 8)
+                | (u16::from(g >> 4) << 4)
+                | u16::from(b >> 4);
+            packed.to_le_bytes().to_vec()
+        }
+        D3DFMT_DXT1 => {
+            let packed = (u16::from(r >> 3) << 11) | (u16::from(g >> 2) << 5) | u16::from(b >> 3);
+            dxt1_solid_block(packed).to_vec()
+        }
+        _ => panic!("no sprite texel for format {format:#x}"),
+    }
+}
+
+/// The texels sprite `version` of `case` writes: its rect widened to whole blocks.
+const fn sprite_region(case: &SpriteCase, version: usize) -> TexelRegion {
+    let block = sprite_block(case.format);
+    let (x, y) = case.origin;
+    let (w, h) = case.sizes[version];
+    TexelRegion {
+        left: x / block * block,
+        top: y / block * block,
+        right: (x + w).div_ceil(block) * block,
+        bottom: (y + h).div_ceil(block) * block,
+    }
+}
+
+/// Fill `region` of a lock whose pointer sits at the region's top left with a solid `color`.
+fn write_sprite(locked: &mut LockedRect<'_>, format: u32, region: &TexelRegion, color: u32) {
+    let unit = sprite_unit(format, color);
+    let block = sprite_block(format);
+    let cols = (region.right - region.left) / block;
+    let rows = (region.bottom - region.top) / block;
+    locked.write_u8_rect(unit.len() * cols, rows, &unit.repeat(cols * rows));
+}
+
+/// The colour sprite `version` is written with in `frame`.
+const fn sprite_color(version: usize, frame: usize) -> u32 {
+    SPRITE_COLORS[(version + frame) % SPRITE_COLORS.len()]
+}
+
+/// The texels every draw of a case is held to.
+///
+/// The centre of each sprite, a point inside each sprite right of the one
+/// written after it, and a point of the fill below the first, each kept only
+/// where it sits at least three back-buffer pixels from every sprite's edge,
+/// so neither filtering nor a scaled frame can move it across one. A centre
+/// a later, smaller sprite covers is what tells the versions apart: each draw
+/// sees there the version it was drawn with, not the frame's last.
+fn sprite_probes(case: &SpriteCase) -> Vec<(usize, usize)> {
+    let regions: Vec<TexelRegion> = (0..case.sizes.len())
+        .map(|version| sprite_region(case, version))
+        .collect();
+    let mut probes: Vec<(usize, usize)> = regions.iter().map(TexelRegion::center).collect();
+    for pair in regions.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        if before.right > after.right {
+            let y = before
+                .top
+                .max(after.top)
+                .midpoint(before.bottom.min(after.bottom));
+            probes.push((after.right.midpoint(before.right), y));
+        }
+    }
+    probes.push((
+        regions[0].center().0,
+        regions[0].bottom.midpoint(case.view.1),
+    ));
+    // Twice the distance in pixels: `(2t + 1) * column / (2 * view)` against
+    // `2e * column / (2 * view)`.
+    let clear = |texel: usize, edge: usize, column: usize, view: usize| {
+        (2 * texel + 1).abs_diff(2 * edge) * column >= 6 * view
+    };
+    probes.retain(|&(x, y)| {
+        x < case.view.0
+            && y < case.view.1
+            && regions.iter().all(|r| {
+                clear(x, r.left, SPRITE_COLUMN.0, case.view.0)
+                    && clear(x, r.right, SPRITE_COLUMN.0, case.view.0)
+                    && clear(y, r.top, SPRITE_COLUMN.1, case.view.1)
+                    && clear(y, r.bottom, SPRITE_COLUMN.1, case.view.1)
+            })
+    });
+    probes.dedup();
+    probes
+}
+
+/// The newest sprite up to `version` that wrote `texel`; `None` is the fill.
+fn sprite_owner(case: &SpriteCase, version: usize, texel: (usize, usize)) -> Option<usize> {
+    (0..=version).rev().find(|&v| {
+        let r = sprite_region(case, v);
+        (r.left..r.right).contains(&texel.0) && (r.top..r.bottom).contains(&texel.1)
+    })
+}
+
+/// The back buffer as `0xAARRGGBB` rows, and the row stride in pixels.
+fn read_sprite_frame(h: &Harness) -> (Vec<u32>, usize) {
+    let rt = h.render_target(0);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "GetRenderTarget desc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let rows = usize::try_from(desc.height).expect("height fits usize");
+    (locked.as_u32(pitch * rows).to_vec(), pitch)
+}
+
+/// The back-buffer pixel version `column`'s draw samples `texel` at.
+const fn sprite_pixel(case: &SpriteCase, column: usize, texel: (usize, usize)) -> (usize, usize) {
+    (
+        column * SPRITE_COLUMN.0 + (2 * texel.0 + 1) * SPRITE_COLUMN.0 / (2 * case.view.0),
+        (2 * texel.1 + 1) * SPRITE_COLUMN.1 / (2 * case.view.1),
+    )
+}
+
+/// Rewrite one texture sprite by sprite between the draws of a frame, and check every draw.
+///
+/// Every sprite is locked while the upload of the one before it is queued, and
+/// each draw is held to the texels its own version put there: the sprite it
+/// drew, the earlier sprite's texels the newer one left alone, and the fill
+/// around them. For a case whose staging settles, every lock after the first
+/// two hands back one pointer, across all the frames: the lock that finds the
+/// texture's upload seen renames its pages once, and the uploads after it no
+/// longer read them.
+fn check_sprite_versions(h: &Harness, case: &SpriteCase, target: &SpriteTarget<'_, '_>) {
+    let edge = usize::try_from(case.edge).expect("edge fits usize");
+    write_sprite(
+        &mut target.lock(None),
+        case.format,
+        &TexelRegion {
+            left: 0,
+            top: 0,
+            right: edge,
+            bottom: edge,
+        },
+        SPRITE_FILL,
+    );
+    target.bind(h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(target.draw(d, 0, case), 0, "priming draw");
+    });
+    let tolerance = if case.format == D3DFMT_DXT1 { 8 } else { 0 };
+    let probes = sprite_probes(case);
+    let mut pointers = Vec::new();
+    for frame in 0..SPRITE_FRAMES {
+        h.render_once(BLACK, |d| {
+            for (version, &(w, height)) in case.sizes.iter().enumerate() {
+                let (x, y) = case.origin;
+                let rect = [x, y, x + w, y + height]
+                    .map(|v| u32::try_from(v).expect("rect fits u32").cast_signed());
+                let mut locked = target.lock(Some(&rect));
+                pointers.push(locked.bits_ptr().addr());
+                write_sprite(
+                    &mut locked,
+                    case.format,
+                    &sprite_region(case, version),
+                    sprite_color(version, frame),
+                );
+                drop(locked);
+                assert_eq!(
+                    target.draw(d, version, case),
+                    0,
+                    "frame {frame} sprite {version} draw"
+                );
+            }
+        });
+        let (pixels, stride) = read_sprite_frame(h);
+        for version in 0..case.sizes.len() {
+            for &texel in &probes {
+                let (x, y) = sprite_pixel(case, version, texel);
+                let wrote = sprite_owner(case, version, texel);
+                let expected = wrote.map_or(SPRITE_FILL, |v| sprite_color(v, frame));
+                let what = wrote.map_or_else(|| "the fill".to_owned(), |v| format!("sprite {v}"));
+                assert_pixel_approx(
+                    pixels[y * stride + x],
+                    expected,
+                    tolerance,
+                    &format!(
+                        "frame {frame}: the draw of sprite {version} samples {what} at texel \
+                         {texel:?}"
+                    ),
+                );
+            }
+        }
+    }
+    if case.stable_pointer {
+        let settled = pointers[2];
+        for (lock, pointer) in pointers.iter().enumerate().skip(2) {
+            assert_eq!(
+                *pointer, settled,
+                "lock {lock} hands back the pages the first rename settled on"
+            );
+        }
+    }
+    assert_eq!(h.clear_texture(0), 0, "unbind the sprite texture");
+}
+
+/// A scratch atlas rewritten sprite by sprite between draws keeps each draw's sprite.
+///
+/// The shape of a 2D game drawing its characters: one managed 512x512
+/// A4R4G4B4 texture, locked at its origin for each character's sprite and
+/// drawn before the next lock. A lock that wrote in place over the pages the
+/// queued uploads read would show every draw the last sprite of the frame.
+#[test]
+fn a_scratch_sprite_rewritten_between_draws_keeps_each_draws_texels() {
+    let h = Harness::new();
+    let tex = h.create_texture(512, 512, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_A4R4G4B4,
+        edge: 512,
+        origin: (0, 0),
+        sizes: &SPRITE_SIZES,
+        view: (128, 120),
+        stable_pointer: true,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A dynamic default-pool sprite at an offset keeps each draw's texels.
+///
+/// The same rewrites on a `D3DUSAGE_DYNAMIC` A8R8G8B8 level, locked away from
+/// the level's origin, so the copy of each sprite starts part-way into a row.
+#[test]
+fn a_dynamic_sprite_rewritten_at_an_offset_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(60, 50), (40, 30), (20, 24)];
+    let h = Harness::new();
+    let tex = h.create_texture(
+        128,
+        128,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let case = SpriteCase {
+        format: D3DFMT_A8R8G8B8,
+        edge: 128,
+        origin: (16, 8),
+        sizes: &SIZES,
+        view: (100, 120),
+        stable_pointer: true,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A 24-bit sprite, which the GPU upload pass widens, keeps each draw's texels.
+#[test]
+fn a_24_bit_sprite_on_the_upload_pass_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(40, 30), (30, 24), (12, 10)];
+    let h = Harness::new();
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_R8G8B8, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_R8G8B8,
+        edge: 64,
+        origin: (1, 1),
+        sizes: &SIZES,
+        view: (64, 64),
+        stable_pointer: true,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A DXT1 sprite on the block grid keeps each draw's texels.
+#[test]
+fn a_dxt1_sprite_on_the_block_grid_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(16, 16), (12, 12), (4, 4)];
+    let h = Harness::new();
+    let tex = h.create_texture(32, 32, 1, 0, D3DFMT_DXT1, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_DXT1,
+        edge: 32,
+        origin: (4, 4),
+        sizes: &SIZES,
+        view: (32, 32),
+        stable_pointer: true,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A DXT1 sprite off the block grid keeps each draw's texels.
+///
+/// Its upload widens to the whole level, so every lock moves to fresh pages
+/// and no pointer settles.
+#[test]
+fn a_dxt1_sprite_off_the_block_grid_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 2] = [(12, 12), (8, 8)];
+    let h = Harness::new();
+    let tex = h.create_texture(32, 32, 1, 0, D3DFMT_DXT1, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_DXT1,
+        edge: 32,
+        origin: (2, 2),
+        sizes: &SIZES,
+        view: (32, 32),
+        stable_pointer: false,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A sprite rewritten on one cube face keeps each draw's texels.
+#[test]
+fn a_cube_face_sprite_rewritten_between_draws_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(40, 40), (30, 30), (16, 16)];
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_A8R8G8B8,
+        edge: 64,
+        origin: (0, 0),
+        sizes: &SIZES,
+        view: (64, 64),
+        stable_pointer: true,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::CubeFace(&cube));
+}
+
 /// A cube face uploads whole onto the device it migrates to.
 ///
 /// A `D3DPOOL_MANAGED` cube outlives the device that created it: the
@@ -6401,12 +6891,16 @@ fn managed_dirty_queued_full_explicit_publication() {
 }
 
 #[test]
-fn managed_dirty_queued_partial_kept_exception() {
-    let observed = managed_dirty_queued_edit(true, false);
-    // Current partial-lock policy intentionally aliases the earlier upload's
-    // backing. Old pixels are not a guaranteed contract for this overlap.
-    assert!(matches!(observed[0], 0xFFFF_0000 | 0xFF00_FF00));
-    assert_eq!(observed[1], 0xFF00_FF00);
+fn managed_dirty_queued_partial_no_dirty_visibility() {
+    assert_eq!(managed_dirty_queued_edit(true, false), [0xFFFF_0000; 2]);
+}
+
+#[test]
+fn managed_dirty_queued_partial_explicit_publication() {
+    assert_eq!(
+        managed_dirty_queued_edit(true, true),
+        [0xFFFF_0000, 0xFF00_FF00]
+    );
 }
 
 /// A no-dirty write neither clears an older dirty region nor expands it.

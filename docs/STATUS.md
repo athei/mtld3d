@@ -291,16 +291,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   undefined values. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
-- A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
-  `D3DLOCK_READONLY` returns a pointer an upload may still read. Under an
-  upload from an earlier frame, or one a GPU operation has seen, only two
-  writes land in place: this partial lock, and any write into a level the game
-  holds mapped by a lock or a device context. Every other CPU writer renames
-  the level's staging first. Under an upload of the frame being recorded that
-  no draw or other GPU operation has seen, it writes in place, which no draw
-  can tell apart. Writes into a render-target or depth texture
-  and read-backs from the GPU always rename when an upload still reads the
-  level. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.

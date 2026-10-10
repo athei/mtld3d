@@ -3,15 +3,19 @@
 //! Several cases per arm of `decide_lock_action`: flag priority, the uncontended shortcut,
 //! `D3DLOCK_DISCARD` where it is honoured (a whole-mip Lock of a default-pool texture) and
 //! where it is dropped (a partial Lock, the managed and system-memory pools), and whole-mip
-//! renames preserving whichever pool the texture is in. The partial arms mostly resolve to
-//! `WriteInPlace`; only an unaligned compressed rect forces a preserve, since the encoder widens
-//! its read to the whole mip. The `honoured_lock_flags` cases pin the two conditions on their
-//! own. The `texture_lock_offset` cases pin block-row arithmetic: a pixel-row index times a
-//! block-row pitch runs past the end. The `staging_droppable_class` cases walk the pool, usage
-//! and shape combinations, since every class outside the one that releases is a level whose only
-//! copy of some byte is the staging. The `decide_staging_write` cases walk every combination of
-//! the write facts and pin the frame rule on its own. The `staging_lazy_class` cases pin that
-//! only a default-pool 2D render-target texture starts without staging.
+//! renames preserving whichever pool the texture is in. A partial Lock under a reader follows
+//! the staging-write rule: in place only under an unseen upload of the frame being recorded,
+//! which one case pins against every combination of the facts, and an unaligned compressed
+//! rect always preserves, since the encoder widens its read to the whole mip. The
+//! `honoured_lock_flags` cases pin the two conditions on their own. The `texture_lock_offset`
+//! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
+//! The `staging_droppable_class` cases walk the pool, usage and shape combinations, since every
+//! class outside the one that releases is a level whose only copy of some byte is the staging.
+//! The `decide_staging_write` cases walk every combination of the write facts and pin the frame
+//! rule on its own. The `staging_lazy_class` cases pin that only a default-pool 2D
+//! render-target texture starts without staging. The `snapshot_layout` cases pin the box
+//! offset, block rows and pitch alignment and the boxes left to the staging, and the
+//! `copy_rows` cases the strides and the bounds a copy refuses.
 
 use std::sync::Arc;
 
@@ -52,9 +56,22 @@ fn recovery_bytes(backing: &PageBox) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(backing.as_ptr(), RECOVERY_BYTES) }.to_vec()
 }
 
+/// The write facts of pages an upload of an earlier frame may still read, or none.
+fn readers(has_readers: bool) -> StagingWrite {
+    let mut write = StagingWrite::empty();
+    write.set(StagingWrite::HAS_READERS, has_readers);
+    write
+}
+
 fn write_retired_staging(backing: &mut Arc<PageBox>, original_seq: u64, retired: u64) {
     let contended = is_in_flight(original_seq, retired) || backing.has_readers();
-    let action = decide_lock_action(contended, 0, D3DPOOL_MANAGED, None, RECOVERY_SHAPE);
+    let action = decide_lock_action(
+        &readers(contended),
+        0,
+        D3DPOOL_MANAGED,
+        None,
+        RECOVERY_SHAPE,
+    );
     if let LockAction::FreshBox { preserve } = action {
         assert_eq!(preserve, PreserveKind::Cpu);
         let mut fresh = PageBox::new_zeroed(RECOVERY_BYTES);
@@ -200,7 +217,7 @@ fn replayable_readers_keep_flag_and_partial_lock_contracts() {
     for flags in [D3DLOCK_READONLY, D3DLOCK_NOOVERWRITE] {
         assert_eq!(
             decide_lock_action(
-                backing.has_readers(),
+                &readers(backing.has_readers()),
                 flags,
                 D3DPOOL_DEFAULT,
                 None,
@@ -211,7 +228,7 @@ fn replayable_readers_keep_flag_and_partial_lock_contracts() {
     }
     assert_eq!(
         decide_lock_action(
-            backing.has_readers(),
+            &readers(backing.has_readers()),
             D3DLOCK_DISCARD,
             D3DPOOL_DEFAULT,
             None,
@@ -223,7 +240,7 @@ fn replayable_readers_keep_flag_and_partial_lock_contracts() {
     );
     assert_eq!(
         decide_lock_action(
-            backing.has_readers(),
+            &readers(backing.has_readers()),
             D3DLOCK_DISCARD,
             D3DPOOL_MANAGED,
             None,
@@ -239,19 +256,23 @@ fn replayable_readers_keep_flag_and_partial_lock_contracts() {
         w: 2,
         h: 2,
     });
+    // A replayable reader belongs to no frame being recorded, so a partial
+    // write under it renames like one under an earlier frame's upload.
     assert_eq!(
         decide_lock_action(
-            backing.has_readers(),
+            &readers(backing.has_readers()),
             0,
             D3DPOOL_MANAGED,
             partial,
             RECOVERY_SHAPE
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
     assert_eq!(
         decide_lock_action(
-            backing.has_readers(),
+            &readers(backing.has_readers()),
             0,
             D3DPOOL_MANAGED,
             partial,
@@ -292,7 +313,13 @@ fn decide(
     coh: u64,
     block: (u32, u32),
 ) -> LockAction {
-    decide_lock_action(is_in_flight(slot, coh), flags, pool, rect, shape(block))
+    decide_lock_action(
+        &readers(is_in_flight(slot, coh)),
+        flags,
+        pool,
+        rect,
+        shape(block),
+    )
 }
 
 // ── flag-priority arms (uncompressed) ──
@@ -447,7 +474,8 @@ fn discard_full_rect_contended_freshbox_none() {
 #[test]
 fn discard_partial_contended_is_dropped() {
     // A partial DISCARD cannot be honoured: the bytes outside the rect stay
-    // part of the level, so the Lock is served as a plain partial one.
+    // part of the level, so the Lock is served as a plain partial one, which
+    // under an earlier frame's upload renames with a preserve.
     assert_eq!(
         decide(
             D3DLOCK_DISCARD,
@@ -457,7 +485,9 @@ fn discard_partial_contended_is_dropped() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
@@ -572,9 +602,9 @@ fn whole_mip_via_none_rect_freshbox_cpu() {
 // ── partial uncompressed: narrowing arms ──
 
 #[test]
-fn partial_default_contended_in_place() {
-    // The headline narrowing: previously fresh+preserve_cpu, now
-    // WriteInPlace under the no-overlap contract.
+fn partial_default_under_an_earlier_upload_freshbox_cpu() {
+    // An upload of an earlier frame may be replaying while the game writes,
+    // so the partial write moves to fresh pages carrying the level.
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
@@ -584,12 +614,14 @@ fn partial_default_contended_in_place() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
 #[test]
-fn partial_managed_contended_in_place() {
+fn partial_managed_under_an_earlier_upload_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
@@ -599,16 +631,19 @@ fn partial_managed_contended_in_place() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
 // ── partial compressed: alignment guard arms ──
 
 #[test]
-fn compressed_aligned_partial_contended_in_place() {
-    // Block-aligned partial (origin + size both multiples of 4)
-    // — encoder won't fall back; narrowing applies.
+fn compressed_aligned_partial_under_an_earlier_upload_freshbox_cpu() {
+    // Block-aligned partial (origin and size both multiples of 4): the
+    // encoder would not widen the read, but an earlier frame's upload may
+    // still read the pages, so the write renames.
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
@@ -618,12 +653,14 @@ fn compressed_aligned_partial_contended_in_place() {
             COHERENT,
             (4, 4)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
 #[test]
-fn compressed_aligned_partial_managed_in_place() {
+fn compressed_aligned_partial_managed_under_an_earlier_upload_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
@@ -633,7 +670,9 @@ fn compressed_aligned_partial_managed_in_place() {
             COHERENT,
             (4, 4)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
@@ -696,50 +735,58 @@ fn compressed_unaligned_managed_freshbox_cpu() {
 fn compressed_partial_extends_to_mip_edge_in_place() {
     // The right-edge clause `r.x + r.w == mip_w` only matters when `r.w`
     // is not a multiple of `block_w`, which on a power-of-two mip with an
-    // aligned origin needs a mip that is itself not block-aligned — and
+    // aligned origin needs a mip that is itself not block-aligned, and
     // such a rect is typically whole-mip, so the earlier whole-mip arm
     // claims it first. Exercising the clause therefore needs a
     // non-power-of-two mip and a strictly partial rect, driving the
     // helper directly so mip_w / mip_h can vary.
     //
-    // 6×8 DXT mip, rect (0, 0, 6, 4): width 6 reaches mip_w=6 without
+    // The write is under an unseen upload of this frame, which the partial
+    // arm writes in place, so `WriteInPlace` proves the alignment guard let
+    // the rect through. Under an earlier frame's upload it renames anyway.
+    let unseen = StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME);
+    // 6x8 DXT mip, rect (0, 0, 6, 4): width 6 reaches mip_w=6 without
     // being a multiple of 4 (right-edge clause), height 4 is
-    // block-aligned, and the rect covers only the top half — partial, so
-    // it lands in the alignment-guard arm. Expect WriteInPlace.
+    // block-aligned, and the rect covers only the top half.
+    let right_edge = MipShape {
+        mip_w: 6,
+        mip_h: 8,
+        block_w: 4,
+        block_h: 4,
+    };
+    let top_half = Some(rect(0, 0, 6, 4));
     assert_eq!(
         decide_lock_action(
-            is_in_flight(IN_FLIGHT_SEQ, COHERENT),
+            &unseen,
             DEFAULT_FLAGS,
             D3DPOOL_DEFAULT,
-            Some(DirtyRect {
-                x: 0,
-                y: 0,
-                w: 6,
-                h: 4,
-            }),
-            MipShape {
-                mip_w: 6,
-                mip_h: 8,
-                block_w: 4,
-                block_h: 4,
-            },
+            top_half,
+            right_edge
         ),
         LockAction::WriteInPlace,
         "right-edge tolerance: r.x + r.w == mip_w with r.w % bw != 0"
     );
-    // Height-edge mirror: 8×6 mip, rect covers right half of top
-    // half. r.h=6 reaches mip_h=6 with non-multiple-of-4 height.
     assert_eq!(
         decide_lock_action(
-            is_in_flight(IN_FLIGHT_SEQ, COHERENT),
+            &readers(true),
             DEFAULT_FLAGS,
             D3DPOOL_DEFAULT,
-            Some(DirtyRect {
-                x: 0,
-                y: 0,
-                w: 4,
-                h: 6,
-            }),
+            top_half,
+            right_edge
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        },
+        "an earlier frame's upload renames the aligned rect"
+    );
+    // Height-edge mirror: 8x6 mip, rect covers the left half. r.h=6
+    // reaches mip_h=6 with a non-multiple-of-4 height.
+    assert_eq!(
+        decide_lock_action(
+            &unseen,
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(0, 0, 4, 6)),
             MipShape {
                 mip_w: 8,
                 mip_h: 6,
@@ -750,6 +797,108 @@ fn compressed_partial_extends_to_mip_edge_in_place() {
         LockAction::WriteInPlace,
         "bottom-edge tolerance: r.y + r.h == mip_h with r.h % bh != 0"
     );
+}
+
+// ── the partial arm follows the staging-write rule ──
+
+/// A partial aligned Lock of the 256x256 test mip with `write`'s facts.
+fn partial_lock(write: &StagingWrite) -> LockAction {
+    decide_lock_action(
+        write,
+        DEFAULT_FLAGS,
+        D3DPOOL_MANAGED,
+        Some(rect(0, 0, 129, 112)),
+        shape((1, 1)),
+    )
+}
+
+#[test]
+fn a_partial_lock_without_readers_writes_in_place() {
+    assert_eq!(
+        partial_lock(&StagingWrite::empty()),
+        LockAction::WriteInPlace
+    );
+    assert_eq!(
+        partial_lock(&StagingWrite::SAME_FRAME.union(StagingWrite::OBSERVED)),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn a_partial_lock_under_an_unseen_upload_of_this_frame_writes_in_place() {
+    assert_eq!(
+        partial_lock(&StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME)),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn a_partial_lock_under_a_seen_upload_of_this_frame_renames() {
+    let seen = StagingWrite::HAS_READERS
+        .union(StagingWrite::SAME_FRAME)
+        .union(StagingWrite::OBSERVED);
+    assert_eq!(
+        partial_lock(&seen),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    let attached = StagingWrite::HAS_READERS
+        .union(StagingWrite::SAME_FRAME)
+        .union(StagingWrite::ALWAYS_RENAME);
+    assert_eq!(
+        partial_lock(&attached),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn a_partial_lock_under_an_earlier_frames_upload_renames() {
+    assert_eq!(
+        partial_lock(&StagingWrite::HAS_READERS),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn a_whole_level_lock_under_an_unseen_upload_still_preserves() {
+    // The game may read every byte through a whole-level pointer, and
+    // D3D9 hands it the level's contents, so the whole-level arm renames
+    // with a preserve under any reader, as before.
+    assert_eq!(
+        decide_lock_action(
+            &StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME),
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            None,
+            shape((1, 1)),
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn the_partial_arm_matches_the_staging_write_rule_for_every_fact_combination() {
+    // Mapped and whole-level are the Lock's own to decide; every other
+    // fact feeds the staging-write rule unchanged once a reader exists.
+    for bits in 0..=StagingWrite::all().bits() {
+        let write = StagingWrite::from_bits_truncate(bits);
+        let rule_facts = StagingWrite::from_bits_retain(
+            bits & !StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL).bits(),
+        );
+        let expected = if write.contains(StagingWrite::HAS_READERS) {
+            decide_staging_write(&rule_facts)
+        } else {
+            LockAction::WriteInPlace
+        };
+        assert_eq!(partial_lock(&write), expected, "facts {bits:#08b}");
+    }
 }
 
 #[test]
@@ -797,7 +946,9 @@ fn unknown_high_bits_pass_through() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 

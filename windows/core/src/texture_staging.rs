@@ -1,28 +1,37 @@
 //! Decision helpers for per-mip texture staging: the Lock action and the release class.
 //!
-//! Mirrors `crate::buffer_rename::plan_lock`'s structure for textures.
-//! Same well-behaved-game no-overlap contract VB/IB now relies on —
-//! the locked sub-rect doesn't overlap with bytes any in-flight blit
-//! reads. Same contract that non-persistent mapped-buffer APIs (e.g.
-//! OpenGL `glBufferSubData`) make implicitly; UI atlas regen via
-//! whole-mip Locks and DISCARD-heavy geometry texture uploads both
-//! satisfy it in practice.
+//! A writable Lock either hands back a pointer into the level's current
+//! staging pages or moves the level to fresh pages first. The pages may still
+//! be read by an upload: one scheduled at an earlier draw, waiting for the GPU
+//! to copy it, or kept for a replay after an aborted submit. Writing such
+//! pages in place changes what that upload carries, so a draw recorded before
+//! the Lock would sample texels written after it.
 //!
 //! Decision tree:
-//! - `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY`, or uncontended
-//!   (no in-flight or replayable upload): `WriteInPlace`.
+//! - `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY`, or no upload reads the
+//!   pages: `WriteInPlace`.
 //! - `D3DLOCK_DISCARD` on a whole-mip Lock of a `D3DPOOL_DEFAULT`
 //!   texture: Rename, no preserve (game promised the old bytes are
 //!   gone). Every other DISCARD is dropped first, see
 //!   [`honoured_lock_flags`].
-//! - Whole-mip contended: Rename + CPU-memcpy preserve. The game may
+//! - Whole-mip with a reader: Rename + CPU-memcpy preserve. The game may
 //!   read every byte through the Lock pointer, and D3D9 hands it the
 //!   level's current contents whatever the texture's usage says.
-//! - Partial contended, compressed AND not block-aligned: Rename + Cpu
-//!   preserve — see `rect_block_aligned` for the formula and why
+//! - Partial, compressed AND not block-aligned, with a reader: Rename +
+//!   Cpu preserve, see `rect_block_aligned` for the formula and why
 //!   preserve is forced.
-//! - Partial contended, otherwise (uncompressed or block-aligned):
-//!   `WriteInPlace`. Relies on the well-behaved-game no-overlap contract.
+//! - Partial otherwise: the rule every other CPU write of a subresource
+//!   follows, [`decide_staging_write`]. In place when every upload still
+//!   reading the pages belongs to the frame being recorded and no GPU
+//!   operation on the texture was recorded since, which is the one case in
+//!   which nothing that can see the old bytes exists yet. Rename + Cpu
+//!   preserve otherwise.
+//!
+//! A level a partial Lock renames this way is the one a game rewrites in
+//! part between draws, so its later partial uploads copy their box into the
+//! device's snapshot arena (`crate::upload_snapshot`) and stop reading the
+//! staging: the next Lock finds no reader and writes in place, and the level
+//! pays one preserve rather than one per Lock.
 //!
 //! Why `D3DUSAGE_DYNAMIC` has no say: `plan_lock` keys the buffer
 //! equivalent on `D3DUSAGE_WRITEONLY`, the spec-documented "no readback"
@@ -37,10 +46,10 @@
 //! Why no GPU preserve path: `copyFromBuffer:toTexture:` only writes
 //! the locked sub-rect, leaving prior `MTLTexture` pixels intact. The
 //! GPU side preserves outside-rect pixels automatically. The Cpu
-//! preserve only matters when the GAME reads bytes outside its
-//! written rect through the Lock pointer (whole-mip locks), or when
-//! the encoder's compressed-fallback is forced to read more bytes
-//! than the rect (the alignment-guard arm).
+//! preserve keeps the staging the whole level's CPU mirror: the game may
+//! read outside its written rect through the Lock pointer, a later
+//! upload's box may span texels this Lock did not write, and the
+//! encoder's compressed fallback reads the whole level.
 //!
 //! Side effects (allocate `PageBox`, sync memcpy preserve, queue
 //! retention, bump perf counters) stay in `d3d9::texture`; this
@@ -80,9 +89,10 @@ pub enum PreserveKind {
 pub enum LockAction {
     /// Hand back a pointer into the existing `Arc<PageBox>`.
     ///
-    /// Either uncontended, the caller promised no in-flight overlap
-    /// (NOOVERWRITE / READONLY), or the partial sub-rect is small
-    /// enough that the well-behaved-game contract holds.
+    /// No upload reads the pages, the caller promised not to touch what an
+    /// upload reads (NOOVERWRITE / READONLY), or every upload still reading
+    /// them belongs to the frame being recorded with no GPU operation on the
+    /// texture recorded since.
     WriteInPlace,
     /// Swap the slot's `Arc<PageBox>` for a fresh allocation and apply `preserve`.
     ///
@@ -172,9 +182,11 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 
 /// Decide the Lock action for a single mip.
 ///
-/// - `contended` includes both in-flight submits and retained upload readers.
-///   A retired upload can still be replayed, so retirement alone does not end
-///   its read lifetime.
+/// - `write` is what the caller knows about the pages, gathered as for any
+///   other CPU write (see [`StagingWrite`]). `HAS_READERS` covers in-flight
+///   submits as well as retained upload readers: a retired upload can still
+///   be replayed, so retirement alone does not end its read lifetime.
+///   `MAPPED` and `WHOLE_LEVEL` are ignored; the Lock decides those itself.
 /// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A DISCARD the
 ///   Lock cannot honour is dropped here as well as in the caller (see
 ///   [`honoured_lock_flags`]), so a verdict never rests on one.
@@ -186,7 +198,7 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 /// `log_once_warn!`.
 #[must_use]
 pub const fn decide_lock_action(
-    contended: bool,
+    write: &StagingWrite,
     flags: u32,
     pool: u32,
     rect: Option<DirtyRect>,
@@ -196,7 +208,7 @@ pub const fn decide_lock_action(
     if flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE) != 0 {
         return LockAction::WriteInPlace;
     }
-    if !contended {
+    if !write.contains(StagingWrite::HAS_READERS) {
         return LockAction::WriteInPlace;
     }
     if flags & D3DLOCK_DISCARD != 0 {
@@ -213,11 +225,9 @@ pub const fn decide_lock_action(
         };
     }
 
-    // Partial. Force the rename when the compressed alignment
-    // formula would push the encoder into its full-mip-fallback path
-    // — the GPU's read range becomes "all bytes" rather than the
-    // rect, so we can't trust no-overlap and must preserve outside-
-    // rect bytes.
+    // Partial off the compressed block grid: the encoder widens its read
+    // to the whole level, so even an unseen upload of this frame would
+    // carry this write. Rename and preserve every byte.
     if let Some(r) = rect
         && !rect_block_aligned(r, shape)
     {
@@ -226,7 +236,13 @@ pub const fn decide_lock_action(
         };
     }
 
-    LockAction::WriteInPlace
+    // Partial, with a reader: the pointer aliases pages an upload reads,
+    // so the write is one that upload must not see unless nothing recorded
+    // can see the version it replaces.
+    let lock_decides = StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL);
+    decide_staging_write(&StagingWrite::from_bits_retain(
+        write.bits() & !lock_decides.bits(),
+    ))
 }
 
 bitflags::bitflags! {

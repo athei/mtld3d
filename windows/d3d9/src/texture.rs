@@ -238,11 +238,12 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
-    /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
-    /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
-    /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
-    /// same primitive READONLY uses) and `FreshBox` (allocate + swap).
+    /// pointer returned by `lock_region_ptr`. The bind-time flush hands the
+    /// upload a read of the `Arc` (a refcount bump, no memcpy), unless the
+    /// level is in `snapshot_staging` and the box is copied out instead.
+    /// `lock_region_ptr` decides between `WriteInPlace` (cast `as_ptr()` to
+    /// `*mut u8`, the primitive READONLY uses) when no upload can see the
+    /// write, and `FreshBox` (allocate + swap) otherwise.
     staging: Vec<Arc<PageBox>>,
     mip_widths: Vec<u32>,
     mip_heights: Vec<u32>,
@@ -2582,24 +2583,33 @@ impl TextureInner {
 
         let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
-        let contended = is_in_flight(last_submit_seq, coherent_seq)
-            || self.cube.as_deref()?.staging[index].has_readers();
-        let action =
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
+        let mut write = self.staging_write_facts(face, level)?;
+        if is_in_flight(last_submit_seq, coherent_seq) {
+            write.insert(StagingWrite::HAS_READERS);
+        }
+        let contended = write.contains(StagingWrite::HAS_READERS);
+        let action = decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level));
         let device_inner = self.device_inner;
         let base = match action {
             LockAction::WriteInPlace => {
-                // The kept divergence, counted like its VB/IB twin: a
-                // contended partial Lock handed back over bytes an upload
-                // may still be reading (`docs/STATUS.md#kept-divergences`).
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
+                // In place over a reader only under NOOVERWRITE, or when every
+                // upload reading the pages is this frame's and no GPU
+                // operation on the cube was recorded since; the latter is
+                // counted (see `lock_region_ptr`).
+                if !contended {
+                    self.note_unread_staging(face, level);
+                } else if flags & D3DLOCK_NOOVERWRITE == 0 && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.cube.as_deref()?.staging[index].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_cube_staging(face, level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_cube_staging(face, level, preserve);
+                self.note_unread_staging(face, level);
+                base
+            }
         };
         // SAFETY: `offset` was checked against the logical staging length.
         Some((unsafe { base.add(offset) }, pitch))
@@ -2720,21 +2730,19 @@ impl TextureInner {
         self.observed_staging = u128::MAX;
     }
 
-    fn move_staging_off_readers(
-        &mut self,
-        face: u32,
-        level: usize,
-        whole_level: bool,
-        always: bool,
-    ) {
-        if self.dc_in_use() {
-            return;
-        }
+    /// What a CPU write of `(face, level)` would find on its staging pages right now.
+    ///
+    /// Every fact [`decide_staging_write`] reads except the two the writer
+    /// knows itself, `WHOLE_LEVEL` and a read back's `ALWAYS_RENAME`: whether
+    /// the game holds the subresource mapped, whether an upload still reads
+    /// the pages, whether the latest upload belongs to the frame being
+    /// recorded, whether a GPU operation on the texture was recorded since,
+    /// and whether passes the texture is attached to use it unrecorded.
+    /// `None` for a cube face past the chain.
+    fn staging_write_facts(&self, face: u32, level: usize) -> Option<StagingWrite> {
         let (mapped, has_readers, last_upload_seq) = match self.cube.as_deref() {
             Some(cube) => {
-                let Some(index) = self.cube_subresource_index(face, level) else {
-                    return;
-                };
+                let index = self.cube_subresource_index(face, level)?;
                 (
                     cube.locked.get(index).copied().unwrap_or(false),
                     cube.staging
@@ -2752,11 +2760,6 @@ impl TextureInner {
             ),
         };
         let bit = self.observed_bit(face, level);
-        if !mapped && !has_readers {
-            // Nothing reads these pages, so the next GPU use is the first
-            // that can see what lands in them.
-            self.observed_staging &= !bit;
-        }
         let same_frame = self.device_inner != 0
             && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
         // A render target or depth texture is read and written by the passes
@@ -2772,7 +2775,38 @@ impl TextureInner {
             StagingWrite::OBSERVED,
             bit == 0 || self.observed_staging & bit != 0,
         );
-        write.set(StagingWrite::ALWAYS_RENAME, always || attached);
+        write.set(StagingWrite::ALWAYS_RENAME, attached);
+        Some(write)
+    }
+
+    /// Note that a write of `(face, level)` landed on pages no upload reads.
+    ///
+    /// The next GPU use of the texture is then the first that can see what
+    /// lands in them, so the subresource's observed bit starts over.
+    fn note_unread_staging(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        self.observed_staging &= !bit;
+    }
+
+    fn move_staging_off_readers(
+        &mut self,
+        face: u32,
+        level: usize,
+        whole_level: bool,
+        always: bool,
+    ) {
+        if self.dc_in_use() {
+            return;
+        }
+        let Some(mut write) = self.staging_write_facts(face, level) else {
+            return;
+        };
+        if !write.intersects(StagingWrite::MAPPED.union(StagingWrite::HAS_READERS)) {
+            self.note_unread_staging(face, level);
+        }
+        if always {
+            write.insert(StagingWrite::ALWAYS_RENAME);
+        }
         write.set(StagingWrite::WHOLE_LEVEL, whole_level);
         let LockAction::FreshBox { preserve } = decide_staging_write(&write) else {
             return;
@@ -2782,7 +2816,7 @@ impl TextureInner {
         } else {
             self.rename_staging(level, preserve);
         }
-        self.observed_staging &= !bit;
+        self.note_unread_staging(face, level);
     }
 
     fn cube_stash_lock(
@@ -2886,23 +2920,20 @@ impl TextureInner {
     /// READONLY is a fast-path: the game promised it won't write, so
     /// two readers (the game + any in-flight GPU blit sourcing from
     /// `pending_blit_retention`'s Arc clone) can share the same
-    /// backing Box with no race. Return `as_ptr()` directly — no
+    /// backing Box with no race. Return `as_ptr()` directly: no
     /// rename, no allocation, no preserve memcpy. The pointer is cast
     /// to `*mut u8` only to satisfy the shared signature; the lock
     /// contract forbids writes through it.
     ///
     /// Writable locks delegate the policy decision to
-    /// `decide_lock_action` in `mtld3d-core` — same shape as
-    /// `vertex_buffer::vb_lock` consumes `buffer_rename::plan_lock`.
-    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast
-    /// READONLY uses) and trusts the well-behaved-game no-overlap
-    /// contract for partial sub-rects. `FreshBox { preserve }`
-    /// allocates a fresh uninit Box and applies the requested preserve
-    /// (CPU memcpy when the game might read outside the locked rect
-    /// through the Lock pointer, or when the encoder's compressed
-    /// full-mip-fallback would read outside-rect bytes; otherwise no
-    /// preserve). The old `Arc<PageBox>` stays alive via
-    /// `pending_blit_retention` until GPU retire.
+    /// `decide_lock_action` in `mtld3d-core`, fed the same facts every
+    /// other CPU write of the level gathers (`staging_write_facts`).
+    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast READONLY
+    /// uses): either no upload reads the pages, or every upload reading them
+    /// is this frame's and nothing recorded since can see the version the
+    /// write replaces. `FreshBox { preserve }` allocates a fresh Box and
+    /// applies the requested preserve, and the old `Arc<PageBox>` stays with
+    /// the uploads that read it until they retire.
     fn lock_region_ptr(
         &mut self,
         level: usize,
@@ -2969,8 +3000,11 @@ impl TextureInner {
         // command buffer that upload rides decides which retirement counter
         // frees it. See `staging_coherent_seq`.
         let coherent_seq = self.staging_coherent_seq(level);
-        let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
-            || self.staging[level].has_readers();
+        let mut write = self.staging_write_facts(0, level)?;
+        if is_in_flight(self.last_submit_seq[level], coherent_seq) {
+            write.insert(StagingWrite::HAS_READERS);
+        }
+        let contended = write.contains(StagingWrite::HAS_READERS);
         let action = if contended && self.flags.contains(TextureFlags::DEPTH_FORMAT) {
             LockAction::FreshBox {
                 preserve: if flags & D3DLOCK_DISCARD == 0 {
@@ -2980,37 +3014,35 @@ impl TextureInner {
                 },
             }
         } else {
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level))
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
         };
 
         let base: *mut u8 = match action {
             LockAction::WriteInPlace => {
-                // No rename, no preserve — same primitive as the
-                // READONLY fast-path above. `PageBox` exposes only
-                // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder operations
-                // hold Arc clones to keep the staging alive while
-                // they construct `newBufferWithBytesNoCopy:` MTLBuffer
-                // wrappers; they never borrow the bytes themselves.
-                // The GPU read happens at command-buffer execution
-                // time, after the next submit retires; under the
-                // well-behaved-game no-overlap contract the locked
-                // sub-rect doesn't overlap any in-flight read range.
-                // Same model `vb_lock` now uses (see `plan_lock` doc).
+                // No rename, no preserve: the same primitive as the
+                // READONLY fast path above. `PageBox` exposes only
+                // raw-pointer accessors, so no Rust `&[u8]` borrow of the
+                // bytes lives across this cast. Encoder operations hold Arc
+                // clones to keep the staging alive while they wrap it; they
+                // never borrow the bytes themselves.
                 //
-                // Counted when it is the kept divergence: a contended
-                // partial Lock without NOOVERWRITE handed back over
-                // bytes an upload may still be reading
-                // (`docs/STATUS.md#kept-divergences`). READONLY returned
-                // above and an uncontended Lock is the specified behaviour.
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
+                // With a reader this is NOOVERWRITE, or an upload of this
+                // frame no GPU operation has seen: counted, since each one
+                // is a write that lands in pages an upload will carry.
+                if !contended {
+                    self.note_unread_staging(0, level);
+                } else if flags & D3DLOCK_NOOVERWRITE == 0 && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.staging[level].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_staging(level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_staging(level, preserve);
+                self.note_unread_staging(0, level);
+                base
+            }
         };
 
         // SAFETY: `offset` is the byte offset of the locked sub-rect

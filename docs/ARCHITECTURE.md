@@ -282,11 +282,10 @@ original owner; it never transfers allocator ownership to Unix.
 Texture staging pages are recycled through the process-wide page-box pool
 (`windows/core/src/page_box_pool.rs`), in a staging lane beside the VB/IB
 lane. A staging box parks there once its last owner drops it: the texture at
-release, at a rename (a `LockRect`, or a CPU write such as `UpdateSurface`,
+release, at a rename (a `LockRect` or a CPU write such as `UpdateSurface`,
 `UpdateTexture`, `ColorFill`, `GetDC` or a read-back into a level an upload
-still reads, unless every such upload belongs to the frame being recorded and
-no GPU operation on the texture followed it) or after its upload, or an upload
-lease at retirement, whichever is last. The next `CreateTexture` or rename of
+still reads; see "CPU writes over a queued upload" below) or after its upload,
+or an upload lease at retirement, whichever is last. The next `CreateTexture` or rename of
 the same padded size pops it before it allocates. Both lanes share
 `memory.pageboxPoolCapMB`, and the staging lane may park at most a quarter of
 it (`STAGING_SHARE_DIVISOR`, 32 MiB at the default 128 MiB), so staging cannot
@@ -337,6 +336,56 @@ next upload wraps that same backing again its wrapper is kept through later
 answers: one extra wrapper per backing, not one per upload. A kept wrapper
 still retires at a backing change or at the texture's destroy.
 
+### CPU writes over a queued upload
+
+An upload reads its level's staging pages from the draw that schedules it
+until the GPU has copied them and the encoder has acknowledged the copy, a
+replay after an aborted submit included (`PageBox::has_readers`). A CPU write
+into those pages changes what the upload carries, so every writer gathers the
+same facts about the pages (`staging_write_facts` in
+`windows/d3d9/src/texture.rs`) and asks one rule, `decide_staging_write` in
+`windows/core/src/texture_staging.rs`: in place when no upload reads the
+pages, or when every upload that does belongs to the frame being recorded and
+no GPU operation on the texture was recorded since, since nothing that could
+see the old bytes exists yet. Otherwise the write moves to fresh pages, bare
+when it covers the whole level and carrying the level's bytes when it does
+not. A `LockRect` follows the same rule for a partial rect
+(`decide_lock_action`); a whole-level lock always preserves under a reader,
+since the game may read every byte through the pointer, and a compressed rect
+off the block grid does too, since the encoder widens its read to the level.
+Writes into a render-target or depth texture and read-backs from the GPU
+always move, and a level the game holds mapped is always written in place.
+
+A game that rewrites one scratch texture in part between draws, a sprite per
+character, would then copy the whole level on every lock, because each draw
+schedules an upload of the rect the lock before it wrote. So a level that has
+needed such a preserve is marked (`snapshot_staging`), and from then on each
+partial upload of it copies its box into the device's upload-snapshot arena
+(`windows/core/src/upload_snapshot.rs`) when it is scheduled. That upload
+reads the copy, not the staging, so the next lock finds no reader and writes
+in place: the level pays one preserve, then a box-sized copy per upload. The
+snapshot's rows are 16-byte aligned for the formats the upload pass widens and
+at least the device's linear texture alignment otherwise, so a blit never
+takes the CPU repack. Whole-level boxes, compressed boxes off the block grid,
+boxes over 64 KiB, volumes, depth formats and planar levels keep reading the
+staging, and so does every texture that never needed the preserve.
+
+The arena is a queue of 256 KiB PE page chunks, at most 64 of them. A
+snapshot is appended at the next 16-byte offset of the active chunk; a chunk
+that cannot fit one goes to the back of the queue, and the chunk at the front
+starts over from offset zero once `has_readers` says nothing reads it.
+Otherwise a new chunk is allocated, and past the cap the upload reads the
+staging, which logs once and counts in the summary's `snapshot` row. The
+chunks are not a ring stamped by submit sequence because an aborted
+submission's sequence retires while its uploads still wait to be replayed from
+the same bytes, and they are PE pages, not native memory like the encoder's
+upload ring for inline draw data, because the upload record, its page lease
+and its replay already carry PE pages across the boundary: a snapshot reaches
+the encoder exactly as staging does, under the record's `SNAPSHOT` flag with
+its `source_offset` into the chunk. The encoder caches one wrapper per chunk,
+keyed by the chunk's page generation, and notifies and retains only the
+snapshot's span of it.
+
 Page allocation is infallible: a box the allocator refuses ends the process,
 because past creation there is nothing to give back that the retention cap and
 the pool have not already bounded. The one exception is the system-memory copy
@@ -345,7 +394,9 @@ dynamic depth texture, lockable render target or system-memory offscreen plain,
 and the backing of a vertex or index buffer: that allocation is fallible, and a
 create whose copy cannot be allocated answers `E_OUTOFMEMORY` with no object,
 as D3D9 does. A rename, a re-created staging, a read-back page and every other
-later allocation keep the infallible contract.
+later allocation keep the infallible contract, except a chunk of the
+upload-snapshot arena: one the allocator refuses leaves the upload reading its
+staging, as a full arena does.
 
 Metal documents that one queue executes its buffers in commit order, and consecutive
 buffers may overlap on the GPU; it documents nothing about the order their completions are
@@ -703,17 +754,17 @@ IDirect3DDevice9Ex::ResetEx 1280x720 -> 1920x1080 X8R8G8B8, 1 back buffer, windo
 
 ### The address-space watch
 
-A 32-bit build of `d3d9.dll` walks its address space with `VirtualQuery` every 600 presents (`windows/d3d9/src/device/mem_watch.rs`). The walk, both threshold latches, the region map, the process-wide holder figures, the formatting and the logging run on the device's watch thread ("Threading model" above), so `Present` pays a counter bump and one atomic load, and one non-blocking send per sample. The device's own figures, the live textures' footprint and the upload leases, are computed by the next `Present` after the thread asks for them, which it does only for a sample that logs, so a line lands a present or two after its walk. The thread waits two seconds for that answer at most, so a game that stops presenting (a loading stall, the run-up to running out of space) still gets its warnings: the threshold warnings and the region map are logged without the device's figures, with a clause saying no present answered within 2 s of the walk and naming the figures left out (textures, mip data, texture staging, upload leases), followed by the page boxes the thread reads itself (the total, surfaces, vertex/index backing, encoder leases, pool parked) with no `other`, and the debug breakdown of that sample is dropped with a debug note. Each answer echoes the index of the sample it answers, and the thread throws away one that answers a request it gave up on. The free figure is the sum of the free regions the walk visits, each trimmed to the 64 KiB allocation granularity (a reservation can only start on a granule boundary, so a sliver smaller than a granule counts nothing), next to the largest of them, so the largest block never exceeds it. It is not `GlobalMemoryStatusEx`'s `ullAvailVirtual`: Wine computes that as the total minus the process working set, and on macOS the working set is the resident size of the whole process, the 64-bit host side included, so it falls with resident growth while the 32-bit space stays free. The crash lines (`FATAL` and `fault outside d3d9.dll`) carry the same two figures as `free_mib` and `largest_free_mib`. A 64-bit build starts no watch thread and skips the walk and the thresholds, since its space cannot run out and Wine takes 9 to 19 ms to walk it, and keeps the breakdown below, logged from `Present`.
+A 32-bit build of `d3d9.dll` walks its address space with `VirtualQuery` every 600 presents (`windows/d3d9/src/device/mem_watch.rs`). The walk, both threshold latches, the region map, the process-wide holder figures, the formatting and the logging run on the device's watch thread ("Threading model" above), so `Present` pays a counter bump and one atomic load, and one non-blocking send per sample. The device's own figures, the live textures' footprint, the upload leases and the upload-snapshot arena, are computed by the next `Present` after the thread asks for them, which it does only for a sample that logs, so a line lands a present or two after its walk. The thread waits two seconds for that answer at most, so a game that stops presenting (a loading stall, the run-up to running out of space) still gets its warnings: the threshold warnings and the region map are logged without the device's figures, with a clause saying no present answered within 2 s of the walk and naming the figures left out (textures, mip data, texture staging, upload leases, upload snapshots), followed by the page boxes the thread reads itself (the total, surfaces, vertex/index backing, encoder leases, pool parked) with no `other`, and the debug breakdown of that sample is dropped with a debug note. Each answer echoes the index of the sample it answers, and the thread throws away one that answers a request it gave up on. The free figure is the sum of the free regions the walk visits, each trimmed to the 64 KiB allocation granularity (a reservation can only start on a granule boundary, so a sliver smaller than a granule counts nothing), next to the largest of them, so the largest block never exceeds it. It is not `GlobalMemoryStatusEx`'s `ullAvailVirtual`: Wine computes that as the total minus the process working set, and on macOS the working set is the resident size of the whole process, the 64-bit host side included, so it falls with resident growth while the 32-bit space stays free. The crash lines (`FATAL` and `fault outside d3d9.dll`) carry the same two figures as `free_mib` and `largest_free_mib`. A 64-bit build starts no watch thread and skips the walk and the thresholds, since its space cannot run out and Wine takes 9 to 19 ms to walk it, and keeps the breakdown below, logged from `Present`.
 
 Two latches watch the samples, one on the free total (1536, 1024, 768, 512, 256 and 128 MiB) and one on the largest free block (512, 256 and 128 MiB), so a fragmented space with plenty free in total still warns before a large allocation fails. A sample below a threshold it had not crossed before logs one warning per latch naming the lowest threshold crossed, with the page-box breakdown below, and then one `address space map:` line: region counts by owner (image, mapped file, private commit, private reserve) and the largest used regions and holes. Each threshold is reported once per process. The first sample only arms the latches: a process already below some thresholds then, such as one without large-address-aware and its 2 GiB, logs one info line saying so and reports only the lower ones. The warnings log at warn on `mtld3d::d3d9::mem_watch`, so they show by default.
 
 `RUST_LOG=mtld3d::d3d9::mem_watch=debug` adds a line every second sample (about ten seconds), without the rest of the layer's debug output. With illustrative figures:
 
 ```
-address space: 1836 MiB free, largest free block 1182 MiB, walked 2310 regions in 1730 us; mtld3d holds 4998 textures with 715 MiB of mip data; page boxes 1042 MiB: texture staging 640, surfaces 24, vertex/index backing 3, encoder leases 2, upload leases 240, pool parked 126, other 7; d3d9.dll heap 1110 MiB committed; texture staging split default static 300 / render target 220 / default dynamic 70 / other 50, 295 MiB before page rounding; vertex/index backing split writeonly static 0 / dynamic 3 / other 0; locks on static default textures 0
+address space: 1836 MiB free, largest free block 1182 MiB, walked 2310 regions in 1730 us; mtld3d holds 4998 textures with 715 MiB of mip data; page boxes 1042 MiB: texture staging 640, surfaces 24, vertex/index backing 3, encoder leases 2, upload leases 240, upload snapshots 1, pool parked 126, other 7; d3d9.dll heap 1110 MiB committed; texture staging split default static 300 / render target 220 / default dynamic 70 / other 50, 295 MiB before page rounding; vertex/index backing split writeonly static 0 / dynamic 3 / other 0; locks on static default textures 0
 ```
 
-The walk's region count and duration, in microseconds of the PE side's calibrated counter, say what the sample costs the watch thread in that process. Every page-box figure is padded bytes on the PE side, the 16 KiB multiples `PageBox` allocates in the 32-bit space, so the named holders and `other` add up to the total (`mtld3d_core::address_space::PageBoxHolders`). Texture staging is what the device's live textures hold, every level not yet dropped and every cube face level, split by pool and usage: default-pool static textures, default-pool render-target textures (whose 2D levels hold staging only once a CPU path has used them, and whose cube faces always do), default-pool dynamic textures, and every other pool; "before page rounding" is the same staging at the lengths the levels asked for, and the gap between the two is the rounding a chain of small levels costs. Surfaces are the backing of system-memory and scratch offscreen plain surfaces, the staging of lockable render targets and the page a back-buffer `LockRect` or `GetDC` holds; encoder leases are the renamed vertex/index backings and upload snapshots the PE side keeps until the encoder acknowledges its last read (both `mtld3d_core::held_pages`). Vertex/index backing is the CPU copy of live buffers, split by the class that decides whether it can be released (`mtld3d_core::buffer_backing`). Upload leases are texture staging the texture itself let go of and only the device's upload leases still keep, because native code holds an owner of the pages (the upload's read, the encoder's cached wrapper of the level) whose acknowledgment has not arrived; the sample walks the device's retained leases and counts an allocation only when every reference to it is a lease's (`mtld3d_core::guest_pages::LeaseOnlyPages`), so staging a texture still holds stays under texture staging. Pool parked is what the recycle pool keeps for reuse. `other` is everything else: read-back pages of a call in progress, and any holder not counted yet. Pages the native encoder allocates for itself (padded repack staging, depth read-backs, evicted visibility buffers) live outside the 32-bit space and are in none of these figures. The heap figure is what `d3d9.dll`'s snmalloc has committed and handed to its allocators, two atomic loads: the page boxes, every other heap block of the image, and what its per-thread caches keep for reuse, so the part above the page-box total is the image's other allocations. The threshold warnings carry the same holder clause and heap figure.
+The walk's region count and duration, in microseconds of the PE side's calibrated counter, say what the sample costs the watch thread in that process. Every page-box figure is padded bytes on the PE side, the 16 KiB multiples `PageBox` allocates in the 32-bit space, so the named holders and `other` add up to the total (`mtld3d_core::address_space::PageBoxHolders`). Texture staging is what the device's live textures hold, every level not yet dropped and every cube face level, split by pool and usage: default-pool static textures, default-pool render-target textures (whose 2D levels hold staging only once a CPU path has used them, and whose cube faces always do), default-pool dynamic textures, and every other pool; "before page rounding" is the same staging at the lengths the levels asked for, and the gap between the two is the rounding a chain of small levels costs. Surfaces are the backing of system-memory and scratch offscreen plain surfaces, the staging of lockable render targets and the page a back-buffer `LockRect` or `GetDC` holds; encoder leases are the renamed vertex/index backings and upload snapshots the PE side keeps until the encoder acknowledges its last read (both `mtld3d_core::held_pages`). Vertex/index backing is the CPU copy of live buffers, split by the class that decides whether it can be released (`mtld3d_core::buffer_backing`). Upload leases are texture staging the texture itself let go of and only the device's upload leases still keep, because native code holds an owner of the pages (the upload's read, the encoder's cached wrapper of the level) whose acknowledgment has not arrived; the sample walks the device's retained leases and counts an allocation only when every reference to it is a lease's (`mtld3d_core::guest_pages::LeaseOnlyPages`), so staging a texture still holds stays under texture staging. Upload snapshots are the chunks of the device's upload-snapshot arena ("CPU writes over a queued upload" above), read or not, at most 16 MiB. Pool parked is what the recycle pool keeps for reuse. `other` is everything else: read-back pages of a call in progress, and any holder not counted yet. Pages the native encoder allocates for itself (padded repack staging, depth read-backs, evicted visibility buffers) live outside the 32-bit space and are in none of these figures. The heap figure is what `d3d9.dll`'s snmalloc has committed and handed to its allocators, two atomic loads: the page boxes, every other heap block of the image, and what its per-thread caches keep for reuse, so the part above the page-box total is the image's other allocations. The threshold warnings carry the same holder clause and heap figure.
 
 ### Command-buffer completion and encoder errors
 
@@ -981,7 +1032,8 @@ in its row, and every family carries the suffixes its row names.
 | `vbib_destroy_total`, `vbib_ret_cap_drain_total`, `vbib_ret_cap_submit_total` | VB/IB `destroys` and `ret cap`. |
 | `vbib_retention_peak_count`, `vbib_retained_bytes` | VB/IB `retention`: peak depth and peak bytes. |
 | `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak); the recycles and parked bytes are the encoder's own pool's. |
-| `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. |
+| `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. `in-place` counts partial locks written in place over an upload of the frame being recorded that no GPU operation has seen. |
+| `tex_snapshot_total`, `tex_snapshot_bytes_total`, `tex_snapshot_full_total` | Texture `snapshot`: partial uploads that copied their box into the upload-snapshot arena, the bytes copied, and the snapshots the arena declined (`full`), whose uploads read the staging. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
 | `tex_wrapper_create_total`, `tex_wrapper_retire_total` | Texture `churn`: per-level staging wrappers created, and queued for their destroy (at a backing change, an upload that releases its level's staging, or the texture's release). |
