@@ -3,12 +3,17 @@
 //! Two decisions the crash paths of `mtld3d.so` take, kept here because both
 //! are pure and both are wrong in ways only a crash would otherwise show.
 //!
-//! [`crash_route`] picks the destination of a crash report from what the
-//! process's log sink knows. Lines wait in a backlog until `Direct3DCreate9`
-//! names the log location, so a process that faults before then would lose
-//! the report and every line before it; the sink therefore keeps an early
-//! location, the default one beside the executable, which a crash report
-//! opens instead of waiting.
+//! [`crash_route`] picks the destination of a fault report from what the
+//! process's log sink knows and from how bad the fault is. Lines wait in a
+//! backlog until `Direct3DCreate9` names the log location, so a process that
+//! dies before then would lose the report and every line before it; the sink
+//! therefore keeps an early location, the default one beside the executable,
+//! which a terminal report opens instead of waiting. A first-chance report
+//! never does: the fault may be one the game or Wine recovers (a protection
+//! probe, a guard page, a handled access violation), and a process that lives
+//! on must keep its log where `log.dir` puts it, or have none at all if it
+//! never creates a device. Such a report only marks the process, so that its
+//! exit can still write the backlog out if nothing named the location.
 //!
 //! [`fault_site`] decides whether an address `dladdr` attributes to a loaded
 //! image is that image's content. `dyld` counts every segment of an image,
@@ -29,6 +34,9 @@ pub const MACHO_HEADER_LEN: usize = 32;
 /// Bytes of `segment_command_64` up to and including `filesize`.
 const SEGMENT_COMMAND_LEN: usize = 56;
 
+/// `segname` of the segment that starts with the image's header.
+const TEXT_SEGMENT: &[u8; 16] = b"__TEXT\0\0\0\0\0\0\0\0\0\0";
+
 /// What the process's log sink knows when a crash report arrives.
 pub enum SinkState {
     /// No location yet: lines wait in the backlog.
@@ -43,7 +51,21 @@ pub enum SinkState {
     /// Lines go to stderr.
     Stderr,
     /// Another holder has the sink, possibly the faulting thread itself.
+    ///
+    /// The report then never waits for it.
     Busy,
+}
+
+/// How bad the fault a report describes is.
+pub enum Severity {
+    /// A fault someone may still recover.
+    ///
+    /// The first chance of an exception, or a signal handed back to its owner.
+    FirstChance,
+    /// A fault that ends the process.
+    ///
+    /// A fault in our own code, an abort, a fatal exception code, a panic.
+    Terminal,
 }
 
 /// Where a crash report is written from.
@@ -65,7 +87,7 @@ pub enum CrashRoute {
     EarlyFile,
     /// Write the backlog and the report to stderr.
     ///
-    /// Every later line follows them there until `OpenLog` names a location.
+    /// Every later line of the dying process follows them there.
     Stderr,
     /// Leave the sink alone and write to its descriptor, the open file's or stderr's.
     Descriptor,
@@ -89,17 +111,21 @@ pub struct ImageSegment {
     size: u64,
     file_offset: u64,
     file_size: u64,
+    text: bool,
 }
 
 impl ImageSegment {
     /// A segment of `size` bytes at `start`, mapping `file_size` bytes from `file_offset`.
+    ///
+    /// `text` marks the `__TEXT` segment, the one the header starts.
     #[must_use]
-    pub const fn new(start: u64, size: u64, file_offset: u64, file_size: u64) -> Self {
+    pub const fn new(start: u64, size: u64, file_offset: u64, file_size: u64, text: bool) -> Self {
         Self {
             start,
             size,
             file_offset,
             file_size,
+            text,
         }
     }
 
@@ -108,8 +134,8 @@ impl ImageSegment {
         addr >= self.start && addr - self.start < self.size
     }
 
-    /// True for the segment that maps the start of the file, the header with it.
-    const fn maps_header(&self) -> bool {
+    /// True for a segment that maps the start of the image's file.
+    const fn maps_file_start(&self) -> bool {
         self.file_offset == 0 && self.file_size > 0
     }
 }
@@ -156,30 +182,43 @@ impl Iterator for MachoSegments<'_> {
                 read_u64(command, 32)?,
                 read_u64(command, 40)?,
                 read_u64(command, 48)?,
+                command.get(8..24) == Some(TEXT_SEGMENT.as_slice()),
             ));
         }
         None
     }
 }
 
-/// Where a crash report goes, given what the sink knows and where the report is written from.
+/// Where a fault report goes, given what the sink knows, how bad the fault is, and the caller.
 ///
-/// A report with no location named yet opens the early one, so it and the
-/// backlog reach a file instead of dying with the process; without an early
-/// location both go to stderr. A signal handler cannot create the file a
-/// named location still waits for, nor take a sink another holder has, so it
-/// writes to whatever descriptor the sink already has.
+/// Only a terminal report with no location named yet opens the early one,
+/// so it and the backlog reach a file instead of dying with the process;
+/// without an early location both go to stderr. A first-chance report goes
+/// where any line goes, into the backlog while the location is pending, and
+/// a signal handler's to the descriptor the sink already has, stderr until a
+/// file is open. A signal handler never creates the file a named location
+/// still waits for, and no report waits for a sink another holder has.
 #[must_use]
-pub const fn crash_route(state: &SinkState, context: &CrashContext) -> CrashRoute {
-    match state {
-        SinkState::Pending {
-            early_location: true,
-        } => CrashRoute::EarlyFile,
-        SinkState::Pending {
-            early_location: false,
-        } => CrashRoute::Stderr,
-        SinkState::Busy => CrashRoute::Descriptor,
-        SinkState::Named | SinkState::Open | SinkState::Stderr => match context {
+pub const fn crash_route(
+    state: &SinkState,
+    severity: &Severity,
+    context: &CrashContext,
+) -> CrashRoute {
+    match (state, severity) {
+        (SinkState::Busy, _) => CrashRoute::Descriptor,
+        (
+            SinkState::Pending {
+                early_location: true,
+            },
+            Severity::Terminal,
+        ) => CrashRoute::EarlyFile,
+        (
+            SinkState::Pending {
+                early_location: false,
+            },
+            Severity::Terminal,
+        ) => CrashRoute::Stderr,
+        _ => match context {
             CrashContext::Thread => CrashRoute::Sink,
             CrashContext::Signal => CrashRoute::Descriptor,
         },
@@ -215,13 +254,12 @@ pub fn macho_segments(image: &[u8], load_address: u64) -> MachoSegments<'_> {
             slide: 0,
         };
     };
-    let slide = MachoSegments {
+    let unslid = MachoSegments {
         commands,
         remaining: count,
         slide: 0,
-    }
-    .find(ImageSegment::maps_header)
-    .map_or(0, |header| load_address.wrapping_sub(header.start));
+    };
+    let slide = header_segment(unslid).map_or(0, |header| load_address.wrapping_sub(header.start));
     MachoSegments {
         commands,
         remaining: count,
@@ -246,6 +284,26 @@ pub fn fault_site(addr: u64, segments: impl IntoIterator<Item = ImageSegment>) -
                 FaultSite::Image
             }
         })
+}
+
+/// The segment that maps the image's header, the one the slide is measured from.
+///
+/// `__TEXT` by name first: an image in the dyld shared cache keeps the cache
+/// file's offsets in its load commands, so its `__TEXT` does not map offset
+/// 0. Failing the name, the segment that maps the start of the file. An
+/// image with neither is left unslid; its segments then cover none of its
+/// addresses, and [`fault_site`] answers what `dladdr` said.
+fn header_segment(segments: MachoSegments<'_>) -> Option<ImageSegment> {
+    let mut file_start = None;
+    for segment in segments {
+        if segment.text {
+            return Some(segment);
+        }
+        if file_start.is_none() && segment.maps_file_start() {
+            file_start = Some(segment);
+        }
+    }
+    file_start
 }
 
 /// The native-endian `u32` at `offset`, or `None` past the end.

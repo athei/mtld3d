@@ -364,7 +364,7 @@ fn init_logger(instance: *mut c_void) {
     // interleave by seq.
     mtld3d_shared::crumb::init();
     crash::install(instance);
-    mtld3d_shared::crumb::set_write_sink(log_sink::write_raw);
+    mtld3d_shared::crumb::set_write_sink(log_sink::write_fault);
     let filter = std::env::var("RUST_LOG").unwrap_or_default();
     // Where a crash report goes if one comes before `Direct3DCreate9`
     // names the log location; empty when it cannot be derived.

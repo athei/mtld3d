@@ -23,13 +23,15 @@
 //! has to name what it can read and stop at the first word it cannot, and
 //! must stay absent from a trap in our own code and from a memory fault.
 //!
-//! The early-log tests fault before any location is named, the shape of a
-//! game that dies before `Direct3DCreate9`: the report and the lines logged
-//! before it reach the early location when `InitLogger` named one, and
-//! stderr together when it did not. The reserved-space test reports a PC in
-//! a zero-fill segment of this binary, the shape of a guest address inside
-//! Wine's loader, which must read as guest memory rather than an offset into
-//! the image.
+//! The early-log tests fault before any location is named. A terminal fault,
+//! the shape of a game that dies before `Direct3DCreate9`, puts the report
+//! and the lines logged before it in the early location when `InitLogger`
+//! named one, and on stderr together when it did not. A fault its owner
+//! recovers opens nothing and leaves the log for `OpenLog` to place; an exit
+//! after one, with no location named, saves the backlog to the early one. The
+//! reserved-space test reports a PC in a zero-fill segment of this binary,
+//! the shape of a guest address inside Wine's loader, which must read as
+//! reserved memory rather than an offset into the image.
 //!
 //! Wine is not in a unit test's process, so the branch that asks it for the
 //! calling thread's TEB is exercised through a stand-in `NtCurrentTeb` stored
@@ -846,32 +848,122 @@ fn foreign_image_under_our_directory_forwards_fault() {
     assert!(report.contains("/foreign-image+0x"), "{report}");
 }
 
-/// A foreign fault before the log location is named takes the backlog along to stderr.
+/// Run the child half of an early-log test: `dir` names the early location when given.
+///
+/// Logs a line, installs the handler and takes a foreign fault on a thread
+/// that answers with no TEB, which the handler reports here and ends the
+/// process on: the terminal shape a game dies in before `Direct3DCreate9`.
+fn terminal_fault_before_the_log(dir: Option<&std::ffi::OsStr>) -> ! {
+    if let Some(dir) = dir {
+        crate::log_file::set_early_location(&dir.to_string_lossy(), "early");
+    }
+    crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
+    super::install();
+    pin_wine_teb(no_teb_stub);
+    // SAFETY: deliberately unsound; this is the fault under test, taken in a
+    // child process that never returns from the handler.
+    let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
+    unreachable!("the strlen above must fault, not return {len}");
+}
+
+/// A previous signal owner that recovers the fault, the way Wine does for a handled one.
+extern "C" fn recovering_owner(
+    _signo: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ctx: *mut c_void,
+) {
+}
+
+/// Take a foreign `SIGSEGV` the previous owner recovers, after logging a line.
+///
+/// The fault is handed to the real handler with a context whose PC is in
+/// libsystem, the shape of a guest fault Wine turns into an exception the
+/// game handles; the handler returns, as it would to the faulting code.
+fn recovered_foreign_fault(early_dir: &std::ffi::OsStr) {
+    crate::log_file::set_early_location(&early_dir.to_string_lossy(), "early");
+    crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
+    // SAFETY: all-zero sigaction is a valid starting value for initialization.
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_sigaction = recovering_owner as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    // SAFETY: action contains a valid mask out-parameter.
+    assert_eq!(unsafe { libc::sigemptyset(&raw mut action.sa_mask) }, 0);
+    assert_eq!(
+        // SAFETY: installs a correctly typed handler in this child process only.
+        unsafe { libc::sigaction(libc::SIGSEGV, &raw const action, ptr::null_mut()) },
+        0
+    );
+    super::install();
+    let mut registers = [0u64; 40];
+    #[cfg(target_arch = "x86_64")]
+    let pc_slot = 144 / 8;
+    #[cfg(target_arch = "aarch64")]
+    let pc_slot = 272 / 8;
+    registers[pc_slot] = libc::strlen as *const () as usize as u64;
+    let mut context = [0u64; 7];
+    context[0x30 / 8] = registers.as_ptr() as usize as u64;
+    // A value the interrupted code must find intact once the handler returns.
+    let errno = super::Errno(libc::EINTR);
+    errno.restore();
+    super::handler(libc::SIGSEGV, ptr::null_mut(), context.as_mut_ptr().cast());
+    assert_eq!(
+        super::Errno::save().0,
+        libc::EINTR,
+        "the handler left errno changed"
+    );
+}
+
+/// Re-execute `test` with the early-log variable set to `value`; returns its pid and output.
+fn early_log_child(test: &str, value: &std::ffi::OsStr) -> (u32, std::process::Output) {
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", test, "--nocapture"])
+        .env(EARLY_LOG_SELFTEST_ENV, value)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("re-exec the test binary");
+    let pid = child.id();
+    (pid, child.wait_with_output().expect("wait for the child"))
+}
+
+/// A scratch directory for one early-log test, removed when dropped.
+struct EarlyLogScratch(std::path::PathBuf);
+
+impl EarlyLogScratch {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("mtld3d-early-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        Self(root)
+    }
+
+    /// The early location, not created: the code under test makes it.
+    fn early(&self) -> std::path::PathBuf {
+        self.0.join("mtld3d-logs")
+    }
+}
+
+impl Drop for EarlyLogScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A terminal fault before the log location is named takes the backlog along to stderr.
 ///
 /// No early location here: the lines logged so far go to stderr ahead of the
 /// report, where they used to wait for a file the process never named.
 #[test]
-fn a_fault_before_the_log_is_named_writes_the_backlog_to_stderr() {
+fn a_terminal_fault_before_the_log_is_named_writes_the_backlog_to_stderr() {
+    const TEST: &str =
+        "crash::tests::a_terminal_fault_before_the_log_is_named_writes_the_backlog_to_stderr";
     if std::env::var_os(EARLY_LOG_SELFTEST_ENV).is_some() {
-        crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
-        super::install();
-        // SAFETY: deliberately unsound; this is the fault under test, taken
-        // in a child process that dies on it.
-        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
-        unreachable!("the strlen above must fault, not return {len}");
+        terminal_fault_before_the_log(None);
     }
 
-    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args([
-            "--exact",
-            "crash::tests::a_fault_before_the_log_is_named_writes_the_backlog_to_stderr",
-            "--nocapture",
-        ])
-        .env(EARLY_LOG_SELFTEST_ENV, "1")
-        .output()
-        .expect("re-exec the test binary");
+    let (_, out) = early_log_child(TEST, std::ffi::OsStr::new("1"));
     let report = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
+    assert_eq!(out.status.code(), Some(1), "{report}");
     let backlog = report
         .find(BACKLOG_LINE)
         .unwrap_or_else(|| panic!("the backlog line is lost:\n{report}"));
@@ -881,48 +973,25 @@ fn a_fault_before_the_log_is_named_writes_the_backlog_to_stderr() {
     assert!(backlog < fault, "{report}");
 }
 
-/// A foreign fault before the log location is named opens the early location.
+/// A terminal fault before the log location is named opens the early location.
 ///
-/// The child names the early location as `InitLogger` would, logs a line and
-/// faults: the file `<dir>/<stem>-<pid>.log` holds the line and then the
-/// report, its directory created on the way, and stderr holds neither.
+/// The file `<dir>/<stem>-<pid>.log` holds the line logged before and then
+/// the whole report, its directory created on the way, and stderr holds none
+/// of it.
 #[test]
-fn a_fault_before_the_log_is_named_opens_the_early_location() {
+fn a_terminal_fault_before_the_log_is_named_opens_the_early_location() {
+    const TEST: &str =
+        "crash::tests::a_terminal_fault_before_the_log_is_named_opens_the_early_location";
     if let Some(dir) = std::env::var_os(EARLY_LOG_SELFTEST_ENV) {
-        crate::log_file::set_early_location(&dir.to_string_lossy(), "early");
-        crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
-        super::install();
-        // SAFETY: deliberately unsound; this is the fault under test, taken
-        // in a child process that dies on it.
-        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
-        unreachable!("the strlen above must fault, not return {len}");
+        terminal_fault_before_the_log(Some(&dir));
     }
 
-    let root = std::env::temp_dir().join(format!("mtld3d-early-log-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("scratch root");
-    // Not created yet: the handler makes it, as the first crash in a game's
-    // directory would.
-    let dir = root.join("mtld3d-logs");
-    let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args([
-            "--exact",
-            "crash::tests::a_fault_before_the_log_is_named_opens_the_early_location",
-            "--nocapture",
-        ])
-        .env(EARLY_LOG_SELFTEST_ENV, &dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("re-exec the test binary");
-    let pid = child.id();
-    let out = child.wait_with_output().expect("wait for the child");
+    let scratch = EarlyLogScratch::new("terminal");
+    let (pid, out) = early_log_child(TEST, scratch.early().as_os_str());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let log = std::fs::read_to_string(dir.join(format!("early-{pid}.log")));
-    let _ = std::fs::remove_dir_all(&root);
-    let log = log.unwrap_or_else(|e| panic!("no early log ({e}); stderr:\n{stderr}"));
-
-    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{stderr}");
+    let log = std::fs::read_to_string(scratch.early().join(format!("early-{pid}.log")))
+        .unwrap_or_else(|e| panic!("no early log ({e}); stderr:\n{stderr}"));
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     let backlog = log
         .find(BACKLOG_LINE)
         .unwrap_or_else(|| panic!("the backlog line is lost:\n{log}"));
@@ -930,12 +999,85 @@ fn a_fault_before_the_log_is_named_opens_the_early_location() {
         .find("fault outside mtld3d.so")
         .unwrap_or_else(|| panic!("no foreign-fault line:\n{log}"));
     assert!(backlog < fault, "{log}");
-    assert!(log.contains("mtld3d.so return addrs on stack:"), "{log}");
+    assert!(log.contains("has no Wine TEB"), "{log}");
+    assert!(log.contains("FATAL: SIGSEGV"), "{log}");
     assert!(!stderr.contains("fault outside mtld3d.so"), "{stderr}");
     assert!(!stderr.contains(BACKLOG_LINE), "{stderr}");
 }
 
-/// A PC in a segment with no file bytes is reported as guest memory, not an image offset.
+/// A foreign fault its owner recovers opens no log, and the log goes where it is later named.
+///
+/// The report goes to stderr as before, `errno` survives the handler, and
+/// the backlog waits: `OpenLog` naming another directory afterwards puts the
+/// line logged before the fault there, and the exit that follows writes
+/// nothing to the early location.
+#[test]
+fn a_recovered_foreign_fault_creates_no_file_and_leaves_the_sink_pending() {
+    const TEST: &str =
+        "crash::tests::a_recovered_foreign_fault_creates_no_file_and_leaves_the_sink_pending";
+    if let Some(root) = std::env::var_os(EARLY_LOG_SELFTEST_ENV) {
+        let root = std::path::PathBuf::from(root);
+        recovered_foreign_fault(root.join("mtld3d-logs").as_os_str());
+        let named = crate::log_file::open(&root.join("configured").to_string_lossy(), "named");
+        crate::log_file::write_all(format!("[selftest] named {}\n", named.display()).as_bytes());
+        std::process::exit(0);
+    }
+
+    let scratch = EarlyLogScratch::new("recovered");
+    let (pid, out) = early_log_child(TEST, scratch.0.as_os_str());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("fault outside mtld3d.so"),
+        "the report goes to stderr:\n{stderr}"
+    );
+    assert!(
+        !scratch.early().exists(),
+        "a recovered fault created the early location"
+    );
+    let named = scratch
+        .0
+        .join("configured")
+        .join(format!("named-{pid}.log"));
+    let log = std::fs::read_to_string(&named)
+        .unwrap_or_else(|e| panic!("no log at {} ({e}); stderr:\n{stderr}", named.display()));
+    assert!(log.contains(BACKLOG_LINE), "{log}");
+    assert!(
+        log.contains(&format!("[selftest] named {}", named.display())),
+        "{log}"
+    );
+}
+
+/// A recovered foreign fault, then an exit before `OpenLog`, saves the backlog early.
+///
+/// The exit is the one Wine makes for a process that ends on its own; the
+/// file holds the line logged before the fault and the note the exit writes.
+#[test]
+fn a_recorded_foreign_fault_flushes_the_backlog_to_the_early_location_at_exit() {
+    const TEST: &str =
+        "crash::tests::a_recorded_foreign_fault_flushes_the_backlog_to_the_early_location_at_exit";
+    if let Some(dir) = std::env::var_os(EARLY_LOG_SELFTEST_ENV) {
+        recovered_foreign_fault(&dir);
+        std::process::exit(0);
+    }
+
+    let scratch = EarlyLogScratch::new("exit");
+    let (pid, out) = early_log_child(TEST, scratch.early().as_os_str());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let log = std::fs::read_to_string(scratch.early().join(format!("early-{pid}.log")))
+        .unwrap_or_else(|e| panic!("no early log ({e}); stderr:\n{stderr}"));
+    let backlog = log
+        .find(BACKLOG_LINE)
+        .unwrap_or_else(|| panic!("the backlog line is lost:\n{log}"));
+    let note = log
+        .find("the process exits after a fault report")
+        .unwrap_or_else(|| panic!("no exit note:\n{log}"));
+    assert!(backlog < note, "{log}");
+    assert!(stderr.contains("fault outside mtld3d.so"), "{stderr}");
+}
+
+/// A PC in a segment with no file bytes is reported as reserved memory, not an image offset.
 ///
 /// The PC lies in this binary's zero-fill segment, which `dladdr` attributes
 /// to the binary just as it attributes a guest address to Wine's loader. The
@@ -977,10 +1119,7 @@ fn a_pc_in_reserved_space_is_reported_as_reserved_memory() {
         .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
     assert!(line.contains("signo=10"), "{line}");
     // The zero-fill pages are mapped read-write and nothing else.
-    assert!(
-        line.contains(" memory=guest page=rw- reserved_by=/"),
-        "{line}"
-    );
+    assert!(line.contains(" memory=reserved page=rw- by=/"), "{line}");
     assert!(!line.contains("image="), "{line}");
     assert!(!line.contains(" sym="), "{line}");
     assert!(!line.contains("+0x"), "{line}");

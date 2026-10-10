@@ -87,8 +87,13 @@ impl Thunk for InitLoggerParams {
 pub enum LogLineKind {
     /// An ordinary line: it waits in the backlog until `OpenLog` names the file.
     Ordinary = 0,
-    /// A line of a crash report: before `OpenLog` it opens the early location.
-    CrashReport = 1,
+    /// A line of a fault report the process may still recover from.
+    ///
+    /// Written as an ordinary line; it marks the process, so an exit before
+    /// `OpenLog` saves the backlog to the early location.
+    FaultReport = 1,
+    /// A line of a terminal fault's report: before `OpenLog` it opens the early location.
+    CrashReport = 2,
 }
 
 /// One formatted log line from the PE-side logger, for the process's log file.

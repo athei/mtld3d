@@ -27,12 +27,14 @@
 //! is the unix side's own: the one this side sees is Wine's process id, which
 //! repeats from one launch to the next.
 //!
-//! A crash report cannot wait for that. [`early_location`] derives the default
-//! location at load for `InitLogger`, and [`write_raw`], the crash path, marks
-//! its lines as a crash report, which opens that location on the unix side
-//! when nothing has named one yet. It first hands over the lines still queued
-//! for a logging thread that is not running, so they reach the file ahead of
-//! the report rather than dying in the queue.
+//! A crash cannot wait for that. [`early_location`] derives the default
+//! location at load for `InitLogger`, and [`write_crash`], the path of a
+//! fault that ends the process, marks its lines as a crash report, which
+//! opens that location on the unix side when nothing has named one yet. A
+//! fault that may still be handled goes through [`write_fault`] instead,
+//! which opens nothing. Both first hand over the lines still queued for a
+//! logging thread that is not running, so they reach the log ahead of the
+//! report rather than dying in the queue.
 
 use core::ffi::c_void;
 use std::{
@@ -388,7 +390,7 @@ fn add_image_reference() -> Option<*mut c_void> {
     Some(module)
 }
 
-/// Hand a line of a crash report to the unix side right now, on the calling thread.
+/// Hand a line of a terminal fault's report to the unix side right now, on the calling thread.
 ///
 /// For the crash path only: a fault or panic handler cannot rely on the
 /// logging thread ever running again, so it thunks synchronously instead
@@ -396,16 +398,29 @@ fn add_image_reference() -> Option<*mut c_void> {
 /// before `Direct3DCreate9`) go first, so the report follows them. The line
 /// travels as a crash report, which opens the early log location when none
 /// is named yet. Everything else goes through [`Sink`].
-pub fn write_raw(line: &[u8]) {
+pub fn write_crash(line: &[u8]) {
     forward_parked();
     forward(line, LogLineKind::CrashReport);
+}
+
+/// Hand a line of a first-chance fault report to the unix side right now, on the calling thread.
+///
+/// As [`write_crash`], except that the fault may still be handled: the line
+/// goes where any line goes and opens no log, and the unix side only marks
+/// the process, so an exit that follows can still save the lines. The crumb
+/// dump's sink.
+pub fn write_fault(line: &[u8]) {
+    forward_parked();
+    forward(line, LogLineKind::FaultReport);
 }
 
 /// Forward the lines waiting in the queue while no logging thread runs.
 ///
 /// The receiver is parked in the queue then, and only tried: a crash on a
 /// thread that holds it, or one the logging thread races for, leaves the
-/// lines where they are rather than waiting.
+/// lines where they are rather than waiting. Each line is leaked once it is
+/// forwarded rather than freed, since this runs inside the exception
+/// handler, whose faulting thread may hold the allocator.
 fn forward_parked() {
     let Ok(parked) = QUEUE.rx.try_lock() else {
         return;
@@ -416,6 +431,7 @@ fn forward_parked() {
     while let Ok(message) = rx.try_recv() {
         if let Message::Line(line) = message {
             forward(&line, LogLineKind::Ordinary);
+            core::mem::forget(line);
         }
     }
 }

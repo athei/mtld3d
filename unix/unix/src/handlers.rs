@@ -88,6 +88,7 @@ pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
         unsafe { core::slice::from_raw_parts(params.ptr as *const u8, params.len as usize) };
     match params.kind {
         LogLineKind::Ordinary => crate::log_file::write_all(bytes),
+        LogLineKind::FaultReport => crate::log_file::write_fault(bytes),
         LogLineKind::CrashReport => crate::log_file::write_crash(bytes),
     }
     STATUS_SUCCESS

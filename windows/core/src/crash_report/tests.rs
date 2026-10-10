@@ -1,11 +1,13 @@
 //! Crash-report routing and the reading of image segments.
 //!
-//! The routing table pins that a report arriving before `OpenLog` opens the
-//! early location (or goes to stderr with the backlog when there is none),
-//! and that a signal handler never creates a file the sink would or takes a
-//! sink another holder has. The segment tests build Mach-O headers by hand:
-//! the layout Wine's loader links with, whose zero-fill segments `dladdr`
-//! attributes guest addresses to, and a slid image, so the slide is applied.
+//! The routing table pins that only a terminal report arriving before
+//! `OpenLog` opens the early location (or goes to stderr with the backlog
+//! when there is none), that a first-chance report goes where any line goes
+//! and leaves the sink as it is, and that no report waits for a busy sink.
+//! The segment tests build Mach-O headers by hand: the layout Wine's loader
+//! links with, whose zero-fill segments `dladdr` attributes guest addresses
+//! to, a slid image, so the slide is applied, and a shared-cache image, whose
+//! `__TEXT` maps no file offset 0.
 
 use super::*;
 
@@ -153,6 +155,35 @@ fn segments_move_with_the_slide() {
 }
 
 #[test]
+fn a_shared_cache_image_slides_by_its_text_segment() {
+    // In the dyld shared cache the offsets are the cache file's, so no
+    // segment maps offset 0 and `__TEXT` is found by name.
+    let header = image(&[
+        Segment {
+            name: "__TEXT",
+            vmaddr: 0x1_8000_0000,
+            vmsize: 0x4000,
+            fileoff: 0x0123_4000,
+            filesize: 0x4000,
+        },
+        Segment {
+            name: "__DATA_CONST",
+            vmaddr: 0x1_9000_0000,
+            vmsize: 0x4000,
+            fileoff: 0x0223_4000,
+            filesize: 0x4000,
+        },
+    ]);
+    let load = 0x1_8800_0000;
+    let starts: Vec<_> = macho_segments(&header, load).map(|s| s.start).collect();
+    assert_eq!(starts, [load, 0x1_9800_0000]);
+    assert_eq!(
+        fault_site(0x1_9800_0010, macho_segments(&header, load)),
+        FaultSite::Image
+    );
+}
+
+#[test]
 fn a_header_that_cannot_be_read_leaves_the_address_to_the_image() {
     let mut header = wine_loader();
     assert_eq!(
@@ -183,14 +214,30 @@ fn a_header_that_cannot_be_read_leaves_the_address_to_the_image() {
     assert_eq!(macho_commands_len(&[0u8; 4]), None);
 }
 
+/// Every sink state a report can meet, the busy one aside.
+fn held_states() -> [SinkState; 5] {
+    [
+        SinkState::Pending {
+            early_location: true,
+        },
+        SinkState::Pending {
+            early_location: false,
+        },
+        SinkState::Named,
+        SinkState::Open,
+        SinkState::Stderr,
+    ]
+}
+
 #[test]
-fn a_report_before_the_location_is_named_opens_the_early_one() {
+fn a_terminal_report_before_the_location_is_named_opens_the_early_one() {
     for context in [CrashContext::Signal, CrashContext::Thread] {
         assert_eq!(
             crash_route(
                 &SinkState::Pending {
                     early_location: true
                 },
+                &Severity::Terminal,
                 &context
             ),
             CrashRoute::EarlyFile
@@ -201,6 +248,7 @@ fn a_report_before_the_location_is_named_opens_the_early_one() {
                 &SinkState::Pending {
                     early_location: false
                 },
+                &Severity::Terminal,
                 &context
             ),
             CrashRoute::Stderr
@@ -209,23 +257,43 @@ fn a_report_before_the_location_is_named_opens_the_early_one() {
 }
 
 #[test]
-fn a_signal_handler_never_creates_a_file_nor_waits_for_the_sink() {
-    for state in [
-        SinkState::Named,
-        SinkState::Open,
-        SinkState::Stderr,
-        SinkState::Busy,
-    ] {
+fn a_first_chance_report_never_opens_a_file_nor_moves_the_sink() {
+    for state in held_states() {
+        // Into the backlog, or the file once there is one.
         assert_eq!(
-            crash_route(&state, &CrashContext::Signal),
+            crash_route(&state, &Severity::FirstChance, &CrashContext::Thread),
+            CrashRoute::Sink
+        );
+        // Stderr, or the open file's descriptor.
+        assert_eq!(
+            crash_route(&state, &Severity::FirstChance, &CrashContext::Signal),
             CrashRoute::Descriptor
         );
     }
+}
+
+#[test]
+fn once_the_location_is_named_a_signal_handler_writes_to_the_sinks_descriptor() {
     for state in [SinkState::Named, SinkState::Open, SinkState::Stderr] {
-        assert_eq!(crash_route(&state, &CrashContext::Thread), CrashRoute::Sink);
+        assert_eq!(
+            crash_route(&state, &Severity::Terminal, &CrashContext::Signal),
+            CrashRoute::Descriptor
+        );
+        assert_eq!(
+            crash_route(&state, &Severity::Terminal, &CrashContext::Thread),
+            CrashRoute::Sink
+        );
     }
-    assert_eq!(
-        crash_route(&SinkState::Busy, &CrashContext::Thread),
-        CrashRoute::Descriptor
-    );
+}
+
+#[test]
+fn no_report_waits_for_a_busy_sink() {
+    for severity in [Severity::FirstChance, Severity::Terminal] {
+        for context in [CrashContext::Signal, CrashContext::Thread] {
+            assert_eq!(
+                crash_route(&SinkState::Busy, &severity, &context),
+                CrashRoute::Descriptor
+            );
+        }
+    }
 }

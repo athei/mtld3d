@@ -41,15 +41,18 @@
 //! loader keeps the guest's low address space and its own top-down heap as
 //! two such segments, so a guest PC lands in the loader at an offset that
 //! wraps below its load address. A PC in such a segment is reported as
-//! `memory=guest` instead, with the protection its page has now (`---` for
-//! space reserved and not committed, or freed; `unmapped` for a hole) and
-//! the image that reserves the space. Wine's loader is the only image in a
-//! Wine process that reserves space this way.
+//! `memory=reserved` instead, with the protection its page has now (`---`
+//! for space reserved and not committed, or freed; `unmapped` for a hole)
+//! and the image that reserves the space. Wine's loader is the only image in
+//! a Wine process that reserves space this way, so there it is guest memory.
 //!
-//! Every report goes to the process's log file. Before `Direct3DCreate9` has
-//! named it, the first report opens the early location `InitLogger` named,
-//! with the lines logged so far ahead of it, since the process may never get
-//! as far as naming one (see `log_file::crash_fd`).
+//! A terminal report goes to the process's log file. Before `Direct3DCreate9`
+//! has named it, the report opens the early location `InitLogger` named,
+//! with the lines logged so far ahead of it, since the process will never
+//! get as far as naming one (see `log_file::crash_fd`). A fault handed back
+//! is not known to be terminal, so its report goes to stderr until a file is
+//! open, and only marks the process for the exit hook. Both paths leave
+//! `errno` as the interrupted code had it.
 //!
 //! Forwarding needs a thread Wine can serve. Wine's unix side keeps each
 //! thread's TEB in a pthread key and reads it as soon as a fault reaches
@@ -162,7 +165,12 @@ unsafe extern "C" {
 const VM_REGION_BASIC_INFO_64: c_int = 9;
 
 /// `vm_region_basic_info_64` in `natural_t` words, the count that flavor takes.
+const VM_REGION_BASIC_INFO_COUNT_64: libc::mach_msg_type_number_t = 9;
+
+/// [`VM_REGION_BASIC_INFO_COUNT_64`] as the length of the buffer that receives the words.
 const VM_REGION_BASIC_INFO_WORDS: usize = 9;
+
+const _: () = assert!(VM_REGION_BASIC_INFO_WORDS == VM_REGION_BASIC_INFO_COUNT_64 as usize);
 
 /// Index into [`PREV`] for a signal we handle, or `None` for anything else.
 const fn signal_slot(signo: c_int) -> Option<usize> {
@@ -192,6 +200,9 @@ pub fn install() {
     }
 
     resolve_wine_current_teb();
+    // A first-chance fault report before `Direct3DCreate9` leaves the log
+    // pending; an exit that follows writes it out.
+    crate::log_file::install_exit_flush();
 
     // Diagnostic escape hatch: with `MTLD3D_NO_CRASH_HANDLER=1` we do NOT
     // intercept SIGSEGV/SIGBUS, so Wine's own SEH machinery translates the
@@ -347,9 +358,15 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         // one, is what a report would name. Report this one in full instead
         // and end the process below.
         let terminal = !wine_serves_this_thread();
+        // The report writes through `write(2)` and may create the log, and
+        // the interrupted code resumes once the fault is handed back: it
+        // finds `errno` as it left it.
+        let errno = Errno::save();
         report_foreign_fault(signo, ctx, terminal);
         if !terminal {
+            errno.restore();
             forward_to_previous(signo, info, ctx);
+            errno.restore();
             return;
         }
         // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
@@ -572,7 +589,15 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT && !terminal {
         return;
     }
-    let fd = crate::log_file::crash_fd();
+    // A fault handed back may be one its owner recovers, so its report
+    // opens nothing: stderr, or the log once one is open, and a mark for the
+    // exit. Only a terminal one may open the early log.
+    let fd = if terminal {
+        crate::log_file::crash_fd()
+    } else {
+        crate::log_file::note_fault_report();
+        crate::log_file::raw_fd()
+    };
     let mut b = [0u8; 192];
     let mut p = 0;
     push(
@@ -598,9 +623,9 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
         // Space Wine's loader reserves for the guest: no offset into the
         // loader names it, the page's protection says what it holds now.
         FaultSite::Reserved => {
-            push(&mut b, &mut p, b" memory=guest page=");
+            push(&mut b, &mut p, b" memory=reserved page=");
             push(&mut b, &mut p, protection_label(page_protection(pc)));
-            push(&mut b, &mut p, b" reserved_by=");
+            push(&mut b, &mut p, b" by=");
         }
     }
     // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
@@ -697,8 +722,7 @@ fn page_protection(addr: u64) -> Option<libc::vm_prot_t> {
     let mut region = addr;
     let mut size = 0;
     let mut info: [c_int; VM_REGION_BASIC_INFO_WORDS] = [0; VM_REGION_BASIC_INFO_WORDS];
-    let mut count = libc::mach_msg_type_number_t::try_from(VM_REGION_BASIC_INFO_WORDS)
-        .expect("nine words fit the count");
+    let mut count = VM_REGION_BASIC_INFO_COUNT_64;
     let mut object = 0;
     // SAFETY: reads libSystem's task port for this process.
     let task = unsafe { mach_task_self_ };
@@ -730,6 +754,28 @@ fn protection_label(protection: Option<libc::vm_prot_t>) -> &'static [u8] {
         if protection & flag == 0 { 0 } else { value }
     };
     LABELS[bit(libc::VM_PROT_READ, 1) | bit(libc::VM_PROT_WRITE, 2) | bit(libc::VM_PROT_EXECUTE, 4)]
+}
+
+/// The calling thread's `errno`, kept across a handler that hands the fault back.
+struct Errno(c_int);
+
+impl Errno {
+    /// Read the calling thread's `errno`.
+    fn save() -> Self {
+        // SAFETY: `__error` answers the calling thread's `errno` slot and
+        // touches nothing else; async-signal-safe.
+        let slot = unsafe { libc::__error() };
+        // SAFETY: the slot is the calling thread's, live as long as it is.
+        Self(unsafe { slot.read() })
+    }
+
+    /// Put the saved value back.
+    fn restore(&self) {
+        // SAFETY: as in `save`.
+        let slot = unsafe { libc::__error() };
+        // SAFETY: the calling thread's own slot, written by this thread only.
+        unsafe { slot.write(self.0) };
+    }
 }
 
 /// The calling thread's system-wide id, the one `ps -M` and a sample show.
