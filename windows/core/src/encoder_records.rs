@@ -508,14 +508,19 @@ impl TextureUploadRecord {
         {
             return Err(WireError::InvalidValue);
         }
+        // The blit and the upload pass write the box where it says, unclamped,
+        // so it must lie inside the level.
+        let mip_width = (self.texture.width >> self.level).max(1);
+        let mip_height = (self.texture.height >> self.level).max(1);
+        let end_x = self.origin_x.checked_add(self.width);
+        let end_y = self.origin_y.checked_add(self.height);
+        if end_x.is_none_or(|end| end > mip_width) || end_y.is_none_or(|end| end > mip_height) {
+            return Err(WireError::InvalidValue);
+        }
         let row_bytes = if self.bytes_per_pixel == 0 {
             let format =
                 crate::format::map_d3d_format(self.source_format).ok_or(WireError::InvalidValue)?;
             let (bw, bh) = (format.block_width(), format.block_height());
-            let mip_width = (self.texture.width >> self.level).max(1);
-            let mip_height = (self.texture.height >> self.level).max(1);
-            let end_x = self.origin_x.checked_add(self.width);
-            let end_y = self.origin_y.checked_add(self.height);
             let aligned = self.origin_x.is_multiple_of(bw)
                 && self.origin_y.is_multiple_of(bh)
                 && (self.width.is_multiple_of(bw) || end_x == Some(mip_width))

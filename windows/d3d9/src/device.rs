@@ -2510,7 +2510,7 @@ impl DeviceInner {
     }
 
     /// Padded bytes of the upload-snapshot arena's chunks.
-    pub fn upload_snapshot_bytes(&self) -> u64 {
+    pub fn texture_snapshot_bytes(&self) -> u64 {
         self.upload_snapshots.held_bytes()
     }
 

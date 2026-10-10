@@ -736,8 +736,13 @@ fn canonical_upload_retains_source_and_feedback_through_native_use() {
     assert!(weak_feedback.upgrade().is_none());
 }
 
-/// A 4x4 A8R8G8B8 upload at (4, 4) of a 16x16 level, from `source` at `pitch`.
-fn upload_job(source: Arc<PageBox>, snapshot_offset: Option<u32>, pitch: u32) -> TextureUploadJob {
+/// A 4x4 A8R8G8B8 upload at `origin` of a 16x16 level, from `source` at `pitch`.
+fn upload_job(
+    source: Arc<PageBox>,
+    snapshot_offset: Option<u32>,
+    pitch: u32,
+    origin: u32,
+) -> TextureUploadJob {
     use mtld3d_shared::mtl::{Swizzle, TextureCreateFlags, TextureUsage};
     use mtld3d_types::D3DFMT_A8R8G8B8;
     TextureUploadJob {
@@ -757,7 +762,7 @@ fn upload_job(source: Arc<PageBox>, snapshot_offset: Option<u32>, pitch: u32) ->
         level: 0,
         destination_slice: 0,
         staging_index: 0,
-        origin_x: 4,
+        origin_x: origin,
         origin_y: 4,
         region_w: 4,
         region_h: 4,
@@ -777,28 +782,32 @@ fn upload_job(source: Arc<PageBox>, snapshot_offset: Option<u32>, pitch: u32) ->
 ///
 /// The staging form keeps a zero offset and its level-shaped span. A
 /// snapshot's rows must start on the arena's alignment and end inside the
-/// chunk its lease names.
+/// chunk its lease names, and its box must lie inside the level, overflow
+/// included.
 #[test]
 fn snapshot_upload_records_carry_their_offset_and_check_their_span() {
     use crate::{encoder_data::UploadTextureOpFlags, encoder_records::TextureUploadRecord};
     let staging = Arc::new(PageBox::new_zeroed(16 * 64));
     let chunk = Arc::new(PageBox::new_zeroed(65_536));
     let cases = [
-        (Arc::clone(&staging), None, 64, true),
-        (Arc::clone(&chunk), Some(0), 16, true),
-        (Arc::clone(&chunk), Some(4096), 16, true),
-        (Arc::clone(&chunk), Some(8), 16, false),
-        (Arc::clone(&chunk), Some(65_536 - 48), 16, false),
-        (Arc::clone(&chunk), Some(0), 12, false),
+        (Arc::clone(&staging), None, 64, 4, true),
+        (Arc::clone(&chunk), Some(0), 16, 4, true),
+        (Arc::clone(&chunk), Some(4096), 16, 12, true),
+        (Arc::clone(&chunk), Some(8), 16, 4, false),
+        (Arc::clone(&chunk), Some(65_536 - 48), 16, 4, false),
+        (Arc::clone(&chunk), Some(0), 12, 4, false),
+        // Four texels from x = 14 reach past the 16-texel level.
+        (Arc::clone(&chunk), Some(0), 16, 14, false),
+        (Arc::clone(&chunk), Some(0), 16, u32::MAX - 1, false),
     ];
     let mut frame = empty_frame();
     let mut recorder = FrameRecorder::new();
-    for (source, offset, pitch, _) in &cases {
+    for (source, offset, pitch, origin, _) in &cases {
         recorder
             .record_typed(
                 &mut frame.scratch,
                 UploadTextureOp {
-                    job: upload_job(Arc::clone(source), *offset, *pitch),
+                    job: upload_job(Arc::clone(source), *offset, *pitch, *origin),
                 },
             )
             .unwrap();
@@ -827,7 +836,7 @@ fn snapshot_upload_records_carry_their_offset_and_check_their_span() {
     {}
     let expected: Vec<_> = cases
         .iter()
-        .map(|(_, offset, _, valid)| (offset.is_some(), *offset, offset.unwrap_or(0), *valid))
+        .map(|(_, offset, _, _, valid)| (offset.is_some(), *offset, offset.unwrap_or(0), *valid))
         .collect();
     assert_eq!(seen, expected);
     let frame = packet
