@@ -10,6 +10,8 @@
 //! between the passes before it and the passes after it, whether or not the
 //! level is bound as a target when it is written.
 
+use std::time::{Duration, Instant};
+
 use mtld3d_tests::{Harness, Surface, Texture};
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
@@ -21,7 +23,7 @@ use mtld3d_types::{
 };
 
 use super::{
-    device::{await_logged_lines, run_in_private_log_child, running_as},
+    device::{logged_lines, run_in_private_log_child, running_as},
     render_target::{draw_fill, read_back, sample_mip_level_4, textured_fullscreen_quad},
 };
 
@@ -46,10 +48,12 @@ const RESIDENCY_LOG_FILTER: &str = "warn,mtld3d::d3d9::mem_watch=debug";
 /// Render-target textures drawn into hold no staging while no CPU path has used them.
 ///
 /// Four 1024x1024 A8R8G8B8 targets are 16 MiB of levels. Each is drawn into,
-/// and the first `Present` logs the address-space watch's breakdown, whose
-/// texture staging holder then counts none of them. The workload runs in a
-/// process of its own, so the line it reads holds its device's textures
-/// alone.
+/// and the first `Present` samples the address-space watch, whose breakdown
+/// counts none of them as texture staging. A 32-bit build walks on the
+/// watch's thread, and a later `Present` hands that thread the device's
+/// figures, so the workload presents until the line is logged. The workload
+/// runs in a process of its own, so the line it reads holds its device's
+/// textures alone.
 #[test]
 fn render_target_textures_hold_no_staging_until_a_cpu_path_uses_them() {
     if running_as(RESIDENCY_CHILD_NAME) {
@@ -63,10 +67,12 @@ fn render_target_textures_hold_no_staging_until_a_cpu_path_uses_them() {
     );
 }
 
-/// Draw into four large render-target textures, present once and read the watch's line.
+/// Draw into four large render-target textures, present until the watch logs, and read its line.
 fn residency_workload() {
     const TARGETS: usize = 4;
     const SIDE: u32 = 1024;
+    /// How long the workload presents before it gives up on the line.
+    const BOUND: Duration = Duration::from_secs(10);
     let h = Harness::new();
     let back = h.render_target(0);
     let targets: Vec<Texture<'_>> = (0..TARGETS)
@@ -86,7 +92,19 @@ fn residency_workload() {
         "restore the back buffer"
     );
     assert_eq!(h.present(), D3D_OK, "the first Present samples the watch");
-    let lines = await_logged_lines("address space:", 1);
+    let deadline = Instant::now() + BOUND;
+    let lines = loop {
+        let lines = logged_lines("address space:");
+        if !lines.is_empty() {
+            break lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no address-space line logged within {BOUND:?} of presents"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(h.present(), D3D_OK, "a later Present answers the watch");
+    };
     let line = &lines[0];
     let staging = texture_staging_mib(line);
     assert!(

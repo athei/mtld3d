@@ -94,6 +94,7 @@ pub mod stretch_rect;
 pub mod surface_lock;
 pub mod texture_flags;
 pub mod texture_staging;
+pub mod thread_wait;
 pub mod upload_pass;
 pub mod upload_recovery;
 pub mod upload_redirty;

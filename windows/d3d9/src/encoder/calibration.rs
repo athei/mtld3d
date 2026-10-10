@@ -1,13 +1,6 @@
 //! PERF-only source-clock publication retained through native shutdown.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{Ordering, fence},
-    },
-    thread::JoinHandle,
-    time::Duration,
-};
+use std::{sync::Arc, thread::JoinHandle};
 
 use mtld3d_shared::clock_calibration::ClockCalibration;
 
@@ -65,23 +58,14 @@ impl SourceClock {
 
     /// Wait for the calibration worker to end, then let its handle go.
     ///
-    /// Polls `is_finished` rather than calling `JoinHandle::join`: Wine can
-    /// invalidate a thread handle held for a long session, and `join` panics
-    /// on the failed wait, which ends the process at device release.
-    /// `is_finished` reads the count std keeps on the thread's result, so it
-    /// never waits on the OS handle.
+    /// Waits through `mtld3d_core::thread_wait::wait_until_finished`, never
+    /// `JoinHandle::join`, which can panic at device release under Wine. The
+    /// worker's publication is visible to the check below once it returns.
     pub(super) fn wait(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
         };
-        while !worker.is_finished() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // `is_finished` may read the count without ordering; the worker's
-        // last writes, its publication included, happen before its release
-        // of that count, and this fence makes them visible to the check below.
-        fence(Ordering::Acquire);
-        drop(worker);
+        mtld3d_core::thread_wait::wait_until_finished(worker);
         if matches!(self.clock.get(), Ok(None)) {
             log::warn!(target: LOG_TARGET, "source clock calibration ended without a result; timing invalid");
             // SAFETY: the worker has ended without publishing; this is now

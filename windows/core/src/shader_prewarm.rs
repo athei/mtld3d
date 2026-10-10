@@ -11,7 +11,6 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use crate::LOG_TARGET;
@@ -50,13 +49,7 @@ impl PrewarmHandle {
     pub fn cancel_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
-            // Wine can invalidate the Win32 thread handle during long sessions.
-            // JoinHandle::join would panic on WAIT_FAILED. is_finished reads
-            // the std Packet's Arc count without waiting on that OS handle.
-            while !join.is_finished() {
-                thread::sleep(Duration::from_millis(1));
-            }
-            drop(join);
+            crate::thread_wait::wait_until_finished(join);
         }
     }
 
