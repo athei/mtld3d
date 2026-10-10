@@ -37,15 +37,13 @@
 //!    replaced returns, or `EXCEPTION_CONTINUE_SEARCH` with none, so the
 //!    exception goes on to the debugger or to termination as before. When the
 //!    vectored handler already reported the same exception at first chance,
-//!    the filter's line refers to that report instead of repeating it. The C
-//!    runtime of an MSVC-built program sets a top-level filter of its own at
-//!    startup, after a statically imported d3d9.dll's `DllMain`, and does not
-//!    chain to the one it replaces; so the vectored handler, on every
-//!    exception it treats as possibly fatal, puts this filter back on top and
-//!    keeps the displaced one as the filter it chains to. Best effort: a
-//!    filter installed between that exception and its dispatch to the
-//!    top-level filter replaces this one, which then only runs if that
-//!    filter chains to it. The filter is
+//!    the filter's line refers to that report instead of repeating it. Best
+//!    effort: it runs only where nothing replaces it later, or where what
+//!    replaces it chains to it. The C runtime of an MSVC-built program sets a
+//!    filter of its own at startup, after a statically imported d3d9.dll's
+//!    `DllMain`, and does not chain, so in such a game a crash keeps only the
+//!    first-chance reports, which reach stderr from the unix side before the
+//!    log is named. The filter is
 //!    put back on a `PROCESS_DETACH` the process survives when it is still
 //!    the top one; when something replaced it, a filter that may chain to it
 //!    still exists, so it stops reporting and the image is pinned so the
@@ -369,23 +367,6 @@ fn install_top_filter() {
     TOP_FILTER.armed.store(true, Ordering::Release);
 }
 
-/// Put [`unhandled_filter`] back on top, keeping the filter it displaces to chain to.
-///
-/// Called from the vectored handler for an exception that may end the
-/// process, before the exception reaches the top-level filter. One
-/// interlocked exchange in `kernelbase` when the filter is already on top.
-fn rearm_top_filter() {
-    if !TOP_FILTER.armed.load(Ordering::Acquire) {
-        return;
-    }
-    let ours = unhandled_filter as TopLevelFilter as *mut c_void;
-    // SAFETY: kernel32 export; the argument is this image's filter.
-    let displaced = unsafe { SetUnhandledExceptionFilter(ours) };
-    if displaced != ours {
-        TOP_FILTER.previous.store(displaced, Ordering::Release);
-    }
-}
-
 /// Take [`unhandled_filter`] out before the image goes away, or keep the image if it cannot.
 ///
 /// Still the top-level filter: the one it replaced goes back. Replaced by a
@@ -501,10 +482,6 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
             | STATUS_PRIVILEGED_INSTRUCTION
             | STATUS_ILLEGAL_INSTRUCTION
     );
-
-    if always_fatal || possibly_fatal {
-        rearm_top_filter();
-    }
 
     // Diagnostic-only. Do NOT terminate — let SEH unwind so the game's own
     // unhandled-exception filter still gets to write its crash report.
