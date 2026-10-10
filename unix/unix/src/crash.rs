@@ -40,11 +40,12 @@
 //! image as the image, the ones mapped from no file bytes too, and Wine's
 //! loader keeps the guest's low address space and its own top-down heap as
 //! two such segments, so a guest PC lands in the loader at an offset that
-//! wraps below its load address. A PC in such a segment is reported as
-//! `memory=reserved` instead, with the protection its page has now (`---`
-//! for space reserved and not committed, or freed; `unmapped` for a hole)
-//! and the image that reserves the space. Wine's loader is the only image in
-//! a Wine process that reserves space this way, so there it is guest memory.
+//! wraps below its load address. Wine's loader is the only image in a Wine
+//! process that reserves space this way, so a PC in such a segment is guest
+//! memory, any guest address including the code of a PE image, and is
+//! reported as `memory=guest` instead, with the protection its page has now
+//! (`---` for space reserved and not committed, or freed; `unmapped` for a
+//! hole) and the image that reserves the space.
 //!
 //! A terminal report goes to the process's log file. Before `Direct3DCreate9`
 //! has named it, the report opens the early location `InitLogger` named,
@@ -620,7 +621,7 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
         // Space Wine's loader reserves for the guest: no offset into the
         // loader names it, the page's protection says what it holds now.
         FaultSite::Reserved => {
-            push(&mut b, &mut p, b" memory=reserved page=");
+            push(&mut b, &mut p, b" memory=guest page=");
             push(&mut b, &mut p, protection_label(page_protection(pc)));
             push(&mut b, &mut p, b" by=");
         }
