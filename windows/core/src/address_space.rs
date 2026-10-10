@@ -192,6 +192,12 @@ pub struct PageBoxHolders {
     /// read, a cached wrapper) and the PE side sees the acknowledgment.
     /// Staging a texture still holds counts as texture staging, not here.
     pub upload_leases: u64,
+    /// Chunks of the device's upload-snapshot arena, read or not.
+    ///
+    /// Copies of the box a partial upload carries, for the levels whose
+    /// partial locks would otherwise rename their staging
+    /// (`crate::upload_snapshot`). Held for the device's life, at most 16 MiB.
+    pub upload_snapshots: u64,
     /// Retired boxes parked in the recycle pool for reuse.
     pub pool_parked: u64,
 }
@@ -206,6 +212,7 @@ impl PageBoxHolders {
                 .saturating_add(self.vertex_index_backing)
                 .saturating_add(self.encoder_leases)
                 .saturating_add(self.upload_leases)
+                .saturating_add(self.upload_snapshots)
                 .saturating_add(self.pool_parked),
         )
     }
@@ -217,13 +224,14 @@ impl fmt::Display for PageBoxHolders {
         write!(
             f,
             "page boxes {} MiB: texture staging {}, surfaces {}, vertex/index backing {}, \
-             encoder leases {}, upload leases {}, pool parked {}, other {}",
+             encoder leases {}, upload leases {}, upload snapshots {}, pool parked {}, other {}",
             self.total >> 20,
             self.texture_staging >> 20,
             self.surfaces >> 20,
             self.vertex_index_backing >> 20,
             self.encoder_leases >> 20,
             self.upload_leases >> 20,
+            self.upload_snapshots >> 20,
             self.pool_parked >> 20,
             self.other() >> 20
         )

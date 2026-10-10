@@ -683,6 +683,7 @@ fn summary_golden_layout() {
         "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
         "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
         "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
+        "snapshot    2 6 KB                  full=1                      API: partial uploads copying their box, for levels a partial Lock renamed (full = arena declined)\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
@@ -880,7 +881,8 @@ fn kv_golden_line() {
         " pe_pagebox_pool_parked_bytes=0",
         " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
         " tex_preserve_cpu_total=1",
-        " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
+        " tex_in_place_total=0 tex_snapshot_total=2 tex_snapshot_bytes_total=6144",
+        " tex_snapshot_full_total=1 tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
         " tex_staging_wrapped_bytes=4194304 tex_wrapper_create_total=3",
@@ -1316,6 +1318,10 @@ fn sample_window() -> PerfWindow {
             pagebox_frees: 0,
             pagebox_uncached_allocs: 0,
             pool_recycled: 0,
+            // Two partial uploads snapshotted 6 KiB between them; one was declined.
+            texture_snapshot_bytes: 6144,
+            texture_snapshot_uploads: 2,
+            texture_snapshot_full: 1,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,

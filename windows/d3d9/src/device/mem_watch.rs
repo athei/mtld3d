@@ -172,6 +172,8 @@ impl TextureFootprint {
 struct DeviceFigures {
     footprint: TextureFootprint,
     upload_leases: u64,
+    /// Chunks of the upload-snapshot arena, which only the API thread changes.
+    upload_snapshots: u64,
 }
 
 /// One sample's walk, with what it cost.
@@ -438,6 +440,7 @@ impl DeviceInner {
         DeviceFigures {
             footprint: self.live_texture_footprint(),
             upload_leases: self.encoder.upload_lease_bytes(),
+            upload_snapshots: self.upload_snapshot_bytes(),
         }
     }
 
@@ -510,6 +513,7 @@ fn page_box_holders(figures: &DeviceFigures) -> PageBoxHolders {
         vertex_index_backing: mtld3d_core::buffer_backing::live_backing_bytes().total(),
         encoder_leases: mtld3d_core::held_pages::live_encoder_lease_bytes(),
         upload_leases: figures.upload_leases,
+        upload_snapshots: figures.upload_snapshots,
         pool_parked: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
     }
 }

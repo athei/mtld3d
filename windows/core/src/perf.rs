@@ -1107,6 +1107,20 @@ struct FrameCounters {
     /// pool; the encoder's own pool counts its parks in
     /// `EncoderFrameCounters::pagebox_pool_recycled`.
     pool_recycled: u32,
+    /// Bytes behind `texture_snapshot_uploads`, the snapshots' rows at their padded pitch.
+    texture_snapshot_bytes: u64,
+    /// Partial texture uploads this frame that copied their box into the snapshot arena.
+    ///
+    /// Only a level a partial lock has had to move to fresh pages snapshots
+    /// its partial uploads, so a texture rewritten in part between draws
+    /// pays a box-sized copy per upload here instead of a level-sized one per
+    /// lock in `texture_preserve_cpu`.
+    texture_snapshot_uploads: u32,
+    /// Snapshots the arena could not take: every chunk read and at its cap, or no memory.
+    ///
+    /// Each such upload read the level's staging instead, so the next
+    /// partial lock of the level may rename it again.
+    texture_snapshot_full: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1129,6 +1143,9 @@ impl FrameCounters {
             pagebox_frees: 0,
             pagebox_uncached_allocs: 0,
             pool_recycled: 0,
+            texture_snapshot_bytes: 0,
+            texture_snapshot_uploads: 0,
+            texture_snapshot_full: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1946,6 +1963,21 @@ impl ApiPerfState {
         self.counters.texture_renames = self.counters.texture_renames.saturating_add(1);
     }
 
+    /// One partial upload copied `bytes` of its box into the snapshot arena.
+    pub fn bump_texture_snapshot(&mut self, bytes: u32) {
+        self.counters.texture_snapshot_uploads =
+            self.counters.texture_snapshot_uploads.saturating_add(1);
+        self.counters.texture_snapshot_bytes = self
+            .counters
+            .texture_snapshot_bytes
+            .saturating_add(u64::from(bytes));
+    }
+
+    /// One snapshot the arena could not take; the upload read the staging.
+    pub const fn bump_texture_snapshot_full(&mut self) {
+        self.counters.texture_snapshot_full = self.counters.texture_snapshot_full.saturating_add(1);
+    }
+
     /// Subset of `bump_texture_rename` that took the no-preserve branch.
     ///
     /// A whole-level `D3DLOCK_DISCARD` on a default-pool texture,
@@ -2162,6 +2194,10 @@ impl ApiPerfState {
     pub const fn bump_texture_add_dirty_rect(&mut self, _partial: bool, _area_bp: u32) {}
     #[inline]
     pub const fn bump_texture_rename(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot(&mut self, _bytes: u32) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_full(&mut self) {}
     #[inline]
     pub const fn bump_texture_discard(&mut self) {}
     #[inline]
@@ -3641,6 +3677,11 @@ struct PerfWindow {
     texture_add_dirty_calls: Stat,
     texture_add_dirty_partial: Stat,
     texture_add_dirty_area_bp: Stat,
+    /// Partial uploads that read a snapshot of their box, and the bytes copied.
+    texture_snapshot_uploads: Stat,
+    texture_snapshot_bytes: Stat,
+    /// Snapshots the arena declined; their uploads read the staging.
+    texture_snapshot_full: Stat,
     texture_destroys: Stat,
     texture_blit_uploads: Stat,
     texture_blit_padded_uploads: Stat,
@@ -3913,6 +3954,12 @@ impl PerfWindow {
             .add(u64::from(s.counters.texture_add_dirty_partial));
         self.texture_add_dirty_area_bp
             .add(u64::from(s.counters.texture_add_dirty_area_bp));
+        self.texture_snapshot_uploads
+            .add(u64::from(s.counters.texture_snapshot_uploads));
+        self.texture_snapshot_bytes
+            .add(s.counters.texture_snapshot_bytes);
+        self.texture_snapshot_full
+            .add(u64::from(s.counters.texture_snapshot_full));
         self.texture_destroys.add(u64::from(s.enc.texture_destroys));
         self.texture_blit_uploads
             .add(u64::from(s.enc.texture_blit_uploads));
@@ -5974,6 +6021,17 @@ impl<'a> Summary<'a> {
             None,
             "API: staging pops a warm same-size PageBox; last owners park retired staging",
         );
+        self.res_row(
+            out,
+            "snapshot",
+            &format!(
+                "{n} {kb} KB",
+                n = w.texture_snapshot_uploads.sum,
+                kb = w.texture_snapshot_bytes.sum / 1024,
+            ),
+            Some(&format!("full={f}", f = w.texture_snapshot_full.sum)),
+            "API: partial uploads copying their box, for levels a partial Lock renamed (full = arena declined)",
+        );
         // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
         // around the game's PageBox). `padded` is a blit too, but its
@@ -6839,6 +6897,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("tex_pool_miss", c.texture_pool_misses.sum);
     kv.total("tex_preserve_cpu", c.texture_preserve_cpu.sum);
     kv.total("tex_in_place", c.texture_write_in_place_contended.sum);
+    kv.total("tex_snapshot", c.texture_snapshot_uploads.sum);
+    kv.total("tex_snapshot_bytes", c.texture_snapshot_bytes.sum);
+    kv.total("tex_snapshot_full", c.texture_snapshot_full.sum);
     kv.total("tex_uploads", c.texture_blit_uploads.sum);
     kv.total("tex_uploads_raw", c.raw_texture_uploads());
     kv.total("tex_uploads_padded", c.texture_blit_padded_uploads.sum);
@@ -6951,7 +7012,7 @@ const _: () = {
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 976);
+    assert!(size_of::<FrameCounters>() == 992);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -7010,14 +7071,17 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, pagebox_frees) == 964);
     assert!(core::mem::offset_of!(FrameCounters, pagebox_uncached_allocs) == 968);
     assert!(core::mem::offset_of!(FrameCounters, pool_recycled) == 972);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_bytes) == 976);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_uploads) == 984);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_full) == 988);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 1008);
+    assert!(size_of::<FramePerfPayload>() == 1024);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 976);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 992);
 };

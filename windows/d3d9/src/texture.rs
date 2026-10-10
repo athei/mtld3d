@@ -338,6 +338,18 @@ pub struct TextureInner {
     /// upload scheduled without either would let such a draw sample pages a
     /// later write changes in place.
     observed_staging: u128,
+    /// Subresources whose partial uploads copy their box instead of reading the staging.
+    ///
+    /// Indexed like `observed_staging`. Set, and never cleared, when a write
+    /// moves the subresource's staging to fresh pages carrying the old
+    /// contents: the write landed while an upload still read the pages, which
+    /// a level the game rewrites in part between draws does on every lock.
+    /// From then on each partial upload of it snapshots its box into the
+    /// device's arena when it is scheduled, so it no longer reads the
+    /// staging and the next lock writes in place instead of copying the
+    /// whole level again. Every other subresource keeps reading its staging
+    /// with no copy at all.
+    snapshot_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -2439,14 +2451,6 @@ impl TextureInner {
         }
     }
 
-    /// Clone the staging `Arc` for this mip.
-    ///
-    /// The upload retains these bytes through encoding and GPU retirement. A cached
-    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
-    pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
-        Arc::clone(&self.staging[level])
-    }
-
     /// Base, page-aligned length and row stride of one subresource's staging.
     ///
     /// `face` selects a cube subresource, `None` the 2D mip chain. The
@@ -2613,6 +2617,9 @@ impl TextureInner {
             .expect("validated cube subresource");
         let device_inner = self.device_inner;
         let texture_id = self.texture_id;
+        if preserve == PreserveKind::Cpu {
+            self.snapshot_staging |= self.observed_bit(face, level);
+        }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET,
             key: (texture_id.raw() << 8)
@@ -3050,6 +3057,7 @@ impl TextureInner {
                 // A later lock or whole-mip upload can read bytes outside
                 // the write region, so preserve every logical byte across
                 // all depth slices. The old Arc keeps the source live.
+                self.snapshot_staging |= self.observed_bit(0, level);
                 if perf_attached {
                     DeviceInner::from_ptr(dev_inner_raw)
                         .perf_mut()
@@ -3490,6 +3498,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         upload_generation: Vec::new(),
         dc_open: 0,
         observed_staging: 0,
+        snapshot_staging: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -4941,6 +4950,110 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
+/// What an upload of one subresource reads: its staging, or a snapshot of its box.
+struct UploadSource {
+    staging: PageBoxRead,
+    /// Row stride of `staging`: the level's, or the snapshot's.
+    src_pitch: u32,
+    /// Byte offset of the box in a snapshot chunk; `None` for the staging.
+    snapshot_offset: Option<u32>,
+}
+
+impl UploadSource {
+    /// A read of the subresource's own staging pages.
+    fn staging(pages: &Arc<PageBox>, src_pitch: u32) -> Self {
+        Self {
+            staging: PageBoxRead::new(Arc::clone(pages)),
+            src_pitch,
+            snapshot_offset: None,
+        }
+    }
+}
+
+/// The source an upload of `rect` of `(face, level)` reads.
+///
+/// A subresource marked in `snapshot_staging` copies a partial box into the
+/// device's snapshot arena, so the upload leaves its staging pages alone; any
+/// other upload, and one the arena cannot take, reads the staging. A volume
+/// level, a depth format and a planar YUV level always read the staging: their
+/// uploads take paths that address the whole level.
+fn upload_source(
+    ti: &TextureInner,
+    dev: &mut DeviceInner,
+    face: u32,
+    level: usize,
+    rect: DirtyRect,
+) -> UploadSource {
+    let pages = ti.cube.as_deref().map_or_else(
+        || &ti.staging[level],
+        |cube| {
+            &cube.staging[ti
+                .cube_subresource_index(face, level)
+                .expect("validated cube subresource")]
+        },
+    );
+    let src_pitch = ti.mip_bytes_per_row(level);
+    if ti.snapshot_staging & ti.observed_bit(face, level) == 0
+        || ti.depth > 1
+        || ti.flags.contains(TextureFlags::DEPTH_FORMAT)
+        || ti.planar_storage_extent().is_some()
+    {
+        return UploadSource::staging(pages, src_pitch);
+    }
+    // The upload pass addresses its source by texel and takes any 16-byte
+    // aligned pitch; a blit needs the device's linear texture alignment, so
+    // a snapshot never falls into the encoder's repack.
+    let expansion =
+        mtld3d_core::upload_pass::is_expanded_upload(ti.d3d_format, ti.metal_pixel_format);
+    let align = u32::try_from(mtld3d_core::upload_snapshot::SNAPSHOT_ALIGN).expect("16 fits u32");
+    let pitch_align = if expansion {
+        align
+    } else {
+        align.max(dev.gpu_caps().min_linear_texture_align)
+    };
+    let Some(layout) = mtld3d_core::texture_staging::snapshot_layout(
+        rect,
+        ti.mip_shape(level),
+        ti.block_bytes,
+        src_pitch,
+        pitch_align,
+    ) else {
+        // A whole-level box, one off the block grid or one over the size
+        // limit reads the staging by design: the next write's rule covers it.
+        return UploadSource::staging(pages, src_pitch);
+    };
+    let source = &pages.as_slice()[..pages.logical_len()];
+    let written = dev
+        .upload_snapshots_mut()
+        .write(layout.len as usize, |destination| {
+            mtld3d_core::texture_staging::copy_rows(
+                source,
+                layout.src_offset,
+                src_pitch as usize,
+                destination,
+                layout.pitch as usize,
+                layout.row_bytes as usize,
+                layout.rows as usize,
+            )
+        });
+    let Some(snapshot) = written else {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the arena holds no free chunk under its cap, or the box \
+             could not be copied; the upload reads the staging and the next partial lock of the \
+             level may rename it"
+        );
+        dev.perf_mut().bump_texture_snapshot_full();
+        return UploadSource::staging(pages, src_pitch);
+    };
+    dev.perf_mut().bump_texture_snapshot(layout.len);
+    UploadSource {
+        staging: snapshot.read,
+        src_pitch: layout.pitch,
+        snapshot_offset: Some(snapshot.offset),
+    }
+}
+
 /// Build the upload operation and push it onto the current frame's op list.
 ///
 /// The operation holds an `Arc` clone of the staging mip plus a snapshot of
@@ -5013,9 +5126,11 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
         ti.observed_staging |= ti.observed_bit(0, level_u);
     }
+    let source = upload_source(ti, dev, 0, level_u, rect);
+    let snapshot_offset = source.snapshot_offset;
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging: PageBoxRead::new(ti.staging_arc(level_u)),
+        staging: source.staging,
         level,
         destination_slice: 0,
         staging_index: level_u,
@@ -5024,18 +5139,22 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: (ti.depth >> level).max(1),
         slice_pitch,
         redirty: dev.upload_redirty(),
         release_staging,
         upload_generation,
-        snapshot_offset: None,
+        snapshot_offset,
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
-    ti.last_submit_seq[level as usize] = dev.current_seq();
+    // A snapshot leaves the staging unread, so the level's in-flight stamp
+    // stays as it was, as for a resampled upload.
+    if snapshot_offset.is_none() {
+        ti.last_submit_seq[level as usize] = dev.current_seq();
+    }
     ti.was_uploaded[level as usize] = true;
     // Once per (texture, level, whole-or-partial), so a log shows which levels
     // publish sub-rects and which always go whole.
@@ -5180,18 +5299,22 @@ fn schedule_cube_upload<const ORDERED: bool>(
         rect.h
     );
     let bit = ti.observed_bit(face, level_u);
+    let source = upload_source(ti, dev, face, level_u, rect);
+    let snapshot_offset = source.snapshot_offset;
     let cube = ti.cube.as_deref_mut().expect("cube storage");
     let older_reader =
         cube.staging[index].has_readers() && cube.last_submit_seq[index] != dev.current_seq();
-    let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
-    cube.last_submit_seq[index] = dev.current_seq();
+    // A snapshot leaves the staging unread, so its in-flight stamp stays.
+    if snapshot_offset.is_none() {
+        cube.last_submit_seq[index] = dev.current_seq();
+    }
     cube.was_uploaded[index] = true;
     if older_reader {
         ti.observed_staging |= bit;
     }
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging,
+        staging: source.staging,
         level,
         destination_slice: face,
         staging_index: index,
@@ -5200,7 +5323,7 @@ fn schedule_cube_upload<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: 1,
         slice_pitch,
@@ -5209,7 +5332,7 @@ fn schedule_cube_upload<const ORDERED: bool>(
         // written and uploaded by paths that expect the level to be there.
         release_staging: false,
         upload_generation: 0,
-        snapshot_offset: None,
+        snapshot_offset,
     };
     if ORDERED {
         // The ordered placement rides the flags only the mip-carrying form
