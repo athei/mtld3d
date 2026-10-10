@@ -48,7 +48,10 @@ use mtld3d_core::{
     shader_compile_stats::{self, CompileStats},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
-    texture_versions::{TextureVersions, VersionShape},
+    texture_versions::{
+        TexelRect, TextureVersions, UploadFootprint, VersionShape, records_every_write,
+        upload_written_rect,
+    },
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
     upload_redirty::RedirtyEntry,
@@ -58,7 +61,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType, CopyBufferToBufferInfo,
-    CopyBufferToTextureInfo, ExtraColorDesc, MetalHandle, PassDescriptor, TextureCreateDesc,
+    CopyBufferToTextureInfo, CopyTextureSubRectInfo, ExtraColorDesc, MetalHandle, PassDescriptor,
+    TextureCreateDesc,
     encoder_protocol::EncoderSubmitMode,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
@@ -1148,6 +1152,15 @@ pub struct FrameEncoder {
     /// and queues the version it replaces; the retention drain reclaims
     /// what has settled under the same gate as `pending_resource_retention`.
     texture_versions: TextureVersions<TextureViews>,
+    /// Every version handle of a texture whose preserve copies follow its write history.
+    ///
+    /// Live and retiring versions; a version leaves at `retire_texture_handle`
+    /// and comes back when a rename takes it again. The attachment setters
+    /// and the `StretchRect`, `ColorFill` and region-upload writers check
+    /// their destination against it (`assert_unversioned_write`), since a
+    /// write through any of them would be missing from the history.
+    #[cfg(debug_assertions)]
+    versioned_handles: FxHashSet<u64>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
     ///
@@ -1722,6 +1735,8 @@ impl FrameEncoder {
             texture_cache: FxHashMap::default(),
             snapshot_wrappers: FxHashMap::default(),
             texture_versions: TextureVersions::new(),
+            #[cfg(debug_assertions)]
+            versioned_handles: FxHashSet::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
             vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
@@ -3444,6 +3459,10 @@ impl FrameEncoder {
     /// no further pass opens this frame, `submit` synthesises a trailing
     /// blit-only `PassDescriptor` to drain it.
     pub fn push_stretch_rect_blit(&mut self, blit: BlitCommand) {
+        #[cfg(debug_assertions)]
+        if blit.cmd != BlitCommandType::GenerateMipmaps as u32 {
+            self.assert_unversioned_write(blit.dst_handle, "a StretchRect or region-update blit");
+        }
         self.pass_state.push_pending_leading_blit(blit);
     }
 
@@ -3458,6 +3477,8 @@ impl FrameEncoder {
 
     /// Bind render target 0, with its subresource, alpha bit and multisample companion.
     pub fn set_color_render_target(&mut self, binding: &ColorRtBinding) {
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(binding.texture.raw(), "render target 0");
         self.pass_state.set_color_render_target_subresource(
             binding.texture,
             &TargetExtent::new(binding.scale, binding.logical_size, binding.size),
@@ -3606,6 +3627,10 @@ impl FrameEncoder {
     /// `binding.logical_size` is the D3D9-reported extent and `binding.scale`
     /// what it is rasterized at, as for render target 0.
     pub fn set_extra_color_render_target(&mut self, slot: usize, binding: Option<ExtraColorSlot>) {
+        #[cfg(debug_assertions)]
+        if let Some(bound) = &binding {
+            self.assert_unversioned_write(bound.texture.raw(), "an extra render target");
+        }
         self.pass_state.set_extra_color_render_target(slot, binding);
     }
 
@@ -3737,6 +3762,8 @@ impl FrameEncoder {
         is_sampleable: bool,
         has_stencil: bool,
     ) {
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(texture.raw(), "the depth-stencil attachment");
         self.pass_state.set_depth_stencil_attachment_level(
             texture,
             level,
@@ -4532,6 +4559,8 @@ impl FrameEncoder {
         if dst_handle == 0 || src_handle == 0 {
             return;
         }
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(dst_handle, "a scaling StretchRect");
         // SAFETY: both handles are live Metal texture addresses resolved by
         // the caller (`get_or_create_texture` / a standalone colour handle),
         // non-zero per the guard above.
@@ -4757,6 +4786,8 @@ impl FrameEncoder {
         if fill.texture.is_null() || rw == 0 || rh == 0 {
             return;
         }
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(fill.texture.raw(), "ColorFill");
         // Save the device's current attachments + viewport so the one-off
         // destination pass doesn't perturb the live render target. The colour
         // set comes back verbatim, scale and extra targets included.
@@ -6550,11 +6581,51 @@ impl FrameEncoder {
         else {
             return false;
         };
-        if job.depth() > 1 {
+        let emitted = if job.depth() > 1 {
             self.run_volume_upload_blit(&job, handle)
         } else {
             self.run_texture_upload_blit::<false>(&job, handle)
+        };
+        if emitted {
+            self.note_upload_write(&job);
         }
+        emitted
+    }
+
+    /// Stamp an emitted upload into its texture's write history, if it keeps one.
+    ///
+    /// The rectangle is the one the upload writes, which for a compressed
+    /// rectangle off the block grid is the whole level
+    /// (`run_texture_upload_blit` falls back to a full-level copy there).
+    fn note_upload_write(&mut self, job: &UploadView<'_>) {
+        let info = job.info();
+        if job.depth() > 1 || !self.texture_versions.records_writes(info.texture_id()) {
+            return;
+        }
+        let level = job.level();
+        let extent = (
+            (info.width().max(1) >> level).max(1),
+            (info.height().max(1) >> level).max(1),
+        );
+        let requested = TexelRect::new(
+            job.origin_x(),
+            job.origin_y(),
+            job.region_w(),
+            job.region_h(),
+        );
+        // The same format and grid check the blit path decides its fallback by.
+        let compressed = if job.bytes_per_pixel() == 0 {
+            map_d3d_format(job.src_d3d_format())
+        } else {
+            None
+        };
+        let written = upload_written_rect(requested, extent, compressed.as_ref());
+        self.texture_versions.note_write(
+            info.texture_id(),
+            job.destination_slice(),
+            level,
+            &written,
+        );
     }
 
     /// Prune the handle-keyed records for a texture being destroyed.
@@ -6574,6 +6645,8 @@ impl FrameEncoder {
         // The address can name the next texture Metal creates, which must not
         // inherit this one's clears.
         self.cleared_targets.forget(texture);
+        #[cfg(debug_assertions)]
+        self.versioned_handles.remove(&handle);
         let copies =
             take_source_scratch(&mut self.depth_snapshots, &mut self.stretch_scratch, handle);
         for copy in copies.into_iter().flatten() {
@@ -6587,6 +6660,25 @@ impl FrameEncoder {
                     from_texture: false,
                 });
         }
+    }
+
+    /// Stop a write the write history of `handle`'s texture would miss.
+    ///
+    /// `handle` is a destination about to be written outside the upload and
+    /// mip-regeneration paths. A version of a texture whose preserve copies
+    /// follow its write history (`records_every_write`) is never one: D3D9
+    /// refuses such a texture as a render target and as a `StretchRect` or
+    /// `ColorFill` destination. If it ever were, a later reuse of a spare
+    /// would copy only the stamped tiles and drop this write, so builds with
+    /// debug assertions stop here instead; production builds compile none of
+    /// it.
+    #[cfg(debug_assertions)]
+    fn assert_unversioned_write(&self, handle: u64, writer: &str) {
+        assert!(
+            !self.versioned_handles.contains(&handle),
+            "{writer} writes texture {handle:#x}, a version whose write history records only \
+             uploads and mip regeneration",
+        );
     }
 
     /// Drain resource-retention entries whose seq has retired on the GPU.
@@ -6603,7 +6695,7 @@ impl FrameEncoder {
         // completing does not stand for the upload buffer's completion. The
         // unix side publishes a frame that uploads nothing on the upload
         // counter too, so the lower of the two keeps moving without uploads.
-        let Some((coh, _)) = self.upload_gate() else {
+        let Some((coh, failed)) = self.upload_gate() else {
             return;
         };
         let mut buffers: Vec<u64> = Vec::new();
@@ -6654,7 +6746,7 @@ impl FrameEncoder {
             }
             drained.push(entry);
         }
-        self.reclaim_texture_versions(coh, &mut textures);
+        self.reclaim_texture_versions(coh, failed, &mut textures);
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         // PageBoxes inside `drained` are released here, after every
@@ -6684,19 +6776,21 @@ impl FrameEncoder {
 
     /// Park every retired texture version the GPU has finished with, and trim aged spares.
     ///
-    /// `settled` is the drain's gate, the lower of the two retirement
-    /// counters. Each popped version leaves the handle-keyed records first,
+    /// `settled` and `failed` are the drain's gate, the lower of the two
+    /// retirement counters and the highest aborted submission read with it;
+    /// a version that was live through an abort parks with unknown contents.
+    /// Each popped version leaves the handle-keyed records first,
     /// as a destroyed texture does at this drain: it may serve the next
     /// rename under the same addresses, which must not inherit its clears,
     /// its sampled marks or its scratch copies. What the pool turns away and
     /// the spares past their age join the drain's texture destroys; nothing
     /// names them, since a parked spare is in no cache and no command.
-    fn reclaim_texture_versions(&mut self, settled: u64, textures: &mut Vec<u64>) {
+    fn reclaim_texture_versions(&mut self, settled: u64, failed: u64, textures: &mut Vec<u64>) {
         while let Some(entry) = self.texture_versions.pop_retired(settled) {
             for handle in entry.views().owned_handles() {
                 self.retire_texture_handle(handle.raw());
             }
-            if let Some(views) = self.texture_versions.park(entry) {
+            if let Some(views) = self.texture_versions.park(entry, failed) {
                 self.collect_version_destroy(&views, textures);
             }
         }
@@ -7039,6 +7133,7 @@ impl FrameEncoder {
                 self.pass_state
                     .note_ordered_texture_write(unsafe { MetalHandle::new(handle) });
             }
+            self.note_upload_write(job);
             // The subresource reached the command stream, so its decline
             // record (if it had one) has served its purpose and its retry
             // budget goes back, and a level that was holding its staging for
@@ -7075,6 +7170,10 @@ impl FrameEncoder {
     /// *before* the caller's upload blit, so the stream order is: earlier
     /// uploads → old, copies old → new, this upload → new. The dominant case
     /// — a single-mip texture with a full-mip upload — carries nothing over.
+    /// A spare of a texture that keeps a write history receives only the
+    /// box of tiles written since it retired (`TextureVersions::preserve_plan`),
+    /// so a sprite rewritten at one corner copies that corner, not the level;
+    /// a fresh texture or a spare of unknown contents receives every level.
     /// The old version retires behind this frame's submission, which holds
     /// the draws that sampled it, and becomes a spare once the GPU has
     /// finished that submission.
@@ -7092,14 +7191,15 @@ impl FrameEncoder {
         let info = job.info();
         let texture_id = info.texture_id();
         let desc = self.texture_desc_from_view(&info);
-        let (spare, discarded) = self
-            .texture_versions
-            .take_spare(texture_id, VersionShape::of(&desc));
+        let records = records_every_write(&desc, info.usage_flags());
+        let (spare, discarded) =
+            self.texture_versions
+                .take_spare(texture_id, VersionShape::of(&desc), records);
         for stale in discarded {
             self.retire_texture_views(&stale, MetalHandle::NULL);
         }
-        let views = if let Some(spare) = spare {
-            spare.into_views()
+        let (views, held_writes) = if let Some(spare) = spare {
+            spare.into_parts()
         } else {
             let mut views = TextureViews::EMPTY;
             let status = self.batch_create_textures(
@@ -7119,7 +7219,7 @@ impl FrameEncoder {
                 );
                 return old_handle;
             }
-            views
+            (views, None)
         };
         let fresh = views.linear;
 
@@ -7144,51 +7244,71 @@ impl FrameEncoder {
             && job.origin_y() == 0
             && job.region_w() >= mip_w
             && job.region_h() >= mip_h;
-        let slices = if info.create_flags().contains(TextureCreateFlags::TYPE_CUBE) {
-            6
-        } else {
-            1
-        };
         // A write ordered among application passes must complete before its
         // untouched pixels are preserved. The caller places the following
         // upload in this same stream, including for a full overwrite.
         if ordered {
             self.end_current_pass("ordered_texture_preserve");
         }
-        for slice in 0..slices {
-            for level in 0..info.levels() {
-                if slice == job.destination_slice() && level == job.level() && full_cover {
-                    continue;
-                }
-                let lw = (info.width().max(1) >> level).max(1);
-                let lh = (info.height().max(1) >> level).max(1);
-                let mut preserve = if is_volume {
-                    BlitCommand::copy_texture_to_texture_full_volume_mip(
-                        old_handle,
-                        fresh.raw(),
-                        level,
-                        lw,
-                        lh,
-                        (info.depth().max(1) >> level).max(1),
-                    )
-                } else {
-                    BlitCommand::copy_texture_to_texture_full_mip(
-                        old_handle,
-                        fresh.raw(),
-                        level,
-                        lw,
-                        lh,
-                    )
-                };
-                preserve.src_slice = slice;
-                preserve.dst_slice = slice;
-                if ordered {
-                    self.pass_state.push_pending_leading_blit(preserve);
-                } else {
-                    self.pass_state.note_stencil_blit(&preserve);
-                    self.frame_blit_commands.push(preserve);
-                }
+        // A fresh texture, or a spare of unknown contents, takes every level
+        // whole; a known spare takes what was written since it retired.
+        let footprint = UploadFootprint::new(job.destination_slice(), job.level(), full_cover);
+        let plan = self.texture_versions.preserve_plan(
+            texture_id,
+            &VersionShape::of(&desc),
+            held_writes,
+            &footprint,
+        );
+        for copy in &plan {
+            let (slice, level) = (copy.slice(), copy.level());
+            let lw = (info.width().max(1) >> level).max(1);
+            let lh = (info.height().max(1) >> level).max(1);
+            let mut preserve = if is_volume {
+                BlitCommand::copy_texture_to_texture_full_volume_mip(
+                    old_handle,
+                    fresh.raw(),
+                    level,
+                    lw,
+                    lh,
+                    (info.depth().max(1) >> level).max(1),
+                )
+            } else if let Some(region) = copy.region() {
+                BlitCommand::copy_texture_to_texture_sub_rect(&CopyTextureSubRectInfo {
+                    src_texture: old_handle,
+                    dst_texture: fresh.raw(),
+                    mip_level: level,
+                    dst_mip_level: level,
+                    src_slice: slice,
+                    dst_slice: slice,
+                    src_origin_x: region.x(),
+                    src_origin_y: region.y(),
+                    dst_origin_x: region.x(),
+                    dst_origin_y: region.y(),
+                    region_w: region.width(),
+                    region_h: region.height(),
+                })
+            } else {
+                BlitCommand::copy_texture_to_texture_full_mip(
+                    old_handle,
+                    fresh.raw(),
+                    level,
+                    lw,
+                    lh,
+                )
+            };
+            preserve.src_slice = slice;
+            preserve.dst_slice = slice;
+            if ordered {
+                self.pass_state.push_pending_leading_blit(preserve);
+            } else {
+                self.pass_state.note_stencil_blit(&preserve);
+                self.frame_blit_commands.push(preserve);
             }
+        }
+        #[cfg(debug_assertions)]
+        if records {
+            self.versioned_handles.insert(old_handle);
+            self.versioned_handles.insert(fresh.raw());
         }
         if !ordered {
             self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
@@ -7226,6 +7346,7 @@ impl FrameEncoder {
         self.frame_blit_commands
             .push(BlitCommand::generate_mipmaps(state.views.linear.raw()));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.texture_versions.note_mip_regeneration(texture_id);
     }
 
     /// Regenerate an autogen texture's mip chain in the *ordered* stretch-rect blit stream.
@@ -7249,6 +7370,7 @@ impl FrameEncoder {
         self.pass_state.note_texture_read(state.views.linear);
         self.end_current_pass("autogen_rt_regen");
         self.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
+        self.texture_versions.note_mip_regeneration(texture_id);
     }
 
     /// Blit-based 2D upload.
@@ -7302,10 +7424,11 @@ impl FrameEncoder {
             let bb = fmt.block_bytes();
             let mip_w = (job.info().width().max(1) >> job.level()).max(1);
             let mip_h = (job.info().height().max(1) >> job.level()).max(1);
-            let aligned = job.origin_x().is_multiple_of(bw)
-                && job.origin_y().is_multiple_of(bh)
-                && (job.region_w().is_multiple_of(bw) || job.origin_x() + job.region_w() == mip_w)
-                && (job.region_h().is_multiple_of(bh) || job.origin_y() + job.region_h() == mip_h);
+            let aligned = fmt.rect_on_block_grid(
+                (job.origin_x(), job.origin_y()),
+                (job.region_w(), job.region_h()),
+                (mip_w, mip_h),
+            );
             if aligned {
                 let block_x = job.origin_x() / bw;
                 let block_y = job.origin_y() / bh;
@@ -7955,6 +8078,8 @@ impl FrameEncoder {
         if color_handle == 0 || width == 0 || height == 0 || src_stride == 0 {
             return;
         }
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(color_handle, "a colour-surface write-back");
         let Some((buffer_handle, bytes_per_row)) =
             self.stage_color_rows("upload_bytes_to_color_handle", rows, height, src_stride)
         else {

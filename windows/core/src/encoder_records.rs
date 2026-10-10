@@ -520,15 +520,15 @@ impl TextureUploadRecord {
         let row_bytes = if self.bytes_per_pixel == 0 {
             let format =
                 crate::format::map_d3d_format(self.source_format).ok_or(WireError::InvalidValue)?;
-            let (bw, bh) = (format.block_width(), format.block_height());
-            let aligned = self.origin_x.is_multiple_of(bw)
-                && self.origin_y.is_multiple_of(bh)
-                && (self.width.is_multiple_of(bw) || end_x == Some(mip_width))
-                && (self.height.is_multiple_of(bh) || end_y == Some(mip_height));
+            let aligned = format.rect_on_block_grid(
+                (self.origin_x, self.origin_y),
+                (self.width, self.height),
+                (mip_width, mip_height),
+            );
             if !format.is_compressed() || !aligned {
                 return Err(WireError::InvalidValue);
             }
-            u64::from(self.width.div_ceil(bw)) * u64::from(format.block_bytes())
+            u64::from(self.width.div_ceil(format.block_width())) * u64::from(format.block_bytes())
         } else {
             u64::from(self.width) * u64::from(self.bytes_per_pixel)
         };

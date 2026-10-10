@@ -442,6 +442,41 @@ attachment selection immediately, while forward aliases survive final store
 and clear-coalescing decisions until the existing GPU retirement boundary.
 The retirement walk removes each alias before destroying its native object.
 
+A rename (an upload into a texture an earlier draw of the submission sampled,
+`rename_sampled_texture`) does not destroy the version it replaces. The
+version waits in the retiring queue of `TextureVersions`
+(`windows/core/src/texture_versions.rs`) under the submission that last named
+it, and the retention drain pops it under the drain's own gate, the lower of
+`coherent_seq` and `upload_coherent_seq`. It then leaves every handle-keyed
+record through `retire_texture_handle`, exactly as a destroyed texture does,
+since the next rename of the same texture takes the newest such spare instead
+of allocating, keeps its views and registers them again, and nothing may
+answer for it from before. The pool holds at most 256 MiB across every
+texture; a version that would take it past that, a version of a released
+texture or of a changed shape, and a spare unused for 120 submissions are
+destroyed. `Reset` and shutdown queue every spare and retiring version before
+their GPU-idle wait.
+
+A reused spare still has to receive what the texture changed after it
+retired. For a 2D or cube colour texture whose application usage is neither
+render target nor depth stencil, D3D9 leaves uploads and mip regeneration as
+the only writers: such a texture cannot be a render target, a `StretchRect`
+destination or a `ColorFill` destination. Those textures keep a write counter
+and, per slice and level, a grid of at most 32 by 32 tiles of at least 16
+texels holding the counter of the last write that touched each tile. Emitted
+uploads, their replays after an aborted submission, the whole-level fallback
+of a compressed rectangle off the block grid and mip regeneration (levels 1
+and up) stamp it. A version records the counter when it retires, and the
+preserve copy into it covers only the tile-aligned bounding box of the tiles
+stamped later, so every version is still a complete snapshot. A version that
+was live through an aborted submission, a fresh allocation and every other
+texture kind take whole-level copies. Builds with debug assertions check the
+attachment setters and the `StretchRect`, `ColorFill` and region-update
+writers against the handles of such textures and stop on a write the history
+would miss. In the `perf-kv` line `tex_reorder` still counts every rename,
+`tex_destroy` falls by the renames a spare served, and the allocations and
+copies saved show in `enc_op` and `gpu_upload`.
+
 ## The device record the wire names
 
 `CreateCommandQueue` builds one record per D3D device on the unix side (`metal/record.rs`): the `MTLCommandQueue` and its retain, the presentation state the presenter thread and the submit thread share, and the device's presented-cadence probe. It hands the PE side a `DeviceRecordHandle` for it, which `DeviceInner` keeps and every later thunk that acts on that device carries: a submission, the wait-policy and idle-wait barriers, the creation-time clears, a read-back, and the `DestroyCommandQueue` that gives the handle back and frees the record. The unix side resolves a device by dereferencing what the caller holds, so nothing indexes devices by address and no `MTLCommandQueue` pointer rides the wire for the PE side to outlive.
