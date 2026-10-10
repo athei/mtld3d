@@ -41,6 +41,17 @@
 //! chaining, and one left behind by a `FreeLibrary` before any device would
 //! point into unmapped code.
 //!
+//! The vectored handler runs on whatever thread raised the exception, and
+//! nothing it reaches touches a Rust thread-local or the allocator: fixed
+//! buffers, atomics, `kernel32` lookups that allocate nothing, and the
+//! synchronous log thunk. Wine leaves `TEB.ThreadLocalStoragePointer` null
+//! on a thread created without thread-attach notifications and after a
+//! thread's detach, and copy protectors raise exceptions on such threads, so
+//! a thread-local read in the handler faults inside this image; that fault
+//! reaches the handler again, and a protector's frame that resumes the first
+//! exception at its own PC loops the thread. A faulting thread may also hold
+//! an allocator's lock.
+//!
 //! `RUST_BACKTRACE=1` is set here (if unset) so the default panic hook
 //! attempts a backtrace.
 
@@ -63,6 +74,8 @@ const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// `GetModuleHandleEx` flag that leaves the module's reference count as it is.
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 2;
 /// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
 
@@ -248,7 +261,7 @@ unsafe extern "system" {
     fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
-    fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
+    fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
     fn VirtualQuery(
         address: *const c_void,
         buffer: *mut MemoryBasicInformation,
@@ -303,7 +316,9 @@ pub fn uninstall() {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // A panic ends the process: its report may open the early log.
+        // A panic ends the process: its report may open the early log, with
+        // the lines queued since load ahead of it.
+        crate::log_sink::forward_parked();
         crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
         crumb::dump_recent(32);
         emit_image_bases();
@@ -395,23 +410,32 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
         return;
     }
+    // The lookup and the file name each take Wine's loader lock for the
+    // walk of the module list (`RtlPcToFileHeader` and `LdrGetDllFullName`
+    // enter `loader_section` in `dlls/ntdll/loader.c`). The lock is a critical
+    // section, so a fault on the thread that holds it re-enters it, and the
+    // report costs this only for the first few foreign faults. The handle is
+    // borrowed: without UNCHANGED_REFCOUNT every report would add a reference
+    // the faulting module never loses.
     let mut module: *mut c_void = core::ptr::null_mut();
     // SAFETY: kernel32 export; `addr` is only used as a lookup key.
     let found = unsafe {
         GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             addr.cast::<u8>(),
             &raw mut module,
         )
     };
-    let mut path = [0u8; 260];
+    // The wide form: the ANSI one converts through a buffer it allocates on
+    // the process heap.
+    let mut path = [0u16; 260];
     let path_len = if found == 0 || module.is_null() {
         0
     } else {
-        // SAFETY: kernel32 export writing at most `path.len()` bytes.
-        unsafe { GetModuleFileNameA(module, path.as_mut_ptr(), 260) }
+        // SAFETY: kernel32 export writing at most `path.len()` UTF-16 units.
+        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), 260) }
     };
-    let mut buf = [0u8; 400];
+    let mut buf = [0u8; 1024];
     let mut pos = 0;
     push(
         &mut buf,
@@ -426,7 +450,7 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
         push(&mut buf, &mut pos, b"?");
     } else {
         let n = (path_len as usize).min(path.len());
-        push(&mut buf, &mut pos, &path[..n]);
+        push_utf16(&mut buf, &mut pos, &path[..n]);
         push(&mut buf, &mut pos, b" base=");
         push_hex(&mut buf, &mut pos, module as usize as u64);
     }
@@ -446,25 +470,22 @@ fn push_free_space(buf: &mut [u8], pos: &mut usize) {
     push_hex(buf, pos, space.largest_mib());
 }
 
+/// Whether `addr` lies in this image, from its own headers.
+///
+/// Every access violation and illegal instruction in the process asks this,
+/// so it makes no call: no loader lock, and no reference taken on the module
+/// that faulted.
 fn fault_in_our_dll(addr: *mut c_void) -> bool {
-    let our = D3D9_HMODULE.load(Ordering::Acquire);
-    if our.is_null() {
+    let base = D3D9_HMODULE.load(Ordering::Acquire) as usize;
+    if base == 0 {
         return false;
     }
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: GetModuleHandleExA with FROM_ADDRESS returns the HMODULE
-    // containing `addr` without incrementing its refcount when paired
-    // with UNCHANGED_REFCOUNT (flag 2). Passing just FROM_ADDRESS
-    // (flag 4) adds a refcount — the leak is acceptable because this
-    // only runs on a fault the process does not survive.
-    let ok = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            addr.cast::<u8>(),
-            &raw mut module,
-        )
+    // SAFETY: `base` is this image's `HMODULE` from `DllMain`, and the
+    // handler is registered only while the image is mapped.
+    let Some(size) = (unsafe { mtld3d_shared::identity::image_size(base) }) else {
+        return false;
     };
-    ok != 0 && module == our
+    (addr as usize).wrapping_sub(base) < size
 }
 
 /// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
@@ -497,6 +518,15 @@ fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {
     let take = bytes.len().min(avail);
     buf[*pos..*pos + take].copy_from_slice(&bytes[..take]);
     *pos += take;
+}
+
+/// Append UTF-16 text as UTF-8, an unpaired surrogate as U+FFFD.
+fn push_utf16(buf: &mut [u8], pos: &mut usize, units: &[u16]) {
+    for c in char::decode_utf16(units.iter().copied()) {
+        let mut utf8 = [0u8; 4];
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        push(buf, pos, c.encode_utf8(&mut utf8).as_bytes());
+    }
 }
 
 fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {

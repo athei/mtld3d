@@ -36,6 +36,7 @@ mod device;
 mod draw;
 mod dxt_volume;
 mod dynamic_depth;
+mod exception_handler;
 mod expand16;
 mod export_prologues;
 mod failure_exits;

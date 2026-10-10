@@ -30,7 +30,7 @@
 //! recovers opens nothing and leaves the log for `OpenLog` to place. The
 //! reserved-space test reports a PC in a zero-fill segment of this binary,
 //! the shape of a guest address inside Wine's loader, which must read as
-//! reserved memory rather than an offset into the image.
+//! guest memory rather than an offset into the image.
 //!
 //! Wine is not in a unit test's process, so the branch that asks it for the
 //! calling thread's TEB is exercised through a stand-in `NtCurrentTeb` stored
@@ -1046,14 +1046,14 @@ fn a_recovered_foreign_fault_creates_no_file_and_leaves_the_sink_pending() {
     );
 }
 
-/// A PC in a segment with no file bytes is reported as reserved memory, not an image offset.
+/// A PC in a segment with no file bytes is reported as guest memory, not an image offset.
 ///
 /// The PC lies in this binary's zero-fill segment, which `dladdr` attributes
 /// to the binary just as it attributes a guest address to Wine's loader. The
-/// report names the reserved space, the page's protection and the image that
-/// reserves it, and no image offset or symbol.
+/// report names it guest memory, with the page's protection and the image
+/// that reserves the space, and no image offset or symbol.
 #[test]
-fn a_pc_in_reserved_space_is_reported_as_reserved_memory() {
+fn a_pc_in_reserved_space_is_reported_as_guest_memory() {
     if std::env::var_os(RESERVED_SELFTEST_ENV).is_some() {
         let pc = (&raw const mtld3d_test_reserve) as usize as u64 + 0x100;
         // The kernel's context, modelled with live local storage; a zero
@@ -1074,7 +1074,7 @@ fn a_pc_in_reserved_space_is_reported_as_reserved_memory() {
     let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args([
             "--exact",
-            "crash::tests::a_pc_in_reserved_space_is_reported_as_reserved_memory",
+            "crash::tests::a_pc_in_reserved_space_is_reported_as_guest_memory",
             "--nocapture",
         ])
         .env(RESERVED_SELFTEST_ENV, "1")
@@ -1088,7 +1088,7 @@ fn a_pc_in_reserved_space_is_reported_as_reserved_memory() {
         .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
     assert!(line.contains("signo=10"), "{line}");
     // The zero-fill pages are mapped read-write and nothing else.
-    assert!(line.contains(" memory=reserved page=rw- by=/"), "{line}");
+    assert!(line.contains(" memory=guest page=rw- by=/"), "{line}");
     assert!(!line.contains("image="), "{line}");
     assert!(!line.contains(" sym="), "{line}");
     assert!(!line.contains("+0x"), "{line}");

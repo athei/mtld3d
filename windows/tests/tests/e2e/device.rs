@@ -4938,8 +4938,8 @@ const LOADER_LOCK_RELEASE_LIMIT: Duration = Duration::from_secs(10);
 /// The exit code the loader-lock child ends with when its release hung, libtest's failure code.
 const LOADER_LOCK_HUNG_EXIT_CODE: u32 = 101;
 
-/// An `ntdll` export by name, for the loader-lock calls no import library names.
-fn ntdll_export(name: &core::ffi::CStr) -> *mut c_void {
+/// An `ntdll` export by name, for the calls no import library names.
+pub fn ntdll_export(name: &core::ffi::CStr) -> *mut c_void {
     // SAFETY: plain kernel32 lookup by a NUL-terminated name.
     let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr()) };
     assert!(!ntdll.is_null(), "ntdll.dll is loaded in every process");

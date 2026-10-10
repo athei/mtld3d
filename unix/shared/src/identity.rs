@@ -30,7 +30,7 @@ pub const BUILD: &str = env!("MTLD3D_BUILD");
 pub use platform::LoadedImage;
 pub use platform::image_id;
 #[cfg(target_family = "windows")]
-pub use platform::version_blob;
+pub use platform::{image_size, version_blob};
 
 #[cfg(target_family = "windows")]
 mod platform {
@@ -255,10 +255,14 @@ mod platform {
 
     /// The extent a mapped image covers, from its own `SizeOfImage`.
     ///
+    /// Two reads of the mapped headers and no call, so the exception handler
+    /// can ask whether an address lies in its own image.
+    ///
     /// # Safety
     ///
     /// `base` must be the load base of a mapped image.
-    unsafe fn image_size(base: usize) -> Option<usize> {
+    #[must_use]
+    pub unsafe fn image_size(base: usize) -> Option<usize> {
         // SAFETY: a loaded image has its DOS header mapped.
         let nt = base + unsafe { read_u32(base + E_LFANEW) } as usize;
         // SAFETY: `nt` is the mapped NT header.
