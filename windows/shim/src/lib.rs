@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 
 use log::{error, info};
-use mtld3d_shared::{WriteLogParams, identity};
+use mtld3d_shared::{LogLineKind, WriteLogParams, identity};
 
 const LOG_TARGET: &str = "mtld3d::shim";
 
@@ -46,7 +46,7 @@ impl std::io::Write for LogSink {
         let mut params = WriteLogParams {
             ptr: buf.as_ptr() as usize as u64,
             len,
-            pad0: 0,
+            kind: LogLineKind::Ordinary,
         };
         let _ = dispatch_unix_call(
             <WriteLogParams as mtld3d_shared::Thunk>::CODE,

@@ -30,11 +30,26 @@
 //! lies in a native image (a framework, libobjc, libsystem, Wine's own
 //! `.so`): `fault outside mtld3d.so:` with the signal number, the thread id
 //! and name, the PC as image plus offset and nearest symbol, then the return
-//! addresses into our own dylib found on the faulting stack. Guest code and
-//! translated code resolve to no image and stay silent: those faults are
-//! Wine's ordinary work. The report is capped at a few per process and
-//! carries no signal name, since a fault Wine recovers must not read as a
-//! crash to anything that scans the log for one.
+//! addresses into our own dylib found on the faulting stack. Translated code
+//! resolves to no image and stays silent: those faults are Wine's ordinary
+//! work. The report is capped at a few per process and carries no signal
+//! name, since a fault Wine recovers must not read as a crash to anything
+//! that scans the log for one.
+//!
+//! Guest memory does resolve to an image. `dyld` counts every segment of an
+//! image as the image, the ones mapped from no file bytes too, and Wine's
+//! loader keeps the guest's low address space and its own top-down heap as
+//! two such segments, so a guest PC lands in the loader at an offset that
+//! wraps below its load address. A PC in such a segment is reported as
+//! `memory=guest` instead, with the protection its page has now (`---` for
+//! space reserved and not committed, or freed; `unmapped` for a hole) and
+//! the image that reserves the space. Wine's loader is the only image in a
+//! Wine process that reserves space this way.
+//!
+//! Every report goes to the process's log file. Before `Direct3DCreate9` has
+//! named it, the first report opens the early location `InitLogger` named,
+//! with the lines logged so far ahead of it, since the process may never get
+//! as far as naming one (see `log_file::crash_fd`).
 //!
 //! Forwarding needs a thread Wine can serve. Wine's unix side keeps each
 //! thread's TEB in a pthread key and reads it as soon as a fault reaches
@@ -65,6 +80,9 @@ use core::{
 };
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
+use mtld3d_core::crash_report::{
+    FaultSite, MACHO_HEADER_LEN, fault_site, macho_commands_len, macho_segments,
+};
 use mtld3d_shared::{crumb, fatal};
 
 /// Re-entrancy guard: reading the faulting stack/registers can itself fault on a corrupted context.
@@ -119,6 +137,15 @@ unsafe extern "C" {
         data: libc::mach_vm_address_t,
         outsize: *mut libc::mach_vm_size_t,
     ) -> libc::kern_return_t;
+    fn mach_vm_region(
+        target_task: libc::vm_map_t,
+        address: *mut libc::mach_vm_address_t,
+        size: *mut libc::mach_vm_size_t,
+        flavor: c_int,
+        info: *mut c_int,
+        info_count: *mut libc::mach_msg_type_number_t,
+        object_name: *mut libc::mach_port_t,
+    ) -> libc::kern_return_t;
     fn backtrace(array: *mut *mut c_void, size: c_int) -> c_int;
     fn backtrace_symbols_fd(array: *const *mut c_void, size: c_int, fd: c_int);
     /// macOS `pthread_getname_np` (not exposed by the `libc` crate).
@@ -130,6 +157,12 @@ unsafe extern "C" {
         len: usize,
     ) -> c_int;
 }
+
+/// `mach_vm_region` flavor answering `vm_region_basic_info_64`, protection first.
+const VM_REGION_BASIC_INFO_64: c_int = 9;
+
+/// `vm_region_basic_info_64` in `natural_t` words, the count that flavor takes.
+const VM_REGION_BASIC_INFO_WORDS: usize = 9;
 
 /// Index into [`PREV`] for a signal we handle, or `None` for anything else.
 const fn signal_slot(signo: c_int) -> Option<usize> {
@@ -322,7 +355,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
             let _ = libc::write(
-                crate::log_file::raw_fd(),
+                crate::log_file::crash_fd(),
                 NO_TEB.as_ptr().cast::<c_void>(),
                 NO_TEB.len(),
             );
@@ -362,7 +395,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
     unsafe {
         let _ = libc::write(
-            crate::log_file::raw_fd(),
+            crate::log_file::crash_fd(),
             buf.as_ptr().cast::<c_void>(),
             pos,
         );
@@ -539,7 +572,7 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT && !terminal {
         return;
     }
-    let fd = crate::log_file::raw_fd();
+    let fd = crate::log_file::crash_fd();
     let mut b = [0u8; 192];
     let mut p = 0;
     push(
@@ -559,7 +592,17 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
         push(&mut b, &mut p, b" arg0=");
         push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
     }
-    push(&mut b, &mut p, b" image=");
+    let site = image_site(&info, pc);
+    match site {
+        FaultSite::Image => push(&mut b, &mut p, b" image="),
+        // Space Wine's loader reserves for the guest: no offset into the
+        // loader names it, the page's protection says what it holds now.
+        FaultSite::Reserved => {
+            push(&mut b, &mut p, b" memory=guest page=");
+            push(&mut b, &mut p, protection_label(page_protection(pc)));
+            push(&mut b, &mut p, b" reserved_by=");
+        }
+    }
     // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
     unsafe {
         let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
@@ -574,13 +617,15 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     }
     let mut b = [0u8; 192];
     let mut p = 0;
-    push(&mut b, &mut p, b"+");
-    push_hex(
-        &mut b,
-        &mut p,
-        pc.wrapping_sub(info.dli_fbase as usize as u64),
-    );
-    if !info.dli_sname.is_null() {
+    if site == FaultSite::Image {
+        push(&mut b, &mut p, b"+");
+        push_hex(
+            &mut b,
+            &mut p,
+            pc.wrapping_sub(info.dli_fbase as usize as u64),
+        );
+    }
+    if site == FaultSite::Image && !info.dli_sname.is_null() {
         push(&mut b, &mut p, b" sym=");
         // SAFETY: `dli_sname` is the NUL-terminated symbol name dyld owns;
         // `strlen` is async-signal-safe.
@@ -619,6 +664,72 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
             our_frames_on_stack(sp, STACK_SCAN_WORDS);
         }
     }
+}
+
+/// Whether `addr`, which `dladdr` placed in the image `info` names, is the image's content.
+///
+/// Reads the image's segments from its Mach-O header, which is mapped for as
+/// long as the image is loaded; an address in a segment with no file bytes
+/// is space the image only reserves. No allocation and no lock.
+fn image_site(info: &libc::Dl_info, addr: u64) -> FaultSite {
+    let base = info.dli_fbase.cast::<u8>().cast_const();
+    if base.is_null() {
+        return FaultSite::Image;
+    }
+    // SAFETY: `dli_fbase` is the Mach-O header of an image `dladdr` found
+    // loaded, mapped readable at least as far as the fixed-size header.
+    let header = unsafe { core::slice::from_raw_parts(base, MACHO_HEADER_LEN) };
+    let Some(len) = macho_commands_len(header) else {
+        return FaultSite::Image;
+    };
+    // SAFETY: the load commands follow the header in the same mapped
+    // segment, `sizeofcmds` bytes of them, which is what `len` counts.
+    let image = unsafe { core::slice::from_raw_parts(base, len) };
+    fault_site(addr, macho_segments(image, base as usize as u64))
+}
+
+/// The current protection of the page at `addr`, or `None` when nothing is mapped there.
+///
+/// `mach_vm_region` answers the region at or above the address, so a region
+/// that starts past it means the address is in a hole. A Mach call that
+/// allocates nothing, so a signal handler may ask.
+fn page_protection(addr: u64) -> Option<libc::vm_prot_t> {
+    let mut region = addr;
+    let mut size = 0;
+    let mut info: [c_int; VM_REGION_BASIC_INFO_WORDS] = [0; VM_REGION_BASIC_INFO_WORDS];
+    let mut count = libc::mach_msg_type_number_t::try_from(VM_REGION_BASIC_INFO_WORDS)
+        .expect("nine words fit the count");
+    let mut object = 0;
+    // SAFETY: reads libSystem's task port for this process.
+    let task = unsafe { mach_task_self_ };
+    // SAFETY: every out-parameter is a live local of the size the flavor and
+    // its count promise; the kernel validates the address.
+    let status = unsafe {
+        mach_vm_region(
+            task,
+            &raw mut region,
+            &raw mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &raw mut count,
+            &raw mut object,
+        )
+    };
+    (status == libc::KERN_SUCCESS && region <= addr).then_some(info[0])
+}
+
+/// A page's protection as `rwx` letters, or `unmapped`.
+fn protection_label(protection: Option<libc::vm_prot_t>) -> &'static [u8] {
+    const LABELS: [&[u8]; 8] = [
+        b"---", b"r--", b"-w-", b"rw-", b"--x", b"r-x", b"-wx", b"rwx",
+    ];
+    let Some(protection) = protection else {
+        return b"unmapped";
+    };
+    let bit = |flag: libc::vm_prot_t, value: usize| {
+        if protection & flag == 0 { 0 } else { value }
+    };
+    LABELS[bit(libc::VM_PROT_READ, 1) | bit(libc::VM_PROT_WRITE, 2) | bit(libc::VM_PROT_EXECUTE, 4)]
 }
 
 /// The calling thread's system-wide id, the one `ps -M` and a sample show.

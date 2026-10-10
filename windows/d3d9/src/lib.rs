@@ -366,10 +366,23 @@ fn init_logger(instance: *mut c_void) {
     crash::install(instance);
     mtld3d_shared::crumb::set_write_sink(log_sink::write_raw);
     let filter = std::env::var("RUST_LOG").unwrap_or_default();
+    // Where a crash report goes if one comes before `Direct3DCreate9`
+    // names the log location; empty when it cannot be derived.
+    let (early_dir, early_stem) = log_sink::early_location().unwrap_or_else(|| {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "log file: no default location at load, a crash before Direct3DCreate9 reports to stderr"
+        );
+        (String::new(), String::new())
+    });
     let mut params = InitLoggerParams {
         filter_ptr: filter.as_ptr() as u64,
+        early_dir_ptr: early_dir.as_ptr() as u64,
+        early_stem_ptr: early_stem.as_ptr() as u64,
         filter_len: u32::try_from(filter.len()).unwrap_or(0),
-        reserved: 0,
+        early_dir_len: u32::try_from(early_dir.len()).unwrap_or(0),
+        early_stem_len: u32::try_from(early_stem.len()).unwrap_or(0),
+        pad0: 0,
     };
     unix_call(&mut params);
 }

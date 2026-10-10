@@ -23,6 +23,14 @@
 //! has to name what it can read and stop at the first word it cannot, and
 //! must stay absent from a trap in our own code and from a memory fault.
 //!
+//! The early-log tests fault before any location is named, the shape of a
+//! game that dies before `Direct3DCreate9`: the report and the lines logged
+//! before it reach the early location when `InitLogger` named one, and
+//! stderr together when it did not. The reserved-space test reports a PC in
+//! a zero-fill segment of this binary, the shape of a guest address inside
+//! Wine's loader, which must read as guest memory rather than an offset into
+//! the image.
+//!
 //! Wine is not in a unit test's process, so the branch that asks it for the
 //! calling thread's TEB is exercised through a stand-in `NtCurrentTeb` stored
 //! where the install-time lookup would have put one: what the handler reads is
@@ -52,6 +60,24 @@ const STACK_SELFTEST_ENV: &str = "MTLD3D_CRASH_STACK_SELFTEST";
 /// Set in the re-executed child that takes a `CoreFoundation` trap; its value picks the object.
 #[cfg(target_arch = "x86_64")]
 const TRAP_OBJECT_SELFTEST_ENV: &str = "MTLD3D_CRASH_TRAP_OBJECT_SELFTEST";
+
+/// Set in the re-executed child that faults before the log location is named.
+const EARLY_LOG_SELFTEST_ENV: &str = "MTLD3D_CRASH_EARLY_LOG_SELFTEST";
+
+/// Set in the re-executed child that reports a PC in reserved space.
+const RESERVED_SELFTEST_ENV: &str = "MTLD3D_CRASH_RESERVED_SELFTEST";
+
+/// A line logged before the fault, which the report must not outlive.
+const BACKLOG_LINE: &str = "[selftest] logged before the location was named";
+
+// A segment of this binary mapped from no file bytes, the way Wine's loader
+// reserves the guest's address space.
+core::arch::global_asm!(".zerofill MTLD3D_RESERVE,MTLD3D_RESERVE,_mtld3d_test_reserve,0x8000,14");
+
+unsafe extern "C" {
+    /// The start of the zero-fill segment above.
+    static mtld3d_test_reserve: u8;
+}
 
 /// The byte a stand-in TEB pointer points at; only its address is ever used.
 static FAKE_TEB: u8 = 0;
@@ -818,4 +844,180 @@ fn foreign_image_under_our_directory_forwards_fault() {
     assert!(!report.contains("FATAL"), "{report}");
     assert!(report.contains("fault outside mtld3d.so:"), "{report}");
     assert!(report.contains("/foreign-image+0x"), "{report}");
+}
+
+/// A foreign fault before the log location is named takes the backlog along to stderr.
+///
+/// No early location here: the lines logged so far go to stderr ahead of the
+/// report, where they used to wait for a file the process never named.
+#[test]
+fn a_fault_before_the_log_is_named_writes_the_backlog_to_stderr() {
+    if std::env::var_os(EARLY_LOG_SELFTEST_ENV).is_some() {
+        crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
+        super::install();
+        // SAFETY: deliberately unsound; this is the fault under test, taken
+        // in a child process that dies on it.
+        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
+        unreachable!("the strlen above must fault, not return {len}");
+    }
+
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "crash::tests::a_fault_before_the_log_is_named_writes_the_backlog_to_stderr",
+            "--nocapture",
+        ])
+        .env(EARLY_LOG_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
+    let backlog = report
+        .find(BACKLOG_LINE)
+        .unwrap_or_else(|| panic!("the backlog line is lost:\n{report}"));
+    let fault = report
+        .find("fault outside mtld3d.so")
+        .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
+    assert!(backlog < fault, "{report}");
+}
+
+/// A foreign fault before the log location is named opens the early location.
+///
+/// The child names the early location as `InitLogger` would, logs a line and
+/// faults: the file `<dir>/<stem>-<pid>.log` holds the line and then the
+/// report, its directory created on the way, and stderr holds neither.
+#[test]
+fn a_fault_before_the_log_is_named_opens_the_early_location() {
+    if let Some(dir) = std::env::var_os(EARLY_LOG_SELFTEST_ENV) {
+        crate::log_file::set_early_location(&dir.to_string_lossy(), "early");
+        crate::log_file::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
+        super::install();
+        // SAFETY: deliberately unsound; this is the fault under test, taken
+        // in a child process that dies on it.
+        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
+        unreachable!("the strlen above must fault, not return {len}");
+    }
+
+    let root = std::env::temp_dir().join(format!("mtld3d-early-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch root");
+    // Not created yet: the handler makes it, as the first crash in a game's
+    // directory would.
+    let dir = root.join("mtld3d-logs");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "crash::tests::a_fault_before_the_log_is_named_opens_the_early_location",
+            "--nocapture",
+        ])
+        .env(EARLY_LOG_SELFTEST_ENV, &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("re-exec the test binary");
+    let pid = child.id();
+    let out = child.wait_with_output().expect("wait for the child");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let log = std::fs::read_to_string(dir.join(format!("early-{pid}.log")));
+    let _ = std::fs::remove_dir_all(&root);
+    let log = log.unwrap_or_else(|e| panic!("no early log ({e}); stderr:\n{stderr}"));
+
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{stderr}");
+    let backlog = log
+        .find(BACKLOG_LINE)
+        .unwrap_or_else(|| panic!("the backlog line is lost:\n{log}"));
+    let fault = log
+        .find("fault outside mtld3d.so")
+        .unwrap_or_else(|| panic!("no foreign-fault line:\n{log}"));
+    assert!(backlog < fault, "{log}");
+    assert!(log.contains("mtld3d.so return addrs on stack:"), "{log}");
+    assert!(!stderr.contains("fault outside mtld3d.so"), "{stderr}");
+    assert!(!stderr.contains(BACKLOG_LINE), "{stderr}");
+}
+
+/// A PC in a segment with no file bytes is reported as guest memory, not an image offset.
+///
+/// The PC lies in this binary's zero-fill segment, which `dladdr` attributes
+/// to the binary just as it attributes a guest address to Wine's loader. The
+/// report names the reserved space, the page's protection and the image that
+/// reserves it, and no image offset or symbol.
+#[test]
+fn a_pc_in_reserved_space_is_reported_as_reserved_memory() {
+    if std::env::var_os(RESERVED_SELFTEST_ENV).is_some() {
+        let pc = (&raw const mtld3d_test_reserve) as usize as u64 + 0x100;
+        // The kernel's context, modelled with live local storage; a zero
+        // stack pointer keeps the stack scan out of the report.
+        let mut registers = [0u64; 40];
+        #[cfg(target_arch = "x86_64")]
+        let pc_slot = 144 / 8;
+        #[cfg(target_arch = "aarch64")]
+        let pc_slot = 272 / 8;
+        registers[pc_slot] = pc;
+        let mut context = [0u64; 7];
+        context[0x30 / 8] = registers.as_ptr() as usize as u64;
+        super::report_foreign_fault(libc::SIGBUS, context.as_mut_ptr().cast(), false);
+        // SAFETY: ends only this child, without running exit hooks.
+        unsafe { libc::_exit(0) };
+    }
+
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "crash::tests::a_pc_in_reserved_space_is_reported_as_reserved_memory",
+            "--nocapture",
+        ])
+        .env(RESERVED_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    let line = report
+        .lines()
+        .find(|l| l.contains("fault outside mtld3d.so"))
+        .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
+    assert!(line.contains("signo=10"), "{line}");
+    // The zero-fill pages are mapped read-write and nothing else.
+    assert!(
+        line.contains(" memory=guest page=rw- reserved_by=/"),
+        "{line}"
+    );
+    assert!(!line.contains("image="), "{line}");
+    assert!(!line.contains(" sym="), "{line}");
+    assert!(!line.contains("+0x"), "{line}");
+}
+
+/// A page's protection reads as `rwx` letters, and a hole as `unmapped`.
+#[test]
+fn page_protection_labels() {
+    use libc::{VM_PROT_EXECUTE, VM_PROT_NONE, VM_PROT_READ, VM_PROT_WRITE};
+
+    assert_eq!(super::protection_label(None), b"unmapped");
+    assert_eq!(super::protection_label(Some(VM_PROT_NONE)), b"---");
+    assert_eq!(super::protection_label(Some(VM_PROT_READ)), b"r--");
+    assert_eq!(
+        super::protection_label(Some(VM_PROT_READ | VM_PROT_WRITE)),
+        b"rw-"
+    );
+    assert_eq!(
+        super::protection_label(Some(VM_PROT_READ | VM_PROT_EXECUTE)),
+        b"r-x"
+    );
+    assert_eq!(
+        super::protection_label(Some(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)),
+        b"rwx"
+    );
+
+    // A live stack page; the first page of the address space, reserved with
+    // no access; and an address past every region.
+    let local = 0u8;
+    assert_eq!(
+        super::page_protection(std::hint::black_box(&raw const local) as usize as u64)
+            .map(|p| p & (VM_PROT_READ | VM_PROT_WRITE)),
+        Some(VM_PROT_READ | VM_PROT_WRITE)
+    );
+    assert!(
+        super::page_protection(0x10).is_none_or(|p| p & VM_PROT_READ == 0),
+        "page zero is never readable"
+    );
+    assert_eq!(super::page_protection(!0xfff_u64), None);
 }

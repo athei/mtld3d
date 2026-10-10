@@ -22,6 +22,7 @@ pub mod caps;
 pub mod capture_chord;
 pub mod config;
 pub mod convert;
+pub mod crash_report;
 pub mod cursor;
 pub mod departed_textures;
 pub mod depth_stencil_state;
