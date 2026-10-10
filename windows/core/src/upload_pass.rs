@@ -121,6 +121,50 @@ pub const fn is_expanded_upload(src_d3d_format: u32, gpu_format: PixelFormat) ->
     }
 }
 
+/// The decode an upload whose rows sit `pitch` bytes apart takes on the pass, `None` for a blit.
+///
+/// An expansion has no blit form and always takes the pass. A verbatim copy
+/// takes it only when `pitch` is under the device's linear texture
+/// alignment, which a blit copy cannot accept; above it the blit is the
+/// cheaper write. The encoder routes each upload with this, and the API
+/// thread reads it to know which retirement counter frees the staging and
+/// how a snapshot of a box must lay out its rows.
+#[must_use]
+pub const fn upload_pass_decode(
+    src_d3d_format: u32,
+    gpu_format: PixelFormat,
+    pitch: u32,
+    min_linear_texture_align: u32,
+) -> Option<UploadDecode> {
+    match upload_decode(src_d3d_format, gpu_format) {
+        Some(decode) if is_expansion(decode) || pitch < min_linear_texture_align => Some(decode),
+        _ => None,
+    }
+}
+
+/// The byte the upload pass addresses texel `(0, 0)` at, for a source starting at `origin`.
+///
+/// The fragment function reads texel `(x, y)` of the destination at
+/// `base + y * pitch + x * bytes_per_texel`, in wrapping 32-bit arithmetic. A
+/// snapshot holds only the box, its first row at `source_offset`, so the base
+/// sits `origin_y` rows and `origin_x` texels before it; the subtraction may
+/// wrap below zero, and the shader's own additions wrap back for every texel
+/// of the box.
+#[must_use]
+pub const fn snapshot_pass_base(
+    source_offset: u32,
+    origin: (u32, u32),
+    pitch: u32,
+    bytes_per_texel: u32,
+) -> u32 {
+    source_offset.wrapping_sub(
+        origin
+            .1
+            .wrapping_mul(pitch)
+            .wrapping_add(origin.0.wrapping_mul(bytes_per_texel)),
+    )
+}
+
 /// Create-time predicate: does this texture need `RenderTarget` usage for its uploads?
 ///
 /// `width` and `levels` are the texture's level-0 width and mip count;

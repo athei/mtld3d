@@ -385,6 +385,29 @@ fn staged_upload_byte_totals_are_wide_and_saturating() {
 ///
 /// First-frame `frame_total` must be 0 (no predecessor TSC yet);
 /// subsequent drains report a delta.
+/// The snapshot counters keep their three outcomes apart and leave with the drain.
+///
+/// A copied box adds its bytes, an arena with no room counts as `full`, and
+/// a box of the wrong shape counts as `declined`, so a perf run tells the
+/// arena's cap from the boxes it can never take.
+#[test]
+fn snapshot_counters_split_copies_full_and_declined() {
+    let mut api = ApiPerfState::new();
+    api.bump_texture_snapshot(4096);
+    api.bump_texture_snapshot(2048);
+    api.bump_texture_snapshot_full();
+    api.bump_texture_snapshot_declined();
+    api.bump_texture_snapshot_declined();
+    let mut p = FramePerfPayload::new();
+    api.drain_into_payload(&mut p, true);
+    assert_eq!(p.counters.texture_snapshot_uploads, 2);
+    assert_eq!(p.counters.texture_snapshot_bytes, 6144);
+    assert_eq!(p.counters.texture_snapshot_full, 1);
+    assert_eq!(p.counters.texture_snapshot_declined, 2);
+    assert_eq!(api.counters.texture_snapshot_uploads, 0);
+    assert_eq!(api.counters.texture_snapshot_declined, 0);
+}
+
 #[test]
 fn api_perf_drain_moves_and_resets() {
     let mut api = ApiPerfState::new();
@@ -680,9 +703,10 @@ fn summary_golden_layout() {
         "Resources (textures)  — same layout as VB/IB; n/a rows omitted\n",
         "rename      2                                                   API: fresh staging Arc on contended LockRect\n",
         "  discards  1                                                   API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)\n",
-        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
-        "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
+        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level Lock over a reader, partial over a seen or older upload)\n",
+        "in-place    0                                                   API: partial Lock over an upload of this frame no GPU use has seen, handed back live\n",
         "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
+        "snapshot    2 6 KB                  full=1 declined=1           API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape)\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
@@ -880,7 +904,9 @@ fn kv_golden_line() {
         " pe_pagebox_pool_parked_bytes=0",
         " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
         " tex_preserve_cpu_total=1",
-        " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
+        " tex_in_place_total=0 tex_snapshot_total=2 tex_snapshot_bytes_total=6144",
+        " tex_snapshot_full_total=1 tex_snapshot_declined_total=1",
+        " tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
         " tex_staging_wrapped_bytes=4194304 tex_wrapper_create_total=3",
@@ -1264,7 +1290,7 @@ fn sample_window() -> PerfWindow {
             texture_renames: 2,
             texture_discards: 1,
             texture_preserve_cpu: 1,
-            texture_write_in_place_contended: 0,
+            texture_write_in_place_unseen: 0,
             // Staging pool fixture: 7 of 8 staging allocations served
             // warm (87.5%), one fell through to the allocator.
             texture_pool_hits: 7,
@@ -1316,6 +1342,12 @@ fn sample_window() -> PerfWindow {
             pagebox_frees: 0,
             pagebox_uncached_allocs: 0,
             pool_recycled: 0,
+            // Two partial uploads snapshotted 6 KiB between them; the arena
+            // had no room for one, and one box was off the block grid.
+            texture_snapshot_bytes: 6144,
+            texture_snapshot_uploads: 2,
+            texture_snapshot_full: 1,
+            texture_snapshot_declined: 1,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,

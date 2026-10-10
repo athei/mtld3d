@@ -357,6 +357,7 @@ fn staging_upload_packet(
         redirty: Arc::new(RedirtyQueue::new()),
         release_staging: false,
         upload_generation: 1,
+        snapshot_offset: None,
     };
     recorder
         .record_typed(&mut frame.scratch, UploadTextureOp { job })

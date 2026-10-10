@@ -238,11 +238,12 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
-    /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
-    /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
-    /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
-    /// same primitive READONLY uses) and `FreshBox` (allocate + swap).
+    /// pointer returned by `lock_region_ptr`. The bind-time flush hands the
+    /// upload a read of the `Arc` (a refcount bump, no memcpy), unless the
+    /// level is in `snapshot_staging` and the box is copied out instead.
+    /// `lock_region_ptr` decides between `WriteInPlace` (cast `as_ptr()` to
+    /// `*mut u8`, the primitive READONLY uses) when no upload can see the
+    /// write, and `FreshBox` (allocate + swap) otherwise.
     staging: Vec<Arc<PageBox>>,
     mip_widths: Vec<u32>,
     mip_heights: Vec<u32>,
@@ -325,11 +326,11 @@ pub struct TextureInner {
     /// Bit `face * levels + level` for a cube, bit `level` otherwise.
     /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
     /// texture is recorded, after it flushes the texture's dirty levels. A CPU
-    /// write clears its subresource's bit once it lands on pages no upload
-    /// reads, fresh or renamed. Scheduling an upload onto pages an earlier
-    /// frame's upload still reads sets the bit too. So a clear bit over pages
-    /// uploads still read means no GPU operation on the texture was recorded
-    /// since those uploads were scheduled.
+    /// write, a `LockRect` included, clears its subresource's bit once it
+    /// lands on pages no upload reads, fresh or renamed. Scheduling an upload
+    /// onto pages an earlier frame's upload still reads sets the bit too. So
+    /// a clear bit over pages uploads still read means no GPU operation on
+    /// the texture was recorded since those uploads were scheduled.
     ///
     /// That holds only while every path that schedules an upload of the
     /// texture either marks the device's snapshot dirty, so the next draw
@@ -338,6 +339,18 @@ pub struct TextureInner {
     /// upload scheduled without either would let such a draw sample pages a
     /// later write changes in place.
     observed_staging: u128,
+    /// Subresources whose partial uploads copy their box instead of reading the staging.
+    ///
+    /// Indexed like `observed_staging`. Set, and never cleared, when a write
+    /// moves the subresource's staging to fresh pages carrying the old
+    /// contents: the write landed while an upload still read the pages, which
+    /// a level the game rewrites in part between draws does on every lock.
+    /// From then on each partial upload of it snapshots its box into the
+    /// device's arena when it is scheduled, so it no longer reads the
+    /// staging and the next lock writes in place instead of copying the
+    /// whole level again. Every other subresource keeps reading its staging
+    /// with no copy at all.
+    snapshot_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -2382,13 +2395,13 @@ impl TextureInner {
             return 0;
         }
         let device = DeviceInner::from_ptr(self.device_inner);
-        let takes_upload_pass =
-            mtld3d_core::upload_pass::upload_decode(self.d3d_format, self.metal_pixel_format)
-                .is_some_and(|decode| {
-                    mtld3d_core::upload_pass::is_expansion(decode)
-                        || self.mip_bytes_per_row[level]
-                            < device.gpu_caps().min_linear_texture_align
-                });
+        let takes_upload_pass = mtld3d_core::upload_pass::upload_pass_decode(
+            self.d3d_format,
+            self.metal_pixel_format,
+            self.mip_bytes_per_row[level],
+            device.gpu_caps().min_linear_texture_align,
+        )
+        .is_some();
         let seq = if takes_upload_pass {
             device.coherent_seq_arc()
         } else {
@@ -2437,14 +2450,6 @@ impl TextureInner {
             swizzle: self.swizzle.unwrap_or([Swizzle::Zero; 4]),
             usage_flags: self.usage_flags,
         }
-    }
-
-    /// Clone the staging `Arc` for this mip.
-    ///
-    /// The upload retains these bytes through encoding and GPU retirement. A cached
-    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
-    pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
-        Arc::clone(&self.staging[level])
     }
 
     /// Base, page-aligned length and row stride of one subresource's staging.
@@ -2578,24 +2583,41 @@ impl TextureInner {
 
         let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
         let contended = is_in_flight(last_submit_seq, coherent_seq)
             || self.cube.as_deref()?.staging[index].has_readers();
-        let action =
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
+        let action = if contended {
+            let mut write = self.staging_write_facts(face, level)?;
+            write.insert(StagingWrite::HAS_READERS);
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
+        } else {
+            LockAction::WriteInPlace
+        };
         let device_inner = self.device_inner;
         let base = match action {
             LockAction::WriteInPlace => {
-                // The kept divergence, counted like its VB/IB twin: a
-                // contended partial Lock handed back over bytes an upload
-                // may still be reading (`docs/STATUS.md#kept-divergences`).
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
+                // In place over a reader only under NOOVERWRITE, or when every
+                // upload reading the pages is this frame's and no GPU
+                // operation on the cube was recorded since; the latter is
+                // counted (see `lock_region_ptr`).
+                if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
+                    self.note_unread_staging(face, level);
+                } else if flags & D3DLOCK_NOOVERWRITE == 0 && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.cube.as_deref()?.staging[index].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_cube_staging(face, level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_cube_staging(face, level, preserve);
+                self.note_unread_staging(face, level);
+                base
+            }
         };
         // SAFETY: `offset` was checked against the logical staging length.
         Some((unsafe { base.add(offset) }, pitch))
@@ -2613,6 +2635,9 @@ impl TextureInner {
             .expect("validated cube subresource");
         let device_inner = self.device_inner;
         let texture_id = self.texture_id;
+        if preserve == PreserveKind::Cpu {
+            self.snapshot_staging |= self.observed_bit(face, level);
+        }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET,
             key: (texture_id.raw() << 8)
@@ -2713,21 +2738,19 @@ impl TextureInner {
         self.observed_staging = u128::MAX;
     }
 
-    fn move_staging_off_readers(
-        &mut self,
-        face: u32,
-        level: usize,
-        whole_level: bool,
-        always: bool,
-    ) {
-        if self.dc_in_use() {
-            return;
-        }
+    /// What a CPU write of `(face, level)` would find on its staging pages right now.
+    ///
+    /// Every fact [`decide_staging_write`] reads except the two the writer
+    /// knows itself, `WHOLE_LEVEL` and a read back's `ALWAYS_RENAME`: whether
+    /// the game holds the subresource mapped, whether an upload still reads
+    /// the pages, whether the latest upload belongs to the frame being
+    /// recorded, whether a GPU operation on the texture was recorded since,
+    /// and whether passes the texture is attached to use it unrecorded.
+    /// `None` for a cube face past the chain.
+    fn staging_write_facts(&self, face: u32, level: usize) -> Option<StagingWrite> {
         let (mapped, has_readers, last_upload_seq) = match self.cube.as_deref() {
             Some(cube) => {
-                let Some(index) = self.cube_subresource_index(face, level) else {
-                    return;
-                };
+                let index = self.cube_subresource_index(face, level)?;
                 (
                     cube.locked.get(index).copied().unwrap_or(false),
                     cube.staging
@@ -2745,11 +2768,6 @@ impl TextureInner {
             ),
         };
         let bit = self.observed_bit(face, level);
-        if !mapped && !has_readers {
-            // Nothing reads these pages, so the next GPU use is the first
-            // that can see what lands in them.
-            self.observed_staging &= !bit;
-        }
         let same_frame = self.device_inner != 0
             && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
         // A render target or depth texture is read and written by the passes
@@ -2765,7 +2783,38 @@ impl TextureInner {
             StagingWrite::OBSERVED,
             bit == 0 || self.observed_staging & bit != 0,
         );
-        write.set(StagingWrite::ALWAYS_RENAME, always || attached);
+        write.set(StagingWrite::ALWAYS_RENAME, attached);
+        Some(write)
+    }
+
+    /// Note that a write of `(face, level)` landed on pages no upload reads.
+    ///
+    /// The next GPU use of the texture is then the first that can see what
+    /// lands in them, so the subresource's observed bit starts over.
+    fn note_unread_staging(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        self.observed_staging &= !bit;
+    }
+
+    fn move_staging_off_readers(
+        &mut self,
+        face: u32,
+        level: usize,
+        whole_level: bool,
+        always: bool,
+    ) {
+        if self.dc_in_use() {
+            return;
+        }
+        let Some(mut write) = self.staging_write_facts(face, level) else {
+            return;
+        };
+        if !write.intersects(StagingWrite::MAPPED.union(StagingWrite::HAS_READERS)) {
+            self.note_unread_staging(face, level);
+        }
+        if always {
+            write.insert(StagingWrite::ALWAYS_RENAME);
+        }
         write.set(StagingWrite::WHOLE_LEVEL, whole_level);
         let LockAction::FreshBox { preserve } = decide_staging_write(&write) else {
             return;
@@ -2775,7 +2824,7 @@ impl TextureInner {
         } else {
             self.rename_staging(level, preserve);
         }
-        self.observed_staging &= !bit;
+        self.note_unread_staging(face, level);
     }
 
     fn cube_stash_lock(
@@ -2879,23 +2928,20 @@ impl TextureInner {
     /// READONLY is a fast-path: the game promised it won't write, so
     /// two readers (the game + any in-flight GPU blit sourcing from
     /// `pending_blit_retention`'s Arc clone) can share the same
-    /// backing Box with no race. Return `as_ptr()` directly — no
+    /// backing Box with no race. Return `as_ptr()` directly: no
     /// rename, no allocation, no preserve memcpy. The pointer is cast
     /// to `*mut u8` only to satisfy the shared signature; the lock
     /// contract forbids writes through it.
     ///
     /// Writable locks delegate the policy decision to
-    /// `decide_lock_action` in `mtld3d-core` — same shape as
-    /// `vertex_buffer::vb_lock` consumes `buffer_rename::plan_lock`.
-    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast
-    /// READONLY uses) and trusts the well-behaved-game no-overlap
-    /// contract for partial sub-rects. `FreshBox { preserve }`
-    /// allocates a fresh uninit Box and applies the requested preserve
-    /// (CPU memcpy when the game might read outside the locked rect
-    /// through the Lock pointer, or when the encoder's compressed
-    /// full-mip-fallback would read outside-rect bytes; otherwise no
-    /// preserve). The old `Arc<PageBox>` stays alive via
-    /// `pending_blit_retention` until GPU retire.
+    /// `decide_lock_action` in `mtld3d-core`, fed the same facts every
+    /// other CPU write of the level gathers (`staging_write_facts`).
+    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast READONLY
+    /// uses): either no upload reads the pages, or every upload reading them
+    /// is this frame's and nothing recorded since can see the version the
+    /// write replaces. `FreshBox { preserve }` allocates a fresh Box and
+    /// applies the requested preserve, and the old `Arc<PageBox>` stays with
+    /// the uploads that read it until they retire.
     fn lock_region_ptr(
         &mut self,
         level: usize,
@@ -2962,9 +3008,14 @@ impl TextureInner {
         // command buffer that upload rides decides which retirement counter
         // frees it. See `staging_coherent_seq`.
         let coherent_seq = self.staging_coherent_seq(level);
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
         let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
             || self.staging[level].has_readers();
-        let action = if contended && self.flags.contains(TextureFlags::DEPTH_FORMAT) {
+        let action = if !contended {
+            LockAction::WriteInPlace
+        } else if self.flags.contains(TextureFlags::DEPTH_FORMAT) {
             LockAction::FreshBox {
                 preserve: if flags & D3DLOCK_DISCARD == 0 {
                     PreserveKind::Cpu
@@ -2973,37 +3024,39 @@ impl TextureInner {
                 },
             }
         } else {
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level))
+            let mut write = self.staging_write_facts(0, level)?;
+            write.insert(StagingWrite::HAS_READERS);
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
         };
 
         let base: *mut u8 = match action {
             LockAction::WriteInPlace => {
-                // No rename, no preserve — same primitive as the
-                // READONLY fast-path above. `PageBox` exposes only
-                // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder operations
-                // hold Arc clones to keep the staging alive while
-                // they construct `newBufferWithBytesNoCopy:` MTLBuffer
-                // wrappers; they never borrow the bytes themselves.
-                // The GPU read happens at command-buffer execution
-                // time, after the next submit retires; under the
-                // well-behaved-game no-overlap contract the locked
-                // sub-rect doesn't overlap any in-flight read range.
-                // Same model `vb_lock` now uses (see `plan_lock` doc).
+                // No rename, no preserve: the same primitive as the
+                // READONLY fast path above. `PageBox` exposes only
+                // raw-pointer accessors, so no Rust `&[u8]` borrow of the
+                // bytes lives across this cast. Encoder operations hold Arc
+                // clones to keep the staging alive while they wrap it; they
+                // never borrow the bytes themselves.
                 //
-                // Counted when it is the kept divergence: a contended
-                // partial Lock without NOOVERWRITE handed back over
-                // bytes an upload may still be reading
-                // (`docs/STATUS.md#kept-divergences`). READONLY returned
-                // above and an uncontended Lock is the specified behaviour.
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
+                // With a reader this is NOOVERWRITE, or an upload of this
+                // frame no GPU operation has seen: counted, since each one
+                // is a write that lands in pages an upload will carry.
+                if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
+                    self.note_unread_staging(0, level);
+                } else if flags & D3DLOCK_NOOVERWRITE == 0 && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.staging[level].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_staging(level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_staging(level, preserve);
+                self.note_unread_staging(0, level);
+                base
+            }
         };
 
         // SAFETY: `offset` is the byte offset of the locked sub-rect
@@ -3050,6 +3103,7 @@ impl TextureInner {
                 // A later lock or whole-mip upload can read bytes outside
                 // the write region, so preserve every logical byte across
                 // all depth slices. The old Arc keeps the source live.
+                self.snapshot_staging |= self.observed_bit(0, level);
                 if perf_attached {
                     DeviceInner::from_ptr(dev_inner_raw)
                         .perf_mut()
@@ -3490,6 +3544,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         upload_generation: Vec::new(),
         dc_open: 0,
         observed_staging: 0,
+        snapshot_staging: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -4941,6 +4996,136 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
+/// What an upload of one subresource reads: its staging, or a snapshot of its box.
+struct UploadSource {
+    staging: PageBoxRead,
+    /// Row stride of `staging`: the level's, or the snapshot's.
+    src_pitch: u32,
+    /// Slice stride of `staging`: the level's, or the snapshot's whole span.
+    slice_pitch: u32,
+    /// Byte offset of the box in a snapshot chunk; `None` for the staging.
+    snapshot_offset: Option<u32>,
+}
+
+impl UploadSource {
+    /// A read of the subresource's own staging pages.
+    fn staging(pages: &Arc<PageBox>, src_pitch: u32, slice_pitch: u32) -> Self {
+        Self {
+            staging: PageBoxRead::new(Arc::clone(pages)),
+            src_pitch,
+            slice_pitch,
+            snapshot_offset: None,
+        }
+    }
+}
+
+/// The source an upload of `rect` of `(face, level)` reads.
+///
+/// A subresource marked in `snapshot_staging` copies a partial box into the
+/// device's snapshot arena, so the upload leaves its staging pages alone; any
+/// other upload, and one the arena cannot take, reads the staging at
+/// `slice_pitch`. A volume level, a depth format and a planar YUV level always
+/// read the staging: their uploads take paths that address the whole level.
+fn upload_source(
+    ti: &TextureInner,
+    dev: &mut DeviceInner,
+    (face, level): (u32, usize),
+    rect: DirtyRect,
+    slice_pitch: u32,
+) -> UploadSource {
+    use mtld3d_core::texture_staging::SnapshotBox;
+    let pages = ti.cube.as_deref().map_or_else(
+        || &ti.staging[level],
+        |cube| {
+            &cube.staging[ti
+                .cube_subresource_index(face, level)
+                .expect("validated cube subresource")]
+        },
+    );
+    let src_pitch = ti.mip_bytes_per_row(level);
+    if ti.snapshot_staging & ti.observed_bit(face, level) == 0
+        || ti.depth > 1
+        || ti.flags.contains(TextureFlags::DEPTH_FORMAT)
+        || ti.planar_storage_extent().is_some()
+    {
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    }
+    // The upload pass addresses its source by texel and takes any 16-byte
+    // aligned pitch; a blit needs the device's linear texture alignment, so
+    // a snapshot never falls into the encoder's repack.
+    let expansion =
+        mtld3d_core::upload_pass::is_expanded_upload(ti.d3d_format, ti.metal_pixel_format);
+    let align = u32::try_from(mtld3d_core::upload_snapshot::SNAPSHOT_ALIGN).expect("16 fits u32");
+    let pitch_align = if expansion {
+        align
+    } else {
+        align.max(dev.gpu_caps().min_linear_texture_align)
+    };
+    let layout = match mtld3d_core::texture_staging::snapshot_box(
+        rect,
+        ti.mip_shape(level),
+        ti.block_bytes,
+        src_pitch,
+        pitch_align,
+    ) {
+        SnapshotBox::Copy(layout) => layout,
+        // A whole-level upload reads the staging by design: a whole-level
+        // write already moves to bare pages.
+        SnapshotBox::WholeLevel => return UploadSource::staging(pages, src_pitch, slice_pitch),
+        SnapshotBox::Declined => {
+            mtld3d_shared::log_once_info!(
+                target: crate::LOG_TARGET,
+                "texture upload snapshot: a box off the compressed block grid or larger than an \
+                 arena chunk reads the staging, so the next partial lock of its level renames it \
+                 again"
+            );
+            dev.perf_mut().bump_texture_snapshot_declined();
+            return UploadSource::staging(pages, src_pitch, slice_pitch);
+        }
+    };
+    if !layout.fits_source(src_pitch, pages.logical_len()) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the box's rows reach past the level's staging \
+             ({} bytes) → the upload reads the staging",
+            pages.logical_len()
+        );
+        dev.perf_mut().bump_texture_snapshot_declined();
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    }
+    let source = &pages.as_slice()[..pages.logical_len()];
+    let written = dev
+        .upload_snapshots_mut()
+        .write(layout.len as usize, |destination| {
+            mtld3d_core::texture_staging::copy_rows(
+                source,
+                layout.src_offset,
+                src_pitch as usize,
+                destination,
+                layout.pitch as usize,
+                layout.row_bytes as usize,
+                layout.rows as usize,
+            )
+        });
+    let Some(snapshot) = written else {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: every arena chunk is still read and the arena is at its \
+             cap, or a new chunk could not be allocated → the upload reads the staging and the \
+             next partial lock of its level may rename it"
+        );
+        dev.perf_mut().bump_texture_snapshot_full();
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    };
+    dev.perf_mut().bump_texture_snapshot(layout.len);
+    UploadSource {
+        staging: snapshot.read,
+        src_pitch: layout.pitch,
+        slice_pitch: layout.len,
+        snapshot_offset: Some(snapshot.offset),
+    }
+}
+
 /// Build the upload operation and push it onto the current frame's op list.
 ///
 /// The operation holds an `Arc` clone of the staging mip plus a snapshot of
@@ -5013,9 +5198,11 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
         ti.observed_staging |= ti.observed_bit(0, level_u);
     }
+    let source = upload_source(ti, dev, (0, level_u), rect, slice_pitch);
+    let snapshot_offset = source.snapshot_offset;
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging: PageBoxRead::new(ti.staging_arc(level_u)),
+        staging: source.staging,
         level,
         destination_slice: 0,
         staging_index: level_u,
@@ -5024,17 +5211,22 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: (ti.depth >> level).max(1),
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         release_staging,
         upload_generation,
+        snapshot_offset,
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
-    ti.last_submit_seq[level as usize] = dev.current_seq();
+    // A snapshot leaves the staging unread, so the level's in-flight stamp
+    // stays as it was, as for a resampled upload.
+    if snapshot_offset.is_none() {
+        ti.last_submit_seq[level as usize] = dev.current_seq();
+    }
     ti.was_uploaded[level as usize] = true;
     // Once per (texture, level, whole-or-partial), so a log shows which levels
     // publish sub-rects and which always go whole.
@@ -5088,17 +5280,18 @@ fn schedule_resampled_upload(
     let bpp = ti.bytes_per_pixel as usize;
     let pitch = ti.mip_bytes_per_row(level_u) as usize;
     let row_bytes = rect.w as usize * bpp;
-    let staging = ti.staging[level_u].as_slice();
-    let mut rows = Vec::with_capacity(row_bytes * rect.h as usize);
-    for row in rect.y as usize..(rect.y + rect.h) as usize {
-        let start = row * pitch + rect.x as usize * bpp;
-        let Some(src) = staging.get(start..start + row_bytes) else {
-            rows.clear();
-            break;
-        };
-        rows.extend_from_slice(src);
-    }
-    if rows.is_empty() {
+    let staging = &ti.staging[level_u];
+    let mut rows = vec![0; row_bytes * rect.h as usize];
+    let copied = mtld3d_core::texture_staging::copy_rows(
+        &staging.as_slice()[..staging.logical_len()],
+        rect.y as usize * pitch + rect.x as usize * bpp,
+        pitch,
+        &mut rows,
+        row_bytes,
+        row_bytes,
+        rect.h as usize,
+    );
+    if !copied || rows.is_empty() {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: texture_id.raw(),
@@ -5178,18 +5371,22 @@ fn schedule_cube_upload<const ORDERED: bool>(
         rect.h
     );
     let bit = ti.observed_bit(face, level_u);
+    let source = upload_source(ti, dev, (face, level_u), rect, slice_pitch);
+    let snapshot_offset = source.snapshot_offset;
     let cube = ti.cube.as_deref_mut().expect("cube storage");
     let older_reader =
         cube.staging[index].has_readers() && cube.last_submit_seq[index] != dev.current_seq();
-    let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
-    cube.last_submit_seq[index] = dev.current_seq();
+    // A snapshot leaves the staging unread, so its in-flight stamp stays.
+    if snapshot_offset.is_none() {
+        cube.last_submit_seq[index] = dev.current_seq();
+    }
     cube.was_uploaded[index] = true;
     if older_reader {
         ti.observed_staging |= bit;
     }
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging,
+        staging: source.staging,
         level,
         destination_slice: face,
         staging_index: index,
@@ -5198,15 +5395,16 @@ fn schedule_cube_upload<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: 1,
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         // A cube is outside the staging-droppable class: its faces are
         // written and uploaded by paths that expect the level to be there.
         release_staging: false,
         upload_generation: 0,
+        snapshot_offset,
     };
     if ORDERED {
         // The ordered placement rides the flags only the mip-carrying form

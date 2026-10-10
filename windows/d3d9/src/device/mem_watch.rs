@@ -11,7 +11,8 @@
 //! how close the process was and who owned the space.
 //!
 //! The page boxes are reported by holder (texture staging, surfaces,
-//! vertex/index backing, encoder leases, upload leases, the recycle pool)
+//! vertex/index backing, encoder leases, upload leases, texture snapshots, the
+//! recycle pool)
 //! with the rest as `other`, and the texture staging and vertex/index backing
 //! are split again by the class that decides whether the copy can be released
 //! at all, so the line names which holder keeps the space rather than leaving
@@ -24,8 +25,9 @@
 //! (`mtld3d_core::watch_handoff` holds the protocol). The thread walks,
 //! advances the threshold latches, reads the process-wide holder figures,
 //! formats and logs. Two figures only the API thread can read safely: the
-//! live textures' footprint (staging the API thread changes without a lock)
-//! and the upload leases (behind the encoder's retirement lock). The thread
+//! live textures' footprint (staging the API thread changes without a lock),
+//! the upload leases (behind the encoder's retirement lock) and the
+//! upload-snapshot arena (the API thread's alone). The thread
 //! asks for them only when a line is due, and the next present answers, so a
 //! line is logged a present or two after its walk. When no present answers
 //! within `FIGURES_WAIT`, the threshold lines are logged without those figures
@@ -172,6 +174,8 @@ impl TextureFootprint {
 struct DeviceFigures {
     footprint: TextureFootprint,
     upload_leases: u64,
+    /// Chunks of the upload-snapshot arena, which only the API thread changes.
+    texture_snapshots: u64,
 }
 
 /// One sample's walk, with what it cost.
@@ -296,8 +300,8 @@ impl Watch for AddressSpaceWatch {
                         || {
                             format!(
                                 "no present answered within {} s of the walk, so the device's \
-                                 textures, mip data, texture staging and upload leases are not \
-                                 counted; {}",
+                                 textures, mip data, texture staging, upload leases and texture \
+                                 snapshots are not counted; {}",
                                 FIGURES_WAIT.as_secs(),
                                 process_page_boxes()
                             )
@@ -438,6 +442,7 @@ impl DeviceInner {
         DeviceFigures {
             footprint: self.live_texture_footprint(),
             upload_leases: self.encoder.upload_lease_bytes(),
+            texture_snapshots: self.texture_snapshot_bytes(),
         }
     }
 
@@ -510,14 +515,15 @@ fn page_box_holders(figures: &DeviceFigures) -> PageBoxHolders {
         vertex_index_backing: mtld3d_core::buffer_backing::live_backing_bytes().total(),
         encoder_leases: mtld3d_core::held_pages::live_encoder_lease_bytes(),
         upload_leases: figures.upload_leases,
+        texture_snapshots: figures.texture_snapshots,
         pool_parked: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
     }
 }
 
 /// The page-box clause the watch thread can give without the device's figures.
 ///
-/// The process-wide holders only: with the device's texture staging and
-/// upload leases unknown, an `other` figure would count them, so the clause
+/// The process-wide holders only: with the device's texture staging, upload
+/// leases and texture snapshots unknown, an `other` figure would count them, so the clause
 /// names no `other` and says the rest is not split.
 fn process_page_boxes() -> String {
     format!(

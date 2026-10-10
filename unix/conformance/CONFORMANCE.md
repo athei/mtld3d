@@ -304,19 +304,6 @@ record. A knob, where one makes sense, is named with its default.
   frame. The rename path has been measured peaking near 1.4 GB of retained
   backings, which is why `memory.vbibRetentionCapMB` exists. Site:
   `test_map_synchronisation` below. No knob.
-- **A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
-  `D3DLOCK_READONLY` returns a pointer into staging an upload may still
-  read.** The same trade for a font atlas or lightmap page written a few
-  rectangles at a time. A whole-level lock is renamed and its contents
-  preserved, because Half-Life 2's lightmap pages rely on that. The partial
-  lock and a write into a level the game holds mapped by a lock or a device
-  context are the only writes left in place under an upload that still reads
-  the level. `UpdateSurface`, `UpdateTexture`, `ColorFill` and `GetDC` move
-  the level to fresh pages first, except when every pending upload of it
-  belongs to the frame being recorded and no draw or other GPU operation on
-  the texture was recorded since, which nothing can observe. Writes into a
-  render-target or depth texture and read-backs from the GPU always move it.
-  No knob.
 - **A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
   no CPU copy once every byte has reached the GPU.** D3D9 preserves contents
   across a plain `Lock` whatever the usage says, so a title that reads back

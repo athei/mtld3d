@@ -210,6 +210,29 @@ impl UploadView<'_> {
             Self::Record { record, .. } => record.release_staging != 0,
         }
     }
+    /// Offset of the box's first row when the source is a snapshot chunk.
+    pub(super) fn snapshot_offset(&self) -> Option<u32> {
+        match self {
+            Self::Owned(v) => v.snapshot_offset,
+            Self::Record { record, .. } => record.snapshot_offset(),
+        }
+    }
+    /// Bytes the upload reads from its source: the snapshot's rows, or the whole staging.
+    pub(super) fn source_span(&self) -> (u64, u64) {
+        let whole = (0, self.staging().backing().len() as u64);
+        let Some(offset) = self.snapshot_offset() else {
+            return whole;
+        };
+        // A compressed source counts block rows.
+        let block_height = mtld3d_core::format::map_d3d_format(self.src_d3d_format())
+            .filter(|_| self.bytes_per_pixel() == 0)
+            .map_or(1, |format| format.block_height());
+        let rows = self.region_h().div_ceil(block_height);
+        (
+            u64::from(offset),
+            u64::from(self.src_pitch()) * u64::from(rows),
+        )
+    }
     pub(super) const fn upload_generation(&self) -> u32 {
         match self {
             Self::Owned(v) => v.upload_generation,
@@ -238,7 +261,7 @@ impl UploadView<'_> {
             releases_staging: self.release_staging(),
         }
     }
-    pub(super) const fn record_recovery(
+    pub(super) fn record_recovery(
         record: &TextureUploadRecord,
         info: TextureInfo,
         staging: PageBoxRead,
@@ -262,6 +285,7 @@ impl UploadView<'_> {
             slice_pitch: record.slice_pitch,
             release_staging: record.release_staging != 0,
             upload_generation: record.upload_generation,
+            snapshot_offset: record.snapshot_offset(),
         }
     }
 }

@@ -789,6 +789,14 @@ pub struct DeviceInner {
     /// [`Self::apply_upload_answers`] drains the queue once a frame, marks
     /// the declined ones dirty again and releases the staging of the rest.
     upload_redirty: Arc<RedirtyQueue>,
+    /// Copies of the boxes partial texture uploads carry, for levels a partial lock renamed.
+    ///
+    /// A level whose partial lock had to move its staging to fresh pages
+    /// while an upload read them snapshots its later partial uploads here
+    /// when they are scheduled, so they no longer read the staging and the
+    /// next lock writes it in place. Allocates its first chunk at the first
+    /// snapshot; a device that never needs one holds nothing.
+    upload_snapshots: mtld3d_core::upload_snapshot::UploadSnapshots,
     /// Per-draw snapshot dirty-bitmask.
     ///
     /// Each bit marks one `CurrentSnapshot` piece as needing rebuild on the
@@ -2494,6 +2502,18 @@ impl DeviceInner {
         Arc::clone(&self.upload_redirty)
     }
 
+    /// The arena partial uploads of renamed levels copy their box into.
+    pub const fn upload_snapshots_mut(
+        &mut self,
+    ) -> &mut mtld3d_core::upload_snapshot::UploadSnapshots {
+        &mut self.upload_snapshots
+    }
+
+    /// Padded bytes of the upload-snapshot arena's chunks.
+    pub fn texture_snapshot_bytes(&self) -> u64 {
+        self.upload_snapshots.held_bytes()
+    }
+
     /// Act on what the encoder made of the uploads of the frame just ended.
     ///
     /// Runs once per `Present`, before the frame is stamped: a declined
@@ -3545,6 +3565,7 @@ impl Direct3DDevice9 {
             departed_textures: DepartedTextures::default(),
             retired_while_failed: Vec::new(),
             upload_redirty: Arc::new(RedirtyQueue::new()),
+            upload_snapshots: mtld3d_core::upload_snapshot::UploadSnapshots::default(),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
             frame_dump: frame_dump::FrameDump::IDLE,

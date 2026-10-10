@@ -202,13 +202,14 @@ fn holders() -> PageBoxHolders {
         vertex_index_backing: 3 * MIB,
         encoder_leases: 2 * MIB,
         upload_leases: 21 * MIB,
+        texture_snapshots: 4 * MIB,
         pool_parked: 126 * MIB,
     }
 }
 
 #[test]
 fn other_is_the_total_less_every_named_holder() {
-    assert_eq!(holders().other(), 250 * MIB);
+    assert_eq!(holders().other(), 246 * MIB);
 }
 
 #[test]
@@ -225,6 +226,6 @@ fn the_holder_clause_names_every_holder_in_mib() {
     assert_eq!(
         holders().to_string(),
         "page boxes 1042 MiB: texture staging 600, surfaces 40, vertex/index backing 3, \
-         encoder leases 2, upload leases 21, pool parked 126, other 250"
+         encoder leases 2, upload leases 21, texture snapshots 4, pool parked 126, other 246"
     );
 }
