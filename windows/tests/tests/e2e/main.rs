@@ -24,6 +24,7 @@ mod bench_crossing;
 mod bench_frame_shape;
 mod bench_query;
 mod bench_shader_stutter;
+mod bench_sprite_scratch;
 mod bench_streaming;
 mod bench_wow112;
 mod buffers;
