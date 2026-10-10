@@ -40,9 +40,9 @@ pub use params::{
     AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc, CreateBackbufferParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams, ExtraColorDesc,
-    GetDeviceInfoParams, InitLoggerParams, OpenLogParams, PassDescriptor, SetCursorOverlayParams,
-    SetPresentWaitPolicyParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
-    WriteLogParams,
+    GetDeviceInfoParams, InitLoggerParams, LogLineKind, OpenLogParams, PassDescriptor,
+    SetCursorOverlayParams, SetPresentWaitPolicyParams, TextureCreateDesc, VertexAttrDesc,
+    VertexBufferLayoutDesc, WriteLogParams,
 };
 pub use record_handle::DeviceRecordHandle;
 

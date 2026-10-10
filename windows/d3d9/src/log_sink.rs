@@ -26,6 +26,15 @@
 //! create, plus the executable's stem for the file name. The pid in the name
 //! is the unix side's own: the one this side sees is Wine's process id, which
 //! repeats from one launch to the next.
+//!
+//! A crash cannot wait for that. [`early_location`] derives the default
+//! location at load for `InitLogger`, and [`write_crash`], the path of a
+//! fault that ends the process, marks its lines as a crash report, which
+//! opens that location on the unix side when nothing has named one yet. A
+//! fault that may still be handled goes through [`write_fault`] instead,
+//! which opens nothing. Both first hand over the lines still queued for a
+//! logging thread that is not running, so they reach the log ahead of the
+//! report rather than dying in the queue.
 
 use core::ffi::c_void;
 use std::{
@@ -38,7 +47,7 @@ use std::{
 };
 
 use log::warn;
-use mtld3d_shared::{OpenLogParams, WriteLogParams, log_once_warn};
+use mtld3d_shared::{LogLineKind, OpenLogParams, WriteLogParams, log_once_warn};
 
 use crate::{
     LOG_TARGET,
@@ -56,6 +65,9 @@ unsafe extern "system" {
     fn RtlGetCurrentPeb() -> *mut c_void;
     fn RtlIsCriticalSectionLockedByThread(section: *mut c_void) -> i32;
 }
+
+/// The log directory beside the executable when `log.dir` is empty.
+const DEFAULT_DIR: &str = "mtld3d-logs";
 
 /// `OpenThread` access right that allows waiting for the thread's end.
 const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -109,7 +121,7 @@ fn log_location(cfg: &mtld3d_core::config::Mtld3dConfig) -> Result<(String, Stri
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() unavailable ({e})"))?;
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
     let dir = if cfg.log_dir.is_empty() {
-        exe_dir.join("mtld3d-logs")
+        exe_dir.join(DEFAULT_DIR)
     } else {
         exe_dir.join(&cfg.log_dir)
     };
@@ -121,6 +133,26 @@ fn log_location(cfg: &mtld3d_core::config::Mtld3dConfig) -> Result<(String, Stri
     let unix_dir = crate::wine_path::unix_path(&dir)
         .ok_or_else(|| format!("no unix path for {}", dir.display()))?;
     Ok((unix_dir, stem))
+}
+
+/// The default log location as a unix path, plus the executable's stem, or `None`.
+///
+/// Derived at load, before `mtld3d.conf` is read, so `log.dir` plays no
+/// part: this is where a crash report goes when it comes before
+/// `Direct3DCreate9` names the location. Nothing is created here; the unix
+/// side creates the directory only if a crash report needs it. The
+/// executable's directory is mapped rather than the log directory itself,
+/// since a directory that does not exist yet may have no unix path.
+pub fn early_location() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let unix_exe_dir = crate::wine_path::unix_path(exe_dir)?;
+    let stem = exe.file_stem().map_or_else(
+        || String::from("mtld3d"),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let separator = if unix_exe_dir.ends_with('/') { "" } else { "/" };
+    Some((format!("{unix_exe_dir}{separator}{DEFAULT_DIR}"), stem))
 }
 
 /// What travels to the logging thread.
@@ -329,7 +361,7 @@ fn caller_holds_loader_lock() -> bool {
 /// into this image.
 fn drain(rx: Receiver<Message>, module_addr: usize) {
     while let Ok(Message::Line(line)) = rx.recv() {
-        forward(&line);
+        forward(&line, LogLineKind::Ordinary);
     }
     *QUEUE.rx.lock().expect("log queue receiver lock poisoned") = Some(rx);
     // SAFETY: `module_addr` is the HMODULE `add_image_reference` returned,
@@ -358,24 +390,59 @@ fn add_image_reference() -> Option<*mut c_void> {
     Some(module)
 }
 
-/// Hand `line` to the unix side right now, on the calling thread.
+/// Hand a line of a terminal fault's report to the unix side right now, on the calling thread.
 ///
 /// For the crash path only: a fault or panic handler cannot rely on the
 /// logging thread ever running again, so it thunks synchronously instead
-/// of queueing. Everything else goes through [`Sink`].
-pub fn write_raw(line: &[u8]) {
-    forward(line);
+/// of queueing. The lines queued while no logging thread runs (every line
+/// before `Direct3DCreate9`) go first, so the report follows them. The line
+/// travels as a crash report, which opens the early log location when none
+/// is named yet. Everything else goes through [`Sink`].
+pub fn write_crash(line: &[u8]) {
+    forward_parked();
+    forward(line, LogLineKind::CrashReport);
+}
+
+/// Hand a line of a first-chance fault report to the unix side right now, on the calling thread.
+///
+/// As [`write_crash`], except that the fault may still be handled: the line
+/// goes where any line goes and opens no log. The crumb dump's sink.
+pub fn write_fault(line: &[u8]) {
+    forward_parked();
+    forward(line, LogLineKind::FaultReport);
+}
+
+/// Forward the lines waiting in the queue while no logging thread runs.
+///
+/// The receiver is parked in the queue then, and only tried: a crash on a
+/// thread that holds it, or one the logging thread races for, leaves the
+/// lines where they are rather than waiting. Each line is leaked once it is
+/// forwarded rather than freed, since this runs inside the exception
+/// handler, whose faulting thread may hold the allocator.
+fn forward_parked() {
+    let Ok(parked) = QUEUE.rx.try_lock() else {
+        return;
+    };
+    let Some(rx) = parked.as_ref() else {
+        return;
+    };
+    while let Ok(message) = rx.try_recv() {
+        if let Message::Line(line) = message {
+            forward(&line, LogLineKind::Ordinary);
+            core::mem::forget(line);
+        }
+    }
 }
 
 /// One formatted line across the boundary; the unix side writes it to the log file.
-fn forward(line: &[u8]) {
+fn forward(line: &[u8], kind: LogLineKind) {
     let Ok(len) = u32::try_from(line.len()) else {
         return;
     };
     let mut params = WriteLogParams {
         ptr: line.as_ptr() as usize as u64,
         len,
-        pad0: 0,
+        kind,
     };
     unix_call(&mut params);
 }

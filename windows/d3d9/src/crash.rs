@@ -30,7 +30,16 @@
 //!
 //! Faults in other modules (game code, `ClientExtensions.dll` `VMProtect`
 //! probes, system DLLs) pass through to SEH normally, so `VMProtect`'s
-//! first-chance recovery still works and `WoW` continues.
+//! first-chance recovery still works and `WoW` continues. Their report is a
+//! first-chance one: it waits in the backlog and opens no log, since the
+//! fault may be handled. When nothing handles it, Wine ends the process with
+//! `TerminateProcess` on itself, which runs nothing of ours, so before
+//! `Direct3DCreate9` that report dies with the process and only the unix
+//! side's first-chance line on stderr remains. A top-level filter for
+//! unhandled exceptions does not cover that case: the startup code of a game
+//! built with Visual Studio 2015 or later replaces such a filter without
+//! chaining, and one left behind by a `FreeLibrary` before any device would
+//! point into unmapped code.
 //!
 //! `RUST_BACKTRACE=1` is set here (if unset) so the default panic hook
 //! attempts a backtrace.
@@ -294,7 +303,8 @@ pub fn uninstall() {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        write_stderr(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
+        // A panic ends the process: its report may open the early log.
+        crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
         crumb::dump_recent(32);
         emit_image_bases();
         // Chain to the default hook so the usual "thread '…' panicked
@@ -327,7 +337,7 @@ fn emit_image_bases() {
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] d3d9.dll base=");
     push_hex(&mut buf, &mut pos, our as usize as u64);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
+    crate::log_sink::write_crash(&buf[..pos]);
 }
 
 extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
@@ -358,8 +368,15 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
 
     // Diagnostic-only. Do NOT terminate — let SEH unwind so the game's own
     // unhandled-exception filter still gets to write its crash report.
+    // Only an always-fatal code is known to end the process here; a fault in
+    // our image is still a first chance a frame up the stack may handle.
     if always_fatal || (possibly_fatal && fault_in_our_dll(addr)) {
-        emit_fatal(code, addr);
+        let line = fatal_line(code, addr);
+        if always_fatal {
+            crate::log_sink::write_crash(line.bytes());
+        } else {
+            crate::log_sink::write_fault(line.bytes());
+        }
         crumb::dump_recent(32);
     } else if possibly_fatal {
         report_foreign_fault(code, addr);
@@ -415,7 +432,8 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     }
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
+    // A first chance: the fault may be handled, so the line opens no log.
+    crate::log_sink::write_fault(&buf[..pos]);
     crumb::dump_recent(16);
 }
 
@@ -449,7 +467,20 @@ fn fault_in_our_dll(addr: *mut c_void) -> bool {
     ok != 0 && module == our
 }
 
-fn emit_fatal(code: u32, addr: *mut c_void) {
+/// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
+struct FatalLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl FatalLine {
+    /// The line's bytes.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+fn fatal_line(code: u32, addr: *mut c_void) -> FatalLine {
     let mut buf = [0u8; 160];
     let mut pos = 0;
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] FATAL: code=");
@@ -458,13 +489,7 @@ fn emit_fatal(code: u32, addr: *mut c_void) {
     push_hex(&mut buf, &mut pos, addr as usize as u64);
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
-}
-
-fn write_stderr(bytes: &[u8]) {
-    // Synchronously through the unix side, into the process's log file: a
-    // launcher-spawned game has no usable stderr handle of its own.
-    crate::log_sink::write_raw(bytes);
+    FatalLine { buf, len: pos }
 }
 
 fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {

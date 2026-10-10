@@ -15,22 +15,42 @@
 //! the conformance runner) leaves no empty file behind. A location that
 //! cannot be created or opened falls back to stderr with one line saying so.
 //!
+//! A crash cannot wait for `OpenLog`: the process will not live to send it.
+//! `InitLogger` therefore names an early location, the default one
+//! (`mtld3d-logs` beside the executable, before `mtld3d.conf` can move it),
+//! and the report of a terminal fault that arrives while the location is
+//! still pending opens that file and writes the backlog ahead of itself
+//! ([`write_crash`] from an ordinary thread, [`crash_fd`] from a signal
+//! handler). Without an early location the backlog and the report go to
+//! stderr. A fault that may still be recovered opens nothing: its report
+//! goes where any line goes ([`write_fault`]), or to stderr from a signal
+//! handler, so a process that lives on keeps its log where `log.dir` puts
+//! it. One that dies of it later, before the location is named, keeps the
+//! signal handler's line on stderr; the PE side's line waits in the backlog
+//! and is lost with the process.
+//!
 //! The directory keeps the [`KEEP`] newest logs and the [`KEEP`] newest
 //! traces: creating a log or a trace first removes the oldest of its kind
 //! past that count, so a game launched every day does not pile up files.
 
 use core::ffi::c_void;
 use std::{
+    ffi::CString,
     fs::{File, OpenOptions},
     io::Write,
-    os::fd::AsRawFd,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Mutex, MutexGuard, TryLockError,
         atomic::{AtomicI32, AtomicU32, Ordering},
     },
     time::SystemTime,
 };
+
+use mtld3d_core::crash_report::{CrashContext, CrashRoute, Severity, SinkState, crash_route};
 
 /// Logs, and separately traces, the directory keeps; older ones go.
 const KEEP: usize = 10;
@@ -42,28 +62,52 @@ const KEEP: usize = 10;
 /// device, where the backlog would otherwise grow for the process lifetime.
 const BACKLOG_CAP: usize = 1024 * 1024;
 
+/// The first line of a file whose backlog lost lines to the cap.
+const TRUNCATED_NOTE: &[u8] = b"[mtld3d::unix] log file: lines before the location were dropped\n";
+
 /// Where a line goes.
 enum Sink {
     /// Location not known yet: keep the line for the file that will come.
     ///
     /// `truncated` records that the cap dropped lines, so the file can say
-    /// its start is incomplete.
-    Pending { backlog: Vec<u8>, truncated: bool },
+    /// its start is incomplete; `early` is where a crash report goes meanwhile.
+    Pending {
+        backlog: Vec<u8>,
+        truncated: bool,
+        early: Option<EarlyLocation>,
+    },
     /// Location known, file not created yet: the first line creates it.
+    ///
+    /// `early` says a crash report named it, ahead of `OpenLog`.
     Lazy {
         path: PathBuf,
         backlog: Vec<u8>,
         truncated: bool,
+        early: bool,
     },
     /// The open log file.
-    Open(File),
+    ///
+    /// `early` is its path when a crash report opened it before `OpenLog`.
+    Open { file: File, early: Option<PathBuf> },
     /// The location failed; stderr is the fallback.
     Stderr,
+}
+
+/// The default log location, named by `InitLogger` for a crash report that comes before `OpenLog`.
+///
+/// Built whole in advance: a signal handler creates the directory and the
+/// file through `mkdir(2)` and `open(2)` on the two C strings and moves
+/// `path` into the sink, so it allocates nothing and frees nothing.
+struct EarlyLocation {
+    dir: CString,
+    file: CString,
+    path: PathBuf,
 }
 
 static SINK: Mutex<Sink> = Mutex::new(Sink::Pending {
     backlog: Vec::new(),
     truncated: false,
+    early: None,
 });
 
 /// The open file's descriptor for the lock-free crash paths; `-1` when closed.
@@ -82,24 +126,42 @@ static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// its first process the same one every launch, so every run of a game would
 /// append to one file and the retention below would never see a second.
 ///
-/// Returns the path the file will have. Nothing is created here; a location
+/// Returns the path the lines go to. Nothing is created here; a location
 /// that turns out unusable is reported by the first write, which then falls
-/// back to stderr.
+/// back to stderr. A file a crash report already opened at the early
+/// location stays the log, and its path is the one returned.
 pub fn open(dir: &str, stem: &str) -> PathBuf {
     let pid = std::process::id();
     let dir = PathBuf::from(dir);
     let path = dir.join(mtld3d_shared::log_paths::log_file_name(stem, pid));
     let mut guard = SINK.lock().expect("log file mutex poisoned");
     let (backlog, truncated) = match core::mem::replace(&mut *guard, Sink::Stderr) {
-        Sink::Pending { backlog, truncated }
+        Sink::Pending {
+            backlog, truncated, ..
+        }
         | Sink::Lazy {
             backlog, truncated, ..
         } => (backlog, truncated),
         // A second `Direct3DCreate9` names the location again: the file
         // already open keeps everything, and stderr has no backlog.
-        Sink::Open(file) => {
-            *guard = Sink::Open(file);
-            return path;
+        Sink::Open { file, early } => {
+            *guard = Sink::Open { file, early: None };
+            drop(guard);
+            let Some(early) = early else {
+                return path;
+            };
+            // The first naming after a crash report opened the early file.
+            *TRACE_BASE.lock().expect("trace base mutex poisoned") =
+                Some((dir, stem.to_owned(), pid));
+            if early != path {
+                log::info!(
+                    target: crate::LOG_TARGET,
+                    "log file: a crash report before Direct3DCreate9 opened {}, which stays the log instead of {}",
+                    early.display(),
+                    path.display()
+                );
+            }
+            return early;
         }
         Sink::Stderr => (Vec::new(), false),
     };
@@ -107,10 +169,39 @@ pub fn open(dir: &str, stem: &str) -> PathBuf {
         path: path.clone(),
         backlog,
         truncated,
+        early: false,
     };
     drop(guard);
     *TRACE_BASE.lock().expect("trace base mutex poisoned") = Some((dir, stem.to_owned(), pid));
     path
+}
+
+/// Name the early location, `<dir>/<stem>-<pid>.log`, for a crash report before `OpenLog`.
+///
+/// `dir` is the default log directory as the PE side derives it at load,
+/// before `mtld3d.conf` is read. Kept only while the location is pending;
+/// nothing is created until a crash report needs it.
+pub fn set_early_location(dir: &str, stem: &str) {
+    let path = Path::new(dir).join(mtld3d_shared::log_paths::log_file_name(
+        stem,
+        std::process::id(),
+    ));
+    let (Ok(dir_c), Ok(file_c)) = (CString::new(dir), CString::new(path.as_os_str().as_bytes()))
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "log file: the early location holds a NUL byte, a crash before Direct3DCreate9 logs to stderr"
+        );
+        return;
+    };
+    let mut guard = SINK.lock().expect("log file mutex poisoned");
+    if let Sink::Pending { early, .. } = &mut *guard {
+        *early = Some(EarlyLocation {
+            dir: dir_c,
+            file: file_c,
+            path,
+        });
+    }
 }
 
 /// Give up on a file: the backlog and everything after it go to stderr.
@@ -118,8 +209,8 @@ pub fn fall_back_to_stderr() {
     let mut guard = SINK.lock().expect("log file mutex poisoned");
     let spill = match core::mem::replace(&mut *guard, Sink::Stderr) {
         Sink::Pending { backlog, .. } | Sink::Lazy { backlog, .. } => Some(backlog),
-        Sink::Open(file) => {
-            *guard = Sink::Open(file);
+        Sink::Open { file, early } => {
+            *guard = Sink::Open { file, early };
             None
         }
         Sink::Stderr => None,
@@ -144,8 +235,7 @@ fn create(path: &PathBuf, backlog: &[u8], truncated: bool) -> Result<File, Strin
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if truncated {
-        let _ =
-            file.write_all(b"[mtld3d::unix] log file: lines before the location were dropped\n");
+        let _ = file.write_all(TRUNCATED_NOTE);
     }
     file.write_all(backlog)
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -158,50 +248,59 @@ fn create(path: &PathBuf, backlog: &[u8], truncated: bool) -> Result<File, Strin
 /// in userspace when the process dies; a failed write falls back to stderr.
 pub fn write_all(bytes: &[u8]) {
     let mut guard = SINK.lock().expect("log file mutex poisoned");
-    // Whatever stderr gets is written after the lock is released.
-    let spill: Option<Vec<u8>> = match &mut *guard {
-        Sink::Pending { backlog, truncated } => {
-            if backlog.len() + bytes.len() <= BACKLOG_CAP {
-                backlog.extend_from_slice(bytes);
-            } else {
-                *truncated = true;
-            }
-            None
-        }
-        Sink::Lazy {
-            path,
-            backlog,
-            truncated,
-        } => match create(path, backlog, *truncated) {
-            Ok(mut file) => {
-                let ok = file.write_all(bytes).is_ok();
-                LOG_FD.store(file.as_raw_fd(), Ordering::Release);
-                *guard = if ok { Sink::Open(file) } else { Sink::Stderr };
-                None
-            }
-            Err(e) => {
-                let mut out = format!("[mtld3d::unix] log file: {e}; logging to stderr instead\n")
-                    .into_bytes();
-                out.extend_from_slice(backlog);
-                out.extend_from_slice(bytes);
-                *guard = Sink::Stderr;
-                Some(out)
-            }
-        },
-        Sink::Open(file) => {
-            if file.write_all(bytes).is_ok() {
-                None
-            } else {
-                LOG_FD.store(-1, Ordering::Release);
-                *guard = Sink::Stderr;
-                Some(bytes.to_vec())
-            }
-        }
-        Sink::Stderr => Some(bytes.to_vec()),
-    };
+    let spill = write_locked(&mut guard, bytes);
     drop(guard);
-    if let Some(out) = spill {
-        let _ = std::io::stderr().lock().write_all(&out);
+    write_stderr(spill);
+}
+
+/// Write one line of a terminal fault's report from an ordinary thread.
+///
+/// The PE side's exception handler, for a fatal exception code, and its
+/// panic hook reach this through `WriteLog`. While the location is pending
+/// the report opens the early one, with the backlog ahead of it, or goes to
+/// stderr with the backlog when there is none; afterwards it is written as
+/// any line is.
+pub fn write_crash(bytes: &[u8]) {
+    write_report(bytes, &Severity::Terminal);
+}
+
+/// Write one line of a fault report the process may still recover from, on an ordinary thread.
+///
+/// The PE side's exception handler sends its first-chance reports this way.
+/// The line goes where any line goes, so a handled fault leaves the log
+/// where `log.dir` puts it; unlike [`write_all`], the sink is only tried.
+pub fn write_fault(bytes: &[u8]) {
+    write_report(bytes, &Severity::FirstChance);
+}
+
+/// The descriptor a signal handler's terminal report goes to, opened first if need be.
+///
+/// While the location is pending, the early location is created with
+/// `mkdir(2)` and `open(2)` and the backlog is written into it, so the
+/// report follows the lines that led up to it; without one the backlog goes
+/// to stderr ahead of the report. Only the terminal paths call this, since
+/// the process ends right after. Async-signal-safe: the sink is only tried,
+/// since the faulting thread may hold it, and its backlog and early location
+/// are moved out and leaked rather than freed, since the allocator's lock
+/// may be held too. The file skips the retention pass a normal creation
+/// makes, which the next process's log makes up for. Every later call, and
+/// [`raw_fd`], answers the descriptor this one settled on.
+pub fn crash_fd() -> i32 {
+    if LOG_FD.load(Ordering::Acquire) >= 0 {
+        return raw_fd();
+    }
+    let mut guard = try_sink();
+    let state = guard.as_deref().map_or(SinkState::Busy, sink_state);
+    match (
+        crash_route(&state, &Severity::Terminal, &CrashContext::Signal),
+        guard.as_deref_mut(),
+    ) {
+        (CrashRoute::EarlyFile, Some(sink)) => open_early_from_signal(sink),
+        (CrashRoute::Stderr, Some(sink)) => {
+            spill_from_signal(sink);
+            raw_fd()
+        }
+        _ => raw_fd(),
     }
 }
 
@@ -257,6 +356,252 @@ pub fn next_trace_path() -> Option<PathBuf> {
     }
     prune(&dir, "gputrace", KEEP - 1);
     Some(path)
+}
+
+/// Write one line of a fault report from an ordinary thread, routed by its severity.
+///
+/// The sink is only tried, never waited for: a fault Wine raised out of a
+/// unix call can leave it held by the faulting thread, and the report then
+/// goes to the descriptor the sink has.
+fn write_report(bytes: &[u8], severity: &Severity) {
+    let mut guard = try_sink();
+    let state = guard.as_deref().map_or(SinkState::Busy, sink_state);
+    let spill = match (
+        crash_route(&state, severity, &CrashContext::Thread),
+        guard.as_deref_mut(),
+    ) {
+        (CrashRoute::EarlyFile, Some(sink)) => {
+            name_early_location(sink);
+            write_locked(sink, bytes)
+        }
+        (CrashRoute::Stderr, Some(sink)) => Some(take_backlog_for_stderr(sink, bytes)),
+        (CrashRoute::Sink, Some(sink)) => write_locked(sink, bytes),
+        _ => {
+            write_bytes(bytes);
+            None
+        }
+    };
+    drop(guard);
+    write_stderr(spill);
+}
+
+/// The sink, unless another holder has it; a poisoned sink is still a sink.
+fn try_sink() -> Option<MutexGuard<'static, Sink>> {
+    match SINK.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Turn a pending sink with an early location into one named there, the backlog kept.
+fn name_early_location(sink: &mut Sink) {
+    *sink = match core::mem::replace(sink, Sink::Stderr) {
+        Sink::Pending {
+            backlog,
+            truncated,
+            early: Some(early),
+        } => Sink::Lazy {
+            path: early.path,
+            backlog,
+            truncated,
+            early: true,
+        },
+        other => other,
+    };
+}
+
+/// Move a pending sink to stderr; answers its backlog followed by `bytes`, for stderr.
+fn take_backlog_for_stderr(sink: &mut Sink, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match core::mem::replace(sink, Sink::Stderr) {
+        Sink::Pending {
+            backlog, truncated, ..
+        } => {
+            if truncated {
+                out.extend_from_slice(TRUNCATED_NOTE);
+            }
+            out.extend_from_slice(&backlog);
+        }
+        other => *sink = other,
+    }
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// What the sink knows, for [`crash_route`].
+const fn sink_state(sink: &Sink) -> SinkState {
+    match sink {
+        Sink::Pending { early, .. } => SinkState::Pending {
+            early_location: early.is_some(),
+        },
+        Sink::Lazy { .. } => SinkState::Named,
+        Sink::Open { .. } => SinkState::Open,
+        Sink::Stderr => SinkState::Stderr,
+    }
+}
+
+/// Write one line under the sink's lock, and hand back what stderr gets instead.
+///
+/// Whatever stderr gets is written by the caller after the lock is released.
+fn write_locked(sink: &mut Sink, bytes: &[u8]) -> Option<Vec<u8>> {
+    match sink {
+        Sink::Pending {
+            backlog, truncated, ..
+        } => {
+            if backlog.len() + bytes.len() <= BACKLOG_CAP {
+                backlog.extend_from_slice(bytes);
+            } else {
+                *truncated = true;
+            }
+            None
+        }
+        Sink::Lazy {
+            path,
+            backlog,
+            truncated,
+            early,
+        } => match create(path, backlog, *truncated) {
+            Ok(mut file) => {
+                let ok = file.write_all(bytes).is_ok();
+                LOG_FD.store(file.as_raw_fd(), Ordering::Release);
+                let early = early.then(|| path.clone());
+                *sink = if ok {
+                    Sink::Open { file, early }
+                } else {
+                    Sink::Stderr
+                };
+                None
+            }
+            Err(e) => {
+                let mut out = format!("[mtld3d::unix] log file: {e}; logging to stderr instead\n")
+                    .into_bytes();
+                out.extend_from_slice(backlog);
+                out.extend_from_slice(bytes);
+                *sink = Sink::Stderr;
+                Some(out)
+            }
+        },
+        Sink::Open { file, .. } => {
+            if file.write_all(bytes).is_ok() {
+                None
+            } else {
+                LOG_FD.store(-1, Ordering::Release);
+                *sink = Sink::Stderr;
+                Some(bytes.to_vec())
+            }
+        }
+        Sink::Stderr => Some(bytes.to_vec()),
+    }
+}
+
+/// Write what [`write_locked`] handed back to stderr.
+fn write_stderr(spill: Option<Vec<u8>>) {
+    if let Some(out) = spill {
+        let _ = std::io::stderr().lock().write_all(&out);
+    }
+}
+
+/// Open the early location from a signal handler and write the backlog into it.
+///
+/// Answers the file's descriptor, or stderr's when the file cannot be
+/// opened, in which case the backlog goes there instead. Nothing here
+/// allocates or frees: the C strings were built when the location was
+/// named, the path moves into the sink, and the backlog and the C strings
+/// are leaked.
+fn open_early_from_signal(sink: &mut Sink) -> i32 {
+    const CANNOT_OPEN: &[u8] =
+        b"[mtld3d::unix] log file: cannot open the early location, logging to stderr: ";
+
+    let (backlog, truncated, early) = match core::mem::replace(&mut *sink, Sink::Stderr) {
+        Sink::Pending {
+            backlog,
+            truncated,
+            early: Some(early),
+        } => (backlog, truncated, early),
+        other => {
+            *sink = other;
+            return raw_fd();
+        }
+    };
+    // SAFETY: mkdir(2) is async-signal-safe and `dir` is NUL-terminated; an
+    // existing directory is the expected failure and changes nothing.
+    unsafe { libc::mkdir(early.dir.as_ptr(), 0o755) };
+    // SAFETY: open(2) is async-signal-safe and `file` is NUL-terminated.
+    let fd = unsafe {
+        libc::open(
+            early.file.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    let target = if fd < 0 {
+        write_fd(2, CANNOT_OPEN);
+        write_fd(2, early.file.as_bytes());
+        write_fd(2, b"\n");
+        2
+    } else {
+        fd
+    };
+    if truncated {
+        write_fd(target, TRUNCATED_NOTE);
+    }
+    write_fd(target, &backlog);
+    let EarlyLocation { dir, file, path } = early;
+    core::mem::forget(backlog);
+    core::mem::forget(dir);
+    core::mem::forget(file);
+    if fd < 0 {
+        // The sink stays on stderr, where the backlog went.
+        core::mem::forget(path);
+        return raw_fd();
+    }
+    // SAFETY: `fd` is the descriptor `open` just returned, owned by nothing
+    // else; the `File` the sink keeps is its only owner from here on.
+    let file = unsafe { File::from_raw_fd(fd) };
+    *sink = Sink::Open {
+        file,
+        early: Some(path),
+    };
+    LOG_FD.store(fd, Ordering::Release);
+    fd
+}
+
+/// Send a pending backlog to stderr from a signal handler; later lines follow it there.
+///
+/// The backlog and the early location are leaked rather than freed.
+fn spill_from_signal(sink: &mut Sink) {
+    match core::mem::replace(&mut *sink, Sink::Stderr) {
+        Sink::Pending {
+            backlog,
+            truncated,
+            early,
+        } => {
+            if truncated {
+                write_fd(2, TRUNCATED_NOTE);
+            }
+            write_fd(2, &backlog);
+            core::mem::forget(backlog);
+            core::mem::forget(early);
+        }
+        other => *sink = other,
+    }
+}
+
+/// Write all of `bytes` to `fd` with `write(2)`, retrying short writes; async-signal-safe.
+fn write_fd(fd: i32, bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        // SAFETY: write(2) is async-signal-safe; `rest` is readable for its length.
+        let written = unsafe { libc::write(fd, rest.as_ptr().cast::<c_void>(), rest.len()) };
+        let Ok(written) = usize::try_from(written) else {
+            return;
+        };
+        if written == 0 {
+            return;
+        }
+        rest = &rest[written.min(rest.len())..];
+    }
 }
 
 /// Remove the oldest entries in `dir` with extension `ext` beyond the newest `keep`.
