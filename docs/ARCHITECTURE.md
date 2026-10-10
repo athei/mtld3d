@@ -366,16 +366,21 @@ reads the copy, not the staging, so the next lock finds no reader and writes
 in place: the level pays one preserve, then a box-sized copy per upload. The
 snapshot's rows are 16-byte aligned for the formats the upload pass widens and
 at least the device's linear texture alignment otherwise, so a blit never
-takes the CPU repack. Whole-level boxes, compressed boxes off the block grid,
-boxes over 64 KiB, volumes, depth formats and planar levels keep reading the
-staging, and so does every texture that never needed the preserve.
+takes the CPU repack. A snapshot of a box never costs more than the
+whole-level copy a rename would, so any box whose padded rows fit one chunk is
+taken. Whole-level boxes, volumes, depth formats and planar levels keep reading
+the staging by design, and so does every texture that never needed the
+preserve; a marked level's box off the compressed block grid or over a chunk
+reads it too, which the summary's `snapshot` row counts as `declined`, since
+the next partial lock of that level renames it again.
 
 The arena is a queue of 256 KiB PE page chunks, at most 64 of them. A
 snapshot is appended at the next 16-byte offset of the active chunk; a chunk
-that cannot fit one goes to the back of the queue, and the chunk at the front
-starts over from offset zero once `has_readers` says nothing reads it.
-Otherwise a new chunk is allocated, and past the cap the upload reads the
-staging, which logs once and counts in the summary's `snapshot` row. The
+that cannot fit one goes to the back of the queue, leaving its tail unused,
+and the chunk at the front starts over from offset zero once `has_readers`
+says nothing reads it. Otherwise a new chunk is allocated, and past the cap the
+upload reads the staging, which logs once and counts as `full` in the
+summary's `snapshot` row. The
 chunks are not a ring stamped by submit sequence because an aborted
 submission's sequence retires while its uploads still wait to be replayed from
 the same bytes, and they are PE pages, not native memory like the encoder's
@@ -1033,7 +1038,7 @@ in its row, and every family carries the suffixes its row names.
 | `vbib_retention_peak_count`, `vbib_retained_bytes` | VB/IB `retention`: peak depth and peak bytes. |
 | `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak); the recycles and parked bytes are the encoder's own pool's. |
 | `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. `in-place` counts partial locks written in place over an upload of the frame being recorded that no GPU operation has seen. |
-| `tex_snapshot_total`, `tex_snapshot_bytes_total`, `tex_snapshot_full_total` | Texture `snapshot`: partial uploads that copied their box into the upload-snapshot arena, the bytes copied, and the snapshots the arena declined (`full`), whose uploads read the staging. |
+| `tex_snapshot_total`, `tex_snapshot_bytes_total`, `tex_snapshot_full_total`, `tex_snapshot_declined_total` | Texture `snapshot`: partial uploads that copied their box into the upload-snapshot arena, the bytes copied, the snapshots the arena had no room for (`full`), and the uploads of marked levels whose box it cannot take (`declined`: off the compressed block grid, or over a chunk). Both of the last two read the staging. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
 | `tex_wrapper_create_total`, `tex_wrapper_retire_total` | Texture `churn`: per-level staging wrappers created, and queued for their destroy (at a backing change, an upload that releases its level's staging, or the texture's release). |

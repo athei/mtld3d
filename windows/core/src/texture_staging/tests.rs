@@ -13,7 +13,7 @@
 //! class outside the one that releases is a level whose only copy of some byte is the staging.
 //! The `decide_staging_write` cases walk every combination of the write facts and pin the frame
 //! rule on its own. The `staging_lazy_class` cases pin that only a default-pool 2D
-//! render-target texture starts without staging. The `snapshot_layout` cases pin the box
+//! render-target texture starts without staging. The `snapshot_box` cases pin the box
 //! offset, block rows and pitch alignment and the boxes left to the staging, and the
 //! `copy_rows` cases the strides and the bounds a copy refuses.
 
@@ -1383,7 +1383,12 @@ fn staging_write_without_readers_stays_in_place() {
 
 // ── snapshot layout and row copies ──
 
-/// `snapshot_layout` on the 256x256 test mip, its staging rows `pitch` bytes apart.
+/// `snapshot_box` on the 256x256 test mip, its staging rows `pitch` bytes apart.
+fn plan(r: DirtyRect, block: (u32, u32), block_bytes: u32, pitch: u32, align: u32) -> SnapshotBox {
+    snapshot_box(r, shape(block), block_bytes, pitch, align)
+}
+
+/// The layout of a box the arena takes, `None` for one it does not.
 fn layout(
     r: DirtyRect,
     block: (u32, u32),
@@ -1391,7 +1396,10 @@ fn layout(
     pitch: u32,
     align: u32,
 ) -> Option<SnapshotLayout> {
-    snapshot_layout(r, shape(block), block_bytes, pitch, align)
+    match plan(r, block, block_bytes, pitch, align) {
+        SnapshotBox::Copy(layout) => Some(layout),
+        SnapshotBox::WholeLevel | SnapshotBox::Declined => None,
+    }
 }
 
 #[test]
@@ -1432,7 +1440,9 @@ fn a_dxt_box_counts_block_rows_and_block_bytes() {
         block_w: 4,
         block_h: 4,
     };
-    let l = snapshot_layout(rect(4, 4, 6, 6), edge, 8, 24, 16).expect("an edge box");
+    let SnapshotBox::Copy(l) = snapshot_box(rect(4, 4, 6, 6), edge, 8, 24, 16) else {
+        panic!("an edge box is copied");
+    };
     assert_eq!(
         (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
         (24 + 8, 16, 2, 16, 32)
@@ -1440,27 +1450,70 @@ fn a_dxt_box_counts_block_rows_and_block_bytes() {
 }
 
 #[test]
-fn whole_unaligned_empty_and_oversized_boxes_take_no_snapshot() {
-    assert!(layout(full(), (1, 1), 4, 1024, 16).is_none(), "whole level");
+fn a_whole_level_box_reads_the_staging_and_is_not_declined() {
+    assert!(matches!(
+        plan(full(), (1, 1), 4, 1024, 16),
+        SnapshotBox::WholeLevel
+    ));
+}
+
+#[test]
+fn off_grid_empty_and_over_a_chunk_boxes_are_declined() {
+    for (r, block, what) in [
+        (
+            rect(2, 2, 4, 4),
+            (4, 4),
+            "a compressed rect off the block grid",
+        ),
+        (rect(0, 0, 0, 4), (1, 1), "an empty rect"),
+        (
+            rect(0, 0, 255, 255),
+            (1, 1),
+            "over a chunk: 255 rows of 2040 bytes",
+        ),
+    ] {
+        let declined = match block {
+            (4, 4) => plan(r, block, 8, 512, 16),
+            _ => plan(r, block, 4 * 2, 2048, 16),
+        };
+        assert!(matches!(declined, SnapshotBox::Declined), "{what}");
+    }
     assert!(
-        layout(rect(2, 2, 4, 4), (4, 4), 8, 512, 16).is_none(),
-        "a compressed rect off the block grid"
-    );
-    assert!(
-        layout(rect(0, 0, 0, 4), (1, 1), 4, 1024, 16).is_none(),
-        "empty"
-    );
-    assert!(
-        layout(rect(0, 0, 4, 4), (1, 1), 4, 1024, 0).is_none(),
+        matches!(
+            plan(rect(0, 0, 4, 4), (1, 1), 4, 1024, 0),
+            SnapshotBox::Declined
+        ),
         "no alignment"
     );
-    // 128 rows of 129 four-byte texels: 528 * 128 bytes, over 64 KiB.
-    assert!(
-        layout(rect(0, 0, 129, 128), (1, 1), 4, 1024, 16).is_none(),
-        "over the snapshot limit"
+}
+
+#[test]
+fn a_large_box_snapshots_whenever_it_fits_a_chunk() {
+    // 200x200 four-byte texels: 800-byte rows, 160 000 bytes on a 16-byte
+    // pitch and 204 800 on a 256-byte one, both under a 256 KiB chunk.
+    let apple = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 16).expect("fits a chunk");
+    assert_eq!((apple.pitch, apple.len), (800, 160_000));
+    let intel = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 256).expect("fits a chunk");
+    assert_eq!((intel.pitch, intel.len), (1024, 204_800));
+    // 255 rows of 256 texels fill all but one row of a chunk.
+    let edge = layout(rect(0, 0, 256, 255), (1, 1), 4, 1024, 256).expect("fits a chunk");
+    assert_eq!(
+        edge.len as usize,
+        crate::upload_snapshot::SNAPSHOT_MAX_BYTES - 1024
     );
-    let largest = layout(rect(0, 0, 129, 112), (1, 1), 4, 1024, 16).expect("the largest sprite");
-    assert!(largest.len as usize <= crate::upload_snapshot::SNAPSHOT_MAX_BYTES);
+    // The largest sprite of the sprite-atlas shape, at either pitch.
+    assert!(layout(rect(0, 0, 129, 112), (1, 1), 4, 1024, 256).is_some());
+}
+
+#[test]
+fn a_layout_fits_only_a_source_that_holds_its_rows() {
+    // Rows of 16 bytes at (4, 4) of a 64-byte-pitch level: the last row
+    // ends at 7 * 64 + 16 + 16 = 480.
+    let l = layout(rect(4, 4, 4, 4), (1, 1), 4, 64, 16).expect("a partial box");
+    assert!(l.fits_source(64, 480));
+    assert!(l.fits_source(64, 1024));
+    assert!(!l.fits_source(64, 479), "one byte short");
+    assert!(!l.fits_source(64, 1), "a placeholder page");
 }
 
 #[test]

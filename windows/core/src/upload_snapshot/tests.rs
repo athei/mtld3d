@@ -3,12 +3,16 @@
 //! Offsets land on the 16-byte grid and the bytes `fill` writes are the ones
 //! the read sees. A chunk that cannot fit a request moves to the queue, the
 //! front chunk starts over only after every read of it has dropped, the arena
-//! stops at its chunk cap rather than waiting, and a declined fill, an empty
-//! request and an oversized one claim nothing.
+//! stops at its chunk cap rather than waiting, a chunk-sized snapshot takes a
+//! chunk of its own, and a declined fill, an empty request and an oversized
+//! one claim nothing.
 
 use std::sync::Arc;
 
 use super::*;
+
+/// A quarter of a chunk, so four snapshots fill one exactly.
+const QUARTER: usize = CHUNK_BYTES / 4;
 
 /// Write `len` bytes of `value` and return the snapshot.
 fn snapshot(arena: &mut UploadSnapshots, len: usize, value: u8) -> UploadSnapshot {
@@ -42,9 +46,7 @@ fn snapshots_land_on_the_alignment_grid_with_their_bytes() {
 #[test]
 fn a_full_chunk_moves_on_to_a_new_one_while_it_is_read() {
     let mut arena = UploadSnapshots::default();
-    let held: Vec<UploadSnapshot> = (0..4)
-        .map(|i| snapshot(&mut arena, SNAPSHOT_MAX_BYTES, i))
-        .collect();
+    let held: Vec<UploadSnapshot> = (0..4).map(|i| snapshot(&mut arena, QUARTER, i)).collect();
     let offsets: Vec<u32> = held.iter().map(|s| s.offset).collect();
     assert_eq!(offsets, [0, 65_536, 131_072, 196_608]);
     let next = snapshot(&mut arena, 16, 9);
@@ -57,14 +59,10 @@ fn a_full_chunk_moves_on_to_a_new_one_while_it_is_read() {
 #[test]
 fn the_front_chunk_starts_over_only_once_its_reads_drop() {
     let mut arena = UploadSnapshots::default();
-    let first: Vec<UploadSnapshot> = (0..4)
-        .map(|i| snapshot(&mut arena, SNAPSHOT_MAX_BYTES, i))
-        .collect();
+    let first: Vec<UploadSnapshot> = (0..4).map(|i| snapshot(&mut arena, QUARTER, i)).collect();
     let first_chunk = Arc::clone(first[0].read.backing());
     // Fill a second chunk while the first is still read.
-    let second: Vec<UploadSnapshot> = (0..4)
-        .map(|i| snapshot(&mut arena, SNAPSHOT_MAX_BYTES, i))
-        .collect();
+    let second: Vec<UploadSnapshot> = (0..4).map(|i| snapshot(&mut arena, QUARTER, i)).collect();
     assert!(!Arc::ptr_eq(&first_chunk, second[0].read.backing()));
     // One read of the first chunk left keeps it from starting over.
     let mut first = first;
@@ -75,10 +73,8 @@ fn the_front_chunk_starts_over_only_once_its_reads_drop() {
     assert_eq!(arena.chunk_count(), 3);
     drop(last_read);
     // Fill the third chunk so the arena moves on again: the first is free now.
-    let filler: Vec<UploadSnapshot> = (0..3)
-        .map(|i| snapshot(&mut arena, SNAPSHOT_MAX_BYTES, i))
-        .collect();
-    let reused = snapshot(&mut arena, SNAPSHOT_MAX_BYTES, 7);
+    let filler: Vec<UploadSnapshot> = (0..3).map(|i| snapshot(&mut arena, QUARTER, i)).collect();
+    let reused = snapshot(&mut arena, QUARTER, 7);
     assert!(Arc::ptr_eq(&first_chunk, reused.read.backing()));
     assert_eq!(reused.offset, 0);
     assert_eq!(arena.chunk_count(), 3);
@@ -89,7 +85,7 @@ fn the_front_chunk_starts_over_only_once_its_reads_drop() {
 fn the_chunk_cap_falls_back_instead_of_waiting() {
     let mut arena = UploadSnapshots::default();
     let held: Vec<UploadSnapshot> = (0..MAX_CHUNKS * 4)
-        .map(|_| snapshot(&mut arena, SNAPSHOT_MAX_BYTES, 0))
+        .map(|_| snapshot(&mut arena, QUARTER, 0))
         .collect();
     assert_eq!(arena.chunk_count(), MAX_CHUNKS);
     assert!(arena.write(16, |_| true).is_none());
@@ -106,4 +102,19 @@ fn a_declined_fill_an_empty_and_an_oversized_request_claim_nothing() {
     assert!(arena.write(0, |_| true).is_none());
     assert!(arena.write(SNAPSHOT_MAX_BYTES + 1, |_| true).is_none());
     assert_eq!(snapshot(&mut arena, 8, 1).offset, 0);
+}
+
+#[test]
+fn a_chunk_sized_snapshot_takes_a_chunk_of_its_own() {
+    let mut arena = UploadSnapshots::default();
+    let small = snapshot(&mut arena, 16, 1);
+    // The active chunk's tail cannot hold a whole chunk, so it moves on.
+    let whole = snapshot(&mut arena, SNAPSHOT_MAX_BYTES, 2);
+    assert_eq!(whole.offset, 0);
+    assert!(!Arc::ptr_eq(small.read.backing(), whole.read.backing()));
+    assert_eq!(arena.chunk_count(), 2);
+    assert_eq!(
+        bytes_at(&whole.read, 0, SNAPSHOT_MAX_BYTES),
+        vec![2; SNAPSHOT_MAX_BYTES]
+    );
 }

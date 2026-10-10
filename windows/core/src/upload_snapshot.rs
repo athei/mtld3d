@@ -40,11 +40,15 @@ use crate::page_box::{PageBox, PageBoxRead};
 /// buddy operation rather than a commit.
 pub const CHUNK_BYTES: usize = 256 * 1024;
 
-/// The largest snapshot the arena takes, a quarter of a chunk.
+/// The largest snapshot the arena takes: a whole chunk.
 ///
-/// Bounds the tail a chunk can leave unused when the next request does not
-/// fit, to a quarter of its bytes. A larger box reads the staging instead.
-pub const SNAPSHOT_MAX_BYTES: usize = CHUNK_BYTES / 4;
+/// A snapshot of a box never costs more than the whole-level copy a rename
+/// of its level would, so any box that fits a chunk is worth taking. One that
+/// does not fit the active chunk's tail moves the arena to the next chunk,
+/// leaving the tail unused; large snapshots are rare, since only a level a
+/// partial lock had to rename takes any, and [`MAX_CHUNKS`] bounds the arena
+/// whatever they waste.
+pub const SNAPSHOT_MAX_BYTES: usize = CHUNK_BYTES;
 
 /// The most chunks the arena holds, 16 MiB of the 32-bit address space.
 ///

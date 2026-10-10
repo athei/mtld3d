@@ -447,31 +447,58 @@ pub struct SnapshotLayout {
     pub len: u32,
 }
 
-/// The layout of a snapshot of `rect`, or `None` for a box the arena does not take.
+impl SnapshotLayout {
+    /// Whether every row of the box lies inside a staging of `src_len` bytes `src_pitch` apart.
+    ///
+    /// The layout is derived from the level's shape, so this fails only for
+    /// a staging that does not hold the level, such as a released level's
+    /// placeholder page.
+    #[must_use]
+    pub fn fits_source(&self, src_pitch: u32, src_len: usize) -> bool {
+        let last_row = u64::from(self.rows.saturating_sub(1)) * u64::from(src_pitch);
+        let end = (self.src_offset as u64)
+            .checked_add(last_row)
+            .and_then(|v| v.checked_add(u64::from(self.row_bytes)));
+        end.is_some_and(|end| end <= src_len as u64)
+    }
+}
+
+/// What a partial upload of a marked level does with its box.
+pub enum SnapshotBox {
+    /// The box covers the whole level and reads the staging by design.
+    ///
+    /// A whole-level write already moves to bare pages, and a level uploaded
+    /// whole is not the one a partial lock rewrites.
+    WholeLevel,
+    /// The arena cannot take the box.
+    ///
+    /// A compressed rect off the block grid, whose upload the encoder widens
+    /// to the whole level, or a snapshot over
+    /// [`crate::upload_snapshot::SNAPSHOT_MAX_BYTES`].
+    Declined,
+    /// The box is copied with this layout.
+    Copy(SnapshotLayout),
+}
+
+/// How a snapshot of `rect` is laid out, or why the upload reads the staging instead.
 ///
 /// `block_bytes` is bytes per texel for an uncompressed format and per block
 /// for a compressed one, `src_pitch` the staging's row stride, and
-/// `pitch_align` the stride the snapshot's rows are rounded up to. A
-/// whole-level box goes to the staging: a whole-level write already moves to
-/// bare pages, and a level uploaded whole is not the one a partial lock
-/// rewrites. So does a compressed rect off the block grid, whose upload the
-/// encoder widens to the whole level, an empty rect, and a box over
-/// [`crate::upload_snapshot::SNAPSHOT_MAX_BYTES`].
+/// `pitch_align` the stride the snapshot's rows are rounded up to. An empty
+/// rect or a zero alignment, which no caller passes, is declined.
 #[must_use]
-pub fn snapshot_layout(
+pub fn snapshot_box(
     rect: DirtyRect,
     shape: MipShape,
     block_bytes: u32,
     src_pitch: u32,
     pitch_align: u32,
-) -> Option<SnapshotLayout> {
-    if rect.w == 0
-        || rect.h == 0
-        || pitch_align == 0
-        || is_whole_mip(Some(rect), shape)
-        || !rect_block_aligned(rect, shape)
-    {
-        return None;
+) -> SnapshotBox {
+    if is_whole_mip(Some(rect), shape) {
+        return SnapshotBox::WholeLevel;
+    }
+    if rect.w == 0 || rect.h == 0 || pitch_align == 0 || !rect_block_aligned(rect, shape) {
+        return SnapshotBox::Declined;
     }
     let block_x = rect.x / shape.block_w;
     let block_y = rect.y / shape.block_h;
@@ -481,9 +508,17 @@ pub fn snapshot_layout(
     let pitch = row_bytes.next_multiple_of(u64::from(pitch_align));
     let len = pitch * rows;
     if row_bytes == 0 || len > crate::upload_snapshot::SNAPSHOT_MAX_BYTES as u64 {
-        return None;
+        return SnapshotBox::Declined;
     }
-    Some(SnapshotLayout {
+    let (Ok(row_bytes), Ok(rows), Ok(pitch), Ok(len)) = (
+        u32::try_from(row_bytes),
+        u32::try_from(rows),
+        u32::try_from(pitch),
+        u32::try_from(len),
+    ) else {
+        return SnapshotBox::Declined;
+    };
+    SnapshotBox::Copy(SnapshotLayout {
         src_offset: texture_lock_offset(
             Some(rect),
             src_pitch,
@@ -491,10 +526,10 @@ pub fn snapshot_layout(
             shape.block_h,
             block_bytes,
         ),
-        row_bytes: u32::try_from(row_bytes).ok()?,
-        rows: u32::try_from(rows).ok()?,
-        pitch: u32::try_from(pitch).ok()?,
-        len: u32::try_from(len).ok()?,
+        row_bytes,
+        rows,
+        pitch,
+        len,
     })
 }
 

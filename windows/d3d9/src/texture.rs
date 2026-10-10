@@ -4987,16 +4987,19 @@ struct UploadSource {
     staging: PageBoxRead,
     /// Row stride of `staging`: the level's, or the snapshot's.
     src_pitch: u32,
+    /// Slice stride of `staging`: the level's, or the snapshot's whole span.
+    slice_pitch: u32,
     /// Byte offset of the box in a snapshot chunk; `None` for the staging.
     snapshot_offset: Option<u32>,
 }
 
 impl UploadSource {
     /// A read of the subresource's own staging pages.
-    fn staging(pages: &Arc<PageBox>, src_pitch: u32) -> Self {
+    fn staging(pages: &Arc<PageBox>, src_pitch: u32, slice_pitch: u32) -> Self {
         Self {
             staging: PageBoxRead::new(Arc::clone(pages)),
             src_pitch,
+            slice_pitch,
             snapshot_offset: None,
         }
     }
@@ -5006,16 +5009,17 @@ impl UploadSource {
 ///
 /// A subresource marked in `snapshot_staging` copies a partial box into the
 /// device's snapshot arena, so the upload leaves its staging pages alone; any
-/// other upload, and one the arena cannot take, reads the staging. A volume
-/// level, a depth format and a planar YUV level always read the staging: their
-/// uploads take paths that address the whole level.
+/// other upload, and one the arena cannot take, reads the staging at
+/// `slice_pitch`. A volume level, a depth format and a planar YUV level always
+/// read the staging: their uploads take paths that address the whole level.
 fn upload_source(
     ti: &TextureInner,
     dev: &mut DeviceInner,
-    face: u32,
-    level: usize,
+    (face, level): (u32, usize),
     rect: DirtyRect,
+    slice_pitch: u32,
 ) -> UploadSource {
+    use mtld3d_core::texture_staging::SnapshotBox;
     let pages = ti.cube.as_deref().map_or_else(
         || &ti.staging[level],
         |cube| {
@@ -5030,7 +5034,7 @@ fn upload_source(
         || ti.flags.contains(TextureFlags::DEPTH_FORMAT)
         || ti.planar_storage_extent().is_some()
     {
-        return UploadSource::staging(pages, src_pitch);
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
     }
     // The upload pass addresses its source by texel and takes any 16-byte
     // aligned pitch; a blit needs the device's linear texture alignment, so
@@ -5043,17 +5047,38 @@ fn upload_source(
     } else {
         align.max(dev.gpu_caps().min_linear_texture_align)
     };
-    let Some(layout) = mtld3d_core::texture_staging::snapshot_layout(
+    let layout = match mtld3d_core::texture_staging::snapshot_box(
         rect,
         ti.mip_shape(level),
         ti.block_bytes,
         src_pitch,
         pitch_align,
-    ) else {
-        // A whole-level box, one off the block grid or one over the size
-        // limit reads the staging by design: the next write's rule covers it.
-        return UploadSource::staging(pages, src_pitch);
+    ) {
+        SnapshotBox::Copy(layout) => layout,
+        // A whole-level upload reads the staging by design: a whole-level
+        // write already moves to bare pages.
+        SnapshotBox::WholeLevel => return UploadSource::staging(pages, src_pitch, slice_pitch),
+        SnapshotBox::Declined => {
+            mtld3d_shared::log_once_info!(
+                target: crate::LOG_TARGET,
+                "texture upload snapshot: a box off the compressed block grid or larger than an \
+                 arena chunk reads the staging, so the next partial lock of its level renames it \
+                 again"
+            );
+            dev.perf_mut().bump_texture_snapshot_declined();
+            return UploadSource::staging(pages, src_pitch, slice_pitch);
+        }
     };
+    if !layout.fits_source(src_pitch, pages.logical_len()) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the box's rows reach past the level's staging \
+             ({} bytes) → the upload reads the staging",
+            pages.logical_len()
+        );
+        dev.perf_mut().bump_texture_snapshot_declined();
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    }
     let source = &pages.as_slice()[..pages.logical_len()];
     let written = dev
         .upload_snapshots_mut()
@@ -5071,17 +5096,18 @@ fn upload_source(
     let Some(snapshot) = written else {
         mtld3d_shared::log_once_info!(
             target: crate::LOG_TARGET,
-            "texture upload snapshot: the arena holds no free chunk under its cap, or the box \
-             could not be copied; the upload reads the staging and the next partial lock of the \
-             level may rename it"
+            "texture upload snapshot: every arena chunk is still read and the arena is at its \
+             cap, or a new chunk could not be allocated → the upload reads the staging and the \
+             next partial lock of its level may rename it"
         );
         dev.perf_mut().bump_texture_snapshot_full();
-        return UploadSource::staging(pages, src_pitch);
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
     };
     dev.perf_mut().bump_texture_snapshot(layout.len);
     UploadSource {
         staging: snapshot.read,
         src_pitch: layout.pitch,
+        slice_pitch: layout.len,
         snapshot_offset: Some(snapshot.offset),
     }
 }
@@ -5158,7 +5184,7 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
         ti.observed_staging |= ti.observed_bit(0, level_u);
     }
-    let source = upload_source(ti, dev, 0, level_u, rect);
+    let source = upload_source(ti, dev, (0, level_u), rect, slice_pitch);
     let snapshot_offset = source.snapshot_offset;
     let job = TextureUploadJob {
         info: ti.texture_info(),
@@ -5174,7 +5200,7 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: (ti.depth >> level).max(1),
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         release_staging,
         upload_generation,
@@ -5331,7 +5357,7 @@ fn schedule_cube_upload<const ORDERED: bool>(
         rect.h
     );
     let bit = ti.observed_bit(face, level_u);
-    let source = upload_source(ti, dev, face, level_u, rect);
+    let source = upload_source(ti, dev, (face, level_u), rect, slice_pitch);
     let snapshot_offset = source.snapshot_offset;
     let cube = ti.cube.as_deref_mut().expect("cube storage");
     let older_reader =
@@ -5358,7 +5384,7 @@ fn schedule_cube_upload<const ORDERED: bool>(
         src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: 1,
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         // A cube is outside the staging-droppable class: its faces are
         // written and uploaded by paths that expect the level to be there.
