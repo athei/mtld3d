@@ -17,6 +17,8 @@ mod exit_code_hook;
 mod fullscreen;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 mod guest_mem;
+#[macro_use]
+mod hookable;
 mod import_patch;
 mod index_buffer;
 mod log_sink;
@@ -201,20 +203,85 @@ pub fn pin_image() {
     }
 }
 
-#[unsafe(export_name = "Direct3DCreate9")]
-#[must_use]
-pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
+// The exports of the d3d9 API. Each is an entry with a fixed prologue that hook
+// engines relocate (`hookable.rs`), and jumps to the function after `=`.
+
+hookable_export! {
+    /// `Direct3DCreate9`: an `IDirect3D9`.
+    #[must_use]
+    "Direct3DCreate9" => fn direct3d_create9(sdk_version: u32) -> *mut c_void = create9;
+}
+
+hookable_export! {
+    /// `Direct3DCreate9Ex`: an `IDirect3D9Ex`, the factory of extended devices.
+    ///
+    /// The interface is the one `Direct3DCreate9` makes with its extended flag
+    /// set: it answers `IID_IDirect3D9Ex`, and every device it creates, through
+    /// `CreateDeviceEx` or plain `CreateDevice`, is an extended device. A null
+    /// out slot is `D3DERR_INVALIDCALL` and creates nothing.
+    "Direct3DCreate9Ex" => fn direct3d_create9_ex(sdk_version: u32, out: *mut *mut c_void) -> i32 = create9_ex;
+}
+
+hookable_export! {
+    /// `Direct3DShaderValidatorCreate9`: the shader validator interface.
+    #[must_use]
+    "Direct3DShaderValidatorCreate9" => fn direct3d_shader_validator_create9() -> *mut c_void = shader_validator_create9;
+}
+
+// The `D3DPERF_*` family: PIX event markers a game emits around its draw
+// groups. Without a profiler attached the real d3d9.dll does nothing and
+// reports no nesting, no repeat-frame request and no attached tool, which is
+// the complete behaviour here too. They are exported because engines resolve
+// the whole family by name in one table and treat a missing entry as a broken
+// d3d9.dll: an in-game overlay SDK refuses to initialise when any of them
+// resolves to null, even though the game itself renders fine.
+
+hookable_export! {
+    /// `D3DPERF_BeginEvent`: opens a PIX event; returns the nesting level.
+    ///
+    /// Logged once so a game that emits PIX markers is visible in triage; the
+    /// markers are not forwarded to a Metal capture.
+    "D3DPERF_BeginEvent" => fn d3dperf_begin_event(color: u32, name: *const u16) -> i32 = perf_begin_event;
+}
+
+hookable_export! {
+    /// `D3DPERF_EndEvent`: closes a PIX event; returns the nesting level.
+    #[must_use]
+    "D3DPERF_EndEvent" => const fn d3dperf_end_event() -> i32 = perf_end_event;
+}
+
+hookable_export! {
+    /// `D3DPERF_SetMarker`: a single PIX marker, not forwarded.
+    "D3DPERF_SetMarker" => const fn d3dperf_set_marker(color: u32, name: *const u16) = perf_set_marker;
+}
+
+hookable_export! {
+    /// `D3DPERF_SetRegion`: a PIX region marker, not forwarded.
+    "D3DPERF_SetRegion" => const fn d3dperf_set_region(color: u32, name: *const u16) = perf_set_region;
+}
+
+hookable_export! {
+    /// `D3DPERF_QueryRepeatFrame`: `FALSE`, no profiler asks for a frame replay.
+    #[must_use]
+    "D3DPERF_QueryRepeatFrame" => const fn d3dperf_query_repeat_frame() -> i32 = perf_query_repeat_frame;
+}
+
+hookable_export! {
+    /// `D3DPERF_SetOptions`: profiler permission flags, nothing to apply them to.
+    "D3DPERF_SetOptions" => const fn d3dperf_set_options(options: u32) = perf_set_options;
+}
+
+hookable_export! {
+    /// `D3DPERF_GetStatus`: `0`, no profiler attached.
+    #[must_use]
+    "D3DPERF_GetStatus" => const fn d3dperf_get_status() -> u32 = perf_get_status;
+}
+
+extern "system" fn create9(_sdk_version: u32) -> *mut c_void {
     create_interface(false).cast::<c_void>()
 }
 
-/// `Direct3DCreate9Ex`: an `IDirect3D9Ex`, the factory of extended devices.
-///
-/// The interface is the one `Direct3DCreate9` makes with its extended flag
-/// set: it answers `IID_IDirect3D9Ex`, and every device it creates, through
-/// `CreateDeviceEx` or plain `CreateDevice`, is an extended device. A null
-/// out slot is `D3DERR_INVALIDCALL` and creates nothing.
-#[unsafe(export_name = "Direct3DCreate9Ex")]
-pub extern "system" fn direct3d_create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
+extern "system" fn create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
     if out.is_null() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -246,26 +313,11 @@ fn create_interface(extended: bool) -> *mut Direct3D9 {
     Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg), extended)))
 }
 
-#[unsafe(export_name = "Direct3DShaderValidatorCreate9")]
-#[must_use]
-pub extern "system" fn direct3d_shader_validator_create9() -> *mut c_void {
+extern "system" fn shader_validator_create9() -> *mut c_void {
     shader_validator::create()
 }
 
-// The `D3DPERF_*` family: PIX event markers a game emits around its draw
-// groups. Without a profiler attached the real d3d9.dll does nothing and
-// reports no nesting, no repeat-frame request and no attached tool, which is
-// the complete behaviour here too. They are exported because engines resolve
-// the whole family by name in one table and treat a missing entry as a broken
-// d3d9.dll: an in-game overlay SDK refuses to initialise when any of them
-// resolves to null, even though the game itself renders fine.
-
-/// `D3DPERF_BeginEvent`: opens a PIX event; returns the nesting level.
-///
-/// Logged once so a game that emits PIX markers is visible in triage; the
-/// markers are not forwarded to a Metal capture.
-#[unsafe(export_name = "D3DPERF_BeginEvent")]
-pub extern "system" fn d3dperf_begin_event(_color: u32, _name: *const u16) -> i32 {
+extern "system" fn perf_begin_event(_color: u32, _name: *const u16) -> i32 {
     mtld3d_shared::log_once_info!(
         target: LOG_TARGET,
         "D3DPERF_BeginEvent: PIX event markers not forwarded (no profiler)"
@@ -273,36 +325,21 @@ pub extern "system" fn d3dperf_begin_event(_color: u32, _name: *const u16) -> i3
     0
 }
 
-/// `D3DPERF_EndEvent`: closes a PIX event; returns the nesting level.
-#[unsafe(export_name = "D3DPERF_EndEvent")]
-#[must_use]
-pub const extern "system" fn d3dperf_end_event() -> i32 {
+const extern "system" fn perf_end_event() -> i32 {
     0
 }
 
-/// `D3DPERF_SetMarker`: a single PIX marker, not forwarded.
-#[unsafe(export_name = "D3DPERF_SetMarker")]
-pub const extern "system" fn d3dperf_set_marker(_color: u32, _name: *const u16) {}
+const extern "system" fn perf_set_marker(_color: u32, _name: *const u16) {}
 
-/// `D3DPERF_SetRegion`: a PIX region marker, not forwarded.
-#[unsafe(export_name = "D3DPERF_SetRegion")]
-pub const extern "system" fn d3dperf_set_region(_color: u32, _name: *const u16) {}
+const extern "system" fn perf_set_region(_color: u32, _name: *const u16) {}
 
-/// `D3DPERF_QueryRepeatFrame`: `FALSE`, no profiler asks for a frame replay.
-#[unsafe(export_name = "D3DPERF_QueryRepeatFrame")]
-#[must_use]
-pub const extern "system" fn d3dperf_query_repeat_frame() -> i32 {
+const extern "system" fn perf_query_repeat_frame() -> i32 {
     0
 }
 
-/// `D3DPERF_SetOptions`: profiler permission flags, nothing to apply them to.
-#[unsafe(export_name = "D3DPERF_SetOptions")]
-pub const extern "system" fn d3dperf_set_options(_options: u32) {}
+const extern "system" fn perf_set_options(_options: u32) {}
 
-/// `D3DPERF_GetStatus`: `0`, no profiler attached.
-#[unsafe(export_name = "D3DPERF_GetStatus")]
-#[must_use]
-pub const extern "system" fn d3dperf_get_status() -> u32 {
+const extern "system" fn perf_get_status() -> u32 {
     0
 }
 
