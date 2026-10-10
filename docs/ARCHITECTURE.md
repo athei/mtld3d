@@ -459,19 +459,21 @@ their GPU-idle wait.
 
 A reused spare still has to receive what the texture changed after it
 retired. For a 2D or cube colour texture whose application usage is neither
-render target nor depth stencil, D3D9 leaves uploads and mip regeneration as
-the only writers: such a texture cannot be a render target, a `StretchRect`
-destination or a `ColorFill` destination. Those textures keep a write counter
+render target nor depth stencil, D3D9 leaves few writers: such a texture
+cannot be a render target or a `ColorFill` destination, and only an extended
+device copies into it with `StretchRect`, as a whole surface of one format and
+size. Those textures keep a write counter
 and, per slice and level, a grid of at most 32 by 32 tiles of at least 16
 texels holding the counter of the last write that touched each tile. Emitted
 uploads, their replays after an aborted submission, the whole-level fallback
-of a compressed rectangle off the block grid and mip regeneration (levels 1
-and up) stamp it. A version records the counter when it retires, and the
+of a compressed rectangle off the block grid, mip regeneration (levels 1 and
+up) and every `StretchRect` into a texture level, with the mip regeneration
+that follows it on an `AUTOGENMIPMAP` texture, stamp it. A version records the counter when it retires, and the
 preserve copy into it covers only the tile-aligned bounding box of the tiles
 stamped later, so every version is still a complete snapshot. A version that
 was live through an aborted submission, a fresh allocation and every other
 texture kind take whole-level copies. Builds with debug assertions check the
-attachment setters and the `StretchRect`, `ColorFill` and region-update
+attachment setters and the `ColorFill`, region-update and colour write-back
 writers against the handles of such textures and stop on a write the history
 would miss. In the `perf-kv` line `tex_reorder` still counts every rename,
 `tex_destroy` falls by the renames a spare served, and the allocations and

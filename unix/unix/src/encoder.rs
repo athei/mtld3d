@@ -1156,7 +1156,7 @@ pub struct FrameEncoder {
     ///
     /// Live and retiring versions; a version leaves at `retire_texture_handle`
     /// and comes back when a rename takes it again. The attachment setters
-    /// and the `StretchRect`, `ColorFill` and region-upload writers check
+    /// and the `ColorFill`, region-update and colour write-back writers check
     /// their destination against it (`assert_unversioned_write`), since a
     /// write through any of them would be missing from the history.
     #[cfg(debug_assertions)]
@@ -3459,10 +3459,6 @@ impl FrameEncoder {
     /// no further pass opens this frame, `submit` synthesises a trailing
     /// blit-only `PassDescriptor` to drain it.
     pub fn push_stretch_rect_blit(&mut self, blit: BlitCommand) {
-        #[cfg(debug_assertions)]
-        if blit.cmd != BlitCommandType::GenerateMipmaps as u32 {
-            self.assert_unversioned_write(blit.dst_handle, "a StretchRect or region-update blit");
-        }
         self.pass_state.push_pending_leading_blit(blit);
     }
 
@@ -4559,8 +4555,6 @@ impl FrameEncoder {
         if dst_handle == 0 || src_handle == 0 {
             return;
         }
-        #[cfg(debug_assertions)]
-        self.assert_unversioned_write(dst_handle, "a scaling StretchRect");
         // SAFETY: both handles are live Metal texture addresses resolved by
         // the caller (`get_or_create_texture` / a standalone colour handle),
         // non-zero per the guard above.
@@ -6662,13 +6656,41 @@ impl FrameEncoder {
         }
     }
 
+    /// Stamp a `StretchRect` into a texture level in the texture's write history.
+    ///
+    /// An extended device copies a whole surface into a texture level that is
+    /// no render target, which keeps a write history; on a plain device the
+    /// destination is a render target and this finds no history to stamp.
+    /// The copy is queued among the application's passes, after every rename
+    /// copy at the head of this submission, and it marks the destination
+    /// blit-written, so a later upload of this frame writes after it in the
+    /// same stream rather than renaming: stamping here, as the copy is queued,
+    /// orders the stamp the way the GPU orders the writes. `regenerates` is an
+    /// `AUTOGENMIPMAP` texture's chain following the copy.
+    pub fn note_texture_blit_write(
+        &mut self,
+        texture_id: TextureId,
+        (slice, level): (u32, u32),
+        rect: &TexelRect,
+        regenerates: bool,
+    ) {
+        self.texture_versions
+            .note_write(texture_id, slice, level, rect);
+        if regenerates {
+            self.texture_versions.note_mip_regeneration(texture_id);
+        }
+    }
+
     /// Stop a write the write history of `handle`'s texture would miss.
     ///
     /// `handle` is a destination about to be written outside the upload and
-    /// mip-regeneration paths. A version of a texture whose preserve copies
-    /// follow its write history (`records_every_write`) is never one: D3D9
-    /// refuses such a texture as a render target and as a `StretchRect` or
-    /// `ColorFill` destination. If it ever were, a later reuse of a spare
+    /// mip-regeneration paths, and that does not record itself in the history
+    /// the way `note_texture_blit_write` does for `StretchRect`. A version of
+    /// a texture whose preserve copies follow its write history
+    /// (`records_every_write`) is never one: D3D9 refuses such a texture as a
+    /// render target and as a `ColorFill` destination, and the region-update
+    /// and colour write-back paths serve render targets and the back buffer
+    /// alone. If it ever were, a later reuse of a spare
     /// would copy only the stamped tiles and drop this write, so builds with
     /// debug assertions stop here instead; production builds compile none of
     /// it.
@@ -8131,6 +8153,8 @@ impl FrameEncoder {
         if color_handle == 0 || width == 0 || height == 0 || region.bytes_per_row == 0 {
             return;
         }
+        #[cfg(debug_assertions)]
+        self.assert_unversioned_write(color_handle, "a colour region update");
         self.flush_pending_clears();
         self.end_current_pass("update_color_region");
         let Some((buffer_handle, bytes_per_row)) =

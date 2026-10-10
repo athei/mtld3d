@@ -24,8 +24,10 @@
 //! since it retired, and only those, when the texture's GPU writes are all
 //! known. For a 2D or cube colour texture the application did not create
 //! as a render target or depth stencil they are: D3D9 refuses it as a
-//! render target and as the destination of `StretchRect` and `ColorFill`,
-//! so its only writers are uploads and mip regeneration. Such a texture
+//! render target and as a `ColorFill` destination, and a plain device as a
+//! `StretchRect` destination too, so its writers are uploads, mip
+//! regeneration and an extended device's whole-surface `StretchRect`, which
+//! the encoder records like an upload. Such a texture
 //! keeps a write counter and, per slice and level, a grid of the counter
 //! value of the last write that touched each tile. A version records the
 //! counter when it retires, and the preserve copy into it covers the
@@ -157,8 +159,10 @@ impl VersionShape {
 /// True for a 2D or cube colour texture whose application usage
 /// (`application_usage`, before the encoder adds the render-target bit an
 /// upload pass needs) has neither the render-target nor the depth-stencil
-/// bit: D3D9 lets nothing but uploads and mip regeneration write one. A
-/// volume, a depth texture and a render target take whole-level copies.
+/// bit: D3D9 lets nothing but uploads, mip regeneration and an extended
+/// device's whole-surface `StretchRect` write one, and the caller reports
+/// each. A volume, a depth texture and a render target take whole-level
+/// copies.
 #[must_use]
 pub fn records_every_write(desc: &TextureCreateDesc, application_usage: TextureUsage) -> bool {
     !desc.flags.contains(TextureCreateFlags::TYPE_3D)

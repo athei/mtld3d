@@ -13,20 +13,24 @@
 //! nothing past it. `TestCooperativeLevel` answers `D3D_OK` on an extended
 //! device, after a failed submission too, while `PresentEx`, `Present`, the
 //! swap chain's `Present`, `CheckDeviceState`, `ResetEx` and `Reset` report
-//! the failure with one code.
+//! the failure with one code. A whole-surface `StretchRect` into a texture
+//! level that is no render target reaches the versions later renames of that
+//! texture reuse.
 
 use core::ffi::{c_char, c_void};
 
 use mtld3d_tests::{
-    Factory, Harness, HarnessConfig, PRESENT_STATS_GUARD, PRESENT_STATS_PROBE_BYTES,
-    assert_pixel_eq,
+    Factory, Harness, HarnessConfig, PRESENT_STATS_GUARD, PRESENT_STATS_PROBE_BYTES, Surface,
+    Texture, TexturedVertex, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER,
     D3DDISPLAYROTATION_IDENTITY, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8,
-    D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE,
-    D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE, D3DSCANLINEORDERING_UNKNOWN,
-    D3DSDK_VERSION, E_NOINTERFACE, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3D9EX,
+    D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE, D3DPT_TRIANGLELIST,
+    D3DRECT, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSCANLINEORDERING_INTERLACED,
+    D3DSCANLINEORDERING_PROGRESSIVE, D3DSCANLINEORDERING_UNKNOWN, D3DSDK_VERSION, D3DTEXF_NONE,
+    D3DTEXF_POINT, E_NOINTERFACE, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3D9EX,
     IID_IDIRECT3DDEVICE9, IID_IDIRECT3DDEVICE9EX, IID_IDIRECT3DSWAPCHAIN9,
     IID_IDIRECT3DSWAPCHAIN9EX,
 };
@@ -485,4 +489,126 @@ fn an_overlay_probe_of_the_extended_device_leaves_a_plain_device_working() {
         0xFFFF_0000,
         "the plain device draws",
     );
+}
+
+/// A whole-surface `StretchRect` into a renamed texture reaches the versions it reuses.
+///
+/// An extended device copies a whole surface into a default-pool texture
+/// level that is no render target. Such a texture's renames reuse retired
+/// versions and copy into them only what the texture's write history says
+/// changed since they retired, so the copy has to be in that history: frame
+/// 0 renames the texture (its first version retires holding only the fill),
+/// frame 1 copies a whole surface of another colour over it and patches it
+/// once before drawing, and frame 2's rename reuses that first version, which
+/// must come back holding the copy everywhere the patches do not reach. The
+/// copy leaves the level on the GPU alone, so the first CPU write after it
+/// reads the level back with a blocking flush; frame 1's patch takes that
+/// flush before any draw, so frame 2's draws and patch share one submission
+/// and its upload renames.
+#[test]
+fn a_whole_surface_stretch_rect_reaches_the_versions_a_rename_reuses() {
+    const FILL: u32 = 0xFF80_8080;
+    const PATCH: u32 = 0xFFFF_0000;
+    const COPY: u32 = 0xFF00_00FF;
+    const LATER: u32 = 0xFF00_FF00;
+    const READ_BACK: u32 = 0xFFFF_FF00;
+    let h = extended(Factory::Extended);
+    let texture = h.create_texture(256, 256, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let level = texture.surface_level(0);
+    let source = h.create_texture(256, 256, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let staging = h.create_offscreen_plain_surface(256, 256, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let fill = |dst: &Surface<'_>, rect: [u32; 4], color: u32| {
+        let [x0, y0, x1, y1] = rect.map(|v| i32::try_from(v).expect("small"));
+        let (w, hgt) = ((rect[2] - rect[0]) as usize, (rect[3] - rect[1]) as usize);
+        staging
+            .lock_rect_partial(&[x0, y0, x1, y1], 0)
+            .write_u32_rect(w, hgt, &vec![color; w * hgt]);
+        let src_rect = D3DRECT {
+            x1: x0,
+            y1: y0,
+            x2: x1,
+            y2: y1,
+        };
+        assert_eq!(
+            h.update_surface_region_hr(&staging, &src_rect, dst, (x0, y0)),
+            D3D_OK
+        );
+    };
+    fill(&level, [0, 0, 256, 256], FILL);
+    fill(&source.surface_level(0), [0, 0, 256, 256], COPY);
+    bind_point_sampled(&h, &texture);
+    let quad = fullscreen_textured_quad();
+    let draw = |d: &Harness| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), D3D_OK);
+    };
+    // Frame 0: the second draw's upload renames the texture.
+    h.render_once(0xFF00_0000, |d| {
+        draw(d);
+        fill(&level, [0, 0, 64, 64], PATCH);
+        draw(d);
+    });
+    assert_pixel_eq(h.read_pixel(40, 30), PATCH, "frame 0 patch");
+    // Frame 1: the extended whole-surface copy, then a patch that reads the
+    // level back ahead of the frame's draw.
+    assert_eq!(
+        h.stretch_rect(&source.surface_level(0), &level, D3DTEXF_NONE),
+        D3D_OK
+    );
+    h.render_once(0xFF00_0000, |d| {
+        fill(&level, [64, 0, 128, 64], READ_BACK);
+        draw(d);
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), COPY, "the copy landed");
+    assert_pixel_eq(h.read_pixel(240, 30), READ_BACK, "the patch after it");
+    // Frame 2: this rename reuses the version frame 0 retired.
+    h.render_once(0xFF00_0000, |d| {
+        draw(d);
+        fill(&level, [192, 192, 256, 256], LATER);
+        draw(d);
+    });
+    for (x, y, expected, what) in [
+        (40, 30, COPY, "where frame 0's patch was"),
+        (240, 30, READ_BACK, "frame 1's patch"),
+        (320, 240, COPY, "the middle"),
+        (600, 30, COPY, "the top right"),
+        (600, 450, LATER, "frame 2's patch"),
+    ] {
+        assert_pixel_eq(h.read_pixel(x, y), expected, what);
+    }
+    assert_eq!(h.clear_texture(0), D3D_OK);
+}
+
+/// Bind `texture` at stage 0, point-sampled, its colour alone.
+fn bind_point_sampled(h: &Harness, texture: &Texture<'_>) {
+    assert_eq!(h.set_texture(0, texture), D3D_OK);
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), D3D_OK);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), D3D_OK);
+}
+
+/// Two clockwise triangles over the whole back buffer, sampling the unit square.
+const fn fullscreen_textured_quad() -> [TexturedVertex; 6] {
+    const fn vertex(x: f32, y: f32, u: f32, v: f32) -> TexturedVertex {
+        TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: 0xFFFF_FFFF,
+            u,
+            v,
+        }
+    }
+    [
+        vertex(-1.0, 1.0, 0.0, 0.0),
+        vertex(1.0, 1.0, 1.0, 0.0),
+        vertex(-1.0, -1.0, 0.0, 1.0),
+        vertex(1.0, 1.0, 1.0, 0.0),
+        vertex(1.0, -1.0, 1.0, 1.0),
+        vertex(-1.0, -1.0, 0.0, 1.0),
+    ]
 }
