@@ -278,6 +278,40 @@ impl PageBoxPool {
         self.acquire_in(LaneKind::Buffer, logical_len)
     }
 
+    /// [`Self::acquire`], retried once after `retire` when the first pop misses.
+    ///
+    /// `retire` is the device's lease retirement pass, which parks in this
+    /// pool the backings native code has finished with. That pass otherwise
+    /// runs once per `Present`, so during a burst of allocations (the warm-up,
+    /// a level load) the pool can be empty while finished backings wait for
+    /// it, and each miss allocates fresh pages whose address space the heap
+    /// keeps. A hit returns before `retire` is considered, so in a frame whose
+    /// sizes repeat no allocation does added work. `retire` runs only when a
+    /// retry can succeed: never with the pool disabled, where every lookup
+    /// misses, nor for a class too large to park, nor while the parked bytes
+    /// leave no room under the cap for one more box of the class, since the
+    /// pass could then park nothing of it and a pool held at its cap would
+    /// pay a pass at every miss. The diagnostics count both lookups of a
+    /// retried miss.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool mutex was poisoned.
+    #[must_use]
+    pub fn acquire_or_retire(&self, logical_len: usize, retire: impl FnOnce()) -> Option<PageBox> {
+        if let Some(pb) = self.acquire(logical_len) {
+            return Some(pb);
+        }
+        // `serves` bounds the class first, so the sum cannot overflow.
+        if !self.serves(logical_len)
+            || self.pooled_bytes() + PageBox::padded_len(logical_len) > self.cap_bytes()
+        {
+            return None;
+        }
+        retire();
+        self.acquire(logical_len)
+    }
+
     /// Pop a parked texture staging box whose padded size matches `logical_len`'s class.
     ///
     /// The staging-lane twin of [`Self::acquire`], with the same contract:
@@ -439,15 +473,23 @@ impl PageBoxPool {
         self.pooled_bytes.load(Ordering::Relaxed)
     }
 
+    /// Whether a box of `logical_len` can be parked here: the pool is enabled and its class fits.
+    fn serves(&self, logical_len: usize) -> bool {
+        self.enabled() && PageBox::padded_len(logical_len) / PAGE_SIZE <= MAX_POOL_CLASSES
+    }
+
     fn acquire_in(&self, kind: LaneKind, logical_len: usize) -> Option<PageBox> {
-        if !self.enabled() {
+        if !self.serves(logical_len) {
             #[cfg(perf_tracking)]
-            self.record_acquire(kind, diagnostics::Acquire::Disabled, logical_len);
-            return None;
-        }
-        if PageBox::padded_len(logical_len) / PAGE_SIZE > MAX_POOL_CLASSES {
-            #[cfg(perf_tracking)]
-            self.record_acquire(kind, diagnostics::Acquire::Oversize, logical_len);
+            self.record_acquire(
+                kind,
+                if self.enabled() {
+                    diagnostics::Acquire::Oversize
+                } else {
+                    diagnostics::Acquire::Disabled
+                },
+                logical_len,
+            );
             return None;
         }
         self.inner.lock().expect("PageBoxPool mutex poisoned").pop(

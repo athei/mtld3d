@@ -132,12 +132,25 @@ completion rides the same queue, so an empty queue means nothing has finished
 since the last drain. The API maintains once per `Present`, before the next
 frame records, and skips the pass without a lock while the queue is empty. A
 submission that waits (a mid-frame flush, the retention tier) maintains again
-before it returns, so what native code released is freed by then. A
-pass drains with a bounded budget, leaving the remainder queued, then releases
-the PE owners of finished packets and leases on the API thread without scanning
-every live resource, and returns the slots it retired under one lock. Slots are
-reused only after every notification has been consumed. Native code never
-invokes a PE destructor.
+before it returns, so what native code released is freed by then. A vertex or
+index buffer backing or staged-upload allocation (`alloc_pagebox_capped`) whose
+size class the recycle pool cannot serve maintains too, then pops again before
+it allocates (`PageBoxPool::acquire_or_retire`): in a burst of allocations,
+such as the first frames after device creation, the pool runs empty while
+backings native code has finished with wait for the next `Present`, and every
+fresh allocation in between raises the high-water mark of `d3d9.dll`'s heap,
+whose 16 MiB address-space reservations a 32-bit process never gets back. Only
+a miss maintains there, and only while the parked bytes leave room under the
+cap for one more box of the class: a pool held at its cap could park nothing of
+it, so a miss there allocates without a pass, as before. In a frame whose sizes
+repeat, every allocation hits and adds no pass. Maintaining at every allocation
+instead would multiply the per-submit passes #891 halved. A disabled pool,
+which misses every time, and a class too large to park never maintain on that
+path either. A pass drains with a bounded budget, leaving the remainder queued,
+then releases the PE owners of finished packets and leases on the API thread
+without scanning every live resource, and returns the slots it retired under
+one lock. Slots are reused only after every notification has been consumed.
+Native code never invokes a PE destructor.
 
 A native **presenter thread** (one per device, owned by `mtld3d.so`, `metal/presenter.rs`) presents what the submit thread committed. A present-bearing frame leaves a packet behind its commit: the layer, the texture to present, its sequence. The presenter takes the packets in order, acquires the drawable, encodes the present route into a command buffer of its own and commits it, so a frame's render work never waits for a drawable and present order is the packet order. The split creates one hazard, a later render overwriting the back buffer before a pending present has read it, and the submit thread resolves it before it commits: a present-bearing submit waits for every pending present to have committed, whether the newest reads the back buffer or a copy, which is the cadence the display already set, costs no copy and keeps the queue one deep except behind a barrier; a submit that must not wait, a no-present mid-frame flush or one a barrier hurried, copies the pending present's frame into a slot and retargets the packet at it; the slot array is as deep as the pipeline (`PRESENT_PIPELINE_DEPTH` in `mtld3d-shared`, which the encoder asserts against its channel and payload caps at compile time), since a barrier hurries every frame the pipeline holds and each copies once, and its textures are allocated only when a copy needs them. So a read-back waits for committed render work and the GPU, never for the display. A backlog a barrier leaves behind the presenter is shown frame by frame at the display's cadence, never skipped or hurried: the pipeline refills on the API thread's side, which keeps the presented cadence even. Barriers (`drain_submit_thread`) set the hurry through `SetPresentWaitPolicy` around their wait for the submits in flight; `Reset`, shutdown and the GPU capture additionally wait for the presenter to go idle and its last present to retire (`WaitForPresentIdle`) before the back buffer or the layer can go. `debug.presentGateFile` parks the presenter before each drawable while the named file exists, the seam the test suite holds a read-back against. A present into a fully covered or hidden window skips the drawable, since nothing of it reaches the screen; `debug.presentOccluded` acquires and presents it anyway. The check reads the flag only on that occluded branch, so a present into a visible window pays nothing for it.
 
