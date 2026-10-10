@@ -25,7 +25,9 @@
 //! stderr. A fault that may still be recovered opens nothing: its report
 //! goes where any line goes ([`write_fault`]), or to stderr from a signal
 //! handler, so a process that lives on keeps its log where `log.dir` puts
-//! it, and one that dies of it later keeps that report only on stderr.
+//! it. One that dies of it later, before the location is named, keeps the
+//! signal handler's line on stderr; the PE side's line waits in the backlog
+//! and is lost with the process.
 //!
 //! The directory keeps the [`KEEP`] newest logs and the [`KEEP`] newest
 //! traces: creating a log or a trace first removes the oldest of its kind
