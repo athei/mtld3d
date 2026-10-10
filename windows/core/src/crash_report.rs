@@ -12,8 +12,7 @@
 //! never does: the fault may be one the game or Wine recovers (a protection
 //! probe, a guard page, a handled access violation), and a process that lives
 //! on must keep its log where `log.dir` puts it, or have none at all if it
-//! never creates a device. Such a report only marks the process, so that its
-//! exit can still write the backlog out if nothing named the location.
+//! never creates a device.
 //!
 //! [`unhandled_report`] decides whether the PE side's unhandled-exception
 //! filter writes the whole report or one line pointing at the first-chance

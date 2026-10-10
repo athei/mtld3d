@@ -11,7 +11,7 @@
 //! needs no such care: it lives in this cdylib's own `std` and nothing else in
 //! the process can reach it once the image is gone.
 //!
-//! Three pieces, all diagnostic-only — they print the crumb trail and
+//! Three pieces, all diagnostic-only: they print the crumb trail and
 //! delegate termination to the normal SEH / `panic_abort` paths:
 //!
 //! 1. A Vectored Exception Handler that filters to truly-fatal `NTSTATUS`
@@ -39,11 +39,13 @@
 //!    vectored handler already reported the same exception at first chance,
 //!    the filter's line refers to that report instead of repeating it. Best
 //!    effort: it runs only where nothing replaces it later, or where what
-//!    replaces it chains to it. The C runtime of an MSVC-built program sets a
-//!    filter of its own at startup, after a statically imported d3d9.dll's
-//!    `DllMain`, and does not chain, so in such a game a crash keeps only the
-//!    first-chance reports, which reach stderr from the unix side before the
-//!    log is named. The filter is
+//!    replaces it chains to it. The startup code MSVC links into every
+//!    executable it builds sets a filter of its own, after a statically
+//!    imported d3d9.dll's `DllMain`: from Visual Studio 2015 on it does not
+//!    chain (`__scrt_unhandled_exception_filter`), while the runtimes of
+//!    Visual Studio 2005 to 2013 are believed to. In such a game a crash
+//!    keeps only the first-chance reports, which reach stderr from the unix
+//!    side before the log is named. The filter is
 //!    put back on a `PROCESS_DETACH` the process survives when it is still
 //!    the top one; when something replaced it, a filter that may chain to it
 //!    still exists, so it stops reporting and the image is pinned so the

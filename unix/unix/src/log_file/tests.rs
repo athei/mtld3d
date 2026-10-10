@@ -9,8 +9,7 @@
 //! The crash-report tests run in a re-executed child, since the sink is process-wide: a terminal
 //! report written before `OpenLog` opens the early location with the backlog ahead of it and
 //! keeps it as the log, or takes the backlog to stderr when there is no early location. A
-//! first-chance report opens nothing, and the exit after one saves the backlog; an exit with no
-//! report leaves nothing behind.
+//! first-chance report opens nothing.
 
 use std::{
     fs::{self, File},
@@ -210,65 +209,31 @@ fn a_crash_report_without_an_early_location_goes_to_stderr_with_the_backlog() {
     assert!(backlog < report, "{stderr}");
 }
 
-/// A first-chance fault report before `OpenLog` opens nothing; the exit then saves the backlog.
+/// A first-chance fault report before `OpenLog` opens nothing.
 ///
 /// The report goes where any line goes, the backlog, so no file exists while
-/// the process lives; its exit writes the backlog, the report among it, to
-/// the early location with the exit's note after it.
+/// the process lives, and none appears when it exits.
 #[test]
-fn a_fault_report_before_the_location_opens_nothing_until_the_exit() {
-    const TEST: &str =
-        "log_file::tests::a_fault_report_before_the_location_opens_nothing_until_the_exit";
+fn a_fault_report_before_the_location_opens_nothing() {
+    const TEST: &str = "log_file::tests::a_fault_report_before_the_location_opens_nothing";
     if let Ok(dir) = std::env::var(CRASH_SELFTEST_ENV) {
-        let early = format!("{dir}/early");
-        super::set_early_location(&early, "game");
-        super::install_exit_flush();
+        super::set_early_location(&format!("{dir}/early"), "game");
         super::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
         super::write_fault(format!("{REPORT_LINE}\n").as_bytes());
         assert!(
-            !std::path::Path::new(&early).exists(),
+            !std::path::Path::new(&format!("{dir}/early")).exists(),
             "a first-chance report created the early location"
         );
         std::process::exit(0);
     }
 
-    let scratch = Scratch::new("fault-exit");
-    let (pid, out) = crash_child(TEST, &scratch.0.to_string_lossy());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    let early = scratch.0.join("early").join(format!("game-{pid}.log"));
-    let log = fs::read_to_string(&early).unwrap_or_else(|e| {
-        panic!(
-            "no early log at {} ({e}); stderr:\n{stderr}",
-            early.display()
-        )
-    });
-    let backlog = log.find(BACKLOG_LINE).expect("the backlog line");
-    let report = log.find(REPORT_LINE).expect("the report line");
-    let note = log
-        .find("the process exits after a fault report")
-        .expect("the exit note");
-    assert!(backlog < report && report < note, "{log}");
-}
-
-/// An exit with no fault report leaves no log behind, early location or not.
-#[test]
-fn an_exit_without_a_fault_report_writes_nothing() {
-    const TEST: &str = "log_file::tests::an_exit_without_a_fault_report_writes_nothing";
-    if let Ok(dir) = std::env::var(CRASH_SELFTEST_ENV) {
-        super::set_early_location(&format!("{dir}/early"), "game");
-        super::install_exit_flush();
-        super::write_all(format!("{BACKLOG_LINE}\n").as_bytes());
-        std::process::exit(0);
-    }
-
-    let scratch = Scratch::new("quiet-exit");
+    let scratch = Scratch::new("fault-first-chance");
     let (_, out) = crash_child(TEST, &scratch.0.to_string_lossy());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(
         !scratch.0.join("early").exists(),
-        "an exit with no fault report created the early location"
+        "a first-chance report created the early location"
     );
-    assert!(!stderr.contains(BACKLOG_LINE), "{stderr}");
+    assert!(!stderr.contains(REPORT_LINE), "{stderr}");
 }

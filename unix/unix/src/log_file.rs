@@ -22,13 +22,10 @@
 //! still pending opens that file and writes the backlog ahead of itself
 //! ([`write_crash`] from an ordinary thread, [`crash_fd`] from a signal
 //! handler). Without an early location the backlog and the report go to
-//! stderr. A fault that may still be recovered opens nothing: its report goes
-//! where any line goes ([`write_fault`]), or to stderr from a signal handler,
-//! and the process is only marked ([`note_fault_report`]). If such a process
-//! then exits before anything named the location, the exit writes the
-//! backlog to the early location ([`install_exit_flush`]); that covers an
-//! exit through `exit(3)`, which is how Wine ends a process that exits on its
-//! own, and not one that ends in `_exit(2)`.
+//! stderr. A fault that may still be recovered opens nothing: its report
+//! goes where any line goes ([`write_fault`]), or to stderr from a signal
+//! handler, so a process that lives on keeps its log where `log.dir` puts
+//! it, and one that dies of it later keeps that report only on stderr.
 //!
 //! The directory keeps the [`KEEP`] newest logs and the [`KEEP`] newest
 //! traces: creating a log or a trace first removes the oldest of its kind
@@ -45,8 +42,8 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Mutex, MutexGuard, Once, TryLockError,
-        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+        Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicI32, AtomicU32, Ordering},
     },
     time::SystemTime,
 };
@@ -62,11 +59,6 @@ const KEEP: usize = 10;
 /// cap only matters for a process that loads d3d9.dll and never creates a
 /// device, where the backlog would otherwise grow for the process lifetime.
 const BACKLOG_CAP: usize = 1024 * 1024;
-
-/// The line an exit writes ahead of a backlog it saves after a fault report.
-const EXIT_NOTE: &[u8] = b"[mtld3d::unix] log file: the process exits after a fault report, \
-before Direct3DCreate9 named the log; its lines so far follow, and the reports a signal handler \
-wrote went to stderr\n";
 
 /// The first line of a file whose backlog lost lines to the cap.
 const TRUNCATED_NOTE: &[u8] = b"[mtld3d::unix] log file: lines before the location were dropped\n";
@@ -118,13 +110,6 @@ static SINK: Mutex<Sink> = Mutex::new(Sink::Pending {
 
 /// The open file's descriptor for the lock-free crash paths; `-1` when closed.
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
-
-/// Whether a fault report was written while the process may still recover.
-///
-/// Process-wide like the log it guards, and set from a signal handler, which
-/// has no object to reach: the exit hook reads it to decide whether the
-/// backlog is worth writing out.
-static FAULT_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Where GPU traces go: the log directory plus the process prefix.
 static TRACE_BASE: Mutex<Option<(PathBuf, String, u32)>> = Mutex::new(None);
@@ -281,17 +266,9 @@ pub fn write_crash(bytes: &[u8]) {
 ///
 /// The PE side's exception handler sends its first-chance reports this way.
 /// The line goes where any line goes, so a handled fault leaves the log
-/// where `log.dir` puts it; the process is marked for the exit hook.
+/// where `log.dir` puts it; unlike [`write_all`], the sink is only tried.
 pub fn write_fault(bytes: &[u8]) {
-    note_fault_report();
     write_report(bytes, &Severity::FirstChance);
-}
-
-/// Mark that a fault report was written while the location may still be pending.
-///
-/// Async-signal-safe: one atomic store.
-pub fn note_fault_report() {
-    FAULT_REPORTED.store(true, Ordering::Release);
 }
 
 /// The descriptor a signal handler's terminal report goes to, opened first if need be.
@@ -323,30 +300,6 @@ pub fn crash_fd() -> i32 {
         }
         _ => raw_fd(),
     }
-}
-
-/// Have the process's exit write the backlog to the early location after a fault report.
-///
-/// Registered once with `atexit(3)`. Wine ends a process that exits on its
-/// own (`ExitProcess`, a C runtime `exit`) with `exit(3)`, so the hook runs
-/// for one that faulted, recovered or reported, and then exited. A process
-/// Wine aborts (`TerminateProcess` on itself, which the unhandled-exception
-/// path does with or without a debugger) ends in `_exit(2)` and runs no
-/// hook; a terminal report there has already opened the file itself.
-pub fn install_exit_flush() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        // SAFETY: `flush_at_exit` is a plain `extern "C"` function of this
-        // image, which Wine never unloads, so the pointer stays valid until
-        // the hooks run at exit.
-        let status = unsafe { libc::atexit(flush_at_exit) };
-        if status != 0 {
-            mtld3d_shared::log_once_warn!(
-                target: crate::LOG_TARGET,
-                "log file: atexit refused the exit flush, a fault report before Direct3DCreate9 may be lost at exit"
-            );
-        }
-    });
 }
 
 /// The descriptor a signal handler writes: the log file's, or stderr's.
@@ -437,35 +390,6 @@ fn try_sink() -> Option<MutexGuard<'static, Sink>> {
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
     }
-}
-
-/// The exit hook: write the backlog out when a fault was reported and nothing named the location.
-///
-/// Routed as a terminal report, since the process is ending: the early
-/// location when there is one, stderr otherwise. A process with no fault
-/// report, or whose log is already open, is left as it is.
-extern "C" fn flush_at_exit() {
-    if !FAULT_REPORTED.load(Ordering::Acquire) {
-        return;
-    }
-    let Some(mut guard) = try_sink() else {
-        return;
-    };
-    let spill = match crash_route(
-        &sink_state(&guard),
-        &Severity::Terminal,
-        &CrashContext::Thread,
-    ) {
-        CrashRoute::EarlyFile => {
-            name_early_location(&mut guard);
-            write_locked(&mut guard, EXIT_NOTE)
-        }
-        CrashRoute::Stderr => Some(take_backlog_for_stderr(&mut guard, EXIT_NOTE)),
-        // The location is named or the log is open: the lines are there already.
-        CrashRoute::Sink | CrashRoute::Descriptor => None,
-    };
-    drop(guard);
-    write_stderr(spill);
 }
 
 /// Turn a pending sink with an early location into one named there, the backlog kept.

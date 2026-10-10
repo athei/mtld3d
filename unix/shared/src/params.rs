@@ -89,8 +89,8 @@ pub enum LogLineKind {
     Ordinary = 0,
     /// A line of a fault report the process may still recover from.
     ///
-    /// Written as an ordinary line; it marks the process, so an exit before
-    /// `OpenLog` saves the backlog to the early location.
+    /// Written as an ordinary line, except that the unix side only tries the
+    /// sink's lock, which a fault raised out of a unix call can leave held.
     FaultReport = 1,
     /// A line of a terminal fault's report: before `OpenLog` it opens the early location.
     CrashReport = 2,

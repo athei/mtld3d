@@ -27,8 +27,7 @@
 //! the shape of a game that dies before `Direct3DCreate9`, puts the report
 //! and the lines logged before it in the early location when `InitLogger`
 //! named one, and on stderr together when it did not. A fault its owner
-//! recovers opens nothing and leaves the log for `OpenLog` to place; an exit
-//! after one, with no location named, saves the backlog to the early one. The
+//! recovers opens nothing and leaves the log for `OpenLog` to place. The
 //! reserved-space test reports a PC in a zero-fill segment of this binary,
 //! the shape of a guest address inside Wine's loader, which must read as
 //! reserved memory rather than an offset into the image.
@@ -1009,8 +1008,7 @@ fn a_terminal_fault_before_the_log_is_named_opens_the_early_location() {
 ///
 /// The report goes to stderr as before, `errno` survives the handler, and
 /// the backlog waits: `OpenLog` naming another directory afterwards puts the
-/// line logged before the fault there, and the exit that follows writes
-/// nothing to the early location.
+/// line logged before the fault there, and the early location stays unused.
 #[test]
 fn a_recovered_foreign_fault_creates_no_file_and_leaves_the_sink_pending() {
     const TEST: &str =
@@ -1046,35 +1044,6 @@ fn a_recovered_foreign_fault_creates_no_file_and_leaves_the_sink_pending() {
         log.contains(&format!("[selftest] named {}", named.display())),
         "{log}"
     );
-}
-
-/// A recovered foreign fault, then an exit before `OpenLog`, saves the backlog early.
-///
-/// The exit is the one Wine makes for a process that ends on its own; the
-/// file holds the line logged before the fault and the note the exit writes.
-#[test]
-fn a_recorded_foreign_fault_flushes_the_backlog_to_the_early_location_at_exit() {
-    const TEST: &str =
-        "crash::tests::a_recorded_foreign_fault_flushes_the_backlog_to_the_early_location_at_exit";
-    if let Some(dir) = std::env::var_os(EARLY_LOG_SELFTEST_ENV) {
-        recovered_foreign_fault(&dir);
-        std::process::exit(0);
-    }
-
-    let scratch = EarlyLogScratch::new("exit");
-    let (pid, out) = early_log_child(TEST, scratch.early().as_os_str());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    let log = std::fs::read_to_string(scratch.early().join(format!("early-{pid}.log")))
-        .unwrap_or_else(|e| panic!("no early log ({e}); stderr:\n{stderr}"));
-    let backlog = log
-        .find(BACKLOG_LINE)
-        .unwrap_or_else(|| panic!("the backlog line is lost:\n{log}"));
-    let note = log
-        .find("the process exits after a fault report")
-        .unwrap_or_else(|| panic!("no exit note:\n{log}"));
-    assert!(backlog < note, "{log}");
-    assert!(stderr.contains("fault outside mtld3d.so"), "{stderr}");
 }
 
 /// A PC in a segment with no file bytes is reported as reserved memory, not an image offset.

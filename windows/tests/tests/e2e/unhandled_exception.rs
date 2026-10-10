@@ -2,10 +2,11 @@
 //!
 //! `d3d9.dll` installs a top-level unhandled-exception filter from `DllMain`,
 //! which reports such an exception as a crash and opens the default log. It is
-//! best effort, and this process shows its limit: the test executable links
-//! the MSVC C runtime statically, whose startup runs after a statically
-//! imported d3d9.dll's `DllMain`, sets a filter of its own and does not chain
-//! to the one it replaces. A game built the same way loses the filter too.
+//! best effort, and this process shows its limit: the startup code MSVC
+//! links into every executable it builds runs after a statically imported
+//! d3d9.dll's `DllMain`, sets a filter of its own and, from Visual Studio
+//! 2015 on, does not chain to the one it replaces. A game built the same way
+//! loses the filter too.
 //! What the test pins is what then happens: the C runtime's filter is the one
 //! on top, the exception still ends the process with its own code, and the
 //! first-chance report, which opens nothing, leaves no stray log behind.
@@ -46,7 +47,7 @@ unsafe extern "system" {
 /// `GetModuleHandleEx` flags: look up by address, take no reference.
 const MODULE_FROM_ADDRESS_UNCHANGED: u32 = 0x4 | 0x2;
 
-/// An unhandled exception before `Direct3DCreate9` in a C-runtime process leaves no log.
+/// An unhandled exception before `Direct3DCreate9` in an MSVC-built process leaves no log.
 ///
 /// The child reports which module the top-level filter at the time of the
 /// exception lies in, which is not d3d9.dll, then raises an access violation

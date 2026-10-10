@@ -406,9 +406,7 @@ pub fn write_crash(line: &[u8]) {
 /// Hand a line of a first-chance fault report to the unix side right now, on the calling thread.
 ///
 /// As [`write_crash`], except that the fault may still be handled: the line
-/// goes where any line goes and opens no log, and the unix side only marks
-/// the process, so an exit that follows can still save the lines. The crumb
-/// dump's sink.
+/// goes where any line goes and opens no log. The crumb dump's sink.
 pub fn write_fault(line: &[u8]) {
     forward_parked();
     forward(line, LogLineKind::FaultReport);

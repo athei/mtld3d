@@ -51,8 +51,8 @@
 //! with the lines logged so far ahead of it, since the process will never
 //! get as far as naming one (see `log_file::crash_fd`). A fault handed back
 //! is not known to be terminal, so its report goes to stderr until a file is
-//! open, and only marks the process for the exit hook. Both paths leave
-//! `errno` as the interrupted code had it.
+//! open, and opens nothing. Both paths leave `errno` as the interrupted code
+//! had it.
 //!
 //! Forwarding needs a thread Wine can serve. Wine's unix side keeps each
 //! thread's TEB in a pthread key and reads it as soon as a fault reaches
@@ -200,9 +200,6 @@ pub fn install() {
     }
 
     resolve_wine_current_teb();
-    // A first-chance fault report before `Direct3DCreate9` leaves the log
-    // pending; an exit that follows writes it out.
-    crate::log_file::install_exit_flush();
 
     // Diagnostic escape hatch: with `MTLD3D_NO_CRASH_HANDLER=1` we do NOT
     // intercept SIGSEGV/SIGBUS, so Wine's own SEH machinery translates the
@@ -590,12 +587,11 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
         return;
     }
     // A fault handed back may be one its owner recovers, so its report
-    // opens nothing: stderr, or the log once one is open, and a mark for the
-    // exit. Only a terminal one may open the early log.
+    // opens nothing: stderr, or the log once one is open. Only a terminal
+    // one may open the early log.
     let fd = if terminal {
         crate::log_file::crash_fd()
     } else {
-        crate::log_file::note_fault_report();
         crate::log_file::raw_fd()
     };
     let mut b = [0u8; 192];
