@@ -297,26 +297,3 @@ fn no_report_waits_for_a_busy_sink() {
         }
     }
 }
-
-#[test]
-fn the_unhandled_filter_refers_to_the_first_chance_report_of_the_same_exception() {
-    let reported = Some((0xc000_0005, 0x7b01_2345));
-    assert_eq!(
-        unhandled_report(reported, 0xc000_0005, 0x7b01_2345),
-        UnhandledReport::Brief
-    );
-    // Another exception, or one the vectored handler never reported, is
-    // reported whole.
-    assert_eq!(
-        unhandled_report(reported, 0xc000_0005, 0x7b01_2346),
-        UnhandledReport::Full
-    );
-    assert_eq!(
-        unhandled_report(reported, 0xe06d_7363, 0x7b01_2345),
-        UnhandledReport::Full
-    );
-    assert_eq!(
-        unhandled_report(None, 0xc000_0005, 0x7b01_2345),
-        UnhandledReport::Full
-    );
-}

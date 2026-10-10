@@ -51,8 +51,9 @@
 //! with the lines logged so far ahead of it, since the process will never
 //! get as far as naming one (see `log_file::crash_fd`). A fault handed back
 //! is not known to be terminal, so its report goes to stderr until a file is
-//! open, and opens nothing. Both paths leave `errno` as the interrupted code
-//! had it.
+//! open, and opens nothing; a game fault Wine then finds unhandled ends the
+//! process through `_exit(2)`, and that stderr line is what remains of it.
+//! Both paths leave `errno` as the interrupted code had it.
 //!
 //! Forwarding needs a thread Wine can serve. Wine's unix side keeps each
 //! thread's TEB in a pthread key and reads it as soon as a fault reaches

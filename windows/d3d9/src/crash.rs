@@ -11,7 +11,7 @@
 //! needs no such care: it lives in this cdylib's own `std` and nothing else in
 //! the process can reach it once the image is gone.
 //!
-//! Three pieces, all diagnostic-only: they print the crumb trail and
+//! Two pieces, both diagnostic-only — they print the crumb trail and
 //! delegate termination to the normal SEH / `panic_abort` paths:
 //!
 //! 1. A Vectored Exception Handler that filters to truly-fatal `NTSTATUS`
@@ -28,45 +28,28 @@
 //!    `thread '…' panicked at …` line and (if `RUST_BACKTRACE=1`) a
 //!    backtrace. Empty backtraces under Wine are accepted as-is.
 //!
-//! 3. A top-level unhandled-exception filter (`SetUnhandledExceptionFilter`).
-//!    Wine's `UnhandledExceptionFilter` calls it once every frame has
-//!    declined an exception, before it starts a debugger or ends the
-//!    process, so it is the one place that knows a fault is terminal. It
-//!    writes the report as a crash, which opens the early log when
-//!    `Direct3DCreate9` never named one, then returns whatever the filter it
-//!    replaced returns, or `EXCEPTION_CONTINUE_SEARCH` with none, so the
-//!    exception goes on to the debugger or to termination as before. When the
-//!    vectored handler already reported the same exception at first chance,
-//!    the filter's line refers to that report instead of repeating it. Best
-//!    effort: it runs only where nothing replaces it later, or where what
-//!    replaces it chains to it. The startup code MSVC links into every
-//!    executable it builds sets a filter of its own, after a statically
-//!    imported d3d9.dll's `DllMain`: from Visual Studio 2015 on it does not
-//!    chain (`__scrt_unhandled_exception_filter`), while the runtimes of
-//!    Visual Studio 2005 to 2013 are believed to. In such a game a crash
-//!    keeps only the first-chance reports, which reach stderr from the unix
-//!    side before the log is named. The filter is
-//!    put back on a `PROCESS_DETACH` the process survives when it is still
-//!    the top one; when something replaced it, a filter that may chain to it
-//!    still exists, so it stops reporting and the image is pinned so the
-//!    chain never reaches unmapped code.
-//!
 //! Faults in other modules (game code, `ClientExtensions.dll` `VMProtect`
 //! probes, system DLLs) pass through to SEH normally, so `VMProtect`'s
-//! first-chance recovery still works and `WoW` continues.
+//! first-chance recovery still works and `WoW` continues. Their report is a
+//! first-chance one: it waits in the backlog and opens no log, since the
+//! fault may be handled. When nothing handles it, Wine ends the process with
+//! `TerminateProcess` on itself, which runs nothing of ours, so before
+//! `Direct3DCreate9` that report dies with the process and only the unix
+//! side's first-chance line on stderr remains. A top-level filter for
+//! unhandled exceptions does not cover that case: the startup code of a game
+//! built with Visual Studio 2015 or later replaces such a filter without
+//! chaining, and one left behind by a `FreeLibrary` before any device would
+//! point into unmapped code.
 //!
 //! `RUST_BACKTRACE=1` is set here (if unset) so the default panic hook
 //! attempts a backtrace.
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
-use mtld3d_core::{
-    address_space::FreeSpace,
-    crash_report::{UnhandledReport, unhandled_report},
-};
+use mtld3d_core::address_space::FreeSpace;
 use mtld3d_shared::crumb;
 
 // NTSTATUS codes the handler filters on.
@@ -89,25 +72,6 @@ static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static VEH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 /// Faults outside our image reported so far; the report stops after a few.
 static FOREIGN_REPORTS: AtomicU32 = AtomicU32::new(0);
-/// The top-level unhandled-exception filter's state.
-///
-/// A static because the filter's caller, Wine's `UnhandledExceptionFilter`,
-/// hands it the exception and nothing else, and because the top-level filter
-/// is one per process.
-static TOP_FILTER: TopFilter = TopFilter {
-    previous: AtomicPtr::new(core::ptr::null_mut()),
-    armed: AtomicBool::new(false),
-    running_on: AtomicU32::new(0),
-};
-/// The exception the vectored handler last reported at first chance.
-///
-/// A static for the same reason as [`TOP_FILTER`]: the vectored handler and
-/// the filter are reached with the exception alone, and the filter reads
-/// this to refer to that report rather than repeat it.
-static FIRST_CHANCE: FirstChance = FirstChance {
-    code: AtomicU32::new(0),
-    address: AtomicUsize::new(0),
-};
 
 /// How many faults outside our image get a line in the log.
 ///
@@ -280,43 +244,9 @@ struct ExceptionPointers {
 
 type VectoredHandler = extern "system" fn(*mut ExceptionPointers) -> i32;
 
-/// `LPTOP_LEVEL_EXCEPTION_FILTER`: same shape as a vectored handler, its own role.
-type TopLevelFilter = extern "system" fn(*mut ExceptionPointers) -> i32;
-
-/// The filter this image installed, the one it replaced, and whether it still reports.
-struct TopFilter {
-    /// The filter `SetUnhandledExceptionFilter` handed back, null for none.
-    previous: AtomicPtr<c_void>,
-    /// False once a detach could not take the filter out; it then only chains.
-    armed: AtomicBool,
-    /// The thread inside the filter, 0 for none, so a chain back into it ends.
-    running_on: AtomicU32,
-}
-
-/// Code and address of the exception the vectored handler last reported; code 0 for none.
-struct FirstChance {
-    code: AtomicU32,
-    address: AtomicUsize,
-}
-
-/// One report line in a fixed buffer, built without the heap.
-struct ReportLine {
-    buf: [u8; 400],
-    len: usize,
-}
-
-impl ReportLine {
-    /// The line's bytes.
-    fn bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-
 unsafe extern "system" {
     fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
-    fn SetUnhandledExceptionFilter(filter: *mut c_void) -> *mut c_void;
-    fn GetCurrentThreadId() -> u32;
     pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
     fn VirtualQuery(
@@ -348,55 +278,7 @@ pub fn install(d3d9_module: *mut c_void) {
     // SAFETY: ntdll export; safe to call from DllMain.
     let veh = unsafe { RtlAddVectoredExceptionHandler(1, handler) };
     VEH_HANDLE.store(veh, Ordering::Release);
-    install_top_filter();
     install_panic_hook();
-}
-
-/// Make [`unhandled_filter`] the top-level filter, keeping the one it replaces.
-///
-/// `SetUnhandledExceptionFilter` takes no lock and starts nothing, so
-/// `DllMain` may call it. A reload whose previous detach left the filter in
-/// place behind a game's own finds it handed back: the filter it replaced
-/// then is kept rather than a chain to itself.
-fn install_top_filter() {
-    let ours = unhandled_filter as TopLevelFilter as *mut c_void;
-    // SAFETY: kernel32 export; the argument is this image's filter, whose
-    // signature is `LPTOP_LEVEL_EXCEPTION_FILTER`'s.
-    let previous = unsafe { SetUnhandledExceptionFilter(ours) };
-    if previous != ours {
-        TOP_FILTER.previous.store(previous, Ordering::Release);
-    }
-    TOP_FILTER.armed.store(true, Ordering::Release);
-}
-
-/// Take [`unhandled_filter`] out before the image goes away, or keep the image if it cannot.
-///
-/// Still the top-level filter: the one it replaced goes back. Replaced by a
-/// later filter, which may chain to it: that one goes back on top, the
-/// filter stops reporting and only chains, and the image is pinned so the
-/// chain never reaches unmapped code.
-fn uninstall_top_filter() {
-    let ours = unhandled_filter as TopLevelFilter as *mut c_void;
-    let previous = TOP_FILTER.previous.load(Ordering::Acquire);
-    // SAFETY: kernel32 export; `previous` is what the install was handed.
-    let current = unsafe { SetUnhandledExceptionFilter(previous) };
-    if current == ours {
-        TOP_FILTER.armed.store(false, Ordering::Release);
-        return;
-    }
-    // SAFETY: as above; puts back the filter that was on top.
-    unsafe { SetUnhandledExceptionFilter(current) };
-    TOP_FILTER.armed.store(false, Ordering::Release);
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: kernel32 export; `TOP_FILTER` is a static of this image, so
-    // its address names the module, and `module` is a writable local.
-    unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            (&raw const TOP_FILTER).cast::<u8>(),
-            &raw mut module,
-        )
-    };
 }
 
 /// Remove the VEH before the image goes away. Idempotent.
@@ -410,7 +292,6 @@ pub fn uninstall() {
     if !INSTALLED.swap(false, Ordering::AcqRel) {
         return;
     }
-    uninstall_top_filter();
     let veh = VEH_HANDLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if veh.is_null() {
         return;
@@ -495,98 +376,12 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
             crate::log_sink::write_crash(line.bytes());
         } else {
             crate::log_sink::write_fault(line.bytes());
-            note_first_chance(code, addr);
         }
         crumb::dump_recent(32);
     } else if possibly_fatal {
         report_foreign_fault(code, addr);
     }
     EXCEPTION_CONTINUE_SEARCH
-}
-
-/// The top-level filter: report the exception as terminal, then chain.
-///
-/// Every frame declined the exception, so the process ends after this
-/// unless the filter it replaced recovers it. Never swallows the exception:
-/// the answer is the replaced filter's, or `EXCEPTION_CONTINUE_SEARCH`, with
-/// which Wine goes on to the debugger or to termination.
-extern "system" fn unhandled_filter(ep: *mut ExceptionPointers) -> i32 {
-    // SAFETY: kernel32 export reading the calling thread's id.
-    let thread = unsafe { GetCurrentThreadId() };
-    // A filter that chains back here on the same thread (one installed after
-    // this image, kept as the replaced filter by a reload) ends the chain
-    // instead of looping. Another thread's exception goes through.
-    if TOP_FILTER.running_on.load(Ordering::Acquire) == thread {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    let owns = TOP_FILTER
-        .running_on
-        .compare_exchange(0, thread, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
-    if TOP_FILTER.armed.load(Ordering::Acquire) {
-        report_unhandled(ep);
-    }
-    let previous = TOP_FILTER.previous.load(Ordering::Acquire);
-    let answer = if previous.is_null() {
-        EXCEPTION_CONTINUE_SEARCH
-    } else {
-        // SAFETY: `previous` is what `SetUnhandledExceptionFilter` handed
-        // back, a live `LPTOP_LEVEL_EXCEPTION_FILTER`.
-        let previous: TopLevelFilter = unsafe { core::mem::transmute(previous) };
-        previous(ep)
-    };
-    if owns {
-        TOP_FILTER.running_on.store(0, Ordering::Release);
-    }
-    answer
-}
-
-/// Write the filter's report of an unhandled exception, as a crash.
-fn report_unhandled(ep: *mut ExceptionPointers) {
-    const PREFIX: &[u8] = b"[mtld3d::d3d9] unhandled exception: code=";
-    const SEE_ABOVE: &[u8] = b", reported above at first chance\n";
-
-    if ep.is_null() {
-        return;
-    }
-    // SAFETY: ep non-null per check; the dispatcher's for the call.
-    let rec = unsafe { (*ep).record };
-    if rec.is_null() {
-        return;
-    }
-    // SAFETY: rec non-null per check.
-    let code = unsafe { (*rec).code };
-    // SAFETY: rec non-null per check.
-    let addr = unsafe { (*rec).address };
-    let reported = FIRST_CHANCE.code.load(Ordering::Acquire);
-    let first_chance = (reported != 0).then(|| {
-        (
-            reported,
-            FIRST_CHANCE.address.load(Ordering::Acquire) as u64,
-        )
-    });
-    match unhandled_report(first_chance, code, addr as usize as u64) {
-        UnhandledReport::Full => {
-            crate::log_sink::write_crash(fault_line(PREFIX, code, addr).bytes());
-        }
-        UnhandledReport::Brief => {
-            let mut buf = [0u8; 400];
-            let mut pos = 0;
-            push(&mut buf, &mut pos, PREFIX);
-            push_hex(&mut buf, &mut pos, u64::from(code));
-            push(&mut buf, &mut pos, b" addr=");
-            push_hex(&mut buf, &mut pos, addr as usize as u64);
-            push(&mut buf, &mut pos, SEE_ABOVE);
-            crate::log_sink::write_crash(&buf[..pos]);
-        }
-    }
-    crumb::dump_recent(32);
-}
-
-/// Record the exception the vectored handler just reported at first chance.
-fn note_first_chance(code: u32, addr: *mut c_void) {
-    FIRST_CHANCE.address.store(addr as usize, Ordering::Release);
-    FIRST_CHANCE.code.store(code, Ordering::Release);
 }
 
 /// Note a fault in someone else's code, with the module it landed in.
@@ -600,15 +395,6 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
         return;
     }
-    let line = fault_line(b"[mtld3d::d3d9] fault outside d3d9.dll: code=", code, addr);
-    // A first chance: the fault may be handled, so the line opens no log.
-    crate::log_sink::write_fault(line.bytes());
-    note_first_chance(code, addr);
-    crumb::dump_recent(16);
-}
-
-/// `prefix`, then the code, the address, the module it lies in and the free address space.
-fn fault_line(prefix: &[u8], code: u32, addr: *mut c_void) -> ReportLine {
     let mut module: *mut c_void = core::ptr::null_mut();
     // SAFETY: kernel32 export; `addr` is only used as a lookup key.
     let found = unsafe {
@@ -627,7 +413,11 @@ fn fault_line(prefix: &[u8], code: u32, addr: *mut c_void) -> ReportLine {
     };
     let mut buf = [0u8; 400];
     let mut pos = 0;
-    push(&mut buf, &mut pos, prefix);
+    push(
+        &mut buf,
+        &mut pos,
+        b"[mtld3d::d3d9] fault outside d3d9.dll: code=",
+    );
     push_hex(&mut buf, &mut pos, u64::from(code));
     push(&mut buf, &mut pos, b" addr=");
     push_hex(&mut buf, &mut pos, addr as usize as u64);
@@ -642,7 +432,9 @@ fn fault_line(prefix: &[u8], code: u32, addr: *mut c_void) -> ReportLine {
     }
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    ReportLine { buf, len: pos }
+    // A first chance: the fault may be handled, so the line opens no log.
+    crate::log_sink::write_fault(&buf[..pos]);
+    crumb::dump_recent(16);
 }
 
 /// Append the free address space so a crash line carries it.
@@ -675,9 +467,21 @@ fn fault_in_our_dll(addr: *mut c_void) -> bool {
     ok != 0 && module == our
 }
 
-/// The `FATAL` line for an exception in our image or with a fatal code.
-fn fatal_line(code: u32, addr: *mut c_void) -> ReportLine {
-    let mut buf = [0u8; 400];
+/// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
+struct FatalLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl FatalLine {
+    /// The line's bytes.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+fn fatal_line(code: u32, addr: *mut c_void) -> FatalLine {
+    let mut buf = [0u8; 160];
     let mut pos = 0;
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] FATAL: code=");
     push_hex(&mut buf, &mut pos, u64::from(code));
@@ -685,7 +489,7 @@ fn fatal_line(code: u32, addr: *mut c_void) -> ReportLine {
     push_hex(&mut buf, &mut pos, addr as usize as u64);
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    ReportLine { buf, len: pos }
+    FatalLine { buf, len: pos }
 }
 
 fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {

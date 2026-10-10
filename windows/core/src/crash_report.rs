@@ -1,7 +1,7 @@
 //! Where a crash report goes, and what the address it names lies in.
 //!
-//! Decisions the crash paths take, kept here because they are pure and
-//! wrong in ways only a crash would otherwise show.
+//! Two decisions the crash paths of `mtld3d.so` take, kept here because both
+//! are pure and both are wrong in ways only a crash would otherwise show.
 //!
 //! [`crash_route`] picks the destination of a fault report from what the
 //! process's log sink knows and from how bad the fault is. Lines wait in a
@@ -13,10 +13,6 @@
 //! probe, a guard page, a handled access violation), and a process that lives
 //! on must keep its log where `log.dir` puts it, or have none at all if it
 //! never creates a device.
-//!
-//! [`unhandled_report`] decides whether the PE side's unhandled-exception
-//! filter writes the whole report or one line pointing at the first-chance
-//! report the vectored handler already wrote for the same exception.
 //!
 //! [`fault_site`] decides whether an address `dladdr` attributes to a loaded
 //! image is that image's content. `dyld` counts every segment of an image,
@@ -94,17 +90,6 @@ pub enum CrashRoute {
     Stderr,
     /// Leave the sink alone and write to its descriptor, the open file's or stderr's.
     Descriptor,
-}
-
-/// What the PE side's unhandled-exception filter writes about the exception it is handed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum UnhandledReport {
-    /// The whole report: code, address, module, free address space.
-    Full,
-    /// One line that the exception went unhandled.
-    ///
-    /// It names the first-chance report the vectored handler already wrote.
-    Brief,
 }
 
 /// Whether an address inside an image is the image's content or space it only reserves.
@@ -236,31 +221,6 @@ pub const fn crash_route(
             CrashContext::Thread => CrashRoute::Sink,
             CrashContext::Signal => CrashRoute::Descriptor,
         },
-    }
-}
-
-/// What the unhandled-exception filter writes, given the last first-chance report.
-///
-/// `first_chance` is the code and address of the exception the vectored
-/// handler last reported, if it reported one. The filter runs for the same
-/// exception after every frame declined it; when that is the one already
-/// reported, a second full report would only repeat it, so the filter's
-/// terminal line refers to it instead. Anything else, an exception code the
-/// vectored handler does not report or one past its cap, gets the whole
-/// report.
-#[must_use]
-pub const fn unhandled_report(
-    first_chance: Option<(u32, u64)>,
-    code: u32,
-    address: u64,
-) -> UnhandledReport {
-    match first_chance {
-        Some((reported_code, reported_address))
-            if reported_code == code && reported_address == address =>
-        {
-            UnhandledReport::Brief
-        }
-        _ => UnhandledReport::Full,
     }
 }
 
