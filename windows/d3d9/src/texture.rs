@@ -2382,13 +2382,13 @@ impl TextureInner {
             return 0;
         }
         let device = DeviceInner::from_ptr(self.device_inner);
-        let takes_upload_pass =
-            mtld3d_core::upload_pass::upload_decode(self.d3d_format, self.metal_pixel_format)
-                .is_some_and(|decode| {
-                    mtld3d_core::upload_pass::is_expansion(decode)
-                        || self.mip_bytes_per_row[level]
-                            < device.gpu_caps().min_linear_texture_align
-                });
+        let takes_upload_pass = mtld3d_core::upload_pass::upload_pass_decode(
+            self.d3d_format,
+            self.metal_pixel_format,
+            self.mip_bytes_per_row[level],
+            device.gpu_caps().min_linear_texture_align,
+        )
+        .is_some();
         let seq = if takes_upload_pass {
             device.coherent_seq_arc()
         } else {
@@ -5031,6 +5031,7 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         redirty: dev.upload_redirty(),
         release_staging,
         upload_generation,
+        snapshot_offset: None,
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
@@ -5088,17 +5089,18 @@ fn schedule_resampled_upload(
     let bpp = ti.bytes_per_pixel as usize;
     let pitch = ti.mip_bytes_per_row(level_u) as usize;
     let row_bytes = rect.w as usize * bpp;
-    let staging = ti.staging[level_u].as_slice();
-    let mut rows = Vec::with_capacity(row_bytes * rect.h as usize);
-    for row in rect.y as usize..(rect.y + rect.h) as usize {
-        let start = row * pitch + rect.x as usize * bpp;
-        let Some(src) = staging.get(start..start + row_bytes) else {
-            rows.clear();
-            break;
-        };
-        rows.extend_from_slice(src);
-    }
-    if rows.is_empty() {
+    let staging = &ti.staging[level_u];
+    let mut rows = vec![0; row_bytes * rect.h as usize];
+    let copied = mtld3d_core::texture_staging::copy_rows(
+        &staging.as_slice()[..staging.logical_len()],
+        rect.y as usize * pitch + rect.x as usize * bpp,
+        pitch,
+        &mut rows,
+        row_bytes,
+        row_bytes,
+        rect.h as usize,
+    );
+    if !copied || rows.is_empty() {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: texture_id.raw(),
@@ -5207,6 +5209,7 @@ fn schedule_cube_upload<const ORDERED: bool>(
         // written and uploaded by paths that expect the level to be there.
         release_staging: false,
         upload_generation: 0,
+        snapshot_offset: None,
     };
     if ORDERED {
         // The ordered placement rides the flags only the mip-carrying form

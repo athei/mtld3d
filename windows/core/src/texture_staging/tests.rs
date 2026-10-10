@@ -1229,3 +1229,108 @@ fn staging_write_without_readers_stays_in_place() {
         LockAction::WriteInPlace
     );
 }
+
+// ── snapshot layout and row copies ──
+
+/// `snapshot_layout` on the 256x256 test mip, its staging rows `pitch` bytes apart.
+fn layout(
+    r: DirtyRect,
+    block: (u32, u32),
+    block_bytes: u32,
+    pitch: u32,
+    align: u32,
+) -> Option<SnapshotLayout> {
+    snapshot_layout(r, shape(block), block_bytes, pitch, align)
+}
+
+#[test]
+fn a_sprite_box_snapshots_its_rows_at_the_aligned_pitch() {
+    // A 2-byte 79x75 box at the origin of a 1024-byte-pitch level.
+    let l = layout(rect(0, 0, 79, 75), (1, 1), 2, 1024, 16).expect("a partial box");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (0, 158, 75, 160, 160 * 75)
+    );
+    // The same box where a blit needs a 256-byte row stride.
+    let l = layout(rect(0, 0, 79, 75), (1, 1), 2, 1024, 256).expect("a partial box");
+    assert_eq!((l.pitch, l.len), (256, 256 * 75));
+}
+
+#[test]
+fn an_offset_box_starts_at_its_rows_and_columns_in_the_staging() {
+    // A 24-bit box at (1, 1): the expansion layout keeps a 16-byte pitch.
+    let l = layout(rect(1, 1, 30, 24), (1, 1), 3, 768, 16).expect("a partial box");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (768 + 3, 90, 24, 96, 96 * 24)
+    );
+}
+
+#[test]
+fn a_dxt_box_counts_block_rows_and_block_bytes() {
+    // One DXT1 block at (4, 4) of a 512-byte-block-row level.
+    let l = layout(rect(4, 4, 4, 4), (4, 4), 8, 512, 16).expect("an aligned block");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (512 + 8, 8, 1, 16, 16)
+    );
+    // A box reaching the mip's right and bottom edges with a partial block.
+    let edge = MipShape {
+        mip_w: 10,
+        mip_h: 10,
+        block_w: 4,
+        block_h: 4,
+    };
+    let l = snapshot_layout(rect(4, 4, 6, 6), edge, 8, 24, 16).expect("an edge box");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (24 + 8, 16, 2, 16, 32)
+    );
+}
+
+#[test]
+fn whole_unaligned_empty_and_oversized_boxes_take_no_snapshot() {
+    assert!(layout(full(), (1, 1), 4, 1024, 16).is_none(), "whole level");
+    assert!(
+        layout(rect(2, 2, 4, 4), (4, 4), 8, 512, 16).is_none(),
+        "a compressed rect off the block grid"
+    );
+    assert!(
+        layout(rect(0, 0, 0, 4), (1, 1), 4, 1024, 16).is_none(),
+        "empty"
+    );
+    assert!(
+        layout(rect(0, 0, 4, 4), (1, 1), 4, 1024, 0).is_none(),
+        "no alignment"
+    );
+    // 128 rows of 129 four-byte texels: 528 * 128 bytes, over 64 KiB.
+    assert!(
+        layout(rect(0, 0, 129, 128), (1, 1), 4, 1024, 16).is_none(),
+        "over the snapshot limit"
+    );
+    let largest = layout(rect(0, 0, 129, 112), (1, 1), 4, 1024, 16).expect("the largest sprite");
+    assert!(largest.len as usize <= crate::upload_snapshot::SNAPSHOT_MAX_BYTES);
+}
+
+#[test]
+fn copy_rows_moves_each_row_to_its_stride() {
+    let src: Vec<u8> = (0..=255).collect();
+    let mut dst = [0u8; 12];
+    // Two rows of three bytes from offset 5, 16 apart, into rows 6 apart.
+    assert!(copy_rows(&src, 5, 16, &mut dst, 6, 3, 2));
+    assert_eq!(dst, [5, 6, 7, 0, 0, 0, 21, 22, 23, 0, 0, 0]);
+    // No rows copies nothing and succeeds.
+    assert!(copy_rows(&src, 0, 16, &mut dst, 6, 3, 0));
+}
+
+#[test]
+fn copy_rows_refuses_a_row_past_either_end() {
+    let src = [1u8; 32];
+    let mut dst = [0u8; 8];
+    assert!(!copy_rows(&src, 30, 16, &mut dst, 4, 3, 1), "source short");
+    assert!(
+        !copy_rows(&src, 0, 16, &mut dst, 6, 3, 2),
+        "destination short"
+    );
+    assert_eq!(dst, [0; 8], "a refused copy writes nothing");
+}

@@ -22,12 +22,12 @@ fn releasing_every_read_drops_the_guards_and_returns_the_gauge_to_zero() {
     let second = Arc::new(PageBox::new_uninit(3 * PAGE_SIZE));
     let mut perf = EncoderPerfState::new();
     let mut retention = BlitRetention::default();
-    retention.hold(PageBoxRead::new(Arc::clone(&first)));
-    retention.hold(PageBoxRead::new(Arc::clone(&second)));
+    retention.hold(PageBoxRead::new(Arc::clone(&first)), first.len());
+    retention.hold(PageBoxRead::new(Arc::clone(&second)), second.len());
     retention.queue(&mut perf, 7);
     #[cfg(perf_tracking)]
     assert_eq!(perf.tex_staging_retained_bytes(), 4 * PAGE_SIZE);
-    retention.hold(PageBoxRead::new(Arc::clone(&first)));
+    retention.hold(PageBoxRead::new(Arc::clone(&first)), first.len());
     assert_eq!(
         retention.queued(),
         2,
@@ -50,9 +50,9 @@ fn reclaim_releases_only_retired_reads() {
     let second = Arc::new(PageBox::new_uninit(2 * PAGE_SIZE));
     let mut perf = EncoderPerfState::new();
     let mut retention = BlitRetention::default();
-    retention.hold(PageBoxRead::new(Arc::clone(&first)));
+    retention.hold(PageBoxRead::new(Arc::clone(&first)), first.len());
     retention.queue(&mut perf, 3);
-    retention.hold(PageBoxRead::new(Arc::clone(&second)));
+    retention.hold(PageBoxRead::new(Arc::clone(&second)), second.len());
     retention.queue(&mut perf, 4);
 
     retention.reclaim(&mut perf, 3);
@@ -61,4 +61,24 @@ fn reclaim_releases_only_retired_reads() {
     assert_eq!(Arc::strong_count(&second), 2, "seq 4 has not retired");
     #[cfg(perf_tracking)]
     assert_eq!(perf.tex_staging_retained_bytes(), 2 * PAGE_SIZE);
+}
+
+/// A read of a shared chunk adds only the bytes it covers to the gauge.
+///
+/// A snapshot is one box in an arena chunk other uploads share, so the gauge
+/// counts the box, not the chunk, and takes the same figure off at reclaim.
+#[test]
+fn a_held_snapshot_counts_only_its_own_bytes() {
+    let chunk = Arc::new(PageBox::new_uninit(16 * PAGE_SIZE));
+    let mut perf = EncoderPerfState::new();
+    let mut retention = BlitRetention::default();
+    retention.hold(PageBoxRead::new(Arc::clone(&chunk)), 4096);
+    retention.hold(PageBoxRead::new(Arc::clone(&chunk)), 512);
+    retention.queue(&mut perf, 5);
+    #[cfg(perf_tracking)]
+    assert_eq!(perf.tex_staging_retained_bytes(), 4608);
+    retention.reclaim(&mut perf, 5);
+    #[cfg(perf_tracking)]
+    assert_eq!(perf.tex_staging_retained_bytes(), 0);
+    assert!(!chunk.has_readers());
 }

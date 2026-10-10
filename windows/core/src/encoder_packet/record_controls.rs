@@ -200,6 +200,10 @@ fn capture_upload(
     let page = lease.descriptor();
     owners.pages.push(lease);
     let staging_index = u32::try_from(job.staging_index).map_err(|_| WireError::TooLarge)?;
+    let snapshot = u32::from(crate::encoder_data::UploadTextureOpFlags::SNAPSHOT.bits());
+    let (mip_flags, source_offset) = job
+        .snapshot_offset
+        .map_or((mip_flags, 0), |offset| (mip_flags | snapshot, offset));
     crate::encoder_records::write(
         destination,
         TextureUploadRecord {
@@ -222,7 +226,7 @@ fn capture_upload(
             release_staging: u32::from(job.release_staging),
             upload_generation: job.upload_generation,
             mip_flags,
-            reserved: 0,
+            source_offset,
         },
     )
 }

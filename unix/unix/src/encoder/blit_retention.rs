@@ -14,28 +14,28 @@ use mtld3d_core::{page_box::PageBoxRead, perf::EncoderPerfState};
 struct PendingBlitRead {
     submit_seq: u64,
     read: PageBoxRead,
-}
-
-impl PendingBlitRead {
-    /// Byte length of the retained staging, what the queue added to the gauge for it.
-    fn byte_len(&self) -> usize {
-        self.read.backing().len()
-    }
+    /// The bytes the read covers, what the queue added to the gauge for it.
+    bytes: usize,
 }
 
 /// The frame's staging reads and the queued reads of submitted frames.
 #[derive(Default)]
 pub struct BlitRetention {
-    /// Reads of the frame being encoded; not on the gauge until queued.
-    current: Vec<PageBoxRead>,
+    /// Reads of the frame being encoded with the bytes each covers; not on the gauge until queued.
+    current: Vec<(PageBoxRead, usize)>,
     /// Submitted frames' reads in `submit_seq` order, each one counted on the gauge.
     pending: VecDeque<PendingBlitRead>,
 }
 
 impl BlitRetention {
     /// Hold a read of staging a blit or upload pass of this frame reads.
-    pub fn hold(&mut self, read: PageBoxRead) {
-        self.current.push(read);
+    ///
+    /// `bytes` is what the copy reads from the pages, the figure the gauge
+    /// carries for it: the whole staging for a level's own pages, the
+    /// snapshot alone for a box copied into a shared arena chunk, whose other
+    /// bytes belong to other uploads.
+    pub fn hold(&mut self, read: PageBoxRead, bytes: usize) {
+        self.current.push((read, bytes));
     }
 
     /// Queue this frame's reads under `submit_seq`, adding each one's bytes to the gauge.
@@ -43,9 +43,13 @@ impl BlitRetention {
     /// Called before submission, so the reads outlive the blit encode and
     /// commit whichever thread runs them.
     pub fn queue(&mut self, perf: &mut EncoderPerfState, submit_seq: u64) {
-        for read in self.current.drain(..) {
-            perf.bump_tex_staging_retained_add(read.backing().len());
-            self.pending.push_back(PendingBlitRead { submit_seq, read });
+        for (read, bytes) in self.current.drain(..) {
+            perf.bump_tex_staging_retained_add(bytes);
+            self.pending.push_back(PendingBlitRead {
+                submit_seq,
+                read,
+                bytes,
+            });
         }
     }
 
@@ -59,7 +63,7 @@ impl BlitRetention {
                 break;
             }
             let entry = self.pending.pop_front().expect("checked front");
-            perf.bump_tex_staging_retained_sub(entry.byte_len());
+            perf.bump_tex_staging_retained_sub(entry.bytes);
             debug_assert!(
                 Arc::strong_count(entry.read.backing()) >= 1,
                 "pending blit Arc already orphaned"
@@ -74,7 +78,7 @@ impl BlitRetention {
     /// were never added, so they leave the gauge alone.
     pub fn release_all(&mut self, perf: &mut EncoderPerfState) {
         for entry in self.pending.drain(..) {
-            perf.bump_tex_staging_retained_sub(entry.byte_len());
+            perf.bump_tex_staging_retained_sub(entry.bytes);
         }
         self.current.clear();
     }

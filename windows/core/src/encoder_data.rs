@@ -38,6 +38,11 @@ bitflags::bitflags! {
     pub struct UploadTextureOpFlags: u8 {
         const ORDERED = 1 << 0;
         const REGENERATE_MIPMAPS = 1 << 1;
+        /// The source is a snapshot of the box, not the level's staging.
+        ///
+        /// Its rows start at the record's `source_offset` in a shared arena
+        /// chunk, `pitch` bytes apart, and hold the box alone.
+        const SNAPSHOT = 1 << 2;
     }
 }
 
@@ -435,6 +440,12 @@ pub struct TextureUploadJob {
     /// Travels back with the emitted answer so the release can tell whether a
     /// later upload of the level is still waiting for an answer of its own.
     pub upload_generation: u32,
+    /// Byte offset of the box's first row when `staging` is a snapshot chunk.
+    ///
+    /// `None` when `staging` is the level's own staging, laid out like the
+    /// level. `Some` when it is an arena chunk holding a copy of the box
+    /// alone, rows `src_pitch` apart (`crate::upload_snapshot`).
+    pub snapshot_offset: Option<u32>,
 }
 
 /// Texture metadata captured from the API thread for deferred Metal creation.

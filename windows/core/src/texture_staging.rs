@@ -414,5 +414,108 @@ pub const fn texture_lock_offset(
     }
 }
 
+/// Where a partial upload's box sits in the staging, and the shape its snapshot takes.
+///
+/// Rows are block rows for a compressed format. The snapshot holds the box's
+/// rows `pitch` bytes apart, so it occupies `pitch * rows` bytes.
+pub struct SnapshotLayout {
+    /// Byte offset of the box's first row in the level's staging.
+    pub src_offset: usize,
+    /// Bytes of one box row.
+    pub row_bytes: u32,
+    /// Rows the box spans.
+    pub rows: u32,
+    /// Row stride of the snapshot, a multiple of the requested alignment.
+    pub pitch: u32,
+    /// Bytes the snapshot occupies.
+    pub len: u32,
+}
+
+/// The layout of a snapshot of `rect`, or `None` for a box the arena does not take.
+///
+/// `block_bytes` is bytes per texel for an uncompressed format and per block
+/// for a compressed one, `src_pitch` the staging's row stride, and
+/// `pitch_align` the stride the snapshot's rows are rounded up to. A
+/// whole-level box goes to the staging: a whole-level write already moves to
+/// bare pages, and a level uploaded whole is not the one a partial lock
+/// rewrites. So does a compressed rect off the block grid, whose upload the
+/// encoder widens to the whole level, an empty rect, and a box over
+/// [`crate::upload_snapshot::SNAPSHOT_MAX_BYTES`].
+#[must_use]
+pub fn snapshot_layout(
+    rect: DirtyRect,
+    shape: MipShape,
+    block_bytes: u32,
+    src_pitch: u32,
+    pitch_align: u32,
+) -> Option<SnapshotLayout> {
+    if rect.w == 0
+        || rect.h == 0
+        || pitch_align == 0
+        || is_whole_mip(Some(rect), shape)
+        || !rect_block_aligned(rect, shape)
+    {
+        return None;
+    }
+    let block_x = rect.x / shape.block_w;
+    let block_y = rect.y / shape.block_h;
+    let cols = u64::from((rect.x + rect.w).div_ceil(shape.block_w) - block_x);
+    let rows = u64::from((rect.y + rect.h).div_ceil(shape.block_h) - block_y);
+    let row_bytes = cols * u64::from(block_bytes);
+    let pitch = row_bytes.next_multiple_of(u64::from(pitch_align));
+    let len = pitch * rows;
+    if row_bytes == 0 || len > crate::upload_snapshot::SNAPSHOT_MAX_BYTES as u64 {
+        return None;
+    }
+    Some(SnapshotLayout {
+        src_offset: texture_lock_offset(
+            Some(rect),
+            src_pitch,
+            shape.block_w,
+            shape.block_h,
+            block_bytes,
+        ),
+        row_bytes: u32::try_from(row_bytes).ok()?,
+        rows: u32::try_from(rows).ok()?,
+        pitch: u32::try_from(pitch).ok()?,
+        len: u32::try_from(len).ok()?,
+    })
+}
+
+/// Copy `rows` rows of `row_bytes` from `src`, `src_pitch` apart from `src_offset`, into `dst`.
+///
+/// The rows land `dst_pitch` apart from the start of `dst`. `false`, with
+/// nothing copied, when a row would reach past the end of either slice.
+#[must_use]
+pub fn copy_rows(
+    src: &[u8],
+    src_offset: usize,
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> bool {
+    let Some(last) = rows.checked_sub(1) else {
+        return true;
+    };
+    let src_end = last
+        .checked_mul(src_pitch)
+        .and_then(|v| v.checked_add(src_offset))
+        .and_then(|v| v.checked_add(row_bytes));
+    let dst_end = last
+        .checked_mul(dst_pitch)
+        .and_then(|v| v.checked_add(row_bytes));
+    if src_end.is_none_or(|end| end > src.len()) || dst_end.is_none_or(|end| end > dst.len()) {
+        return false;
+    }
+    for row in 0..rows {
+        let from = src_offset + row * src_pitch;
+        let to = row * dst_pitch;
+        dst[to..to + row_bytes].copy_from_slice(&src[from..from + row_bytes]);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests;

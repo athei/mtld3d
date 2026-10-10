@@ -349,7 +349,7 @@ record!(TextureUploadRecord {
     release_staging: u32,
     upload_generation: u32,
     mip_flags: u32,
-    reserved: u32
+    source_offset: u32
 });
 
 impl TextureRecord {
@@ -458,6 +458,86 @@ impl TextureRecord {
 }
 
 impl TextureUploadRecord {
+    /// The offset of the box in a snapshot source, `None` when the source is the staging.
+    #[must_use]
+    pub fn snapshot_offset(&self) -> Option<u32> {
+        let snapshot = u32::from(crate::encoder_data::UploadTextureOpFlags::SNAPSHOT.bits());
+        (self.mip_flags & snapshot != 0).then_some(self.source_offset)
+    }
+
+    /// Bytes a snapshot source holds: its rows, `pitch` apart, block rows when compressed.
+    ///
+    /// `None` for a format with no known layout.
+    #[must_use]
+    pub fn snapshot_span(&self) -> Option<u64> {
+        let rows = if self.bytes_per_pixel == 0 {
+            let format = crate::format::map_d3d_format(self.source_format)?;
+            self.height.div_ceil(format.block_height())
+        } else {
+            self.height
+        };
+        Some(u64::from(self.pitch) * u64::from(rows))
+    }
+
+    /// Check a snapshot source: its shape and its span inside `logical_len` bytes.
+    ///
+    /// A snapshot is a single 2D slice of an uncompressed or block-aligned
+    /// compressed box in a colour format laid out a texel or block at a time:
+    /// no volume, no packed depth, no planar YUV. Its first row sits on the
+    /// arena's alignment, each row fits its pitch, and the rows end inside
+    /// the chunk.
+    ///
+    /// # Errors
+    /// Returns an error for a record that is not a snapshot or breaks any of these.
+    pub fn validate_snapshot(&self, logical_len: u64) -> Result<(), WireError> {
+        use mtld3d_shared::mtl::TextureCreateFlags;
+        let offset = self.snapshot_offset().ok_or(WireError::InvalidValue)?;
+        if self.depth != 1
+            || self
+                .texture
+                .creation_flags()?
+                .contains(TextureCreateFlags::TYPE_3D)
+            || crate::depth_texture::PackedDepth::from_d3d(self.source_format).is_some()
+            || matches!(
+                self.source_format,
+                mtld3d_types::D3DFMT_YV12 | mtld3d_types::D3DFMT_NV12
+            )
+            || self.width == 0
+            || self.height == 0
+            || !u64::from(offset).is_multiple_of(crate::upload_snapshot::SNAPSHOT_ALIGN as u64)
+        {
+            return Err(WireError::InvalidValue);
+        }
+        let row_bytes = if self.bytes_per_pixel == 0 {
+            let format =
+                crate::format::map_d3d_format(self.source_format).ok_or(WireError::InvalidValue)?;
+            let (bw, bh) = (format.block_width(), format.block_height());
+            let mip_width = (self.texture.width >> self.level).max(1);
+            let mip_height = (self.texture.height >> self.level).max(1);
+            let end_x = self.origin_x.checked_add(self.width);
+            let end_y = self.origin_y.checked_add(self.height);
+            let aligned = self.origin_x.is_multiple_of(bw)
+                && self.origin_y.is_multiple_of(bh)
+                && (self.width.is_multiple_of(bw) || end_x == Some(mip_width))
+                && (self.height.is_multiple_of(bh) || end_y == Some(mip_height));
+            if !format.is_compressed() || !aligned {
+                return Err(WireError::InvalidValue);
+            }
+            u64::from(self.width.div_ceil(bw)) * u64::from(format.block_bytes())
+        } else {
+            u64::from(self.width) * u64::from(self.bytes_per_pixel)
+        };
+        let span = self.snapshot_span().ok_or(WireError::InvalidValue)?;
+        if row_bytes > u64::from(self.pitch)
+            || u64::from(offset)
+                .checked_add(span)
+                .is_none_or(|end| end > logical_len)
+        {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(())
+    }
+
     /// Check the retained source extent without adopting any resource.
     ///
     /// # Errors
@@ -496,6 +576,12 @@ impl TextureUploadRecord {
                 .bytes_per_pixel()
         };
         if self.bytes_per_pixel != source_bpp {
+            return Err(WireError::InvalidValue);
+        }
+        if self.snapshot_offset().is_some() {
+            return self.validate_snapshot(logical_len);
+        }
+        if self.source_offset != 0 {
             return Err(WireError::InvalidValue);
         }
         let mip_depth = (self.texture.depth >> self.level).max(1);

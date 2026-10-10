@@ -694,6 +694,7 @@ fn canonical_upload_retains_source_and_feedback_through_native_use() {
         redirty,
         release_staging: true,
         upload_generation: 1,
+        snapshot_offset: None,
     };
     recorder
         .record_typed(&mut frame.scratch, UploadTextureOp { job })
@@ -733,6 +734,112 @@ fn canonical_upload_retains_source_and_feedback_through_native_use() {
     drop(owner);
     assert!(weak_page.upgrade().is_none());
     assert!(weak_feedback.upgrade().is_none());
+}
+
+/// A 4x4 A8R8G8B8 upload at (4, 4) of a 16x16 level, from `source` at `pitch`.
+fn upload_job(source: Arc<PageBox>, snapshot_offset: Option<u32>, pitch: u32) -> TextureUploadJob {
+    use mtld3d_shared::mtl::{Swizzle, TextureCreateFlags, TextureUsage};
+    use mtld3d_types::D3DFMT_A8R8G8B8;
+    TextureUploadJob {
+        info: TextureInfo {
+            texture_id: crate::ids::TextureId::new_unique(),
+            d3d_format: D3DFMT_A8R8G8B8,
+            width: 16,
+            height: 16,
+            depth: 1,
+            levels: 1,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            create_flags: TextureCreateFlags::empty(),
+            swizzle: [Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::Alpha],
+            usage_flags: TextureUsage::empty(),
+        },
+        staging: crate::page_box::PageBoxRead::new(source),
+        level: 0,
+        destination_slice: 0,
+        staging_index: 0,
+        origin_x: 4,
+        origin_y: 4,
+        region_w: 4,
+        region_h: 4,
+        src_d3d_format: D3DFMT_A8R8G8B8,
+        src_pitch: pitch,
+        bytes_per_pixel: 4,
+        depth: 1,
+        slice_pitch: pitch * 16,
+        redirty: Arc::new(crate::upload_redirty::RedirtyQueue::new()),
+        release_staging: false,
+        upload_generation: 0,
+        snapshot_offset,
+    }
+}
+
+/// A snapshot upload's record carries its chunk offset under the snapshot flag, span checked.
+///
+/// The staging form keeps a zero offset and its level-shaped span. A
+/// snapshot's rows must start on the arena's alignment and end inside the
+/// chunk its lease names.
+#[test]
+fn snapshot_upload_records_carry_their_offset_and_check_their_span() {
+    use crate::{encoder_data::UploadTextureOpFlags, encoder_records::TextureUploadRecord};
+    let staging = Arc::new(PageBox::new_zeroed(16 * 64));
+    let chunk = Arc::new(PageBox::new_zeroed(65_536));
+    let cases = [
+        (Arc::clone(&staging), None, 64, true),
+        (Arc::clone(&chunk), Some(0), 16, true),
+        (Arc::clone(&chunk), Some(4096), 16, true),
+        (Arc::clone(&chunk), Some(8), 16, false),
+        (Arc::clone(&chunk), Some(65_536 - 48), 16, false),
+        (Arc::clone(&chunk), Some(0), 12, false),
+    ];
+    let mut frame = empty_frame();
+    let mut recorder = FrameRecorder::new();
+    for (source, offset, pitch, _) in &cases {
+        recorder
+            .record_typed(
+                &mut frame.scratch,
+                UploadTextureOp {
+                    job: upload_job(Arc::clone(source), *offset, *pitch),
+                },
+            )
+            .unwrap();
+    }
+    let mut owner = seal(frame, recorder);
+    let mut packet = admit(&mut owner);
+    let mut seen = Vec::new();
+    let mut native = Vec::new();
+    while replay(&mut packet, |command, _, _| {
+        let record = borrow::<TextureUploadRecord>(command.payload())?;
+        let flagged = record.mip_flags & u32::from(UploadTextureOpFlags::SNAPSHOT.bits()) != 0;
+        seen.push((
+            flagged,
+            record.snapshot_offset(),
+            record.source_offset,
+            record.validate_source(record.page.wire_fields()[2]).is_ok(),
+        ));
+        // SAFETY: the actual producer retained these unique read and feedback descriptors.
+        let read = unsafe { record.page.adopt_read()? };
+        // SAFETY: the feedback lease remains owned by this admitted packet through native use.
+        let feedback = unsafe { record.redirty.adopt()? };
+        native.push((read, feedback));
+        Ok(())
+    })
+    .unwrap()
+    {}
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(_, offset, _, valid)| (offset.is_some(), *offset, offset.unwrap_or(0), *valid))
+        .collect();
+    assert_eq!(seen, expected);
+    let frame = packet
+        .into_frame()
+        .unwrap_or_else(|(error, _)| panic!("complete: {error:?}"));
+    drop(frame);
+    drop(native);
+    let mut drain = crate::guest_completions::CompletionDrain::default();
+    owner.drain_test_completions(&mut drain);
+    assert!(owner.maintain());
+    drop(owner);
+    assert!(!chunk.has_readers() && !staging.has_readers());
 }
 
 #[test]

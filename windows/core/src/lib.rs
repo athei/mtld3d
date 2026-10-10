@@ -99,6 +99,7 @@ pub mod thread_wait;
 pub mod upload_pass;
 pub mod upload_recovery;
 pub mod upload_redirty;
+pub mod upload_snapshot;
 pub mod validate_device;
 pub mod visibility;
 pub mod vs_draw;

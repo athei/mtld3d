@@ -1133,6 +1133,14 @@ pub struct FrameEncoder {
     /// meaningful inside the packet that carries them.
     libraries: compile::libraries::StageLibraries,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
+    /// One `MTLBuffer` wrapper per upload-snapshot chunk, keyed by the chunk's page generation.
+    ///
+    /// A snapshot upload reads a shared arena chunk rather than its level's
+    /// staging, so its wrapper belongs to the chunk and never takes a texture's
+    /// per-level slot. The PE side keeps its chunks for the device's life and
+    /// restarts them in place, so a wrapper stays valid across restarts and
+    /// lives until shutdown, where it is destroyed with the staging wrappers.
+    snapshot_wrappers: FxHashMap<u64, MipStagingBuffer>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
     ///
@@ -1705,6 +1713,7 @@ impl FrameEncoder {
             lib_cache: FxHashMap::default(),
             libraries: compile::libraries::StageLibraries::default(),
             texture_cache: FxHashMap::default(),
+            snapshot_wrappers: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
             vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
@@ -6768,6 +6777,74 @@ impl FrameEncoder {
         handle.raw()
     }
 
+    /// The wrapper an upload reads its source through: its level's, or its snapshot chunk's.
+    fn upload_source_buffer(&mut self, job: &UploadView<'_>) -> u64 {
+        if job.snapshot_offset().is_some() {
+            return self.get_or_create_snapshot_buffer(job.staging().backing());
+        }
+        self.get_or_create_staging_buffer(
+            job.info().texture_id(),
+            job.staging_index(),
+            job.staging().backing(),
+        )
+    }
+
+    /// Lazily wrap an upload-snapshot chunk in a Shared `MTLBuffer`, one wrapper per chunk.
+    ///
+    /// Keyed by the chunk's page generation, which names the allocation
+    /// rather than its address. A key whose wrapper no longer matches the
+    /// pages it wraps is retired behind the current submission like a
+    /// texture's stale staging wrapper.
+    fn get_or_create_snapshot_buffer(&mut self, keepalive: &Arc<PageBox>) -> u64 {
+        let backing_ptr = keepalive.as_ptr() as u64;
+        let length = keepalive.len() as u64;
+        let key = keepalive.generation();
+        if let Some(slot) = self.snapshot_wrappers.get(&key)
+            && !slot.handle.is_null()
+            && slot.backing_ptr == backing_ptr
+            && slot.length == length
+        {
+            return slot.handle.raw();
+        }
+        if let Some(stale) = self.snapshot_wrappers.remove(&key)
+            && !stale.handle.is_null()
+        {
+            self.park_staging_wrapper(stale);
+        }
+        let desc = BufferCreateDesc {
+            backing_ptr,
+            length,
+            id: 0,
+            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            kind: BufferKind::TexStaging,
+        };
+        let mut handle = MetalHandle::<MTLBufferKind>::NULL;
+        let status = self.batch_create_buffers(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut handle),
+        );
+        if status != 0 || handle.is_null() {
+            error!(
+                target: LOG_TARGET,
+                "get_or_create_snapshot_buffer: CreateBuffer failed (generation={key}, \
+                 length={length})",
+            );
+            return 0;
+        }
+        self.snapshot_wrappers.insert(
+            key,
+            MipStagingBuffer::created(
+                handle,
+                backing_ptr,
+                length,
+                Arc::clone(keepalive),
+                &MipStagingBuffer::default(),
+            ),
+        );
+        self.perf.bump_staging_wrapper_create();
+        handle.raw()
+    }
+
     /// Queue a staging wrapper's destroy behind the current submission, keepalive included.
     ///
     /// Blits and upload passes emitted earlier in this frame name the
@@ -6806,7 +6883,14 @@ impl FrameEncoder {
             .ok()
             .and_then(UploadTextureOpFlags::from_bits)
             .ok_or(WireError::InvalidValue)?;
-        if record.release_staging > 1 || record.reserved != 0 {
+        if record.release_staging > 1 {
+            return Err(WireError::InvalidValue);
+        }
+        // A snapshot source is a box in a shared chunk: its shape and span are
+        // checked against the chunk the lease names before anything is adopted.
+        if flags.contains(UploadTextureOpFlags::SNAPSHOT) {
+            record.validate_snapshot(record.page.wire_fields()[2])?;
+        } else if record.source_offset != 0 {
             return Err(WireError::InvalidValue);
         }
         // SAFETY: the admitted frame retains the unique page lease through final completion.
@@ -7124,6 +7208,8 @@ impl FrameEncoder {
         if backing_length == 0 {
             return false;
         }
+        // A snapshot holds the box alone, its first row at the offset.
+        let snapshot = job.snapshot_offset();
 
         // Compute the blit descriptor against the staging buffer's
         // src_pitch stride. The format's block height is carried through
@@ -7131,11 +7217,7 @@ impl FrameEncoder {
         // not pixel rows: it turns `region_h` into the row count the GPU
         // actually reads, both for the alignment-pad repack below and for
         // the slice size the copy is given.
-        let staging_buffer_handle = self.get_or_create_staging_buffer(
-            job.info().texture_id(),
-            job.staging_index(),
-            job.staging().backing(),
-        );
+        let staging_buffer_handle = self.upload_source_buffer(job);
         if staging_buffer_handle == 0 {
             return false;
         }
@@ -7159,8 +7241,13 @@ impl FrameEncoder {
             if aligned {
                 let block_x = job.origin_x() / bw;
                 let block_y = job.origin_y() / bh;
-                let buffer_offset = u64::from(block_y) * u64::from(job.src_pitch())
-                    + u64::from(block_x) * u64::from(bb);
+                let buffer_offset = snapshot.map_or_else(
+                    || {
+                        u64::from(block_y) * u64::from(job.src_pitch())
+                            + u64::from(block_x) * u64::from(bb)
+                    },
+                    u64::from,
+                );
                 let info = CopyBufferToTextureInfo {
                     buffer_handle: staging_buffer_handle,
                     buffer_offset,
@@ -7176,6 +7263,14 @@ impl FrameEncoder {
                     bytes_per_image: 0,
                 };
                 (info, bh)
+            } else if snapshot.is_some() {
+                // A snapshot holds the box alone, so there is no whole level to
+                // fall back to; record validation rejects this shape first.
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "run_texture_upload_blit: a snapshot upload off the block grid has no \
+                     whole-level source → upload declined",
+                );
+                return false;
             } else {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "run_texture_upload_blit: compressed sub-rect ({}+{},{}+{}) unaligned to {}×{} block grid → full-mip fallback",
@@ -7204,9 +7299,15 @@ impl FrameEncoder {
             }
         } else {
             // Uncompressed path. Sub-rect offset is
-            // origin_y * pitch + origin_x * bpp bytes into the Box.
-            let buffer_offset = u64::from(job.origin_y()) * u64::from(job.src_pitch())
-                + u64::from(job.origin_x()) * u64::from(job.bytes_per_pixel());
+            // origin_y * pitch + origin_x * bpp bytes into the Box, or the
+            // snapshot's own offset.
+            let buffer_offset = snapshot.map_or_else(
+                || {
+                    u64::from(job.origin_y()) * u64::from(job.src_pitch())
+                        + u64::from(job.origin_x()) * u64::from(job.bytes_per_pixel())
+                },
+                u64::from,
+            );
             let info = CopyBufferToTextureInfo {
                 buffer_handle: staging_buffer_handle,
                 buffer_offset,
@@ -7238,9 +7339,11 @@ impl FrameEncoder {
                 None => return false,
             }
         } else {
-            // Notify the staging MTLBuffer (no-op on UMA). The padded
-            // path notifies the transient buffer instead.
-            self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
+            // Notify the staging MTLBuffer (no-op on UMA), only the snapshot's
+            // span of a shared chunk. The padded path notifies the transient
+            // buffer instead.
+            let (offset, length) = job.source_span();
+            self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, offset, length);
             info
         };
 
@@ -7283,9 +7386,18 @@ impl FrameEncoder {
         // `coherent_seq >= submit_seq`; the caller's own guard in
         // `pending_texture_uploads` outlives it by however long the
         // upload takes to be acknowledged.
-        self.blit_retention
-            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.hold_upload_source(job);
         true
+    }
+
+    /// Hold a read of an upload's source for the GPU's view of this frame.
+    ///
+    /// The gauge counts the bytes the copy reads: the whole staging, or a
+    /// snapshot's span of its shared chunk.
+    fn hold_upload_source(&mut self, job: &UploadView<'_>) {
+        let bytes = usize::try_from(job.source_span().1).expect("an upload source fits usize");
+        self.blit_retention
+            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())), bytes);
     }
 
     /// Volume (3D) full-box upload.
@@ -7375,8 +7487,7 @@ impl FrameEncoder {
             .push(BlitCommand::copy_buffer_to_texture(&info));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
-        self.blit_retention
-            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.hold_upload_source(job);
         true
     }
 
@@ -7387,13 +7498,12 @@ impl FrameEncoder {
     /// texture alignment, which is what a blit copy cannot accept; above it
     /// the blit is the cheaper write.
     fn upload_pass_decode(&self, job: &UploadView<'_>) -> Option<UploadDecode> {
-        let decode = mtld3d_core::upload_pass::upload_decode(
+        mtld3d_core::upload_pass::upload_pass_decode(
             job.src_d3d_format(),
             job.info().pixel_format(),
-        )?;
-        (mtld3d_core::upload_pass::is_expansion(decode)
-            || job.src_pitch() < self.gpu_caps.min_linear_texture_align)
-            .then_some(decode)
+            job.src_pitch(),
+            self.gpu_caps.min_linear_texture_align,
+        )
     }
 
     /// Run the upload as a GPU pass when it takes one, reporting whether the caller is done.
@@ -7472,18 +7582,15 @@ impl FrameEncoder {
         if pipeline == 0 {
             return false;
         }
-        let staging_buffer_handle = self.get_or_create_staging_buffer(
-            job.info().texture_id(),
-            job.staging_index(),
-            job.staging().backing(),
-        );
+        let staging_buffer_handle = self.upload_source_buffer(job);
         if staging_buffer_handle == 0 {
             return false;
         }
         // Non-UMA: the game wrote these pages on the CPU. The notify rides
         // the leading blits of the upload pass that reads these pages.
         let notify_start = self.frame_blit_commands.len();
-        self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
+        let (offset, length) = job.source_span();
+        self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, offset, length);
 
         let mip_w = (job.info().width().max(1) >> job.level()).max(1);
         let mip_h = (job.info().height().max(1) >> job.level()).max(1);
@@ -7516,11 +7623,22 @@ impl FrameEncoder {
             // on the unix side the way the scissor is.
             let w = job.region_w().min(mip_w.saturating_sub(job.origin_x()));
             let h = job.region_h().min(mip_h.saturating_sub(job.origin_y()));
+            // The fragment function addresses the source by destination
+            // texel, so a snapshot holding the box alone moves the base back
+            // by the box's origin.
+            let base = job.snapshot_offset().map_or(0, |offset| {
+                mtld3d_core::upload_pass::snapshot_pass_base(
+                    offset,
+                    (job.origin_x(), job.origin_y()),
+                    job.src_pitch(),
+                    decode.bytes_per_texel(),
+                )
+            });
             self.emit_upload_pass::<ORDERED>(
                 &emit,
                 job.destination_slice(),
                 (job.origin_x(), job.origin_y(), w, h),
-                0,
+                base,
                 notify_start,
             );
         }
@@ -7535,8 +7653,7 @@ impl FrameEncoder {
         self.perf.bump_texture_expand_upload();
         // The pass reads the staging at command-buffer execution time, long
         // after this returns; hold the Box for the GPU's view of the frame.
-        self.blit_retention
-            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.hold_upload_source(job);
         true
     }
 
@@ -8318,6 +8435,12 @@ impl FrameEncoder {
             }
             textures.extend(state.views.owned_handles().map(MetalHandle::raw));
         }
+        buffers.extend(
+            self.snapshot_wrappers
+                .values()
+                .filter(|slot| !slot.handle.is_null())
+                .map(|slot| slot.handle.raw()),
+        );
 
         let pipelines: Vec<u64> = self.pipeline_cache.ready().map(MetalHandle::raw).collect();
         let libraries: Vec<u64> = self
@@ -8406,6 +8529,7 @@ impl FrameEncoder {
         //    pages to snmalloc (or to the OS if it was the last ref).
         self.buffer_cache.clear();
         self.texture_cache.clear();
+        self.snapshot_wrappers.clear();
         self.pipeline_cache.clear();
         self.lib_cache.clear();
         // Non-owning indices into the libraries destroyed above via `lib_cache`
