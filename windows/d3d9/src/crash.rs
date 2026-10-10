@@ -74,6 +74,8 @@ const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// `GetModuleHandleEx` flag that leaves the module's reference count as it is.
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 2;
 /// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
 
@@ -408,11 +410,18 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
         return;
     }
+    // The lookup and the file name each take Wine's loader lock for the
+    // walk of the module list (`RtlPcToFileHeader` and `LdrGetDllFullName`
+    // enter `loader_section` in `dlls/ntdll/loader.c`). The lock is a critical
+    // section, so a fault on the thread that holds it re-enters it, and the
+    // report costs this only for the first few foreign faults. The handle is
+    // borrowed: without UNCHANGED_REFCOUNT every report would add a reference
+    // the faulting module never loses.
     let mut module: *mut c_void = core::ptr::null_mut();
     // SAFETY: kernel32 export; `addr` is only used as a lookup key.
     let found = unsafe {
         GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             addr.cast::<u8>(),
             &raw mut module,
         )
@@ -461,25 +470,22 @@ fn push_free_space(buf: &mut [u8], pos: &mut usize) {
     push_hex(buf, pos, space.largest_mib());
 }
 
+/// Whether `addr` lies in this image, from its own headers.
+///
+/// Every access violation and illegal instruction in the process asks this,
+/// so it makes no call: no loader lock, and no reference taken on the module
+/// that faulted.
 fn fault_in_our_dll(addr: *mut c_void) -> bool {
-    let our = D3D9_HMODULE.load(Ordering::Acquire);
-    if our.is_null() {
+    let base = D3D9_HMODULE.load(Ordering::Acquire) as usize;
+    if base == 0 {
         return false;
     }
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: GetModuleHandleExA with FROM_ADDRESS returns the HMODULE
-    // containing `addr` without incrementing its refcount when paired
-    // with UNCHANGED_REFCOUNT (flag 2). Passing just FROM_ADDRESS
-    // (flag 4) adds a refcount — the leak is acceptable because this
-    // only runs on a fault the process does not survive.
-    let ok = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            addr.cast::<u8>(),
-            &raw mut module,
-        )
+    // SAFETY: `base` is this image's `HMODULE` from `DllMain`, and the
+    // handler is registered only while the image is mapped.
+    let Some(size) = (unsafe { mtld3d_shared::identity::image_size(base) }) else {
+        return false;
     };
-    ok != 0 && module == our
+    (addr as usize).wrapping_sub(base) < size
 }
 
 /// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
