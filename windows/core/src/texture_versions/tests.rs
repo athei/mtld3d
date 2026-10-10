@@ -41,13 +41,18 @@ fn id(raw: u64) -> TextureId {
     TextureId::from_raw(raw)
 }
 
-/// Pop and park everything `settled` covers, returning what came back to destroy.
+/// Pop and park everything `settled` covers, returning the batch the drain would destroy.
 fn reclaim(versions: &mut TextureVersions<&'static str>, settled: u64) -> Vec<&'static str> {
-    let mut destroyed = Vec::new();
     while let Some(entry) = versions.pop_retired(settled) {
-        destroyed.extend(versions.park(entry, 0));
+        versions.park(entry, 0, settled);
     }
-    destroyed
+    versions.take_doomed()
+}
+
+/// Trim at `now`, returning the batch the drain would destroy.
+fn trim(versions: &mut TextureVersions<&'static str>, now: u64) -> Vec<&'static str> {
+    versions.trim(now);
+    versions.take_doomed()
 }
 
 #[test]
@@ -87,7 +92,8 @@ fn a_version_is_not_reclaimed_before_its_submission_settles() {
     assert!(versions.pop_retired(4).is_none());
     let entry = versions.pop_retired(5).expect("seq 5 settled");
     assert_eq!(*entry.views(), "v1");
-    assert!(versions.park(entry, 0).is_none());
+    versions.park(entry, 0, 5);
+    assert_eq!(versions.doomed(), 0);
     assert_eq!(versions.parked_bytes(), SPRITE_BYTES);
 }
 
@@ -174,24 +180,90 @@ fn a_shape_change_discards_the_spares_of_the_old_shape() {
     assert_eq!(versions.parked_bytes(), 2 * SPRITE_BYTES);
 }
 
+/// 4096x4096 BGRA8: 64 MiB a version, so sixteen fill the 1 GiB backstop.
+fn big() -> VersionShape {
+    VersionShape::of(&desc(4096, 4096, 1, PixelFormat::Bgra8Unorm))
+}
+
+const LABELS: [&str; 17] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+];
+
 #[test]
-fn the_cap_destroys_what_would_take_the_pool_past_it() {
-    // 4096x4096 BGRA8 is 64 MiB a version, so four fill the 256 MiB cap.
-    let big = || VersionShape::of(&desc(4096, 4096, 1, PixelFormat::Bgra8Unorm));
-    assert_eq!(big().bytes() * 4, VERSION_POOL_CAP_BYTES);
+fn the_backstop_destroys_what_would_take_the_pool_past_it() {
+    assert_eq!(big().bytes() * 16, VERSION_POOL_BACKSTOP_BYTES);
     let mut versions = TextureVersions::new();
     drop(versions.take_spare(id(1), big(), false, 0));
-    for (seq, label) in (1..).zip(["a", "b", "c", "d", "e"]) {
+    for (seq, label) in (1..).zip(LABELS) {
         versions.retire(id(1), label, seq);
     }
-    assert_eq!(reclaim(&mut versions, 5), vec!["e"]);
-    assert_eq!(versions.parked_bytes(), VERSION_POOL_CAP_BYTES);
+    assert_eq!(reclaim(&mut versions, 17), vec!["q"]);
+    assert_eq!(versions.parked_bytes(), VERSION_POOL_BACKSTOP_BYTES);
     // Taking one makes room for the next.
-    let (spare, _) = versions.take_spare(id(1), big(), false, 0);
-    assert_eq!(spare.map(Spare::into_views), Some("d"));
-    versions.retire(id(1), "f", 6);
-    assert!(reclaim(&mut versions, 6).is_empty());
-    assert_eq!(versions.parked_bytes(), VERSION_POOL_CAP_BYTES);
+    let (spare, _) = versions.take_spare(id(1), big(), false, 18);
+    assert_eq!(spare.map(Spare::into_views), Some("p"));
+    versions.retire(id(1), "r", 18);
+    assert!(reclaim(&mut versions, 18).is_empty());
+    assert_eq!(versions.parked_bytes(), VERSION_POOL_BACKSTOP_BYTES);
+}
+
+#[test]
+fn versions_waiting_to_be_destroyed_count_toward_the_backstop() {
+    let mut versions = TextureVersions::new();
+    drop(versions.take_spare(id(1), big(), false, 0));
+    for (seq, label) in (1..).zip(LABELS[..16].iter().copied()) {
+        versions.retire(id(1), label, seq);
+    }
+    assert!(reclaim(&mut versions, 16).is_empty());
+    // All sixteen age out and wait in the destroy queue, still holding memory.
+    versions.trim(16 + SPARE_MAX_IDLE_SUBMITS + 1);
+    assert_eq!(versions.parked_bytes(), 0);
+    assert_eq!(versions.doomed(), 16);
+    versions.retire(id(1), "q", 30);
+    while let Some(entry) = versions.pop_retired(30) {
+        versions.park(entry, 0, 30);
+    }
+    assert_eq!(versions.parked_bytes(), 0, "the backstop turned it away");
+    assert_eq!(versions.doomed(), 17);
+}
+
+#[test]
+fn destroys_spread_over_drains_in_bounded_batches() {
+    let mut versions = TextureVersions::new();
+    // Versions of a texture nothing tracks are destroyed when popped.
+    for seq in 1..=200 {
+        versions.retire(id(9), "orphan", seq);
+    }
+    // None is handed out before its submission settles.
+    assert!(reclaim(&mut versions, 0).is_empty());
+    assert_eq!(reclaim(&mut versions, 200).len(), MIN_DESTROYS_PER_DRAIN);
+    assert_eq!(versions.take_doomed().len(), MIN_DESTROYS_PER_DRAIN);
+    assert_eq!(versions.take_doomed().len(), MIN_DESTROYS_PER_DRAIN);
+    assert_eq!(
+        versions.take_doomed().len(),
+        200 - 3 * MIN_DESTROYS_PER_DRAIN
+    );
+    assert!(versions.take_doomed().is_empty());
+    // A large queue drains by an eighth at a time, so it cannot grow without bound.
+    for seq in 201..=1200 {
+        versions.retire(id(9), "orphan", seq);
+    }
+    assert_eq!(reclaim(&mut versions, 1200).len(), 125);
+    assert_eq!(versions.doomed(), 875);
+}
+
+#[test]
+fn a_drain_for_reset_takes_the_destroy_queue_too() {
+    let mut versions = TextureVersions::new();
+    for seq in 1..=100 {
+        versions.retire(id(9), "orphan", seq);
+    }
+    assert_eq!(reclaim(&mut versions, 100).len(), MIN_DESTROYS_PER_DRAIN);
+    assert_eq!(
+        versions.drain_versions().len(),
+        100 - MIN_DESTROYS_PER_DRAIN
+    );
+    assert_eq!(versions.doomed(), 0);
 }
 
 #[test]
@@ -200,11 +272,18 @@ fn spares_unused_past_the_age_bound_are_trimmed_oldest_first() {
     drop(versions.take_spare(id(1), sprite(), false, 0));
     versions.retire(id(1), "old", 10);
     versions.retire(id(1), "new", 20);
+    assert!(reclaim(&mut versions, 10).is_empty());
     assert!(reclaim(&mut versions, 20).is_empty());
-    assert!(versions.trim(10 + SPARE_MAX_AGE_SUBMITS).is_empty());
-    assert_eq!(versions.trim(11 + SPARE_MAX_AGE_SUBMITS), vec!["old"]);
+    assert!(trim(&mut versions, 10 + SPARE_MAX_IDLE_SUBMITS).is_empty());
+    assert_eq!(
+        trim(&mut versions, 11 + SPARE_MAX_IDLE_SUBMITS),
+        vec!["old"]
+    );
     assert_eq!(versions.parked_bytes(), SPRITE_BYTES);
-    assert_eq!(versions.trim(21 + SPARE_MAX_AGE_SUBMITS), vec!["new"]);
+    assert_eq!(
+        trim(&mut versions, 21 + SPARE_MAX_IDLE_SUBMITS),
+        vec!["new"]
+    );
     assert_eq!(versions.parked_bytes(), 0);
 }
 
@@ -248,7 +327,8 @@ fn cycle(
 ) -> Option<u64> {
     versions.retire(id(1), "v", seq);
     let entry = versions.pop_retired(seq).expect("settled");
-    assert!(versions.park(entry, failed).is_none());
+    versions.park(entry, failed, seq);
+    assert_eq!(versions.doomed(), 0);
     let (spare, _) = versions.take_spare(id(1), shape(), true, 0);
     spare.expect("the spare just parked").into_parts().1
 }
@@ -550,7 +630,7 @@ fn trim_visits_only_textures_holding_spares() {
     assert!(spare.is_some());
     assert_eq!(versions.holding_spares(), 2);
     // Trimming the other two empties them as well.
-    assert_eq!(versions.trim(2 + SPARE_MAX_AGE_SUBMITS).len(), 2);
+    assert_eq!(trim(&mut versions, 2 + SPARE_MAX_IDLE_SUBMITS).len(), 2);
     assert_eq!(versions.holding_spares(), 0);
     assert_eq!(versions.parked_bytes(), 0);
     // Forgetting and draining leave nothing behind either.
@@ -568,31 +648,37 @@ fn a_texture_with_no_spares_and_no_rename_for_the_age_bound_stops_being_tracked(
     drop(versions.take_spare(id(2), sprite(), true, 10));
     // Texture 2 is renamed again later, so it stays.
     drop(versions.take_spare(id(2), sprite(), true, 50));
-    assert!(versions.trim(10 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    assert!(trim(&mut versions, 10 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 2);
-    assert!(versions.trim(11 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    assert!(trim(&mut versions, 11 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 1);
     assert!(!versions.records_writes(id(1)));
     assert!(versions.records_writes(id(2)));
-    assert!(versions.trim(51 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    assert!(trim(&mut versions, 51 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 0);
 }
 
 #[test]
-fn a_texture_is_dropped_once_its_last_spare_is_trimmed() {
+fn a_texture_is_dropped_after_its_last_spare_is_trimmed() {
     let mut versions = TextureVersions::new();
     drop(versions.take_spare(id(1), sprite(), true, 5));
     versions.retire(id(1), "spare", 5);
     assert!(reclaim(&mut versions, 5).is_empty());
-    // The spare keeps it while it is young; one trim takes both.
-    assert!(versions.trim(5 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    // The spare goes at its own bound, the state at the longer one.
+    assert!(trim(&mut versions, 5 + SPARE_MAX_IDLE_SUBMITS).is_empty());
+    assert_eq!(
+        trim(&mut versions, 6 + SPARE_MAX_IDLE_SUBMITS),
+        vec!["spare"]
+    );
     assert_eq!(versions.tracked(), 1);
-    assert_eq!(versions.trim(6 + SPARE_MAX_AGE_SUBMITS), vec!["spare"]);
+    assert!(trim(&mut versions, 5 + STATE_MAX_IDLE_SUBMITS).is_empty());
+    assert_eq!(versions.tracked(), 1);
+    assert!(trim(&mut versions, 6 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 0);
     // A version still retiring when the state goes is destroyed, not parked.
     drop(versions.take_spare(id(1), sprite(), true, 200));
     versions.retire(id(1), "late", 200);
-    assert!(versions.trim(321).is_empty());
+    assert!(trim(&mut versions, 321).is_empty());
     assert_eq!(versions.tracked(), 0);
     assert_eq!(reclaim(&mut versions, 200), vec!["late"]);
 }
@@ -604,9 +690,9 @@ fn a_state_back_under_its_id_keeps_its_own_age() {
     assert!(versions.forget_texture(id(1)).is_empty());
     drop(versions.take_spare(id(1), sprite(), true, 100));
     // The first state's entry comes due first and must not drop the second.
-    assert!(versions.trim(11 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    assert!(trim(&mut versions, 11 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 1);
-    assert!(versions.trim(101 + SPARE_MAX_AGE_SUBMITS).is_empty());
+    assert!(trim(&mut versions, 101 + STATE_MAX_IDLE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 0);
 }
 
@@ -618,9 +704,24 @@ fn a_texture_renamed_early_is_dropped_on_time_behind_a_younger_one() {
     drop(versions.take_spare(id(2), sprite(), true, 50));
     // Texture 1's entry comes due at 121 and goes back under its rename at
     // 10, which is due before texture 2's entry at 50.
-    assert!(versions.trim(121).is_empty());
+    assert!(trim(&mut versions, 121).is_empty());
     assert_eq!(versions.tracked(), 2);
-    assert!(versions.trim(10 + SPARE_MAX_AGE_SUBMITS + 1).is_empty());
+    assert!(trim(&mut versions, 10 + STATE_MAX_IDLE_SUBMITS + 1).is_empty());
     assert!(!versions.records_writes(id(1)));
     assert!(versions.records_writes(id(2)));
+}
+
+#[test]
+fn a_spare_the_gpu_retired_late_counts_its_idle_time_from_parking() {
+    let mut versions = TextureVersions::new();
+    drop(versions.take_spare(id(1), sprite(), false, 0));
+    versions.retire(id(1), "late", 1);
+    // The GPU lags: the version settles 20 submissions after it retired.
+    assert!(reclaim(&mut versions, 21).is_empty());
+    assert!(trim(&mut versions, 21 + SPARE_MAX_IDLE_SUBMITS).is_empty());
+    assert_eq!(versions.parked_bytes(), SPRITE_BYTES);
+    assert_eq!(
+        trim(&mut versions, 22 + SPARE_MAX_IDLE_SUBMITS),
+        vec!["late"]
+    );
 }

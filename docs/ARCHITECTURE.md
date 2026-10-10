@@ -451,13 +451,20 @@ it, and the retention drain pops it under the drain's own gate, the lower of
 record through `retire_texture_handle`, exactly as a destroyed texture does,
 since the next rename of the same texture takes the newest such spare instead
 of allocating, keeps its views and registers them again, and nothing may
-answer for it from before. The pool holds at most 256 MiB across every
-texture; a version that would take it past that, a version of a released
-texture or of a changed shape, and a spare unused for 120 submissions are
-destroyed. `Reset` and shutdown queue every spare and retiring version before
-their GPU-idle wait. A texture with no spares and no rename for those 120
-submissions stops being tracked, its write history with it, and its next
-rename starts it over.
+answer for it from before. A spare no rename takes within 8 submissions is
+destroyed, which sizes the pool to the demand: the busiest measured scene
+retires about 134 MiB of versions a frame and takes them back one to three
+submissions later, while a 256 MiB cap there destroyed and reallocated about
+110 of its 267 renames a frame. A 1 GiB backstop over spares and pending
+destroys catches a pool that would grow past that, and a version of a released
+texture or of a changed shape is destroyed too. Those destroys wait in a queue
+the drain takes a bounded batch from, the larger of 64 versions and an eighth
+of the queue, so a burst of them, which took 6 ms in one drain, spreads over
+several drains; a queued version was popped after its submission settled and
+has left every record, so nothing in flight names it. `Reset` and shutdown
+queue every spare, retiring version and pending destroy before their GPU-idle
+wait. A texture with no spares and no rename for 120 submissions stops being
+tracked, its write history with it, and its next rename starts it over.
 
 A reused spare still has to receive what the texture changed after it retired.
 For a 2D or cube colour texture whose application usage is neither render

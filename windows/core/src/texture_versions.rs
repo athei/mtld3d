@@ -14,11 +14,15 @@
 //! names it; a rename moves it to the retiring queue under the submission
 //! that last named it; once both retirement counters have passed that
 //! submission the caller pops it, forgets every handle-keyed record of it
-//! exactly as a destroy does, and parks it as a spare of its texture, or
-//! destroys it when the texture is gone or the pool is at its cap. A spare
-//! nobody takes for [`SPARE_MAX_AGE_SUBMITS`] submissions is trimmed, and a
-//! texture with no spares that no rename touched for as long stops being
-//! tracked: its next rename starts it over, write history included.
+//! exactly as a destroy does, and parks it as a spare of its texture. A
+//! spare no rename takes within [`SPARE_MAX_IDLE_SUBMITS`] submissions is
+//! destroyed, and so is a version whose texture is gone or whose parking
+//! would take the pool past [`VERSION_POOL_BACKSTOP_BYTES`]. Those destroys
+//! wait in a queue the caller takes a bounded batch from per drain
+//! ([`TextureVersions::take_doomed`]), so a burst of them spreads over
+//! several drains. A texture with no spares that no rename touched for
+//! [`STATE_MAX_IDLE_SUBMITS`] submissions stops being tracked: its next
+//! rename starts it over, write history included.
 //!
 //! A reused version still has to receive the texels the texture changed
 //! since it retired, and only those, when the texture's GPU writes are all
@@ -48,24 +52,51 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{format::FormatMapping, ids::TextureId};
 
-/// Bytes of texture storage the pool may park across every texture.
+/// Submissions a spare may wait for a rename before it is destroyed.
 ///
-/// The busiest measured scene rewrites one 512x512 A4R4G4B4 sprite scratch
-/// about 268 times a frame, so it retires about 134 MiB of versions per
-/// frame, each reclaimed two to three frames later. 256 MiB holds about two
-/// frames of that. Every spare stands in for an allocation the rename
-/// would otherwise make in the same frame, so in steady state the pool
-/// adds no storage beyond what the renames already held; the cap bounds
-/// the transient after a burst of renames stops. The storage is `Private`
-/// GPU memory, outside the 32-bit guest address space.
-pub const VERSION_POOL_CAP_BYTES: u64 = 256 << 20;
+/// The bound that sizes the pool to the demand. A rename that retires a
+/// version is answered by a spare once the GPU has finished the version's
+/// submission, which in the busiest measured scene (a 512x512 A4R4G4B4
+/// sprite scratch rewritten 267 times a frame, about 134 MiB of versions
+/// retired per frame) comes one to three submissions later, with drains
+/// that reclaim up to about two and a half frames of versions at once.
+/// A texture still being renamed takes its spares back within those few
+/// submissions, so eight leaves room above the lag and still gives a
+/// texture that stopped being renamed its storage back within about 130 ms
+/// at 60 frames a second. A total-bytes cap does not size this: the pool a
+/// scene needs is the per-frame retire times the frames the GPU lags, and
+/// the lag grows as the CPU outruns the GPU; a 256 MiB cap destroyed and
+/// reallocated about 110 versions a frame there, and 512 MiB still 45.
+pub const SPARE_MAX_IDLE_SUBMITS: u64 = 8;
 
-/// Submissions a spare may sit unused before it is destroyed.
+/// Bytes of texture storage the pool may hold, parked or waiting to be destroyed.
 ///
-/// About two seconds at 60 frames a second: a texture that stopped being
-/// renamed gives its storage back that much later, while one renamed in
-/// bursts a second apart (a scene change, a loading screen) keeps it.
-pub const SPARE_MAX_AGE_SUBMITS: u64 = 120;
+/// A backstop, not the bound that normally acts: [`SPARE_MAX_IDLE_SUBMITS`]
+/// does. It is the age bound's own worst case in the busiest measured scene
+/// (eight submissions of 134 MiB of retired versions, about 1 GiB) and
+/// catches a pool that would grow past it. The storage is `Private` GPU
+/// memory, outside the 32-bit guest address space.
+pub const VERSION_POOL_BACKSTOP_BYTES: u64 = 1 << 30;
+
+/// Submissions a texture with no spares may go without a rename before it stops being tracked.
+///
+/// Dropping a texture's state frees its write history, a few KiB of tile
+/// stamps per level, and costs the next rename a fresh history and a
+/// whole-level copy into a fresh allocation, which it would take anyway
+/// with no spare left. The state is far smaller than a spare, so it is
+/// kept longer: about two seconds at 60 frames a second, which spares a
+/// texture renamed in bursts seconds apart the rebuild, while a texture
+/// that stopped being renamed gives the memory back.
+pub const STATE_MAX_IDLE_SUBMITS: u64 = 120;
+
+/// Fewest destroyed versions handed to the caller per drain, when that many wait.
+///
+/// The batch is the larger of this and an eighth of the queue, so a burst
+/// spreads over about eight drains while a queue that keeps growing is
+/// still emptied geometrically. A drain that destroyed 1357 handles at once
+/// (678 versions of two views each) took 6.1 ms, about 4.5 us a handle, so
+/// 64 versions cost about 0.6 ms.
+pub const MIN_DESTROYS_PER_DRAIN: usize = 64;
 
 /// Smallest tile edge of a write-history grid, in texels.
 ///
@@ -295,7 +326,7 @@ impl PreserveCopy {
 pub struct Spare<V> {
     views: V,
     held_writes: Option<u64>,
-    last_seq: u64,
+    parked_seq: u64,
 }
 
 impl<V> Spare<V> {
@@ -324,6 +355,7 @@ pub struct Retiring<V> {
     epoch: u64,
     birth_seq: u64,
     held_writes: u64,
+    bytes: u64,
 }
 
 impl<V> Retiring<V> {
@@ -343,6 +375,10 @@ pub struct TextureVersions<V> {
     textures: FxHashMap<TextureId, VersionState<V>>,
     retiring: VecDeque<Retiring<V>>,
     parked_bytes: u64,
+    /// Versions to destroy, with their bytes, oldest first; see [`Self::take_doomed`].
+    doomed: VecDeque<(V, u64)>,
+    /// Bytes of the versions in `doomed`, which count toward the backstop until destroyed.
+    doomed_bytes: u64,
     /// The epoch the next tracking state gets; 0 is never handed out.
     ///
     /// Every state, a texture's first and every one after a shape change
@@ -356,7 +392,7 @@ pub struct TextureVersions<V> {
     /// One `(submission, raw texture id, epoch)` per tracked state, in submission order.
     ///
     /// [`Self::trim`] looks at a state when its entry is
-    /// [`SPARE_MAX_AGE_SUBMITS`] old, drops it when it has no spares and no
+    /// [`STATE_MAX_IDLE_SUBMITS`] old, drops it when it has no spares and no
     /// rename since, and enters it again under its latest rename otherwise,
     /// so a drain visits only the states whose age came due. The set keeps
     /// the order whatever submission an entry comes back under, so no state
@@ -372,6 +408,8 @@ impl<V> TextureVersions<V> {
             textures: FxHashMap::default(),
             retiring: VecDeque::new(),
             parked_bytes: 0,
+            doomed: VecDeque::new(),
+            doomed_bytes: 0,
             next_epoch: 1,
             with_spares: FxHashSet::default(),
             idle: BTreeSet::new(),
@@ -404,7 +442,7 @@ impl<V> TextureVersions<V> {
     /// starts over under the new shape; versions of the old shape still
     /// retiring are destroyed when they are popped. `seq` is the submission
     /// the rename belongs to, which keeps the texture tracked for another
-    /// [`SPARE_MAX_AGE_SUBMITS`] submissions.
+    /// [`STATE_MAX_IDLE_SUBMITS`] submissions.
     pub fn take_spare(
         &mut self,
         id: TextureId,
@@ -521,13 +559,14 @@ impl<V> TextureVersions<V> {
             self.retiring.back().is_none_or(|back| back.seq <= seq),
             "texture versions must retire in submission order",
         );
-        let (epoch, birth_seq, held_writes) =
-            self.textures.get_mut(&id).map_or((0, 0, 0), |state| {
+        let (epoch, birth_seq, held_writes, bytes) =
+            self.textures.get_mut(&id).map_or((0, 0, 0, 0), |state| {
                 let birth = core::mem::replace(&mut state.live_birth_seq, seq);
                 (
                     state.epoch,
                     birth,
                     state.history.as_ref().map_or(0, |h| h.writes),
+                    state.bytes,
                 )
             });
         self.retiring.push_back(Retiring {
@@ -537,6 +576,7 @@ impl<V> TextureVersions<V> {
             epoch,
             birth_seq,
             held_writes,
+            bytes,
         });
     }
 
@@ -605,29 +645,36 @@ impl<V> TextureVersions<V> {
         self.retiring.pop_front()
     }
 
-    /// Park a popped version as its texture's newest spare, or hand it back to destroy.
+    /// Park a popped version as its texture's newest spare, or queue it to be destroyed.
     ///
-    /// It comes back when its texture is gone or changed shape since it
-    /// retired, or when parking it would take the pool past
-    /// [`VERSION_POOL_CAP_BYTES`]. `failed` is the highest submission the
-    /// GPU aborted (0 for none), read with the counter the pop was gated
-    /// on: a version live through an aborted submission may lack a copy or
-    /// an upload that submission carried, so it parks with unknown contents.
-    pub fn park(&mut self, entry: Retiring<V>, failed: u64) -> Option<V> {
-        let Some(state) = self.textures.get_mut(&entry.id) else {
-            return Some(entry.views);
+    /// It is queued when its texture is gone or changed shape since it
+    /// retired, or when parking it would take the pool, spares and queued
+    /// destroys together, past [`VERSION_POOL_BACKSTOP_BYTES`]. `failed` is
+    /// the highest submission the GPU aborted (0 for none), read with the
+    /// counter the pop was gated on: a version live through an aborted
+    /// submission may lack a copy or an upload that submission carried, so
+    /// it parks with unknown contents. `now` is the submission being built,
+    /// from which the spare's idle time counts: a version the GPU retired
+    /// late is no older for it.
+    pub fn park(&mut self, entry: Retiring<V>, failed: u64, now: u64) {
+        let Some(state) = self
+            .textures
+            .get_mut(&entry.id)
+            .filter(|state| state.epoch == entry.epoch)
+        else {
+            self.doom(entry.views, entry.bytes);
+            return;
         };
-        if state.epoch != entry.epoch {
-            return Some(entry.views);
-        }
-        if self.parked_bytes + state.bytes > VERSION_POOL_CAP_BYTES {
+        if self.parked_bytes + self.doomed_bytes + state.bytes > VERSION_POOL_BACKSTOP_BYTES {
             mtld3d_shared::log_once_info!(
                 target: crate::LOG_TARGET,
-                "texture versions: the rename pool is at its {} MiB cap; further retired \
-                 versions are destroyed until spares are taken or trimmed",
-                VERSION_POOL_CAP_BYTES >> 20,
+                "texture versions: the rename pool reached its {} MiB backstop; retired \
+                 versions past it are destroyed until spares are taken or age out",
+                VERSION_POOL_BACKSTOP_BYTES >> 20,
             );
-            return Some(entry.views);
+            let bytes = state.bytes;
+            self.doom(entry.views, bytes);
+            return;
         }
         self.parked_bytes += state.bytes;
         let aborted = failed != 0 && entry.birth_seq <= failed;
@@ -637,24 +684,51 @@ impl<V> TextureVersions<V> {
         state.spares.push(Spare {
             views: entry.views,
             held_writes: (!aborted).then_some(entry.held_writes),
-            last_seq: entry.seq,
+            parked_seq: now,
         });
-        None
     }
 
-    /// Take every spare no rename used for [`SPARE_MAX_AGE_SUBMITS`] submissions before `now`.
+    /// Hand back the next batch of versions to destroy.
     ///
-    /// A spare's age counts from the submission it last served in. Spares
-    /// park in submission order and renames take the newest, so each
-    /// texture's oldest spares sit at the bottom of its stack. Only the
+    /// The larger of [`MIN_DESTROYS_PER_DRAIN`] and an eighth of the queue,
+    /// oldest first; the rest wait for the next drain. Every queued version
+    /// was popped after its submission settled and has had its handle-keyed
+    /// records forgotten, and no rename takes it again, so no command of a
+    /// submission in flight or being built can name it: destroying it a
+    /// drain or several later is as safe as destroying it at once.
+    pub fn take_doomed(&mut self) -> Vec<V> {
+        let batch = MIN_DESTROYS_PER_DRAIN
+            .max(self.doomed.len().div_ceil(8))
+            .min(self.doomed.len());
+        let mut taken = Vec::with_capacity(batch);
+        for (views, bytes) in self.doomed.drain(..batch) {
+            self.doomed_bytes -= bytes;
+            taken.push(views);
+        }
+        taken
+    }
+
+    /// Queue `views`, of `bytes` bytes, for [`Self::take_doomed`].
+    fn doom(&mut self, views: V, bytes: u64) {
+        self.doomed_bytes += bytes;
+        self.doomed.push_back((views, bytes));
+    }
+
+    /// Queue for destruction every spare idle past the bound, and forget idle textures.
+    ///
+    /// A spare no rename took within [`SPARE_MAX_IDLE_SUBMITS`] submissions
+    /// before `now` is queued for [`Self::take_doomed`]. A spare's age counts
+    /// from the submission it was parked in. Spares park in submission
+    /// order and renames take the newest, so each texture's oldest spares
+    /// sit at the bottom of its stack. Only the
     /// textures holding spares are visited for that. Then every texture
-    /// left without spares and without a rename for as long stops being
-    /// tracked, its write history with it; only the states whose age came
-    /// due are looked at.
-    pub fn trim(&mut self, now: u64) -> Vec<V> {
-        let mut aged = Vec::new();
-        let aged_at = |seq: u64| seq + SPARE_MAX_AGE_SUBMITS < now;
+    /// left without spares and without a rename for
+    /// [`STATE_MAX_IDLE_SUBMITS`] submissions stops being tracked, its write
+    /// history with it; only the states whose age came due are looked at.
+    pub fn trim(&mut self, now: u64) {
+        let spare_aged = |seq: u64| seq + SPARE_MAX_IDLE_SUBMITS < now;
         let (textures, parked_bytes) = (&mut self.textures, &mut self.parked_bytes);
+        let (doomed, doomed_bytes) = (&mut self.doomed, &mut self.doomed_bytes);
         self.with_spares.retain(|id| {
             let Some(state) = textures.get_mut(id) else {
                 return false;
@@ -662,12 +736,20 @@ impl<V> TextureVersions<V> {
             let old = state
                 .spares
                 .iter()
-                .take_while(|spare| aged_at(spare.last_seq))
+                .take_while(|spare| spare_aged(spare.parked_seq))
                 .count();
             *parked_bytes -= state.bytes * old as u64;
-            aged.extend(state.spares.drain(..old).map(Spare::into_views));
+            *doomed_bytes += state.bytes * old as u64;
+            let bytes = state.bytes;
+            doomed.extend(
+                state
+                    .spares
+                    .drain(..old)
+                    .map(|spare| (spare.into_views(), bytes)),
+            );
             !state.spares.is_empty()
         });
+        let aged_at = |seq: u64| seq + STATE_MAX_IDLE_SUBMITS < now;
         while let Some(&(seq, raw, epoch)) = self.idle.first() {
             if !aged_at(seq) {
                 break;
@@ -693,7 +775,6 @@ impl<V> TextureVersions<V> {
             };
             self.idle.insert((again, raw, epoch));
         }
-        aged
     }
 
     /// Stop tracking a released texture, handing back its spares.
@@ -710,12 +791,14 @@ impl<V> TextureVersions<V> {
         state.spares.into_iter().map(Spare::into_views).collect()
     }
 
-    /// Take every spare and every retiring version, leaving the textures tracked.
+    /// Take every spare, retiring version and queued destroy, leaving the textures tracked.
     ///
     /// For `Reset` and shutdown, whose caller waits for the GPU to go idle
     /// before it destroys what this returns.
     pub fn drain_versions(&mut self) -> Vec<V> {
         let mut all: Vec<V> = self.retiring.drain(..).map(|entry| entry.views).collect();
+        all.extend(self.doomed.drain(..).map(|(views, _)| views));
+        self.doomed_bytes = 0;
         for id in self.with_spares.drain() {
             if let Some(state) = self.textures.get_mut(&id) {
                 all.extend(state.spares.drain(..).map(Spare::into_views));
@@ -735,6 +818,12 @@ impl<V> TextureVersions<V> {
     #[cfg(test)]
     fn holding_spares(&self) -> usize {
         self.with_spares.len()
+    }
+
+    /// Versions waiting in the destroy queue.
+    #[cfg(test)]
+    fn doomed(&self) -> usize {
+        self.doomed.len()
     }
 }
 

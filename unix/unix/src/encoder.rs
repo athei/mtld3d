@@ -6805,18 +6805,24 @@ impl FrameEncoder {
     /// as a destroyed texture does at this drain: it may serve the next
     /// rename under the same addresses, which must not inherit its clears,
     /// its sampled marks or its scratch copies. What the pool turns away and
-    /// the spares past their age join the drain's texture destroys; nothing
-    /// names them, since a parked spare is in no cache and no command.
+    /// the spares past their age go to its destroy queue, and a bounded
+    /// batch of that queue joins the drain's texture destroys; nothing names
+    /// them, since a popped version is in no cache and no command.
     fn reclaim_texture_versions(&mut self, settled: u64, failed: u64, textures: &mut Vec<u64>) {
         while let Some(entry) = self.texture_versions.pop_retired(settled) {
             for handle in entry.views().owned_handles() {
                 self.retire_texture_handle(handle.raw());
             }
-            if let Some(views) = self.texture_versions.park(entry, failed) {
-                self.collect_version_destroy(&views, textures);
-            }
+            self.texture_versions
+                .park(entry, failed, self.current_submit_seq);
         }
-        for views in self.texture_versions.trim(self.current_submit_seq) {
+        self.texture_versions.trim(self.current_submit_seq);
+        // A bounded batch: a burst of versions to destroy (a drain that
+        // reclaims several frames of renames past the backstop, a texture
+        // released with many spares) spreads over the next drains instead
+        // of stalling this one. Every queued version is already out of every
+        // command, so a later destroy is as safe as this one.
+        for views in self.texture_versions.take_doomed() {
             self.collect_version_destroy(&views, textures);
         }
     }
