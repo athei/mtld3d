@@ -19,15 +19,17 @@
 //! boxes included, which bounds everything else the image allocates.
 //!
 //! The walk runs on a thread of the device's own (`mtld3d-mem-watch`), never
-//! on the presenting thread, which pays a counter bump and an empty-channel
-//! check per present and hands the thread a sample index every
-//! `SAMPLE_EVERY` presents. The thread walks, advances the threshold latches,
-//! reads the process-wide holder figures, formats and logs. Two figures only
-//! the API thread can read safely: the live textures' footprint (staging the
-//! API thread changes without a lock) and the upload leases (behind the
-//! encoder's retirement lock). The thread asks for them only when a line is
-//! due, and the next present answers, so a line is logged a present or two
-//! after its walk.
+//! on the presenting thread, which pays a counter bump and a load per present
+//! and hands the thread a sample index every `SAMPLE_EVERY` presents
+//! (`mtld3d_core::watch_handoff` holds the protocol). The thread walks,
+//! advances the threshold latches, reads the process-wide holder figures,
+//! formats and logs. Two figures only the API thread can read safely: the
+//! live textures' footprint (staging the API thread changes without a lock)
+//! and the upload leases (behind the encoder's retirement lock). The thread
+//! asks for them only when a line is due, and the next present answers, so a
+//! line is logged a present or two after its walk. When no present answers
+//! within `FIGURES_WAIT`, the threshold lines are logged without those figures
+//! and the breakdown is dropped.
 //!
 //! The periodic breakdown logs at debug on its own target, so
 //! `RUST_LOG=mtld3d::d3d9::mem_watch=debug` turns it on without the rest of
@@ -39,8 +41,8 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::{
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use log::{debug, info, warn};
@@ -50,6 +52,7 @@ use mtld3d_core::{
         UNSAMPLED, cycles_to_micros, threshold_step,
     },
     thread_wait::wait_until_finished,
+    watch_handoff::{self, ApiLink, Offer, Watch},
 };
 use mtld3d_shared::tsc::{rdtsc, tsc_hz};
 
@@ -72,6 +75,24 @@ const REPORT_EVERY_SAMPLES: u32 = 2;
 
 /// Whether this build's process can run out of address space: a 32-bit one can.
 const WALKS: bool = cfg!(target_pointer_width = "32");
+
+/// How long the watch thread waits for a present to answer its request for the device figures.
+///
+/// A game that stops presenting (a loading stall, the run-up to running out
+/// of space) must not keep a crossed threshold's warning out of the log, so
+/// after this the thread logs the warning without the device's figures. Two
+/// seconds is many frames of a game that presents, and short beside the
+/// five seconds between samples.
+const FIGURES_WAIT: Duration = Duration::from_secs(2);
+
+/// The watch thread's stack reservation.
+///
+/// std's default of 2 MiB would be reserved in the 32-bit address space the
+/// thread watches. The thread keeps one region record and a few scalars on
+/// its stack: the region map, every formatted line and the logger's buffer
+/// live on the heap, and logging only queues the line for the log thread.
+/// 256 KiB leaves a wide margin over that.
+const WATCH_STACK_BYTES: usize = 256 * 1024;
 
 /// Index of the next free-total threshold to report, or `UNSAMPLED` before the first sample.
 ///
@@ -110,11 +131,11 @@ impl MemWatchState {
         }
     }
 
-    /// The channels to the watch thread; `None` when the device has no thread.
+    /// The hand-off to the watch thread; `None` when the device has no thread.
     ///
     /// The worker lets its link go only in its own drop, which no present
     /// can overlap, so a device with a thread always finds its link here.
-    fn link(&self) -> Option<&ApiLink> {
+    fn link(&self) -> Option<&ApiLink<DeviceFigures>> {
         self.worker.as_ref().and_then(|worker| worker.link.as_ref())
     }
 }
@@ -184,6 +205,7 @@ impl Walk {
 
 /// One sample as the watch thread took it: the walk, the latch reports, and the lines due.
 struct Sample {
+    index: u32,
     walk: Walk,
     free: Option<ThresholdReport>,
     largest: Option<ThresholdReport>,
@@ -191,9 +213,15 @@ struct Sample {
     breakdown: bool,
 }
 
-impl Sample {
+/// The watch thread's half of the hand-off: the Win32 walk, the latches and the lines.
+struct AddressSpaceWatch;
+
+impl Watch for AddressSpaceWatch {
+    type Sample = Sample;
+    type Figures = DeviceFigures;
+
     /// Walk for sample `index` and advance both threshold latches on what the walk found.
-    fn take(index: u32) -> Self {
+    fn take(&mut self, index: u32) -> Sample {
         let walk = Walk::now();
         let free = advance(
             &NEXT_FREE_THRESHOLD,
@@ -205,7 +233,8 @@ impl Sample {
             &LARGEST_THRESHOLDS_MIB,
             walk.space.largest_mib(),
         );
-        Self {
+        Sample {
+            index,
             walk,
             free,
             largest,
@@ -213,13 +242,14 @@ impl Sample {
         }
     }
 
-    /// Whether the sample logs anything, and so needs the device figures.
+    /// Whether the sample logs anything: the breakdown, the first-sample line or a crossing.
     ///
-    /// The first-sample info line needs none, but it comes once per process
-    /// and is asked for like the rest, so the lines keep their order.
-    fn lines_due(&self) -> bool {
-        self.breakdown
-            || [&self.free, &self.largest].into_iter().any(|report| {
+    /// The first-sample info line needs no device figures, but every line of
+    /// a sample is logged on the one path, which waits for them; the line
+    /// comes once per process.
+    fn lines_due(&self, sample: &Sample) -> bool {
+        sample.breakdown
+            || [&sample.free, &sample.largest].into_iter().any(|report| {
                 matches!(
                     report,
                     Some(ThresholdReport::StartsBelow(_) | ThresholdReport::Crossed(_))
@@ -227,20 +257,30 @@ impl Sample {
             })
     }
 
-    /// Log the breakdown, then the threshold lines, with the device's figures.
+    /// Log the breakdown, then the threshold lines, with the device's figures if they came.
     ///
-    /// One region map follows the warnings of a sample, however many
-    /// thresholds it crossed.
-    fn log(&self, figures: &DeviceFigures) {
-        if self.breakdown {
-            log_breakdown(&self.walk.describe(), figures);
+    /// Without them a crossing still warns, with a clause saying the device's
+    /// figures were not answered in place of them, and the breakdown, which is
+    /// mostly those figures, is dropped with a debug note. One region map
+    /// follows the warnings of a sample, however many thresholds it crossed.
+    fn log(&mut self, sample: &Sample, figures: Option<&DeviceFigures>) {
+        match (sample.breakdown, figures) {
+            (false, _) => {}
+            (true, Some(figures)) => log_breakdown(&sample.walk.describe(), figures),
+            (true, None) => debug!(
+                target: LOG_TARGET,
+                "address space breakdown of sample {} dropped: no present answered for the \
+                 device figures in the {} s after the walk",
+                sample.index,
+                FIGURES_WAIT.as_secs()
+            ),
         }
-        let free = self.walk.space.total_mib();
-        let largest = self.walk.space.largest_mib();
+        let free = sample.walk.space.total_mib();
+        let largest = sample.walk.space.largest_mib();
         let mut crossed = false;
         for (what, value, report) in [
-            ("free", free, &self.free),
-            ("largest free block", largest, &self.largest),
+            ("free", free, &sample.free),
+            ("largest free block", largest, &sample.largest),
         ] {
             match report {
                 None | Some(ThresholdReport::StartsAbove) => {}
@@ -251,15 +291,28 @@ impl Sample {
                 ),
                 Some(ThresholdReport::Crossed(threshold)) => {
                     crossed = true;
-                    let fp = &figures.footprint;
+                    let device = figures.map_or_else(
+                        || {
+                            format!(
+                                "the device's texture and page-box figures were not answered, \
+                                 no present came in the {} s after the walk",
+                                FIGURES_WAIT.as_secs()
+                            )
+                        },
+                        |figures| {
+                            format!(
+                                "mtld3d holds {} textures with {} MiB of mip data; {}",
+                                figures.footprint.count,
+                                figures.footprint.mip_bytes >> 20,
+                                page_box_holders(figures)
+                            )
+                        },
+                    );
                     warn!(
                         target: LOG_TARGET,
                         "address space: {what} {value} MiB (below {threshold} MiB); {free} MiB \
-                         free, largest free block {largest} MiB; mtld3d holds {} textures with \
-                         {} MiB of mip data; {}; d3d9.dll heap {} MiB committed",
-                        fp.count,
-                        fp.mip_bytes >> 20,
-                        page_box_holders(figures),
+                         free, largest free block {largest} MiB; {device}; d3d9.dll heap {} MiB \
+                         committed",
                         heap_committed_bytes() >> 20
                     );
                 }
@@ -271,16 +324,21 @@ impl Sample {
     }
 }
 
-/// The device's watch thread and the API thread's ends of the channels to it.
+/// The device's watch thread and the API thread's end of the hand-off to it.
 ///
-/// Its drop lets the channel ends go before it waits for the thread: a watch
-/// thread blocked on a sample or on the device figures wakes to the
-/// disconnect and ends, and one still walking ends at its next send or
-/// receive. A receive still hands over a sample queued before the
-/// disconnect, so the wait is bounded by two walks.
+/// Its drop lets the link go before it waits for the thread: a watch thread
+/// waiting for a sample or for the device figures wakes to the disconnect and
+/// ends. One still working finishes the sample in progress first, its walk
+/// and, on a crossing, the region map's second walk and sort, and then takes
+/// a sample still queued from before the drop, a walk more, so the wait is
+/// bounded by those. A release whose caller holds the loader lock does not
+/// wait: in a process exit, Wine has terminated the thread before the
+/// detaches run, so its result is never released and `is_finished` would
+/// never turn true. Letting it go is safe because the thread borrows nothing
+/// from the device and the image is pinned from the first `CreateDevice`.
 struct MemWatchWorker {
-    /// The channel ends; `None` only inside `drop`, which lets them go first.
-    link: Option<ApiLink>,
+    /// The API thread's end; `None` only inside `drop`, which lets it go first.
+    link: Option<ApiLink<DeviceFigures>>,
     /// The thread, waited for in `drop` and never joined; `None` only there.
     thread: Option<JoinHandle<()>>,
 }
@@ -288,24 +346,14 @@ struct MemWatchWorker {
 impl MemWatchWorker {
     /// Start the device's watch thread; `None`, logged once, when it cannot start.
     fn spawn() -> Option<Self> {
-        let (samples, sample_rx) = mpsc::sync_channel(1);
-        let (request_tx, figure_requests) = mpsc::sync_channel(1);
-        let (figures, figures_rx) = mpsc::sync_channel(1);
-        let link = WatchLink {
-            samples: sample_rx,
-            figure_requests: request_tx,
-            figures: figures_rx,
-        };
+        let (link, worker_link) = watch_handoff::link(FIGURES_WAIT);
         match thread::Builder::new()
             .name("mtld3d-mem-watch".into())
-            .spawn(move || link.run())
+            .stack_size(WATCH_STACK_BYTES)
+            .spawn(move || worker_link.run(&mut AddressSpaceWatch))
         {
             Ok(handle) => Some(Self {
-                link: Some(ApiLink {
-                    samples,
-                    figure_requests,
-                    figures,
-                }),
+                link: Some(link),
                 thread: Some(handle),
             }),
             Err(error) => {
@@ -323,94 +371,19 @@ impl MemWatchWorker {
 impl Drop for MemWatchWorker {
     fn drop(&mut self) {
         drop(self.link.take());
-        if let Some(thread) = self.thread.take() {
-            wait_until_finished(thread);
-        }
-    }
-}
-
-/// The API thread's ends of the channels to the device's watch thread.
-struct ApiLink {
-    /// Sample indices for the thread, at most one waiting; sent without waiting.
-    samples: SyncSender<u32>,
-    /// The thread's request for the device figures, at most one outstanding.
-    figure_requests: Receiver<()>,
-    /// The answer to a request; the thread has taken the previous one before it asks again.
-    figures: SyncSender<DeviceFigures>,
-}
-
-impl ApiLink {
-    /// Hand the thread sample `index`, or skip it when the thread is still behind.
-    fn offer_sample(&self, index: u32) {
-        match self.samples.try_send(index) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => mtld3d_shared::log_once_info!(
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if crate::log_sink::caller_holds_loader_lock() {
+            debug!(
                 target: LOG_TARGET,
-                "address space: sample {index} skipped, the watch thread has not taken the \
-                 one before it yet"
-            ),
-            Err(TrySendError::Disconnected(_)) => mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "address space: the watch thread has ended; sample {index} and the device's \
-                 later samples are dropped"
-            ),
-        }
-    }
-
-    /// Whether the thread waits for the device figures.
-    fn figures_requested(&self) -> bool {
-        match self.figure_requests.try_recv() {
-            Ok(()) => true,
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "address space: the watch thread has ended; the device answers no more \
-                     figure requests"
-                );
-                false
-            }
-        }
-    }
-
-    /// Hand the thread the figures it asked for.
-    fn answer(&self, figures: DeviceFigures) {
-        if let Err(error) = self.figures.try_send(figures) {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "address space: the watch thread did not take the device figures ({error}); \
-                 that sample logs nothing"
+                "address space: the device's release holds the loader lock; letting the watch \
+                 thread go without waiting for it"
             );
+            drop(thread);
+            return;
         }
-    }
-}
-
-/// The watch thread's ends of the channels whose other ends the device holds.
-struct WatchLink {
-    samples: Receiver<u32>,
-    figure_requests: SyncSender<()>,
-    figures: Receiver<DeviceFigures>,
-}
-
-impl WatchLink {
-    /// One walk per sample and the lines it makes due, until the device lets its ends go.
-    ///
-    /// A failed send or receive means the device is being released, which is
-    /// how the thread ends; the sample in progress logs nothing then.
-    fn run(self) {
-        while let Ok(index) = self.samples.recv() {
-            let sample = Sample::take(index);
-            if !sample.lines_due() {
-                continue;
-            }
-            if self.figure_requests.send(()).is_err() {
-                break;
-            }
-            let Ok(figures) = self.figures.recv() else {
-                break;
-            };
-            sample.log(&figures);
-        }
+        wait_until_finished(thread);
     }
 }
 
@@ -465,7 +438,7 @@ impl DeviceInner {
         }
     }
 
-    /// Count the present, hand the watch thread a sample when one is due, and answer its request.
+    /// Count the present, answer the watch thread's request, and hand it a sample when one is due.
     ///
     /// Called from `present` after its stall timer has stopped. Nothing here
     /// waits for the watch thread. A device without one logs the breakdown
@@ -488,11 +461,30 @@ impl DeviceInner {
             }
             return;
         };
-        if link.figures_requested() {
-            link.answer(self.device_figures());
+        if let Some(index) = link.take_request()
+            && !link.answer(index, self.device_figures())
+        {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "address space: the watch thread has ended; the device figures for sample \
+                 {index} and later ones go unread"
+            );
         }
-        if let Some(index) = sample {
-            link.offer_sample(index);
+        let Some(index) = sample else {
+            return;
+        };
+        match link.offer(index) {
+            Offer::Queued => {}
+            Offer::Skipped => mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "address space: sample {index} skipped, the watch thread has a sample queued \
+                 already"
+            ),
+            Offer::Ended => mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "address space: the watch thread has ended; sample {index} and the device's \
+                 later samples are dropped"
+            ),
         }
     }
 }
