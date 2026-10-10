@@ -48,6 +48,7 @@ use mtld3d_core::{
     shader_compile_stats::{self, CompileStats},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
+    texture_versions::{TextureVersions, VersionShape},
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
     upload_redirty::RedirtyEntry,
@@ -1141,6 +1142,12 @@ pub struct FrameEncoder {
     /// restarts them in place, so a wrapper stays valid across restarts and
     /// lives until shutdown, where it is destroyed with the staging wrappers.
     snapshot_wrappers: FxHashMap<u64, MipStagingBuffer>,
+    /// Retired versions of renamed textures: retiring behind their submission, or parked.
+    ///
+    /// `rename_sampled_texture` takes a spare from here before it allocates,
+    /// and queues the version it replaces; the retention drain reclaims
+    /// what has settled under the same gate as `pending_resource_retention`.
+    texture_versions: TextureVersions<TextureViews>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
     ///
@@ -1714,6 +1721,7 @@ impl FrameEncoder {
             libraries: compile::libraries::StageLibraries::default(),
             texture_cache: FxHashMap::default(),
             snapshot_wrappers: FxHashMap::default(),
+            texture_versions: TextureVersions::new(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
             vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
@@ -6646,6 +6654,7 @@ impl FrameEncoder {
             }
             drained.push(entry);
         }
+        self.reclaim_texture_versions(coh, &mut textures);
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         // PageBoxes inside `drained` are released here, after every
@@ -6670,6 +6679,47 @@ impl FrameEncoder {
             if pool.recycle(pb).is_none() {
                 self.perf.bump_pagebox_pool_recycled(len);
             }
+        }
+    }
+
+    /// Park every retired texture version the GPU has finished with, and trim aged spares.
+    ///
+    /// `settled` is the drain's gate, the lower of the two retirement
+    /// counters. Each popped version leaves the handle-keyed records first,
+    /// as a destroyed texture does at this drain: it may serve the next
+    /// rename under the same addresses, which must not inherit its clears,
+    /// its sampled marks or its scratch copies. What the pool turns away and
+    /// the spares past their age join the drain's texture destroys; nothing
+    /// names them, since a parked spare is in no cache and no command.
+    fn reclaim_texture_versions(&mut self, settled: u64, textures: &mut Vec<u64>) {
+        while let Some(entry) = self.texture_versions.pop_retired(settled) {
+            for handle in entry.views().owned_handles() {
+                self.retire_texture_handle(handle.raw());
+            }
+            if let Some(views) = self.texture_versions.park(entry) {
+                self.collect_version_destroy(&views, textures);
+            }
+        }
+        for views in self.texture_versions.trim(self.current_submit_seq) {
+            self.collect_version_destroy(&views, textures);
+        }
+    }
+
+    /// Add a version the pool gave back to the drain's texture destroys.
+    fn collect_version_destroy(&mut self, views: &TextureViews, textures: &mut Vec<u64>) {
+        for handle in views.owned_handles() {
+            textures.push(handle.raw());
+            self.perf.bump_texture_destroy();
+        }
+    }
+
+    /// Queue every pooled and retiring texture version for destruction behind this submission.
+    ///
+    /// For `Reset` and shutdown, which drain the retention queue after a
+    /// GPU-idle wait, so the versions go with everything else it holds.
+    fn retire_texture_versions(&mut self) {
+        for views in self.texture_versions.drain_versions() {
+            self.retire_texture_views(&views, MetalHandle::NULL);
         }
     }
 
@@ -7014,19 +7064,22 @@ impl FrameEncoder {
         emitted
     }
 
-    /// Redirect an upload that hit an already-sampled texture to a fresh `MTLTexture`.
+    /// Redirect an upload that hit an already-sampled texture to another `MTLTexture`.
     ///
     /// Rename-at-overlap, the texture analogue of `apply_stage_upload`'s
-    /// device-buffer rename. Mips the upload does not fully rewrite are
-    /// carried over with `copyFromTexture` blits; they append to
-    /// `frame_blit_commands` *before* the caller's upload blit, so the
-    /// stream order is: earlier uploads → old, copies old → fresh, this
-    /// upload → fresh. The dominant case — a single-mip texture with a
-    /// full-mip upload — carries nothing over and costs only the texture
-    /// allocation. The old handle stays alive via seq-gated retention until
-    /// this frame's draws retire.
+    /// device-buffer rename. The new version is the texture's newest spare
+    /// in `texture_versions` when it has one, a version an earlier rename
+    /// retired and the GPU has finished with, and a fresh allocation
+    /// otherwise. Mips the upload does not fully rewrite are carried over
+    /// with `copyFromTexture` blits; they append to `frame_blit_commands`
+    /// *before* the caller's upload blit, so the stream order is: earlier
+    /// uploads → old, copies old → new, this upload → new. The dominant case
+    /// — a single-mip texture with a full-mip upload — carries nothing over.
+    /// The old version retires behind this frame's submission, which holds
+    /// the draws that sampled it, and becomes a spare once the GPU has
+    /// finished that submission.
     ///
-    /// Returns the fresh handle, the old handle on allocation failure
+    /// Returns the new handle, the old handle on allocation failure
     /// (mirrors the buffer rename's fallback: one draw may glitch this
     /// frame, but dropping the upload would persist stale content), or
     /// 0 only if the caller should abort.
@@ -7037,27 +7090,40 @@ impl FrameEncoder {
         ordered: bool,
     ) -> u64 {
         let info = job.info();
+        let texture_id = info.texture_id();
         let desc = self.texture_desc_from_view(&info);
-        let mut views = TextureViews::EMPTY;
-        let status = self.batch_create_textures(
-            core::slice::from_ref(&desc),
-            core::slice::from_mut(&mut views),
-        );
-        let fresh = views.linear;
-        if status != 0 || fresh.is_null() {
-            if mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format()).is_some() {
-                error!(target: LOG_TARGET, "rename_sampled_texture: depth allocation failed, upload deferred");
-                return 0;
-            }
-            error!(
-                target: LOG_TARGET,
-                "rename_sampled_texture: fresh CreateTexture failed, uploading into the \
-                 live texture (one already-emitted draw may sample too-new content this frame)"
-            );
-            return old_handle;
+        let (spare, discarded) = self
+            .texture_versions
+            .take_spare(texture_id, VersionShape::of(&desc));
+        for stale in discarded {
+            self.retire_texture_views(&stale, MetalHandle::NULL);
         }
+        let views = if let Some(spare) = spare {
+            spare.into_views()
+        } else {
+            let mut views = TextureViews::EMPTY;
+            let status = self.batch_create_textures(
+                core::slice::from_ref(&desc),
+                core::slice::from_mut(&mut views),
+            );
+            if status != 0 || views.linear.is_null() {
+                if mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format()).is_some()
+                {
+                    error!(target: LOG_TARGET, "rename_sampled_texture: depth allocation failed, upload deferred");
+                    return 0;
+                }
+                error!(
+                    target: LOG_TARGET,
+                    "rename_sampled_texture: fresh CreateTexture failed, uploading into the \
+                     live texture (one already-emitted draw may sample too-new content this frame)"
+                );
+                return old_handle;
+            }
+            views
+        };
+        let fresh = views.linear;
 
-        let Some(state) = self.texture_cache.get_mut(&info.texture_id()) else {
+        let Some(state) = self.texture_cache.get_mut(&texture_id) else {
             error!(target: LOG_TARGET, "rename_sampled_texture: missing cache entry");
             self.retire_texture_views(&views, MetalHandle::NULL);
             return old_handle;
@@ -7128,8 +7194,10 @@ impl FrameEncoder {
             self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
 
-        // Earlier commands retain their original aliases through GPU retirement.
-        self.retire_texture_views(&old_views, MetalHandle::NULL);
+        // Earlier commands retain their original aliases through GPU
+        // retirement; the drain parks the version once that has passed.
+        self.texture_versions
+            .retire(texture_id, old_views, self.current_submit_seq);
         self.perf.bump_texture_gpu_rename();
         fresh.raw()
     }
@@ -8298,6 +8366,11 @@ impl FrameEncoder {
             }
             self.retire_texture_views(&state.views, MetalHandle::NULL);
         }
+        // Its spares go behind this submission like its live version; its
+        // versions still retiring are destroyed when the drain pops them.
+        for spare in self.texture_versions.forget_texture(texture_id) {
+            self.retire_texture_views(&spare, MetalHandle::NULL);
+        }
     }
 
     /// Retire the device buffer of a VB/IB released without a CPU backing.
@@ -8464,6 +8537,7 @@ impl FrameEncoder {
         //    Texture-kind retention entries merge into the `textures`
         //    Vec collected from the live cache above.
         mtld3d_shared::crumb!("phase:SdDrain");
+        self.retire_texture_versions();
         let mut held = self.drain_retention_and_wait(&mut buffers, &mut textures);
         // Shutdown has no future frame to replay uploads into. Reset keeps
         // these queues because its resource caches survive, and a failed
@@ -8561,6 +8635,9 @@ impl FrameEncoder {
         // recreates the implicit surfaces, so no clear before it vouches for
         // a frame after it.
         self.cleared_targets.clear();
+        // The textures survive and their pooled versions go with the rest of
+        // the retention queue; the renames after the `Reset` refill the pool.
+        self.retire_texture_versions();
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
         let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
