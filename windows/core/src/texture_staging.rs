@@ -195,7 +195,10 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 /// - `shape` carries the mip + block dimensions (see [`MipShape`]).
 ///
 /// Unknown flag bits are ignored here — the caller logs them via
-/// `log_once_warn!`.
+/// `log_once_warn!`. Without `HAS_READERS` the answer is `WriteInPlace`
+/// whatever the flags, pool and rect, and the lock callers rely on that: they
+/// skip this call, and the gathering of the other facts, when nothing reads
+/// the pages.
 #[must_use]
 pub const fn decide_lock_action(
     write: &StagingWrite,

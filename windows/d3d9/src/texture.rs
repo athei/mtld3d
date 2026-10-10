@@ -326,11 +326,11 @@ pub struct TextureInner {
     /// Bit `face * levels + level` for a cube, bit `level` otherwise.
     /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
     /// texture is recorded, after it flushes the texture's dirty levels. A CPU
-    /// write clears its subresource's bit once it lands on pages no upload
-    /// reads, fresh or renamed. Scheduling an upload onto pages an earlier
-    /// frame's upload still reads sets the bit too. So a clear bit over pages
-    /// uploads still read means no GPU operation on the texture was recorded
-    /// since those uploads were scheduled.
+    /// write, a `LockRect` included, clears its subresource's bit once it
+    /// lands on pages no upload reads, fresh or renamed. Scheduling an upload
+    /// onto pages an earlier frame's upload still reads sets the bit too. So
+    /// a clear bit over pages uploads still read means no GPU operation on
+    /// the texture was recorded since those uploads were scheduled.
     ///
     /// That holds only while every path that schedules an upload of the
     /// texture either marks the device's snapshot dirty, so the next draw
@@ -2583,12 +2583,18 @@ impl TextureInner {
 
         let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
-        let mut write = self.staging_write_facts(face, level)?;
-        if is_in_flight(last_submit_seq, coherent_seq) {
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
+        let contended = is_in_flight(last_submit_seq, coherent_seq)
+            || self.cube.as_deref()?.staging[index].has_readers();
+        let action = if contended {
+            let mut write = self.staging_write_facts(face, level)?;
             write.insert(StagingWrite::HAS_READERS);
-        }
-        let contended = write.contains(StagingWrite::HAS_READERS);
-        let action = decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level));
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
+        } else {
+            LockAction::WriteInPlace
+        };
         let device_inner = self.device_inner;
         let base = match action {
             LockAction::WriteInPlace => {
@@ -2597,6 +2603,8 @@ impl TextureInner {
                 // operation on the cube was recorded since; the latter is
                 // counted (see `lock_region_ptr`).
                 if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
                     self.note_unread_staging(face, level);
                 } else if flags & D3DLOCK_NOOVERWRITE == 0 && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
@@ -3000,12 +3008,14 @@ impl TextureInner {
         // command buffer that upload rides decides which retirement counter
         // frees it. See `staging_coherent_seq`.
         let coherent_seq = self.staging_coherent_seq(level);
-        let mut write = self.staging_write_facts(0, level)?;
-        if is_in_flight(self.last_submit_seq[level], coherent_seq) {
-            write.insert(StagingWrite::HAS_READERS);
-        }
-        let contended = write.contains(StagingWrite::HAS_READERS);
-        let action = if contended && self.flags.contains(TextureFlags::DEPTH_FORMAT) {
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
+        let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
+            || self.staging[level].has_readers();
+        let action = if !contended {
+            LockAction::WriteInPlace
+        } else if self.flags.contains(TextureFlags::DEPTH_FORMAT) {
             LockAction::FreshBox {
                 preserve: if flags & D3DLOCK_DISCARD == 0 {
                     PreserveKind::Cpu
@@ -3014,6 +3024,8 @@ impl TextureInner {
                 },
             }
         } else {
+            let mut write = self.staging_write_facts(0, level)?;
+            write.insert(StagingWrite::HAS_READERS);
             decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
         };
 
@@ -3030,6 +3042,8 @@ impl TextureInner {
                 // frame no GPU operation has seen: counted, since each one
                 // is a write that lands in pages an upload will carry.
                 if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
                     self.note_unread_staging(0, level);
                 } else if flags & D3DLOCK_NOOVERWRITE == 0 && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)

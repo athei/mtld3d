@@ -343,7 +343,9 @@ until the GPU has copied them and the encoder has acknowledged the copy, a
 replay after an aborted submit included (`PageBox::has_readers`). A CPU write
 into those pages changes what the upload carries, so every writer gathers the
 same facts about the pages (`staging_write_facts` in
-`windows/d3d9/src/texture.rs`) and asks one rule, `decide_staging_write` in
+`windows/d3d9/src/texture.rs`; a `LockRect` gathers them only once it finds a
+reader, since without one it writes in place whatever they say) and asks one
+rule, `decide_staging_write` in
 `windows/core/src/texture_staging.rs`: in place when no upload reads the
 pages, or when every upload that does belongs to the frame being recorded and
 no GPU operation on the texture was recorded since, since nothing that could

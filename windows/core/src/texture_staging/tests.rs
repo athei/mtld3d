@@ -884,6 +884,60 @@ fn a_whole_level_lock_under_an_unseen_upload_still_preserves() {
 }
 
 #[test]
+fn a_lock_without_readers_writes_in_place_whatever_the_flags_pool_and_rect() {
+    // The lock callers skip `decide_lock_action` when nothing reads the
+    // pages; this pins that the answer they skip is always in place.
+    let compressed = shape((4, 4));
+    let shapes = [
+        (None, shape((1, 1)), "whole"),
+        (Some(full()), shape((1, 1)), "whole rect"),
+        (Some(rect(8, 8, 16, 16)), shape((1, 1)), "partial"),
+        (
+            Some(rect(8, 8, 16, 16)),
+            compressed,
+            "compressed on the grid",
+        ),
+        (
+            Some(rect(2, 2, 13, 13)),
+            compressed,
+            "compressed off the grid",
+        ),
+    ];
+    let known = [
+        D3DLOCK_READONLY,
+        D3DLOCK_NOOVERWRITE,
+        D3DLOCK_DISCARD,
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE,
+    ];
+    let reader_free = [
+        StagingWrite::empty(),
+        StagingWrite::SAME_FRAME
+            .union(StagingWrite::OBSERVED)
+            .union(StagingWrite::ALWAYS_RENAME),
+        StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL),
+    ];
+    for combo in 0u32..1 << known.len() {
+        let flags = known
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| combo & (1 << bit) != 0)
+            .fold(0, |flags, (_, flag)| flags | flag);
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+            for (r, mip, what) in shapes {
+                for write in &reader_free {
+                    assert_eq!(
+                        decide_lock_action(write, flags, pool, r, mip),
+                        LockAction::WriteInPlace,
+                        "flags {flags:#x}, pool {pool}, {what}, facts {:#x}",
+                        write.bits()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_partial_arm_matches_the_staging_write_rule_for_every_fact_combination() {
     // Mapped and whole-level are the Lock's own to decide; every other
     // fact feeds the staging-write rule unchanged once a reader exists.
