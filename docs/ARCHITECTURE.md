@@ -306,6 +306,18 @@ render-target texture (an `UnlockRect`, a `ReleaseDC`, an `UpdateSurface` or
 put it at the head of a later frame and over every pass drawn into the target
 since: it uploads at once in application order (`publish_render_target_write`),
 and `SetRenderTarget` publishes any write a texture level it binds still owes.
+Such a texture created at the reported back-buffer size is rasterized at
+`render.scale`, so its Metal levels are smaller than the staging that holds the
+write. Its upload carries the written rect's rows instead of the staging, as
+the colour region update an `UpdateSurface` into a scaled render-target surface
+sends (`schedule_resampled_upload` in `windows/d3d9/src/texture.rs`): the rows
+land in a scratch at their own extent and the blit quad resamples them into the
+rect's rasterized counterpart, leaving the texels around it as the GPU holds
+them. A lockable render-target surface's `UnlockRect` and `ReleaseDC` send the
+same region update over the whole surface (`lockable_rt_upload` in
+`windows/d3d9/src/surface.rs`), at any scale, so a write after a
+`D3DLOCK_DISCARD` lock, which reads nothing back first, still lands after the
+draws before it and under the draws after it.
 
 The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
 uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native

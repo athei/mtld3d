@@ -3,10 +3,11 @@ use core::ffi::c_void;
 use log::trace;
 use mtld3d_core::{
     api_lock::ApiGuard,
+    encoder_data::{ColorRegionUpdate, StretchKind},
     held_pages::{HeldPages, PageHolder},
     page_box::PageBox,
     perf::SurfaceSubCategory,
-    render_scale::RenderScale,
+    render_scale::{RenderScale, TargetExtent},
     surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
 };
 use mtld3d_shared::{
@@ -2880,9 +2881,9 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
 /// The write half of [`readback_full_backbuffer`]. The DIB `GetDC` handed out
 /// and the pointer a writable `LockRect` handed out both point into that page,
 /// not the back buffer itself, so what was drawn or written lives only there
-/// until it is copied back. The copy takes the route a lockable render
-/// target's `UnlockRect` upload takes, the frame's leading blit pass, so it
-/// lands before the next draw (`GetDC` flushed everything before it).
+/// until it is copied back. The copy rides the frame's leading blit pass, so
+/// it lands before the next draw (`GetDC` and the lock read the back buffer
+/// back, which flushed everything before them).
 ///
 /// A `render.scale` below 100% rasterizes the back buffer into a texture
 /// smaller than the extent the DIB was handed out at, so the page cannot be
@@ -3225,18 +3226,22 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     true
 }
 
-/// `UnlockRect` upload for a lockable standalone render target.
+/// `UnlockRect` and `ReleaseDC` upload for a lockable standalone render target.
 ///
 /// Push the CPU staging buffer up to the renderable colour `MTLTexture` so a
 /// subsequent `StretchRect` / sample observes the just-written pixels. The
-/// staging rows are *copied* into the pushed encoder op (a `Vec<u8>` the
-/// operation owns, at the staging's own row pitch) so the surface's `PageBox` is
-/// never aliased across the API/encoder boundary.
+/// staging rows are *copied* into the frame's capture at the staging's own row
+/// pitch, so the surface's `PageBox` is never aliased across the API/encoder
+/// boundary.
 ///
-/// The staging is laid out at the extent D3D9 reports and the colour texture
-/// at `render.scale` of it, so a scaled surface takes the resampling upload
-/// (the same one the back buffer's `ReleaseDC` write-back takes) and every
-/// other one the direct copy.
+/// The write goes out as a whole-surface colour region update, the op an
+/// `UpdateSurface` into a render target sends, so it lands in application
+/// order: after a draw earlier in the frame and under a draw after it, which a
+/// `D3DLOCK_DISCARD` lock, reading nothing back first, does not otherwise
+/// separate. The staging is laid out at the extent D3D9 reports and the colour
+/// texture at `render.scale` of it; the region update copies the rows as they
+/// are at the identity and resamples them through a scratch of the surface's
+/// own otherwise.
 fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -3284,27 +3289,22 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let device_inner = unsafe { &mut *inner.device_inner };
     // SAFETY: the captured token moves directly into this frame's upload operation.
     let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
-    if scale.is_identity() {
-        device_inner.push_control(crate::device::UploadColorOp {
-            color_handle,
-            bytes,
-            width,
-            height,
-            src_stride: pitch,
-        });
-        return;
-    }
-    let target = ResampledUpload {
-        color_handle,
-        format: fmt.metal_pixel_format(),
-        logical: (width, height),
-        texture: (scale.dimension(width), scale.dimension(height)),
-        bytes_per_row: pitch,
-        msaa: inner.live_msaa_handle(),
-        msaa_srgb: inner.live_msaa_srgb_handle(),
-        sample_count: inner.live_multi_sample().sample_count,
-    };
-    device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
+    // A lockable render target is never multisampled (`CreateRenderTarget`
+    // refuses the pair), so the region update has no companion to resolve.
+    device_inner.push_control(crate::device::UpdateColorRegionOp {
+        kind: StretchKind::Backbuffer(inner.live_color_handle()),
+        target: ColorRegionUpdate {
+            level: 0,
+            format: fmt.metal_pixel_format(),
+            origin: (0, 0),
+            extent: (width, height),
+            logical: (width, height),
+            texture: TargetExtent::whole(scale, (width, height)).texture(),
+            scale,
+            bytes_per_row: pitch,
+        },
+        bytes,
+    });
 }
 
 /// Parse a `RECT*` pointer passed to `LockRect` and clamp it against `(full_w, full_h)`.

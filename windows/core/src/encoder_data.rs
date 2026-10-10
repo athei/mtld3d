@@ -286,8 +286,8 @@ pub struct BlitSide {
 ///
 /// `GetDC` and `LockRect` hand their bytes out at the extent D3D9 reports, so
 /// under a `render.scale` below 100% the page the caller wrote is larger than
-/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and a
-/// lockable render target's `UnlockRect`. Built by `surface.rs` on the API
+/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and
+/// `UnlockRect` write-back. Built by `surface.rs` on the API
 /// thread, which is where the device's scale and the surface's extent are both
 /// reachable.
 pub struct ResampledUpload {
@@ -309,24 +309,29 @@ pub struct ResampledUpload {
     pub sample_count: u8,
 }
 
-/// One `UpdateSurface` region into a colour surface no texture backs, resolved on the API thread.
+/// One region of rows into a colour surface or texture level, resolved on the API thread.
 ///
-/// The destination is a render-target surface or the back buffer. Built by
-/// `device_update_surface`, where the surface's extent and scale are
-/// reachable, and run by `update_color_region` on the encoder thread, in API
-/// order among the application's passes.
+/// The destination is a render-target surface or the back buffer, written by
+/// `UpdateSurface` (`device_update_surface`); a lockable render target,
+/// written whole at its `UnlockRect` or `ReleaseDC` (`lockable_rt_upload`); or
+/// a level of a render-target texture `render.scale` shrinks, written by any
+/// CPU path into its staging (`texture::schedule_resampled_upload`). Each
+/// builder runs where the destination's extent and scale are reachable;
+/// `update_color_region` runs it
+/// on the encoder thread, in API order among the application's passes, after
+/// resolving the destination's `MTLTexture` from the op's kind.
 pub struct ColorRegionUpdate {
-    /// Destination colour `MTLTexture`.
-    pub color_handle: u64,
+    /// Mip level of the destination; 0 for a surface.
+    pub level: u32,
     /// Metal format of the destination, which the rows are already encoded in.
     pub format: PixelFormat,
     /// Where the region's top-left texel lands, in the coordinates D3D9 reports.
     pub origin: (u32, u32),
     /// Extent of the region, which is the extent the rows describe.
     pub extent: (u32, u32),
-    /// Extent of the destination as D3D9 reports it.
+    /// Extent of the destination level as D3D9 reports it.
     pub logical: (u32, u32),
-    /// Extent Metal allocated for the destination, at or below `logical`.
+    /// Extent Metal allocated for the destination level, at or below `logical`.
     pub texture: (u32, u32),
     /// The scale that relates `texture` to `logical`.
     pub scale: RenderScale,
@@ -456,6 +461,18 @@ pub struct TextureInfo {
     /// The Metal texture is allocated with `RenderTarget` usage when the
     /// D3D9 texture was created with `D3DUSAGE_RENDERTARGET`.
     pub usage_flags: TextureUsage,
+}
+
+impl TextureInfo {
+    /// The level of this Metal texture a reported mip `level` addresses.
+    ///
+    /// `levels` is the Metal chain, which a texture rasterized at a
+    /// `render.scale` may hold shorter than the chain D3D9 reports; see
+    /// [`crate::render_scale::rasterized_level`].
+    #[must_use]
+    pub const fn rasterized_level(&self, level: u32) -> u32 {
+        crate::render_scale::rasterized_level(level, self.levels)
+    }
 }
 
 /// The Metal textures a standalone colour surface owns, for retirement.
@@ -671,6 +688,7 @@ pub struct UploadResampledOp {
 }
 
 pub struct UpdateColorRegionOp {
+    pub kind: StretchKind,
     pub target: ColorRegionUpdate,
     pub bytes: ScratchSlice,
 }

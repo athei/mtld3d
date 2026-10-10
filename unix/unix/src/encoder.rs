@@ -7751,9 +7751,8 @@ impl FrameEncoder {
     /// Upload `rows` into the standalone colour `MTLTexture` `color_handle`.
     ///
     /// `rows` is `src_stride * height` bytes of the source's own rows; this is
-    /// the `UnlockRect` half of a lockable render target (`CreateRenderTarget`
-    /// with `Lockable == TRUE`), whose staging carries the row pitch every
-    /// host-visible surface store uses. Copies the rows into a fresh
+    /// the write-back of the back buffer's `GetDC` or `LockRect` page, whose
+    /// rows carry the row pitch every host-visible surface store uses. Copies the rows into a fresh
     /// page-aligned `PageBox` (padding each row up to
     /// `min_linear_texture_align` if the source stride is below it), wraps
     /// that in a transient `MTLBuffer`, appends a `CopyBufferToTexture` to the
@@ -7798,35 +7797,42 @@ impl FrameEncoder {
         self.perf.bump_texture_blit_upload();
     }
 
-    /// Write `UpdateSurface` rows into a region of a colour surface no texture backs.
+    /// Write rows into a region of a colour surface or of one level of a texture.
     ///
-    /// The destination is a render-target surface or the back buffer. D3D9
-    /// orders the copy after every call before it, so a `Clear` still
-    /// waiting for a pass lands first, the open pass ends, and the copy rides
-    /// the next pass's leading blits like a `StretchRect` does. A destination
-    /// `render.scale` shrinks takes the rows into a scratch at their own
-    /// extent first and resamples them into the converted rect with the
-    /// blit quad, which a scaling `StretchRect` uses too.
-    pub fn update_color_region(&mut self, region: &ColorRegionUpdate, rows: &[u8]) {
+    /// The destination is a render-target surface or the back buffer, written
+    /// by `UpdateSurface`, or a level of a render-target texture `render.scale`
+    /// shrinks, written by any CPU path into its staging; `color_handle` is
+    /// its `MTLTexture`. D3D9 orders the write after every call before it, so
+    /// a `Clear` still waiting for a pass lands first, the open pass ends, and
+    /// the copy rides the next pass's leading blits like a `StretchRect` does.
+    /// A destination `render.scale` shrinks takes the rows into a scratch at
+    /// their own extent first and resamples them into the converted rect with
+    /// the blit quad, which a scaling `StretchRect` uses too.
+    pub fn update_color_region(
+        &mut self,
+        color_handle: u64,
+        region: &ColorRegionUpdate,
+        rows: &[u8],
+    ) {
         let (width, height) = region.extent;
-        if region.color_handle == 0 || width == 0 || height == 0 || region.bytes_per_row == 0 {
+        if color_handle == 0 || width == 0 || height == 0 || region.bytes_per_row == 0 {
             return;
         }
         self.flush_pending_clears();
-        self.end_current_pass("update_surface");
+        self.end_current_pass("update_color_region");
         let Some((buffer_handle, bytes_per_row)) =
             self.stage_color_rows("update_color_region", rows, height, region.bytes_per_row)
         else {
             return;
         };
-        let copy_into = |texture_handle: u64, (origin_x, origin_y): (u32, u32)| {
+        let copy_into = |texture_handle: u64, mip_level: u32, (origin_x, origin_y): (u32, u32)| {
             BlitCommand::copy_buffer_to_texture(&CopyBufferToTextureInfo {
                 buffer_handle,
                 buffer_offset: 0,
                 bytes_per_row,
                 texture_handle,
                 destination_slice: 0,
-                mip_level: 0,
+                mip_level,
                 origin_x,
                 origin_y,
                 region_w: width,
@@ -7836,27 +7842,45 @@ impl FrameEncoder {
             })
         };
         if region.scale.is_identity() {
-            self.push_stretch_rect_blit(copy_into(region.color_handle, region.origin));
+            self.push_stretch_rect_blit(copy_into(color_handle, region.level, region.origin));
             return;
         }
         let Some((scratch, scratch_w, scratch_h)) =
-            self.stretch_scratch_texture(region.color_handle, region.extent, region.format)
+            self.stretch_scratch_texture(color_handle, region.extent, region.format)
         else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "UpdateSurface: no {width}x{height} {:?} scratch to resample a region into a \
-                 scaled surface through; the region is dropped",
+                "a CPU write: no {width}x{height} {:?} scratch to resample a region into a \
+                 scaled surface or texture level through; the region is dropped",
                 region.format
             );
             return;
         };
-        self.push_stretch_rect_blit(copy_into(scratch, (0, 0)));
+        self.push_stretch_rect_blit(copy_into(scratch, 0, (0, 0)));
         let (x, y, w, h) = TargetExtent::new(region.scale, region.logical, region.texture).rect(
             region.origin.0,
             region.origin.1,
             width,
             height,
         );
+        // The quad maps the converted rect onto the rows' own `width` x
+        // `height`, and a linear tap past the rows would read whatever an
+        // earlier, larger region left in the scratch. Per axis the outermost
+        // destination texel centre maps to `n - n / (2 * m)` for `n` rows
+        // drawn over `m` texels, at or inside the last row's centre exactly
+        // when `m <= n`. A surface or level 0 always has that: the scale is
+        // at most one, so `round(s * x2) - round(s * x1) <= x2 - x1`. A deeper
+        // level can miss it by a texel: its far edge pins to Metal's halving
+        // of the scaled base, which at a scale of 0.77 or more can be a
+        // texel wider than the scale of the level's reported extent, so a
+        // region a few texels from that edge can come out one texel wider than
+        // its rows. Such a region is magnified and point-sampled, whose taps
+        // stay on the rows' own texels.
+        let filter = if w > width || h > height {
+            mtld3d_types::D3DTEXF_POINT
+        } else {
+            mtld3d_types::D3DTEXF_LINEAR
+        };
         self.stretch_blit_scaled(
             &BlitSide {
                 handle: scratch,
@@ -7874,10 +7898,10 @@ impl FrameEncoder {
                 sample_count: 1,
             },
             &BlitSide {
-                handle: region.color_handle,
+                handle: color_handle,
                 rect: StretchRegion { x, y, w, h },
                 dims: region.texture,
-                mip: 0,
+                mip: region.level,
                 slice: None,
                 msaa: MetalHandle::NULL,
                 msaa_srgb: MetalHandle::NULL,
@@ -7885,7 +7909,7 @@ impl FrameEncoder {
             },
             region.format,
             mtld3d_core::stretch_rect::BlitDecode::None,
-            mtld3d_types::D3DTEXF_LINEAR,
+            filter,
         );
     }
 
@@ -7985,8 +8009,8 @@ impl FrameEncoder {
     /// Upload `rows` at their own extent, then resample them into a smaller colour texture.
     ///
     /// The resizing counterpart of [`Self::upload_bytes_to_color_handle`], for
-    /// the back buffer's `ReleaseDC` write-back and a lockable render target's
-    /// `UnlockRect` under a `render.scale` below 100%. The rows land in a
+    /// the back buffer's `ReleaseDC` and `UnlockRect` write-back under a
+    /// `render.scale` below 100%. The rows land in a
     /// scratch texture at the extent they describe,
     /// which the blit-quad pipeline then samples across the destination with a
     /// linear filter, the same resample a scaling `StretchRect` runs. The

@@ -3757,6 +3757,65 @@ fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
     );
 }
 
+/// Two lockable render targets written in one frame each keep their own write.
+///
+/// Each is locked with `D3DLOCK_DISCARD`, which reads nothing back, so the two
+/// writes go out in one submission: red into A, then green into B. At the
+/// back buffer's size both take a `render.scale` below one and resample on the
+/// way in, and A must still read red.
+#[test]
+fn two_lockable_render_targets_written_in_one_frame_keep_their_own_writes() {
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let a = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    let b = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    for (rt, color) in [(&a, RED), (&b, GREEN)] {
+        let mut locked = rt.lock_rect(D3DLOCK_DISCARD);
+        locked.write_u32(&vec![color; (w * height) as usize]);
+    }
+    let pixels = read_back(&h, &a, (w, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        pixels[(height / 2 * w + w / 2) as usize],
+        RED,
+        "A holds its own write"
+    );
+    let pixels = read_back(&h, &b, (w, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        pixels[(height / 2 * w + w / 2) as usize],
+        GREEN,
+        "B holds its own write"
+    );
+}
+
+/// A lock write into a lockable render target lands over a draw earlier in the frame.
+///
+/// The draw fills the target red, then a `D3DLOCK_DISCARD` lock, which reads
+/// nothing back, writes it green with no flush between them. D3D9 orders the
+/// write after the draw, so the target reads green. The target is the back
+/// buffer's size, so a `render.scale` leg takes the resampled write.
+#[test]
+fn a_lock_write_into_a_lockable_render_target_lands_over_an_earlier_draw() {
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    {
+        let mut locked = rt.lock_rect(D3DLOCK_DISCARD);
+        locked.write_u32(&vec![GREEN; (w * height) as usize]);
+    }
+    let pixels = read_back(&h, &rt, (w, height), D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (w / 2, height / 2), (w - 1, height - 1)] {
+        assert_eq!(
+            pixels[(y * w + x) as usize],
+            GREEN,
+            "texel ({x}, {y}): the write over the draw"
+        );
+    }
+}
+
 /// A `ColorFill` into an autogen-mipmap render target regenerates its chain.
 ///
 /// The fill lands on level 0 through the GPU path, so the lower levels have

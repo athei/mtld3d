@@ -8284,8 +8284,9 @@ fn update_surface_into_color_target(
     // SAFETY: the captured token moves directly into this frame's operation.
     let bytes = unsafe { dev.capture_frame_bytes(&rows) };
     dev.push_control(UpdateColorRegionOp {
+        kind: StretchKind::Backbuffer(dst_surf.metal_color_handle()),
         target: mtld3d_core::encoder_data::ColorRegionUpdate {
-            color_handle: dst_surf.metal_color_handle().raw(),
+            level: 0,
             format: dst_mapping.metal_pixel_format(),
             origin,
             extent: (region.w, region.h),
@@ -8665,6 +8666,9 @@ fn readback_from_texture_rt(
     // The texture's own logical extent, which the mip extent above is measured
     // against. Taken here because the flush below reborrows the texture.
     let full_extent = (ti.mip_width(0), ti.mip_height(0));
+    // The Metal level the surface's level reads from, which differs only in
+    // a scaled texture's shortened tail.
+    let metal_level = ti.metal_level(level as usize);
     // Past every gate that rejects the call, so the uploads scheduled here are
     // work this read will use. A level of a non-dynamic DEFAULT-pool texture is
     // lockable here, so the source can carry a CPU write no bind has uploaded
@@ -8700,7 +8704,7 @@ fn readback_from_texture_rt(
             // SAFETY: `h` is non-zero (checked above) and a live retained
             // MTLTexture handle from the encoder texture cache.
             unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-            (level, slice),
+            (metal_level, slice),
             full_extent,
             dst,
         ),
@@ -9611,7 +9615,7 @@ fn resolve_stretch_surface(
             tex.inner().render_scale(),
             (width, height),
             tex.inner().render_extent(),
-            level,
+            tex.inner().metal_level(lvl_idx),
         )
         .texture();
         return Some(StretchSurfaceInfo {

@@ -234,6 +234,25 @@ record. A knob, where one makes sense, is named with its default.
   holds no staging until a CPU path first needs a level, and every lock of a
   level reads it back from the GPU first, unless the level holds a CPU write
   no upload has carried yet. No knob.
+- **The last reported mip levels of a scaled render-target texture can share
+  one rasterized level.** A render-target or depth texture at the reported
+  back-buffer size reports the chain of that size, but rasterizes at
+  `render.scale` of it, and a smaller base can hold a shorter chain: 640x480
+  has ten levels, its 480x360 at 0.75 nine. The Metal texture holds the
+  shorter chain (`rasterized_level_count` in `windows/core/src/render_scale.rs`)
+  and every reported level past it lands on its last level (`rasterized_level`),
+  so a draw, fill, copy or write into one of those tail levels is seen by the
+  others. The shared Metal level is 1x1, so a read of any shared level returns
+  that one texel's colour across the whole level. At a scale of 0.67 or more
+  two levels share, each at most 2 texels on a side; from 0.5, two share and
+  one of them can be 3 texels on a side; below 0.5 more levels share (three
+  at 0.25 to 0.49, each at most 7 texels on a side, and more below that,
+  down to the 0.01 `render.scale` accepts). What such a texture holds at the
+  scale is already a resample of what D3D9 would. Giving every reported level
+  its own Metal level would need a chain longer than its base allows;
+  declining the scale for such a texture would pair it with a scaled
+  depth-stencil of a different size. A texture created with a shared tail
+  logs it once at info. No knob.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without
@@ -1045,9 +1064,14 @@ small for any pixel of it to be interior: those read the blend the resolve
 leaves, and the tell is a channel at one eighth or seven eighths of the
 neighbour (`0x20`, `0xdf`) or within a step of it (`0x04`, `0xfb`). A site
 of that shape is `expected`: the space separation is the design, and a probe
-on a boundary has no exact answer under a resample. A site whose values do
-not fit that mechanism is `real`, exactly as on any other leg; the legs carry
-none today.
+on a boundary has no exact answer under a resample. A CPU write into a scaled
+target (an `UpdateSurface` into a render-target surface or the back buffer, or
+any CPU write into a level of a render-target texture) converts its rect the
+same way and resamples only the rows inside it, so a render texel the rect's
+reported edge cuts takes the written colour or keeps the old one whole: the
+written edge moves by at most half a render texel, and a probe on it is the
+same boundary case. A site whose values do not fit that mechanism is `real`,
+exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 

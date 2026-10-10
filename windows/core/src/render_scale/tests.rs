@@ -237,3 +237,38 @@ fn a_reduced_scale_biases_by_its_log2() {
         "75% biases by log2(0.75), got {bias}"
     );
 }
+
+#[test]
+fn a_scaled_chain_holds_only_the_levels_its_base_can_have() {
+    let three_quarters = RenderScale::from_percent(75);
+    let half = RenderScale::from_percent(50);
+    let two_thirds = RenderScale::from_percent(67);
+    // 640x480 has ten levels, what `levels = 0` asks for; 480x360 nine, 320x240 nine.
+    assert_eq!(rasterized_level_count(three_quarters, (640, 480), 10), 9);
+    assert_eq!(rasterized_level_count(half, (640, 480), 10), 9);
+    // 1920x1080 has eleven; 1286x724 at 0.67 has eleven too.
+    assert_eq!(rasterized_level_count(two_thirds, (1920, 1080), 11), 11);
+    // A single level, and a short explicit chain, are never lengthened.
+    assert_eq!(rasterized_level_count(three_quarters, (640, 480), 1), 1);
+    assert_eq!(rasterized_level_count(three_quarters, (640, 480), 4), 4);
+    // The identity keeps whatever the texture reports.
+    assert_eq!(
+        rasterized_level_count(RenderScale::IDENTITY, (640, 480), 10),
+        10
+    );
+}
+
+#[test]
+fn a_reported_level_past_the_chain_lands_on_its_last_level() {
+    for level in 0..9 {
+        assert_eq!(rasterized_level(level, 9), level, "a level the chain holds");
+    }
+    assert_eq!(
+        rasterized_level(9, 9),
+        8,
+        "the reported tail shares the last level"
+    );
+    assert_eq!(rasterized_level(12, 9), 8);
+    assert_eq!(rasterized_level(0, 1), 0, "a single-level texture");
+    assert_eq!(rasterized_level(3, 1), 0);
+}

@@ -276,6 +276,38 @@ impl TargetExtent {
     }
 }
 
+/// How many mip levels the Metal texture of a texture rasterized at `scale` holds.
+///
+/// D3D9 reports `levels`, counted on the reported base extent `logical`; the
+/// Metal texture is created at `scale` of that extent, and a smaller base can
+/// hold a shorter chain (640x480 has ten levels, its 480x360 at 0.75 nine).
+/// The Metal chain is the shorter of the two, so it never asks Metal for a
+/// level its base cannot have. At the identity it is `levels` itself.
+#[must_use]
+pub fn rasterized_level_count(scale: RenderScale, logical: (u32, u32), levels: u32) -> u32 {
+    if scale.is_identity() {
+        return levels;
+    }
+    let base =
+        crate::format::compute_mip_count(scale.dimension(logical.0), scale.dimension(logical.1));
+    levels.min(base)
+}
+
+/// The Metal level a reported mip `level` lands on in a chain of `rasterized_levels`.
+///
+/// Every level the Metal chain holds is itself. A reported level past its end,
+/// which only a texture [`rasterized_level_count`] shortened has, lands on the
+/// chain's last level: those tail levels are a texel or two on a side and all
+/// share that one Metal level, so a write into one is seen by the others.
+#[must_use]
+pub const fn rasterized_level(level: u32, rasterized_levels: u32) -> u32 {
+    if level < rasterized_levels {
+        level
+    } else {
+        rasterized_levels.saturating_sub(1)
+    }
+}
+
 impl Default for RenderScale {
     fn default() -> Self {
         Self::IDENTITY
