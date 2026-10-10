@@ -74,6 +74,7 @@ mod table_fog;
 mod texture_stages;
 mod textures;
 mod transforms_ff;
+mod unhandled_exception;
 mod unix_encoder;
 mod vertex_decl;
 mod wide_stretch;
