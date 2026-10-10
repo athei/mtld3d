@@ -609,3 +609,18 @@ fn a_state_back_under_its_id_keeps_its_own_age() {
     assert!(versions.trim(101 + SPARE_MAX_AGE_SUBMITS).is_empty());
     assert_eq!(versions.tracked(), 0);
 }
+
+#[test]
+fn a_texture_renamed_early_is_dropped_on_time_behind_a_younger_one() {
+    let mut versions = TextureVersions::<&str>::new();
+    drop(versions.take_spare(id(1), sprite(), true, 0));
+    drop(versions.take_spare(id(1), sprite(), true, 10));
+    drop(versions.take_spare(id(2), sprite(), true, 50));
+    // Texture 1's entry comes due at 121 and goes back under its rename at
+    // 10, which is due before texture 2's entry at 50.
+    assert!(versions.trim(121).is_empty());
+    assert_eq!(versions.tracked(), 2);
+    assert!(versions.trim(10 + SPARE_MAX_AGE_SUBMITS + 1).is_empty());
+    assert!(!versions.records_writes(id(1)));
+    assert!(versions.records_writes(id(2)));
+}

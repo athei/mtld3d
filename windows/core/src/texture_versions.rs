@@ -38,7 +38,7 @@
 //! calls and no blit shapes, so the retirement order, the pool bounds and
 //! the copy plan are host-testable.
 
-use std::collections::{VecDeque, hash_map::Entry};
+use std::collections::{BTreeSet, VecDeque, hash_map::Entry};
 
 use mtld3d_shared::{
     TextureCreateDesc,
@@ -353,14 +353,16 @@ pub struct TextureVersions<V> {
     next_epoch: u64,
     /// The textures with at least one spare, the only ones [`Self::trim`] visits for spares.
     with_spares: FxHashSet<TextureId>,
-    /// One `(submission, texture, epoch)` per tracked state, oldest first.
+    /// One `(submission, raw texture id, epoch)` per tracked state, in submission order.
     ///
     /// [`Self::trim`] looks at a state when its entry is
     /// [`SPARE_MAX_AGE_SUBMITS`] old, drops it when it has no spares and no
-    /// rename since, and queues it again otherwise, so a drain visits only
-    /// the states whose age came due. An entry whose epoch no longer
-    /// matches its texture's state belongs to a state that is gone.
-    idle: VecDeque<(u64, TextureId, u64)>,
+    /// rename since, and enters it again under its latest rename otherwise,
+    /// so a drain visits only the states whose age came due. The set keeps
+    /// the order whatever submission an entry comes back under, so no state
+    /// waits behind a younger one. An entry whose epoch no longer matches its
+    /// texture's state belongs to a state that is gone.
+    idle: BTreeSet<(u64, u64, u64)>,
 }
 
 impl<V> TextureVersions<V> {
@@ -372,7 +374,7 @@ impl<V> TextureVersions<V> {
             parked_bytes: 0,
             next_epoch: 1,
             with_spares: FxHashSet::default(),
-            idle: VecDeque::new(),
+            idle: BTreeSet::new(),
         }
     }
 
@@ -415,7 +417,7 @@ impl<V> TextureVersions<V> {
         let state = match self.textures.entry(id) {
             Entry::Vacant(slot) => {
                 self.next_epoch += 1;
-                self.idle.push_back((seq, id, epoch));
+                self.idle.insert((seq, id.raw(), epoch));
                 slot.insert(VersionState::new(shape, epoch, records_writes))
             }
             Entry::Occupied(slot) => {
@@ -424,7 +426,7 @@ impl<V> TextureVersions<V> {
                     self.parked_bytes -= state.bytes * state.spares.len() as u64;
                     discarded.extend(state.spares.drain(..).map(Spare::into_views));
                     self.next_epoch += 1;
-                    self.idle.push_back((seq, id, epoch));
+                    self.idle.insert((seq, id.raw(), epoch));
                     *state = VersionState::new(shape, epoch, records_writes);
                 }
                 state
@@ -666,11 +668,12 @@ impl<V> TextureVersions<V> {
             aged.extend(state.spares.drain(..old).map(Spare::into_views));
             !state.spares.is_empty()
         });
-        while let Some(&(seq, id, epoch)) = self.idle.front() {
+        while let Some(&(seq, raw, epoch)) = self.idle.first() {
             if !aged_at(seq) {
                 break;
             }
-            self.idle.pop_front();
+            self.idle.pop_first();
+            let id = TextureId::from_raw(raw);
             let Some(state) = self.textures.get(&id) else {
                 continue;
             };
@@ -688,7 +691,7 @@ impl<V> TextureVersions<V> {
             } else {
                 state.last_rename_seq
             };
-            self.idle.push_back((again, id, epoch));
+            self.idle.insert((again, raw, epoch));
         }
         aged
     }
