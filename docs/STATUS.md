@@ -116,8 +116,12 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   through the extended calls. `ComposeRects`, `WaitForVBlank`,
   `CheckResourceResidency`, the GPU thread priority pair,
   `GetLastPresentCount` and `GetPresentStats` succeed without doing
-  anything, each logged once, and `SetConvolutionMonoKernel` answers
-  `D3DERR_INVALIDCALL`.
+  anything, each logged once, `GetPresentStats` filling the 28 bytes the
+  structure has in a 32-bit process and the 32 it has in a 64-bit one, and
+  `SetConvolutionMonoKernel` answers `D3DERR_INVALIDCALL`. Both kinds of
+  device take `D3DPOOL_MANAGED_EX` (pool 6) as `D3DPOOL_MANAGED`, and an
+  extended device, which refuses `D3DPOOL_MANAGED`, accepts it; such a
+  resource reports `D3DPOOL_MANAGED`.
 
 ## Not implemented yet
 
@@ -138,16 +142,18 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
-- Additional swap chains: `CreateAdditionalSwapChain` succeeds and its
-  object carries its own present parameters, but its `GetBackBuffer` hands
-  back a surface object of its own over the device's back-buffer texture and
-  its `Present` presents the device frame into the device window, warned
-  once. There is no back buffer or window per chain, so a title that renders
-  a second view through one sees it alias the first. Within any one swap
-  chain, the implicit one included, every back-buffer index hands back the
-  same surface object over one texture, so a `StretchRect` that stretches
-  between two of them is refused as a stretch inside one surface (see the
-  kept divergences below).
+- Additional swap chains: `CreateAdditionalSwapChain` checks the swap
+  effect, the back-buffer count and the presentation interval as
+  `CreateDevice` and `Reset` do, for the kind of device it is called on, and
+  its object carries its own present parameters, but its `GetBackBuffer`
+  hands back a surface object of its own over the device's back-buffer
+  texture and its `Present` presents the device frame into the device
+  window, warned once. There is no back buffer or window per chain, so a
+  title that renders a second view through one sees it alias the first.
+  Within any one swap chain, the implicit one included, every back-buffer
+  index hands back the same surface object over one texture, so a
+  `StretchRect` that stretches between two of them is refused as a stretch
+  inside one surface (see the kept divergences below).
 - `Present` arguments: a source rect, a destination rect, a destination
   window override and a dirty region are accepted on
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
@@ -237,7 +243,20 @@ unless its entry says otherwise.
   the step that failed first. A failed device drops its open frame at each
   `Present`, and its final `Release` destroys the render targets and depth
   surfaces released after the failure. There is no recovery short of
-  creating a new device.
+  creating a new device. An extended device keeps the same latch with the
+  answers D3D9Ex documents: `TestCooperativeLevel` answers `D3D_OK` whatever
+  the latch holds, while `Present`, `PresentEx`, the swap chain's `Present`,
+  `CheckDeviceState`, `Reset` and `ResetEx` return the latched code, with
+  `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, the out-of-memory
+  code `PresentEx` and `CheckDeviceState` document, and neither reset clears
+  it. A `Reset` the layer could not complete, which leaves a plain device
+  answering `D3DERR_DEVICENOTRESET` from `TestCooperativeLevel`, shows on an
+  extended device only as that code from `Present`, `PresentEx` and the swap
+  chain's `Present`; `CheckDeviceState` does not report it.
+  `D3DERR_DEVICEREMOVED`, which tells a D3D9Ex application to create a new
+  device, is not used: one latch serves both kinds of device, and an
+  extended device keeps the code a plain one reports, `D3DERR_DEVICELOST`,
+  which `CheckDeviceState` documents as a lost device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

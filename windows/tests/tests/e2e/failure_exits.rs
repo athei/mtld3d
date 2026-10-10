@@ -3,15 +3,18 @@
 //! Each test makes a request that used to end the process, leak, or reach
 //! Metal with a descriptor it aborts on: a texture or surface past the extent
 //! the device reports, a lock rect whose offset overflows a 32-bit pointer, an
-//! additional swap chain with nowhere to go. It checks the `HRESULT`, then has
+//! additional swap chain with nowhere to go or present parameters the device
+//! refuses. It checks the `HRESULT`, then has
 //! the device clear, present and read a pixel back, so a refusal that left
 //! something half made, or let the request through to Metal, fails here.
 
-use mtld3d_tests::{Harness, Texture, TexturedVertex};
+use mtld3d_tests::{Factory, Harness, HarnessConfig, Texture, TexturedVertex};
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFVF_DIFFUSE,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DUSAGE_RENDERTARGET,
+    D3DPRESENT_BACK_BUFFERS_MAX, D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DSWAPEFFECT_COPY,
+    D3DSWAPEFFECT_FLIPEX, D3DUSAGE_RENDERTARGET,
 };
 
 const GREEN: u32 = 0xFF00_FF00;
@@ -217,4 +220,92 @@ fn an_additional_swap_chain_with_a_null_output_is_refused() {
     assert_eq!(h.additional_swapchain_null_output_hr(), D3DERR_INVALIDCALL);
     assert_eq!(h.device_refcount(), before, "no device reference is taken");
     assert_device_draws(&h, "swap chain");
+}
+
+/// `CreateAdditionalSwapChain` refuses the present parameters `CreateDevice` and `Reset` refuse.
+///
+/// Swap effect 0, a swap effect past the device's highest (COPY on a plain
+/// device, FLIPEX on an extended one), more back buffers than the device's
+/// limit, COPY with two back buffers and an interval that names none are each
+/// `D3DERR_INVALIDCALL` with no chain made and no device reference taken; the
+/// same request with valid parameters makes a chain, as does FLIPEX with the
+/// extended limit on an extended device.
+#[test]
+fn an_additional_swap_chain_with_invalid_present_parameters_is_refused() {
+    let plain = Harness::new();
+    let extended = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        ..HarnessConfig::default()
+    });
+    for (h, max_back_buffers, highest_effect) in [
+        (&plain, D3DPRESENT_BACK_BUFFERS_MAX, D3DSWAPEFFECT_COPY),
+        (
+            &extended,
+            D3DPRESENT_BACK_BUFFERS_MAX_EX,
+            D3DSWAPEFFECT_FLIPEX,
+        ),
+    ] {
+        let (width, height) = h.dims();
+        let valid = h.windowed_present_params(width, height);
+        let refused = [
+            (
+                "swap effect 0",
+                D3DPRESENT_PARAMETERS {
+                    swap_effect: 0,
+                    ..valid
+                },
+            ),
+            (
+                "a swap effect past the highest",
+                D3DPRESENT_PARAMETERS {
+                    swap_effect: highest_effect + 1,
+                    ..valid
+                },
+            ),
+            (
+                "a back buffer past the limit",
+                D3DPRESENT_PARAMETERS {
+                    back_buffer_count: max_back_buffers + 1,
+                    ..valid
+                },
+            ),
+            (
+                "COPY with two back buffers",
+                D3DPRESENT_PARAMETERS {
+                    swap_effect: D3DSWAPEFFECT_COPY,
+                    back_buffer_count: 2,
+                    ..valid
+                },
+            ),
+            (
+                "an interval that names none",
+                D3DPRESENT_PARAMETERS {
+                    presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE + 1,
+                    ..valid
+                },
+            ),
+        ];
+        let before = h.device_refcount();
+        for (case, mut pp) in refused {
+            let (hr, chain) = h.try_additional_swapchain(&mut pp);
+            assert_eq!(hr, D3DERR_INVALIDCALL, "{case}");
+            assert!(chain.is_none(), "{case}: no chain is made");
+            assert_eq!(h.device_refcount(), before, "{case}: no device reference");
+        }
+        let mut pp = valid;
+        pp.swap_effect = highest_effect;
+        pp.back_buffer_count = if highest_effect == D3DSWAPEFFECT_COPY {
+            1
+        } else {
+            max_back_buffers
+        };
+        let (hr, chain) = h.try_additional_swapchain(&mut pp);
+        assert_eq!(hr, D3D_OK, "the highest swap effect at its limit");
+        drop(chain);
+        let mut pp = valid;
+        let (hr, chain) = h.try_additional_swapchain(&mut pp);
+        assert_eq!(hr, D3D_OK, "valid present parameters");
+        drop(chain);
+        assert_device_draws(h, "additional swap chain parameters");
+    }
 }

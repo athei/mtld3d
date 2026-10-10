@@ -77,7 +77,7 @@ use mtld3d_types::{
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
     D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
+    D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
     D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
@@ -3744,6 +3744,13 @@ impl DeviceInner {
         self.flags.contains(DeviceFlags::EXTENDED)
     }
 
+    /// The code this device reports for a call that produced `hr`.
+    ///
+    /// [`mtld3d_core::extended::state_code`] for this kind of device.
+    pub const fn state_code(&self, hr: i32) -> i32 {
+        mtld3d_core::extended::state_code(hr, self.is_extended())
+    }
+
     /// The frame latency `GetMaximumFrameLatency` reports.
     pub const fn max_frame_latency(&self) -> u32 {
         self.max_frame_latency
@@ -4038,22 +4045,25 @@ fn shared_handle_gate(
     }
 }
 
-/// Whether an extended device refuses `pool` for a create, warned once per kind.
-fn managed_pool_refused(
+/// The pool a create in `pool` makes its resource in, `None` when the device refuses it.
+///
+/// An extended device refuses `D3DPOOL_MANAGED`, warned once per kind; both
+/// kinds of device take `D3DPOOL_MANAGED_EX` as the managed pool.
+fn create_pool(
     this: *mut c_void,
     kind: &mtld3d_core::extended::CreateKind,
     pool: u32,
     entry_point: &str,
-) -> bool {
-    let refused = mtld3d_core::pool::refused_on_extended(pool, device_is_extended(this));
-    if refused {
+) -> Option<u32> {
+    if mtld3d_core::pool::refused_on_extended(pool, device_is_extended(this)) {
         mtld3d_shared::log_once_warn_by!(
             target: LOG_TARGET,
             key: create_kind_key(kind),
             "reject {entry_point}(D3DPOOL_MANAGED) on an extended device → INVALIDCALL"
         );
+        return None;
     }
-    refused
+    Some(mtld3d_core::pool::resolve(pool))
 }
 
 /// A distinct log-latch key per create kind.
@@ -4644,14 +4654,19 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     // DEVICENOTRESET a failed implicit-resource rebuild leaves.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let object = unsafe { InPtr::<Direct3DDevice9>::opt(this) };
+    // D3D9Ex answers `TestCooperativeLevel` with `D3D_OK` on an extended
+    // device. Its failure latch reaches the application through
+    // `CheckDeviceState` and the presents; a `Reset` the layer could not
+    // complete shows only as the DEVICENOTRESET that `Present`, `PresentEx`
+    // and the swap chain's `Present` answer.
+    if object.as_ref().is_some_and(|obj| obj.inner().is_extended()) {
+        return D3D_OK;
+    }
     if let Some(obj) = &object
         && let Err(hr) = obj.inner().encoder_status()
     {
         return hr;
     }
-    // An extended device is never left owing a `Reset` by a rejected one, so
-    // on it DEVICENOTRESET only reports a back buffer the layer could not
-    // rebuild.
     let not_reset = object.is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET
@@ -4858,6 +4873,17 @@ extern "system" fn device_create_additional_swap_chain(
         );
         return D3DERR_INVALIDCALL;
     }
+    // The swap effect, back-buffer count and interval follow the rules
+    // `CreateDevice` and `Reset` apply for this kind of device.
+    if !mtld3d_core::present::present_params_are_valid(&pp, dev.is_extended()) {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain: invalid present params (swap_effect={}, \
+             bb_count={}, interval={:#x}) → INVALIDCALL",
+            pp.swap_effect, pp.back_buffer_count, pp.presentation_interval,
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // Resolve a zero-dimension windowed request against the target window's
     // client rect (the device window when device_window is NULL), and clamp a
     // zero back-buffer count to one — then report both back to the caller.
@@ -4931,7 +4957,17 @@ extern "system" fn device_get_number_of_swap_chains(this: *mut c_void) -> u32 {
 extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    reset_impl(this, present_params, ResetCall::Reset)
+    let hr = reset_impl(this, present_params, ResetCall::Reset);
+    reported_state_code(this, hr)
+}
+
+/// The code the device behind `this` reports for a call that produced `hr`.
+///
+/// [`DeviceInner::state_code`] for a live device, `hr` itself otherwise.
+fn reported_state_code(this: *mut c_void, hr: i32) -> i32 {
+    // SAFETY: vtable thunk argument; `this` is null or *mut Direct3DDevice9
+    // per the IDirect3DDevice9 ABI.
+    unsafe { InPtr::<Direct3DDevice9>::opt(this) }.map_or(hr, |obj| obj.inner().state_code(hr))
 }
 
 /// Which entry point a `Reset` came through.
@@ -5830,7 +5866,8 @@ fn present_impl(
     }
 
     mtld3d_shared::crumb!("d3d9:present");
-    dev.present()
+    let hr = dev.present();
+    dev.state_code(hr)
 }
 
 /// Warn once for each `D3DPRESENT_*` flag bit a present carries, none of which is honoured.
@@ -6185,10 +6222,10 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
             return hr;
         }
     };
-    if managed_pool_refused(this, &kind, pool, "CreateTexture") {
+    let Some(pool) = create_pool(this, &kind, pool, "CreateTexture") else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
-    }
+    };
     // D3DUSAGE_WRITEONLY is a vertex/index-buffer-only flag; on a texture it is
     // INVALIDCALL.
     if usage & D3DUSAGE_WRITEONLY != 0 {
@@ -6844,15 +6881,15 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return hr;
     }
-    if managed_pool_refused(
+    let Some(pool) = create_pool(
         this,
         &mtld3d_core::extended::CreateKind::VolumeTexture,
         pool,
         "CreateVolumeTexture",
-    ) {
+    ) else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
-    }
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         null_out(texture);
@@ -7032,15 +7069,15 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return hr;
     }
-    if managed_pool_refused(
+    let Some(pool) = create_pool(
         this,
         &mtld3d_core::extended::CreateKind::CubeTexture,
         pool,
         "CreateCubeTexture",
-    ) {
+    ) else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
-    }
+    };
     // D3DUSAGE_WRITEONLY is a vertex/index-buffer-only flag; on a cube texture it
     // is INVALIDCALL.
     if usage & D3DUSAGE_WRITEONLY != 0 {
@@ -7247,15 +7284,15 @@ extern "system" fn device_create_vertex_buffer(
         null_out(vb);
         return hr;
     }
-    if managed_pool_refused(
+    let Some(pool) = create_pool(
         this,
         &mtld3d_core::extended::CreateKind::VertexBuffer,
         pool,
         "CreateVertexBuffer",
-    ) {
+    ) else {
         null_out(vb);
         return D3DERR_INVALIDCALL;
-    }
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -7336,15 +7373,15 @@ extern "system" fn device_create_index_buffer(
         null_out(ib);
         return hr;
     }
-    if managed_pool_refused(
+    let Some(pool) = create_pool(
         this,
         &mtld3d_core::extended::CreateKind::IndexBuffer,
         pool,
         "CreateIndexBuffer",
-    ) {
+    ) else {
         null_out(ib);
         return D3DERR_INVALIDCALL;
-    }
+    };
     // D3DFMT_INDEX16 = 101, D3DFMT_INDEX32 = 102 are the only legal index
     // formats; the draw path selects `MTLIndexType` from the stored format, so
     // both are fully supported here.
@@ -9892,6 +9929,8 @@ extern "system" fn device_create_offscreen_plain_surface(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
+    // `D3DPOOL_MANAGED_EX` is the managed pool, which no plain surface takes.
+    let pool = mtld3d_core::pool::resolve(pool);
     // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
     // extended one reads it as user memory for a system-memory surface and as
     // a shared resource, which it does not create, in the default pool.
@@ -15682,7 +15721,7 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
     // default-pool buffer. D3DPOOL_SCRATCH never reaches here for a buffer;
     // both Create* entry points reject it first.
     match pool {
-        0 | D3DPOOL_MANAGED | D3DPOOL_SYSTEMMEM | D3DPOOL_SCRATCH => {}
+        0 | D3DPOOL_MANAGED | D3DPOOL_MANAGED_EX | D3DPOOL_SYSTEMMEM | D3DPOOL_SCRATCH => {}
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "Create{kind}: unknown D3DPOOL={other} — update warn_unused_usage_and_pool_once"

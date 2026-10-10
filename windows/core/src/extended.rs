@@ -8,12 +8,12 @@
 //! answers for both kinds of device.
 
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_DONOTFLIP, D3DPRESENT_DONOTWAIT, D3DPRESENT_FLIPRESTART, D3DPRESENT_FORCEIMMEDIATE,
-    D3DPRESENT_HIDEOVERLAY, D3DPRESENT_LINEAR_CONTENT, D3DPRESENT_UPDATECOLORKEY,
-    D3DPRESENT_UPDATEOVERLAYONLY, D3DPRESENT_VIDEO_RESTRICT_TO_MONITOR,
+    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DERR_OUTOFVIDEOMEMORY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPRESENT_DONOTFLIP, D3DPRESENT_DONOTWAIT, D3DPRESENT_FLIPRESTART,
+    D3DPRESENT_FORCEIMMEDIATE, D3DPRESENT_HIDEOVERLAY, D3DPRESENT_LINEAR_CONTENT,
+    D3DPRESENT_UPDATECOLORKEY, D3DPRESENT_UPDATEOVERLAYONLY, D3DPRESENT_VIDEO_RESTRICT_TO_MONITOR,
     D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
-    D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL,
+    D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL, E_OUTOFMEMORY,
 };
 
 /// The frame latency an extended device reports until the application sets one.
@@ -183,6 +183,23 @@ pub const fn frame_latency(requested: u32) -> Option<u32> {
         0 => Some(DEFAULT_FRAME_LATENCY),
         value if value > MAX_FRAME_LATENCY => None,
         value => Some(value),
+    }
+}
+
+/// What a device's presents, resets and `CheckDeviceState` answer for `hr`.
+///
+/// On an extended device, `PresentEx` and `CheckDeviceState` do not document
+/// `E_OUTOFMEMORY`, the code a frame whose commands could not be recorded
+/// latches; both document `D3DERR_OUTOFVIDEOMEMORY` for a device out of the
+/// memory it renders from, which is what every one of these calls reports
+/// instead, so one failure answers with one code. A plain device reports
+/// `hr` as it is, and every other code passes through on either kind.
+#[must_use]
+pub const fn state_code(hr: i32, extended: bool) -> i32 {
+    if extended && hr == E_OUTOFMEMORY {
+        D3DERR_OUTOFVIDEOMEMORY
+    } else {
+        hr
     }
 }
 

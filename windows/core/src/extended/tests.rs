@@ -1,8 +1,9 @@
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RESTRICT_SHARED_RESOURCE,
-    D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER, D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL,
+    D3D_OK, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DERR_OUTOFVIDEOMEMORY,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_DONOTWAIT,
+    D3DPRESENT_FORCEIMMEDIATE, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
+    D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL, E_OUTOFMEMORY,
 };
 
 use super::*;
@@ -242,4 +243,26 @@ fn an_extended_device_reports_the_whole_texture_budget() {
     );
     assert_eq!(available_texture_mem(1 << 34, 0, true), u32::MAX);
     assert_eq!(available_texture_mem(1 << 20, 1 << 30, false), 0);
+}
+
+#[test]
+fn an_extended_state_reports_out_of_memory_as_out_of_video_memory() {
+    assert_eq!(
+        state_code(E_OUTOFMEMORY, true),
+        D3DERR_OUTOFVIDEOMEMORY,
+        "the code PresentEx and CheckDeviceState document"
+    );
+    assert_eq!(state_code(D3DERR_DEVICELOST, true), D3DERR_DEVICELOST);
+    assert_eq!(state_code(D3D_OK, true), D3D_OK);
+}
+
+#[test]
+fn a_plain_state_reports_every_code_as_it_is() {
+    assert_eq!(
+        state_code(E_OUTOFMEMORY, false),
+        E_OUTOFMEMORY,
+        "a plain device keeps the code it latched"
+    );
+    assert_eq!(state_code(D3DERR_DEVICELOST, false), D3DERR_DEVICELOST);
+    assert_eq!(state_code(D3D_OK, false), D3D_OK);
 }
