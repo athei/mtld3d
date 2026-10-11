@@ -1697,6 +1697,26 @@ pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
 /// `entries` are `key=value` entries, `;`-separated, for every interface the
 /// child creates; empty adds none.
 pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, entries: &str) {
+    let (output, dir) = spawn_private_log_child(child_name, test, filter, entries);
+    assert!(
+        output.status.success(),
+        "workload child {child_name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
+}
+
+/// Run `test` as [`run_in_private_log_child_with`] does; hand back its output and its directory.
+///
+/// The child's log lands in the directory, which the caller removes. Nothing
+/// here judges the child's exit, so a test whose child is meant to die reads
+/// what it left behind.
+pub fn spawn_private_log_child(
+    child_name: &str,
+    test: &str,
+    filter: &str,
+    entries: &str,
+) -> (std::process::Output, std::path::PathBuf) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1728,12 +1748,7 @@ pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str,
         config = format!("{entries};{config}");
     }
     let output = run_child(&mut command, &config).expect("run the workload child");
-    assert!(
-        output.status.success(),
-        "workload child {child_name} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
+    (output, dir)
 }
 
 /// Flip `PresentationInterval` twice, one Present after each Reset.

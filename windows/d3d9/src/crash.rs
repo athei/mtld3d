@@ -21,12 +21,14 @@
 //!    unhandled-exception filter still gets a chance to write
 //!    `Crash.txt` before the process dies.
 //!
-//! 2. A panic hook. `panic = "abort"` on Windows calls `__fastfail`,
-//!    which bypasses VEH entirely, so the panic path needs its own
-//!    diagnostic — we just dump the crumb trail and chain to the
-//!    previous (default) hook. The default hook prints the usual
-//!    `thread '…' panicked at …` line and (if `RUST_BACKTRACE=1`) a
-//!    backtrace. Empty backtraces under Wine are accepted as-is.
+//! 2. A panic hook. `panic = "abort"` ends the process inside the hook's
+//!    caller, so the hook writes the report into the log synchronously:
+//!    the panic's thread name, thread id, location and message, worded as
+//!    the default hook words them, then the crumb trail. It then chains
+//!    to the previous (default) hook, which prints the same
+//!    `thread '…' panicked at …` report and (with `RUST_BACKTRACE`) a
+//!    backtrace to stderr, where a game a launcher spawned shows nothing.
+//!    Empty backtraces under Wine are accepted as-is.
 //!
 //! Faults in other modules (game code, `ClientExtensions.dll` `VMProtect`
 //! probes, system DLLs) pass through to SEH normally, so `VMProtect`'s
@@ -60,7 +62,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
-use mtld3d_core::address_space::FreeSpace;
+use mtld3d_core::{address_space::FreeSpace, crash_report::PanicLine};
 use mtld3d_shared::crumb;
 
 // NTSTATUS codes the handler filters on.
@@ -78,6 +80,14 @@ pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 2;
 /// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
+/// What opens the panic line in the log, ahead of std's own wording.
+const PANIC_PREFIX: &str = "[mtld3d::d3d9] PANIC: ";
+/// The name a panic line gives a thread that has none, as std's default hook does.
+const UNNAMED_THREAD: &str = "<unnamed>";
+/// Bytes of a thread's name a panic line carries.
+const THREAD_NAME_CAPACITY: usize = 128;
+/// UTF-16 units of a thread's description read at most, in search of its terminator.
+const THREAD_DESCRIPTION_SCAN: usize = 512;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
@@ -267,6 +277,10 @@ unsafe extern "system" {
         buffer: *mut MemoryBasicInformation,
         length: usize,
     ) -> usize;
+    fn GetCurrentThread() -> *mut c_void;
+    fn GetCurrentThreadId() -> u32;
+    fn GetThreadDescription(thread: *mut c_void, description: *mut *mut u16) -> i32;
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
 }
 
 /// Install the VEH and the panic hook. Idempotent.
@@ -319,15 +333,82 @@ fn install_panic_hook() {
         // A panic ends the process: its report may open the early log, with
         // the lines queued since load ahead of it.
         crate::log_sink::forward_parked();
+        write_panic_line(info);
         crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
         crumb::dump_recent(32);
         emit_image_bases();
-        // Chain to the default hook so the usual "thread '…' panicked
-        // at …" line + std backtrace (possibly empty on Wine) still
-        // appears. Our crumb dump is the load-bearing diagnostic;
-        // backtrace quality is best-effort.
+        // Chain to the default hook, which prints the same report to stderr
+        // and a backtrace (possibly empty on Wine). The log has the report
+        // already; backtrace quality is best-effort.
         prev(info);
     }));
+}
+
+/// Write the panic's thread, location and message into the log, as std's default hook words them.
+///
+/// The default hook prints them to stderr only, which a game a launcher
+/// spawned does not have, and under `panic = "abort"` nothing runs after the
+/// hooks. So the line goes out here, synchronously, before the crumb trail.
+/// It reads no Rust thread-local and allocates nothing from the Rust
+/// allocator: `std::thread::current` may allocate on a thread std has not
+/// seen and panics on one past its thread-local teardown, and a panic inside
+/// the hook would abort before the line is written. The thread's name comes
+/// from its Win32 description instead, which std sets for every thread it
+/// names, and the id is the one the default hook prints.
+fn write_panic_line(info: &std::panic::PanicHookInfo<'_>) {
+    let mut name = [0u8; THREAD_NAME_CAPACITY];
+    let name = thread_name(&mut name);
+    // SAFETY: kernel32 export with no arguments.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let line = PanicLine::new(
+        PANIC_PREFIX,
+        name,
+        thread_id,
+        info.location(),
+        info.payload_as_str(),
+    );
+    crate::log_sink::write_crash(line.bytes());
+}
+
+/// The calling thread's Win32 description as UTF-8 in `buf`, or `<unnamed>` when it has none.
+///
+/// `GetThreadDescription` hands back a buffer from the process heap, not
+/// from the Rust allocator, freed here with `LocalFree`. A name longer than
+/// `buf` is cut, at a character boundary.
+fn thread_name(buf: &mut [u8; THREAD_NAME_CAPACITY]) -> &str {
+    // SAFETY: kernel32 export; the pseudo-handle names the calling thread.
+    let thread = unsafe { GetCurrentThread() };
+    let mut description: *mut u16 = core::ptr::null_mut();
+    // SAFETY: kernel32 export writing one pointer to the out slot given.
+    let hr = unsafe { GetThreadDescription(thread, &raw mut description) };
+    if hr < 0 || description.is_null() {
+        return UNNAMED_THREAD;
+    }
+    let mut units = 0;
+    while units < THREAD_DESCRIPTION_SCAN {
+        let unit = description.wrapping_add(units);
+        // SAFETY: the description is NUL-terminated and the scan stops at
+        // the terminator, so every unit read lies inside it.
+        if unsafe { unit.read() } == 0 {
+            break;
+        }
+        units += 1;
+    }
+    // SAFETY: the `units` units ahead of the terminator, read above.
+    let units = unsafe { core::slice::from_raw_parts(description, units) };
+    let mut pos = 0;
+    push_utf16(buf, &mut pos, units);
+    // SAFETY: the buffer `GetThreadDescription` allocated, freed once.
+    unsafe { LocalFree(description.cast()) };
+    let text = match core::str::from_utf8(&buf[..pos]) {
+        Ok(text) => text,
+        Err(cut) => core::str::from_utf8(&buf[..cut.valid_up_to()]).unwrap_or_default(),
+    };
+    if text.is_empty() {
+        UNNAMED_THREAD
+    } else {
+        text
+    }
 }
 
 /// Print the runtime load bases for our own DLL(s).
