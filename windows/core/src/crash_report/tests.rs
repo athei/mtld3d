@@ -382,6 +382,8 @@ impl<T> NotWrite for &WriteProbe<T> {}
 #[test]
 fn a_finished_panic_line_takes_no_more_text() {
     // Only the private cursor writes; the finished line has no writer of its own.
-    assert!(!(&WriteProbe::<PanicLine>(core::marker::PhantomData)).implements_write());
-    assert!((&WriteProbe::<LineCursor<'_>>(core::marker::PhantomData)).implements_write());
+    let line = &WriteProbe::<PanicLine>(core::marker::PhantomData);
+    assert!(!line.implements_write());
+    let cursor = &WriteProbe::<LineCursor<'_>>(core::marker::PhantomData);
+    assert!(cursor.implements_write());
 }
