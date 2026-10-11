@@ -1949,17 +1949,19 @@ impl DeviceInner {
         self.encoder.mid_frame_submit(frame)
     }
 
-    /// Let the submits in flight copy the present they wait for, ahead of a flush.
+    /// Let the submits in flight copy the present they wait for, ahead of a flush or a wait.
     ///
-    /// A flush queues behind the encoder, and the encoder may be blocked on a
-    /// payload the submit thread holds while it waits for the previous
-    /// present to commit, which is a wait on the display. Setting the policy
-    /// here, before the flush is sent, wakes that submit into a copy so the
-    /// encoder, and then the flush, go on at once. The encoder puts the policy
-    /// back when the request that follows ends: the flush arm once its own
-    /// submission has committed, the visibility intake once its drain is done.
-    /// The one thunk this side issues off the device lifecycle, and only on a
-    /// path that is already a synchronous read-back.
+    /// A flush, a visibility intake or a wait for retired uploads queues behind
+    /// the encoder, and the encoder may be blocked on a payload the submit
+    /// thread holds while it waits for the previous present to commit, which
+    /// is a wait on the display. Setting the policy here, before the request
+    /// is sent, wakes that submit into a copy so the encoder, and then the
+    /// request, go on at once. The encoder puts the policy back when the
+    /// request that follows ends: the flush arm once its own submission has
+    /// committed, the visibility intake and the upload retirement once their
+    /// drain is done. The one thunk this side issues off the device lifecycle,
+    /// and only on a path that already blocks on the GPU: a synchronous
+    /// read-back, or a full upload-snapshot arena.
     pub fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
             return Ok(());
@@ -2507,6 +2509,19 @@ impl DeviceInner {
         &mut self,
     ) -> &mut mtld3d_core::upload_snapshot::UploadSnapshots {
         &mut self.upload_snapshots
+    }
+
+    /// Wait until the uploads of the submissions through `seq` retired and dropped their reads.
+    ///
+    /// For a full upload-snapshot arena: `seq` names a frame already sent to
+    /// the encoder, never the one being recorded, since nothing would retire
+    /// that one. Hurries presentation first, as the visibility flush does,
+    /// because the request queues behind submits that may be waiting on the
+    /// display.
+    pub fn retire_uploads_through(&self, seq: u64) -> Result<(), i32> {
+        self.encoder.status()?;
+        self.hurry_presentation()?;
+        self.encoder.retire_uploads_through(seq)
     }
 
     /// Padded bytes of the upload-snapshot arena's chunks.

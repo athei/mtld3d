@@ -18,8 +18,11 @@
 //! A sequence-stamped ring cannot use the submit sequence for that: an
 //! aborted submission's sequence retires while its uploads still wait to be
 //! replayed from the same bytes. A front chunk still read means a new chunk,
-//! up to [`MAX_CHUNKS`]; past that the upload reads the staging as it would
-//! without a snapshot, and the lock rule covers the next write.
+//! up to [`MAX_CHUNKS`]. Past that the arena refuses the write and names the
+//! submission the oldest chunk waits for ([`UploadSnapshots::wait_target`]):
+//! the caller can wait for it to retire and write again, or upload from the
+//! staging as it would without a snapshot, and the lock rule covers the next
+//! write.
 //!
 //! Its unix-side twin, the encoder's upload ring for inline draw data, keeps
 //! its chunks in native memory. These bytes are PE pages instead, because the
@@ -52,10 +55,19 @@ pub const SNAPSHOT_MAX_BYTES: usize = CHUNK_BYTES;
 
 /// The most chunks the arena holds, 16 MiB of the 32-bit address space.
 ///
-/// The busiest frame measured snapshots about 1.6 MiB, and a chunk comes back
-/// once its frame's uploads are acknowledged, three to four frames later, so
-/// the cap leaves room for a workload several times heavier before an upload
-/// falls back to reading the staging.
+/// The arena has to hold every snapshot still read, and a chunk's reads drop
+/// once the encoder has seen the GPU retire the frame that filled it. In a
+/// window that presents, the API thread records at most
+/// `PRESENT_PIPELINE_DEPTH` (5) frames ahead of the presenter, which holds at
+/// most `DRAWABLE_POOL_DEPTH` (3) drawables the display has not returned, and
+/// the encoder releases the reads at its next frame: about 9 frames of
+/// snapshots at once. A frame that relocks a sprite atlas 268 times, from
+/// 10x20 to 129x112 texels at two bytes, writes about 1.4 MiB of rows, so 9
+/// frames take about 12.6 MiB. A scene the GPU cannot keep up with runs
+/// further ahead than that; there the wait for the oldest chunk
+/// ([`UploadSnapshots::wait_target`]) bounds the arena whatever its size.
+/// Chunks are allocated as a workload first needs them and kept for the
+/// device's life.
 pub const MAX_CHUNKS: usize = 64;
 
 /// Offset alignment of every snapshot: the largest D3D9 texel or compressed block.
@@ -70,26 +82,43 @@ pub struct UploadSnapshot {
 }
 
 /// The active chunk with its bump cursor, and the full chunks oldest first.
+///
+/// Every chunk carries the submit sequence of the frame its newest snapshot
+/// was recorded in, which is the submission whose retirement lets the chunk
+/// start over.
 #[derive(Default)]
 pub struct UploadSnapshots {
-    active: Option<Arc<PageBox>>,
+    active: Option<Chunk>,
     /// First byte of the active chunk no snapshot handed out since its start covers.
     cursor: usize,
-    full: VecDeque<Arc<PageBox>>,
+    full: VecDeque<Chunk>,
+    /// The newest submit sequence a wait for the oldest chunk has already covered.
+    ///
+    /// A wait that freed nothing (a replay after an aborted submit keeps the
+    /// chunk read past its sequence) is not repeated for that chunk.
+    waited_through: u64,
+}
+
+/// One arena chunk and the submit sequence of its newest snapshot.
+struct Chunk {
+    pages: Arc<PageBox>,
+    last_seq: u64,
 }
 
 impl UploadSnapshots {
-    /// Copy a snapshot of `len` bytes into the arena through `fill`.
+    /// Copy a snapshot of `len` bytes, for the frame submitting as `seq`, into the arena.
     ///
     /// `fill` writes the snapshot into the slice it is given and answers
     /// whether it did; a `false` leaves the slice unclaimed. `None` when the
     /// request is empty or over [`SNAPSHOT_MAX_BYTES`], when every chunk is
     /// still read and the arena holds [`MAX_CHUNKS`], when a new chunk could
-    /// not be allocated, or when `fill` declined. The caller then uploads from
-    /// the staging; nothing here waits.
+    /// not be allocated, or when `fill` declined. Nothing here waits: the
+    /// caller asks [`Self::wait_target`] whether a wait could free room, and
+    /// otherwise uploads from the staging.
     pub fn write(
         &mut self,
         len: usize,
+        seq: u64,
         fill: impl FnOnce(&mut [u8]) -> bool,
     ) -> Option<UploadSnapshot> {
         if len == 0 || len > SNAPSHOT_MAX_BYTES {
@@ -97,8 +126,8 @@ impl UploadSnapshots {
         }
         let start = self.room_for(len)?;
         let offset = u32::try_from(start).ok()?;
-        let chunk = self.active.as_ref()?;
-        let base = chunk.as_ptr().cast_mut().wrapping_add(start);
+        let chunk = self.active.as_mut()?;
+        let base = chunk.pages.as_ptr().cast_mut().wrapping_add(start);
         // SAFETY: `room_for` placed `[start, start + len)` inside the chunk at
         // or past the cursor, so no snapshot handed out since the chunk started
         // covers it, and a chunk starts over only once no upload reads it. The
@@ -108,9 +137,36 @@ impl UploadSnapshots {
         if !fill(destination) {
             return None;
         }
-        let read = PageBoxRead::new(Arc::clone(chunk));
+        let read = PageBoxRead::new(Arc::clone(&chunk.pages));
+        chunk.last_seq = seq;
         self.cursor = start + len;
         Some(UploadSnapshot { read, offset })
+    }
+
+    /// The submit sequence a wait has to see retired before the arena has room again.
+    ///
+    /// `Some` only when the arena holds [`MAX_CHUNKS`] and its oldest chunk is
+    /// still read, the one state in which [`Self::write`] can neither reuse
+    /// a chunk nor allocate one, and only when no earlier wait covered that
+    /// chunk's sequence ([`Self::note_wait`]); the answer is the sequence of
+    /// the frame that recorded the chunk's newest snapshot. A chunk starts
+    /// over only once [`PageBox::has_readers`] drops, which an upload the
+    /// encoder replays after an aborted submit can hold past that sequence,
+    /// so a write after the wait may still find no room, and waiting again
+    /// for the same sequence would free nothing more.
+    #[must_use]
+    pub fn wait_target(&self) -> Option<u64> {
+        if self.chunk_count() < MAX_CHUNKS {
+            return None;
+        }
+        let oldest = self.full.front()?;
+        (oldest.pages.has_readers() && oldest.last_seq > self.waited_through)
+            .then_some(oldest.last_seq)
+    }
+
+    /// Record that a wait for the uploads through `seq` ran, whatever it freed.
+    pub fn note_wait(&mut self, seq: u64) {
+        self.waited_through = self.waited_through.max(seq);
     }
 
     /// Padded bytes of every chunk the arena holds.
@@ -119,7 +175,7 @@ impl UploadSnapshots {
         self.active
             .iter()
             .chain(self.full.iter())
-            .map(|chunk| chunk.len() as u64)
+            .map(|chunk| chunk.pages.len() as u64)
             .sum()
     }
 
@@ -138,10 +194,17 @@ impl UploadSnapshots {
         if let Some(chunk) = self.active.take() {
             self.full.push_back(chunk);
         }
-        if self.full.front().is_some_and(|chunk| !chunk.has_readers()) {
+        if self
+            .full
+            .front()
+            .is_some_and(|chunk| !chunk.pages.has_readers())
+        {
             self.active = self.full.pop_front();
         } else if self.chunk_count() < MAX_CHUNKS {
-            self.active = Some(Arc::new(PageBox::try_new_zeroed(CHUNK_BYTES)?));
+            self.active = Some(Chunk {
+                pages: Arc::new(PageBox::try_new_zeroed(CHUNK_BYTES)?),
+                last_seq: 0,
+            });
         } else {
             return None;
         }

@@ -83,6 +83,8 @@ pub enum EncoderControl {
     DrainRetention = 0,
     IntakeVisibility = 1,
     Reset = 2,
+    /// Wait for the uploads through the submit sequence in `argument`, then drop their reads.
+    RetireUploads = 3,
 }
 
 impl TryFrom<u16> for EncoderOpcode {

@@ -5,7 +5,9 @@
 //! front chunk starts over only after every read of it has dropped, the arena
 //! stops at its chunk cap rather than waiting, a chunk-sized snapshot takes a
 //! chunk of its own, and a declined fill, an empty request and an oversized
-//! one claim nothing.
+//! one claim nothing. A full arena names the submission its oldest chunk's
+//! newest snapshot rode in, only while that chunk is still read and only once
+//! per sequence a wait has covered.
 
 use std::sync::Arc;
 
@@ -14,10 +16,15 @@ use super::*;
 /// A quarter of a chunk, so four snapshots fill one exactly.
 const QUARTER: usize = CHUNK_BYTES / 4;
 
-/// Write `len` bytes of `value` and return the snapshot.
+/// Write `len` bytes of `value` for the frame submitting as 1 and return the snapshot.
 fn snapshot(arena: &mut UploadSnapshots, len: usize, value: u8) -> UploadSnapshot {
+    snapshot_in(arena, len, value, 1)
+}
+
+/// Write `len` bytes of `value` for the frame submitting as `seq` and return the snapshot.
+fn snapshot_in(arena: &mut UploadSnapshots, len: usize, value: u8, seq: u64) -> UploadSnapshot {
     arena
-        .write(len, |destination| {
+        .write(len, seq, |destination| {
             destination.fill(value);
             true
         })
@@ -88,7 +95,7 @@ fn the_chunk_cap_falls_back_instead_of_waiting() {
         .map(|_| snapshot(&mut arena, QUARTER, 0))
         .collect();
     assert_eq!(arena.chunk_count(), MAX_CHUNKS);
-    assert!(arena.write(16, |_| true).is_none());
+    assert!(arena.write(16, 1, |_| true).is_none());
     assert_eq!(arena.chunk_count(), MAX_CHUNKS);
     drop(held);
     assert_eq!(snapshot(&mut arena, 16, 0).offset, 0);
@@ -98,9 +105,9 @@ fn the_chunk_cap_falls_back_instead_of_waiting() {
 #[test]
 fn a_declined_fill_an_empty_and_an_oversized_request_claim_nothing() {
     let mut arena = UploadSnapshots::default();
-    assert!(arena.write(32, |_| false).is_none());
-    assert!(arena.write(0, |_| true).is_none());
-    assert!(arena.write(SNAPSHOT_MAX_BYTES + 1, |_| true).is_none());
+    assert!(arena.write(32, 1, |_| false).is_none());
+    assert!(arena.write(0, 1, |_| true).is_none());
+    assert!(arena.write(SNAPSHOT_MAX_BYTES + 1, 1, |_| true).is_none());
     assert_eq!(snapshot(&mut arena, 8, 1).offset, 0);
 }
 
@@ -117,4 +124,61 @@ fn a_chunk_sized_snapshot_takes_a_chunk_of_its_own() {
         bytes_at(&whole.read, 0, SNAPSHOT_MAX_BYTES),
         vec![2; SNAPSHOT_MAX_BYTES]
     );
+}
+
+#[test]
+fn a_full_arena_names_the_submission_its_oldest_chunk_waits_for() {
+    let mut arena = UploadSnapshots::default();
+    // Frame 5 fills the first chunk, ending with a snapshot of frame 6;
+    // later frames fill the rest up to the cap.
+    let mut held: Vec<UploadSnapshot> = (0..3)
+        .map(|_| snapshot_in(&mut arena, QUARTER, 0, 5))
+        .collect();
+    held.push(snapshot_in(&mut arena, QUARTER, 0, 6));
+    assert_eq!(
+        arena.wait_target(),
+        None,
+        "below the cap a chunk can still be added"
+    );
+    held.extend((4..MAX_CHUNKS * 4).map(|i| {
+        let seq = 7 + u64::try_from(i / 4).expect("chunk index fits u64");
+        snapshot_in(&mut arena, QUARTER, 0, seq)
+    }));
+    assert_eq!(arena.chunk_count(), MAX_CHUNKS);
+    assert!(arena.write(16, 99, |_| true).is_none());
+    assert_eq!(arena.wait_target(), Some(6));
+    // Once every read of the oldest chunk drops, it starts over and a wait
+    // has nothing left to free.
+    let rest = held.split_off(4);
+    drop(held);
+    assert_eq!(arena.wait_target(), None);
+    assert_eq!(snapshot_in(&mut arena, 16, 0, 99).offset, 0);
+    drop(rest);
+}
+
+#[test]
+fn a_wait_that_freed_nothing_is_not_repeated_for_the_same_chunk() {
+    let mut arena = UploadSnapshots::default();
+    // Chunk `k` holds four snapshots of frame `k + 1`, up to the cap.
+    let mut held: Vec<UploadSnapshot> = (0..MAX_CHUNKS * 4)
+        .map(|i| {
+            let seq = 1 + u64::try_from(i / 4).expect("chunk index fits u64");
+            snapshot_in(&mut arena, QUARTER, 0, seq)
+        })
+        .collect();
+    assert!(arena.write(16, 99, |_| true).is_none());
+    assert_eq!(arena.wait_target(), Some(1));
+    // The wait ran but a replay still reads the oldest chunk: no second wait.
+    arena.note_wait(1);
+    assert_eq!(arena.wait_target(), None);
+    // Its reads drop, it starts over for frame 99, and once it is full the
+    // arena names the next chunk's frame, which no wait has covered.
+    let rest = held.split_off(4);
+    drop(held);
+    let refill: Vec<UploadSnapshot> = (0..4)
+        .map(|_| snapshot_in(&mut arena, QUARTER, 0, 99))
+        .collect();
+    assert!(arena.write(16, 99, |_| true).is_none());
+    assert_eq!(arena.wait_target(), Some(2));
+    drop((rest, refill));
 }

@@ -5094,25 +5094,23 @@ fn upload_source(
         return UploadSource::staging(pages, src_pitch, slice_pitch);
     }
     let source = &pages.as_slice()[..pages.logical_len()];
-    let written = dev
-        .upload_snapshots_mut()
-        .write(layout.len as usize, |destination| {
-            mtld3d_core::texture_staging::copy_rows(
-                source,
-                layout.src_offset,
-                src_pitch as usize,
-                destination,
-                layout.pitch as usize,
-                layout.row_bytes as usize,
-                layout.rows as usize,
-            )
-        });
+    let mut written = write_snapshot(dev, source, src_pitch, &layout);
+    if written.is_none() {
+        match wait_for_snapshot_room(dev) {
+            SnapshotRoom::Waited => written = write_snapshot(dev, source, src_pitch, &layout),
+            SnapshotRoom::Recording => {
+                return UploadSource::staging(pages, src_pitch, slice_pitch);
+            }
+            SnapshotRoom::NoWait => {}
+        }
+    }
     let Some(snapshot) = written else {
         mtld3d_shared::log_once_info!(
             target: crate::LOG_TARGET,
             "texture upload snapshot: every arena chunk is still read and the arena is at its \
-             cap, or a new chunk could not be allocated → the upload reads the staging and the \
-             next partial lock of its level may rename it"
+             cap after a wait for the oldest chunk, or one already covered it, or a new chunk \
+             could not be allocated → the upload reads the staging and the next partial lock \
+             of its level may rename it"
         );
         dev.perf_mut().bump_texture_snapshot_full();
         return UploadSource::staging(pages, src_pitch, slice_pitch);
@@ -5123,6 +5121,80 @@ fn upload_source(
         src_pitch: layout.pitch,
         slice_pitch: layout.len,
         snapshot_offset: Some(snapshot.offset),
+    }
+}
+
+/// Copy the box `layout` describes out of `source` into the device's snapshot arena.
+///
+/// The snapshot is stamped with the submit sequence of the frame being
+/// recorded, the one whose upload reads it.
+fn write_snapshot(
+    dev: &mut DeviceInner,
+    source: &[u8],
+    src_pitch: u32,
+    layout: &mtld3d_core::texture_staging::SnapshotLayout,
+) -> Option<mtld3d_core::upload_snapshot::UploadSnapshot> {
+    let seq = dev.current_seq();
+    dev.upload_snapshots_mut()
+        .write(layout.len as usize, seq, |destination| {
+            mtld3d_core::texture_staging::copy_rows(
+                source,
+                layout.src_offset,
+                src_pitch as usize,
+                destination,
+                layout.pitch as usize,
+                layout.row_bytes as usize,
+                layout.rows as usize,
+            )
+        })
+}
+
+/// What a full snapshot arena's wait for its oldest chunk came to.
+enum SnapshotRoom {
+    /// The wait ran; the write may find room now.
+    Waited,
+    /// The frame being recorded reads the oldest chunk, which no wait can free.
+    Recording,
+    /// No wait applies, or the wait failed.
+    ///
+    /// The arena is not at its cap with its oldest chunk read, or an earlier
+    /// wait already covered that chunk's sequence.
+    NoWait,
+}
+
+/// Wait for a full snapshot arena's oldest chunk to lose its readers.
+///
+/// The arena is at its cap and its oldest chunk still read, so a write can
+/// only find room once the submission that recorded that chunk's newest
+/// snapshot has retired and the encoder has dropped the reads. One wait frees
+/// a whole chunk, where reading the staging instead costs a whole-level copy
+/// at each later partial lock of the level. A chunk the frame being recorded
+/// still reads cannot come free, since that frame has not been submitted:
+/// that is counted as `recording` and the upload reads the staging. The wait
+/// does not prove the chunk free (a replay after an aborted submit keeps its
+/// read), so the caller writes again and falls back as a full arena does,
+/// and the arena does not ask for a second wait on the same sequence.
+fn wait_for_snapshot_room(dev: &mut DeviceInner) -> SnapshotRoom {
+    let Some(seq) = dev.upload_snapshots_mut().wait_target() else {
+        return SnapshotRoom::NoWait;
+    };
+    if seq >= dev.current_seq() {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the arena is full and its oldest chunk is read by the frame \
+             being recorded, which no wait can retire → the upload reads the staging"
+        );
+        dev.perf_mut().bump_texture_snapshot_wait_recording();
+        return SnapshotRoom::Recording;
+    }
+    dev.upload_snapshots_mut().note_wait(seq);
+    dev.perf_mut().bump_texture_snapshot_wait();
+    let _wait =
+        mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().texture_snapshot_wait_cycles_ptr());
+    if dev.retire_uploads_through(seq).is_ok() {
+        SnapshotRoom::Waited
+    } else {
+        SnapshotRoom::NoWait
     }
 }
 

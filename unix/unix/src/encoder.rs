@@ -6860,6 +6860,25 @@ impl FrameEncoder {
         }
     }
 
+    /// Wait for the uploads through `target_seq` to retire, then release what read them.
+    ///
+    /// The wait covers the draw and the upload command buffers, since the
+    /// blit-source reads are gated on the first and the upload jobs on the
+    /// lower of the two. A target the GPU already retired waits for nothing.
+    /// An upload whose submit aborted keeps its job, and its read, for the
+    /// replay the next frame emits.
+    fn retire_uploads_through(&mut self, target_seq: u64) {
+        if self
+            .upload_gate()
+            .is_some_and(|(settled, _)| settled < target_seq)
+        {
+            self.wait_for_gpu_retire(target_seq);
+        }
+        self.reclaim_retired_blit_retention();
+        self.drain_retired_resource_retention();
+        self.release_acknowledged_uploads();
+    }
+
     /// Release the queued blit-source reads whose `submit_seq` the GPU has retired.
     ///
     /// A recovery job may still read these pages again after the emitted read
@@ -9179,6 +9198,29 @@ impl EncoderThread {
             .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
     }
 
+    /// Drive the encoder thread to retire the uploads through `target_seq` and drop their reads.
+    ///
+    /// For a full texture upload-snapshot arena whose oldest chunk the
+    /// frames up to `target_seq` read. Routed through the encoder like
+    /// [`Self::intake_visibility_for`], so channel order puts the frame
+    /// `target_seq` names ahead of the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission or acknowledgment disconnects.
+    pub fn retire_uploads_through(&self, target_seq: u64) -> std::io::Result<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        self.sender
+            .send(EncoderMessage::RetireUploadsThrough {
+                target_seq,
+                done: done_tx,
+            })
+            .map_err(|_| std::io::Error::other("encoder control admission failed"))?;
+        done_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
+    }
+
     pub fn shutdown(&mut self) {
         if self.handle.is_none() {
             return;
@@ -9241,6 +9283,16 @@ enum EncoderMessage {
     /// carrying END is in the unix-side `PENDING_CMDBUFS` registry by the
     /// time this handler runs.
     IntakeVisibilityFor {
+        target_seq: u64,
+        done: mpsc::SyncSender<()>,
+    },
+    /// Retire the uploads through `target_seq` and release the reads they hold.
+    ///
+    /// Waits for the draw and upload command buffers up to `target_seq` when
+    /// they have not retired, then releases the retired blit sources, the
+    /// retention entries and the acknowledged upload jobs, so the pages they
+    /// read stop counting readers on the PE side.
+    RetireUploadsThrough {
         target_seq: u64,
         done: mpsc::SyncSender<()>,
     },
@@ -9465,6 +9517,23 @@ fn encoder_thread_main(
                         }
                     }
                     enc.intake_visibility();
+                    let _ = done.send(());
+                }
+                Ok(EncoderMessage::RetireUploadsThrough { target_seq, done }) => {
+                    // The API thread hurried presentation ahead of this request,
+                    // and the request ends the hurry itself on every exit, as
+                    // the visibility intake does.
+                    if enc.failed_replay.is_some() {
+                        enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                        drop(done);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvRetUp", target_seq);
+                    // The buffers up to `target_seq` must be committed and
+                    // registered before the retirement wait can see them.
+                    enc.drain_submit_thread();
+                    enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                    enc.retire_uploads_through(target_seq);
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::Reset {
