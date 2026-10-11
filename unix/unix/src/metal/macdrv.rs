@@ -24,6 +24,7 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 pub mod attachment;
 mod client_surface;
+mod client_view_watch;
 mod cursor_overlay;
 mod delegate_forward;
 
@@ -55,6 +56,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
     let att = attachment::unregister(view_addr)?;
+    client_view_watch::unwatch(&att);
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
     // Another device still presenting into this window gets its surface
@@ -75,6 +77,41 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
         att.layer(),
     );
     Some(att)
+}
+
+/// Have Wine show and size the client surface of the newest device on a view's window.
+///
+/// The device whose metal view is `view_handle` asks at its `Present` after
+/// its client view was hidden or its window's client area changed
+/// (`reasons`). win32u's `client_surface_present` updates the surface's
+/// cocoa view to the window's client rect and makes it the one Wine shows,
+/// the two things winemac's `nextDrawable` override did on every present.
+/// The surface is the newest device's on the record's window, as at a
+/// teardown. Runs on the API thread, a Wine thread, which win32u's calls
+/// need; a view no record names asks for nothing, logged once.
+pub fn present_client_surface(
+    view_handle: MetalHandle<NSViewKind>,
+    reasons: mtld3d_shared::mtl::ClientSurfaceRequest,
+) {
+    let view_addr =
+        usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
+    let Some(att) = attachment::find(view_addr) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: a client surface request names view {view_addr:#x}, which has no \
+             attachment record → ignored",
+        );
+        return;
+    };
+    let Some(calls) = client_surface::SurfaceCalls::load() else {
+        return;
+    };
+    if let Some(surface) =
+        attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
+    {
+        calls.present_requested(surface, reasons);
+        calls.release(surface);
+    }
 }
 
 /// Tell macOS this process is doing continuous, latency-critical, user-interactive work.
@@ -114,7 +151,7 @@ pub fn declare_latency_critical_activity() {
     });
 }
 
-/// Begin tracking the record's window occlusion so presents can skip `nextDrawable`.
+/// Begin tracking the record's window occlusion and its client view's `hidden`.
 ///
 /// `submit_frame` skips the present while the window is fully
 /// covered/minimised. When a window is occluded the compositor stops
@@ -122,19 +159,24 @@ pub fn declare_latency_critical_activity() {
 /// `allowsNextDrawableTimeout` for nothing on screen and back-pressure the
 /// whole pipeline up to the guest's render loop. Records the window pointer
 /// on `att` and seeds its occlusion from the current state, then installs
-/// the (process-lifetime) observer once. Runs the `AppKit` work on the main
-/// thread: `NSView`/`NSWindow` access and the notification center are
-/// main-thread affairs, mirroring [`configure_metal_layer`]'s posture. The
-/// record is registered before this runs, so the observer can already find
-/// it.
-fn install_occlusion_tracking(att: &Arc<Attachment>) {
+/// the (process-lifetime) observer once. The client view the metal view sits
+/// in gets a watch of its own ([`client_view_watch::watch`]), which asks the
+/// device to have Wine show its surface again when Wine hides it. Runs the
+/// `AppKit` work on the main thread: `NSView`/`NSWindow` access and the
+/// notification center are main-thread affairs, mirroring
+/// [`configure_metal_layer`]'s posture. The record is registered before this
+/// runs, so the observers can already find it.
+fn install_window_tracking(att: &Arc<Attachment>) {
     use objc2_app_kit::NSWindowOcclusionState;
 
     let att = Arc::clone(att);
     run_on_main_thread_sync(move || {
-        let mtm =
-            MainThreadMarker::new().expect("install_occlusion_tracking runs on the main thread");
-        let window = attachment::retain_view(&att, mtm).and_then(|view| view.window());
+        let mtm = MainThreadMarker::new().expect("install_window_tracking runs on the main thread");
+        let view = attachment::retain_view(&att, mtm);
+        if let Some(view) = &view {
+            client_view_watch::watch(&att, view, mtm);
+        }
+        let window = view.and_then(|view| view.window());
         let Some(window) = window else {
             // No host window yet: assume visible so a present is never
             // wrongly suppressed; the observer corrects it on the first
@@ -645,6 +687,8 @@ pub struct LayerAttachRequest {
     pub backing_scale_sink_ptr: u64,
     /// Where a cursor re-apply request is written on the PE side, `0` = nowhere.
     pub cursor_kick_sink_ptr: u64,
+    /// Where a client surface present request is written on the PE side, `0` = nowhere.
+    pub client_surface_request_sink_ptr: u64,
     /// `cursor.software`, resolved here against the layer mode attach picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
@@ -999,6 +1043,7 @@ pub fn attach_metal_layer(
         color_space,
         backing_scale_sink_ptr,
         cursor_kick_sink_ptr,
+        client_surface_request_sink_ptr,
         software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
@@ -1044,10 +1089,11 @@ pub fn attach_metal_layer(
     let mut hint = None;
     let mut layer_class = client_surface::LayerClass::Plain;
     let mut surface = 0;
+    let can_present = surface_calls.is_some();
     run_on_main_thread_sync(|| {
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
-        layer_class = client_surface::bypass_present_hook(layer, mtm);
+        layer_class = client_surface::bypass_present_hook(layer, can_present, mtm);
         if !order_out_without_fade(view, mtm) {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -1115,6 +1161,7 @@ pub fn attach_metal_layer(
              record is dropped",
             view as usize,
         );
+        client_view_watch::unwatch(&stale);
         if let Some(calls) = &surface_calls {
             calls.release(stale.client_surface());
         }
@@ -1131,6 +1178,8 @@ pub fn attach_metal_layer(
             backing_scale_sink: usize::try_from(backing_scale_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
+                .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            client_surface_request_sink: usize::try_from(client_surface_request_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface: surface,
         },
@@ -1173,8 +1222,9 @@ pub fn attach_metal_layer(
         hint.panel_max_hz,
     );
     // Start occlusion tracking for this window so presents skip the
-    // `nextDrawable` timeout while it is fully covered/minimised.
-    install_occlusion_tracking(&att);
+    // `nextDrawable` timeout while it is fully covered/minimised, and watch
+    // the client view for Wine hiding it.
+    install_window_tracking(&att);
     // SAFETY: the view is the one `macdrv_view_create_metal_view` handed
     // out retained, either just now or for this window's previous device,
     // kept since. The PE side holds the handle until the matching retire.

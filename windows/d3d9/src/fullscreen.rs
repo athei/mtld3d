@@ -69,6 +69,10 @@ use mtld3d_core::{
     display_mode::{ModeRequest, ModeSetOutcome, RegistryRestore, mode_set_attempts},
     fullscreen_log::{LeaveReason, RectLabel, SessionMode, WindowPlacement},
     fullscreen_resize::REASSERTS_LOGGED_AT_INFO,
+    window_pos::{
+        SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW,
+    },
 };
 use rustc_hash::FxHashMap;
 
@@ -508,14 +512,6 @@ const WS_THICKFRAME: u32 = 0x0004_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
 const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
-
-const SWP_NOSIZE: u32 = 0x0001;
-const SWP_NOMOVE: u32 = 0x0002;
-const SWP_NOZORDER: u32 = 0x0004;
-const SWP_NOACTIVATE: u32 = 0x0010;
-const SWP_SHOWWINDOW: u32 = 0x0040;
-const SWP_HIDEWINDOW: u32 = 0x0080;
-const SWP_FRAMECHANGED: u32 = 0x0020;
 
 const MONITOR_DEFAULTTOPRIMARY: u32 = 0x0000_0001;
 

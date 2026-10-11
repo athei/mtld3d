@@ -12,7 +12,7 @@
 //! own.
 //!
 //! Liveness. A record is live exactly while it is in [`ATTACHMENTS`]. The
-//! `view` and `layer` addresses and the two PE-side sink addresses a record
+//! `view` and `layer` addresses and the three PE-side sink addresses a record
 //! holds are valid only while it is live: `DestroyCommandQueue` unregisters
 //! the record before it releases the view, and the PE side drops the box
 //! behind the sinks after that thunk returns. So every dereference of one of
@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::ColorSpacePolicy;
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -107,6 +107,8 @@ pub struct AttachLatches {
     pub backing_scale_sink: usize,
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
+    /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
+    pub client_surface_request_sink: usize,
     /// Wine's client surface the view sits in, `0` = none.
     ///
     /// The record owns one reference on it, taken at attach and given back
@@ -131,8 +133,16 @@ pub struct Attachment {
     backing_scale_sink: usize,
     /// See [`AttachLatches::cursor_kick_sink`].
     cursor_kick_sink: usize,
+    /// See [`AttachLatches::client_surface_request_sink`].
+    client_surface_request_sink: usize,
     /// See [`AttachLatches::client_surface`].
     client_surface: usize,
+    /// The main-thread watch on the hidden state of the view's client view, `0` = none.
+    ///
+    /// An address `client_view_watch` hands out and takes back, dereferenced
+    /// on the main thread alone; the record only carries it from the attach
+    /// that installs the watch to the teardown that removes it.
+    client_view_watch: AtomicUsize,
     /// When the record was registered, which orders the devices on one window.
     attached_at: Instant,
     flags: AttachFlags,
@@ -241,7 +251,9 @@ impl Attachment {
             hwnd: latches.hwnd,
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
+            client_surface_request_sink: latches.client_surface_request_sink,
             client_surface: latches.client_surface,
+            client_view_watch: AtomicUsize::new(0),
             attached_at: Instant::now(),
             flags: latches.flags,
             color_space: latches.color_space,
@@ -299,6 +311,16 @@ impl Attachment {
     #[must_use]
     pub const fn client_surface(&self) -> usize {
         self.client_surface
+    }
+
+    /// Hand the record the address of its client view watch, giving back any it held.
+    pub fn replace_client_view_watch(&self, watch: usize) -> usize {
+        self.client_view_watch.swap(watch, Ordering::AcqRel)
+    }
+
+    /// Take the client view watch address out of the record, `0` when it holds none.
+    pub fn take_client_view_watch(&self) -> usize {
+        self.client_view_watch.swap(0, Ordering::AcqRel)
     }
 
     /// `color.hdr.enable` as the attach carried it.
@@ -623,13 +645,50 @@ pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
 /// back. `None` when no live record on `hwnd` holds a surface.
 pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> Option<usize> {
     let map = lock();
-    let retained = map
-        .values()
-        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
-        .max_by_key(|att| att.attached_at)
-        .map(|newest| retain(newest.client_surface));
+    let retained = newest_with_surface_on(&map, hwnd).map(|newest| retain(newest.client_surface));
     drop(map);
     retained.filter(|&surface| surface != 0)
+}
+
+/// Ask the device that owns `view` to have Wine show its window's client surface again.
+///
+/// ORs `reason` into the record's PE-side request word, which the device
+/// takes at its next `Present` and answers with `PresentClientSurface`. Only
+/// the newest record on its window that holds a surface asks: Wine shows one
+/// client surface per window, the newest device's, so an older device's view
+/// is hidden on purpose and asking for it would change nothing. `false`, and
+/// nothing written, for a view no live record names, a record without a
+/// surface or a request word, or one a newer device on its window outranks.
+pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool {
+    let map = lock();
+    let Some(att) = map.get(&view) else {
+        return false;
+    };
+    if att.client_surface_request_sink == 0
+        || !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att))
+    {
+        return false;
+    }
+    // SAFETY: as in `publish_backing_scale`: the PE side backs this address
+    // with an `AtomicU32` in a box it keeps until after the teardown thunk
+    // that unregisters the record has returned, and the record is live under
+    // the registry lock.
+    let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU32) };
+    sink.fetch_or(reason.bits(), Ordering::Release);
+    // The write above is what the lock guards: the record's teardown
+    // unregisters it under the same lock before the PE side drops the word.
+    drop(map);
+    true
+}
+
+/// The newest live record on `hwnd` that holds a client surface; `map` is the locked registry.
+fn newest_with_surface_on(
+    map: &FxHashMap<usize, Arc<Attachment>>,
+    hwnd: u64,
+) -> Option<&Arc<Attachment>> {
+    map.values()
+        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
+        .max_by_key(|att| att.attached_at)
 }
 
 /// A snapshot of every live record, for a main-thread observer to walk.

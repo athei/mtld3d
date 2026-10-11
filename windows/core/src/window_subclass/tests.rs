@@ -98,6 +98,24 @@ fn an_unregistered_device_or_window_changes_nothing() {
 }
 
 #[test]
+fn every_device_on_a_window_is_listed_oldest_first() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    assert!(subclasses.devices_on(WINDOW).is_empty(), "no device yet");
+    subclasses.register(WINDOW, FIRST, || proc.hook());
+    subclasses.register(WINDOW, SECOND, || proc.hook());
+    assert_eq!(subclasses.devices_on(WINDOW), &[FIRST, SECOND]);
+    assert!(subclasses.devices_on(OTHER_WINDOW).is_empty());
+    subclasses.unregister(WINDOW, FIRST, |original| proc.restore(original));
+    assert_eq!(subclasses.devices_on(WINDOW), &[SECOND]);
+    subclasses.unregister(WINDOW, SECOND, |original| proc.restore(original));
+    assert!(
+        subclasses.devices_on(WINDOW).is_empty(),
+        "the window is gone"
+    );
+}
+
+#[test]
 fn a_device_moving_between_windows_leaves_the_one_it_came_from() {
     let mut first_window = WindowProc::new();
     let mut second_window = WindowProc::new();

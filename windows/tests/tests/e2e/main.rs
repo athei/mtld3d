@@ -28,6 +28,7 @@ mod bench_sprite_scratch;
 mod bench_streaming;
 mod bench_wow112;
 mod buffers;
+mod client_surface;
 mod clip_planes;
 mod d3d9ex;
 mod d3d9ex_reset;

@@ -33,7 +33,8 @@ pub use frame_signal::{FrameSignal, FrameWait, PACED_PRESENT_CAP};
 pub use gamma::set_gamma_ramp;
 pub use macdrv::{
     LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
-    detach_metal_layer, retire_metal_view, set_cursor_overlay, set_display_sync_enabled,
+    detach_metal_layer, present_client_surface, retire_metal_view, set_cursor_overlay,
+    set_display_sync_enabled,
 };
 pub use mtld3d_shared::perf::init_tracking_enabled;
 pub use pipeline::{create_render_pipeline, destroy_render_pipeline};

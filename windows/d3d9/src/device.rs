@@ -2150,6 +2150,10 @@ impl DeviceInner {
         self.cursor_mut().follow_published_scale(cursor_scale);
         self.cursor_mut().sync_native_visibility();
         self.cursor_mut().note_present();
+        // What winemac's `nextDrawable` override did on every present, done
+        // only on a frame after the client view was hidden or the window's
+        // client area moved: Wine shows the surface again, sized to it.
+        self.cursor().present_client_surface_if_asked();
         // Input polling can deliver WM_SIZE and recreate the implicit textures.
         // Build the continuation only after those callbacks have returned.
         if self.needs_reset() {

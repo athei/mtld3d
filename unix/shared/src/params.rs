@@ -1,9 +1,10 @@
 use super::{
     Thunk, Thunks,
     mtl::{
-        BufferKind, ColorSpacePolicy, CursorOverlayFlags, DestroyKind, DeviceCapsFlags, LoadAction,
-        PixelFormat, PresentDebugFlags, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode,
-        StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
+        BufferKind, ClientSurfaceRequest, ColorSpacePolicy, CursorOverlayFlags, DestroyKind,
+        DeviceCapsFlags, LoadAction, PixelFormat, PresentDebugFlags, PresentWaitPolicy,
+        SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
+        VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -36,8 +37,11 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
     assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 96);
+    assert!(core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr) == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
+    assert!(core::mem::size_of::<PresentClientSurfaceParams>() == 16);
+    assert!(core::mem::offset_of!(PresentClientSurfaceParams, reasons) == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
@@ -293,10 +297,39 @@ pub struct AttachMetalLayerParams {
     /// and the pointer's return concerns each of them. Same backing contract
     /// as `backing_scale_ptr`. `0` disables it.
     pub cursor_kick_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
+    /// Address of a PE-side `AtomicU32` the unix side ORs a `ClientSurfaceRequest` into.
+    ///
+    /// Set from the main thread when the client view the device's metal view
+    /// sits in is hidden, which a Wine that hides it on every window surface
+    /// flush does. The PE side takes the word back to zero at the next
+    /// `Present` and answers a non-zero one with `PresentClientSurface`, since
+    /// win32u's surface calls need a Wine thread. Same backing contract as
+    /// `backing_scale_ptr`. `0` disables it.
+    pub client_surface_request_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
 }
 
 impl Thunk for AttachMetalLayerParams {
     const CODE: u32 = Thunks::AttachMetalLayer as u32;
+}
+
+/// Have Wine show and size the client surface of the newest device on a view's window.
+///
+/// Sent from the API thread at `Present` when the device's request word
+/// (`AttachMetalLayerParams::client_surface_request_ptr`) is set, and only
+/// then. The unix side calls win32u's `client_surface_present` for the newest
+/// attachment record on the window `view_handle`'s record names, which
+/// updates the surface's frame from the window's client rect and makes it the
+/// surface Wine shows. A view no record names is ignored.
+#[repr(C, align(8))]
+pub struct PresentClientSurfaceParams {
+    pub view_handle: MetalHandle<NSViewKind>, // in
+    /// Why the device asks, for the log.
+    pub reasons: ClientSurfaceRequest, // in
+    pub pad0: u32,
+}
+
+impl Thunk for PresentClientSurfaceParams {
+    const CODE: u32 = Thunks::PresentClientSurface as u32;
 }
 
 /// Retire one metal view: its attachment record first, then the view itself.
