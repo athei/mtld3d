@@ -100,7 +100,11 @@ pub const VERSION_POOL_WORKING_SET_DIVISOR: u64 = 8;
 /// Above three quarters of it the process is close to where Metal starts to
 /// page or fail allocations, and spares are the cheapest memory to give
 /// back: nothing names them, and losing one costs the next rename an
-/// allocation and a whole copy, what it cost before the pool.
+/// allocation and a whole copy, what it cost before the pool. Parking
+/// resumes only below the line less the cap, so a process hovering at the
+/// line does not park and destroy in turn. `currentAllocatedSize` may also
+/// count the no-copy buffers that wrap upload staging, so on a discrete GPU
+/// the line can trip early; that costs speed only, never texels.
 pub const VERSION_POOL_PRESSURE_QUARTERS: u64 = 3;
 
 /// How much GPU memory the pool may use, from the device's recommended working set.
@@ -109,7 +113,8 @@ pub const VERSION_POOL_PRESSURE_QUARTERS: u64 = 3;
 /// [`VERSION_POOL_CEILING_BYTES`] and the working set divided by
 /// [`VERSION_POOL_WORKING_SET_DIVISOR`]; past the pressure line,
 /// [`VERSION_POOL_PRESSURE_QUARTERS`] of the working set, the pool parks
-/// nothing and gives its spares back. A working set of 0, which Metal does
+/// nothing and gives its spares back until the process is below the line
+/// less the cap. A working set of 0, which Metal does
 /// not report for a real device, leaves the ceiling as the cap and no
 /// pressure line.
 pub struct VersionBudget {
@@ -150,6 +155,12 @@ impl VersionBudget {
     #[must_use]
     pub const fn pressure_above(&self) -> u64 {
         self.pressure_above
+    }
+
+    /// Process-wide allocated bytes the process has to fall below before parking resumes.
+    #[must_use]
+    pub const fn resume_below(&self) -> u64 {
+        self.pressure_above.saturating_sub(self.spare_cap)
     }
 }
 
@@ -487,8 +498,10 @@ pub struct TextureVersions<V> {
     idle: BTreeSet<(u64, u64, u64)>,
     /// What the pool may hold; see [`VersionBudget`].
     budget: VersionBudget,
-    /// The last [`Self::note_allocated`] found the process past the pressure line.
+    /// Parking is off: past the pressure line and not yet back below the resume mark.
     pressed: bool,
+    /// Bytes the next [`Self::take_doomed`] hands out at least, the excess over the pressure line.
+    relieve_bytes: u64,
 }
 
 impl<V> TextureVersions<V> {
@@ -508,6 +521,7 @@ impl<V> TextureVersions<V> {
             idle: BTreeSet::new(),
             budget,
             pressed: false,
+            relieve_bytes: 0,
         }
     }
 
@@ -800,12 +814,20 @@ impl<V> TextureVersions<V> {
     /// Note the process's allocated GPU bytes, once per drain before parking.
     ///
     /// Past the budget's pressure line the pool parks nothing until a later
-    /// drain finds it below again, and queues spares to be destroyed, oldest
-    /// first, until what waits in the destroy queue covers the excess: the
-    /// queue's versions are still allocated, so they count toward it.
+    /// drain finds the process below [`VersionBudget::resume_below`], and
+    /// queues spares to be destroyed, oldest first, until what waits in the
+    /// destroy queue covers the excess: the queue's versions are still
+    /// allocated, so they count toward it. The next [`Self::take_doomed`]
+    /// hands out at least that excess at once, so the pressure is relieved
+    /// in one drain rather than spread like a burst.
     pub fn note_allocated(&mut self, allocated: u64) {
-        self.pressed = allocated > self.budget.pressure_above;
-        if !self.pressed {
+        self.relieve_bytes = allocated.saturating_sub(self.budget.pressure_above);
+        self.pressed = if self.pressed {
+            allocated >= self.budget.resume_below()
+        } else {
+            allocated > self.budget.pressure_above
+        };
+        if self.relieve_bytes == 0 {
             return;
         }
         mtld3d_shared::log_once_info!(
@@ -815,7 +837,7 @@ impl<V> TextureVersions<V> {
             allocated >> 20,
             self.budget.pressure_above >> 20,
         );
-        let excess = allocated - self.budget.pressure_above;
+        let excess = self.relieve_bytes;
         if self.doomed_bytes >= excess {
             return;
         }
@@ -868,7 +890,9 @@ impl<V> TextureVersions<V> {
     /// next drain. A steady stream is handed out at the rate it arrives and
     /// whatever queued while the average caught up shrinks every drain, so
     /// no queue persists; a burst raises the average for a few drains and
-    /// is spread over them. Every queued version
+    /// is spread over them. After a [`Self::note_allocated`] past the
+    /// pressure line the batch also covers at least the excess bytes. Every
+    /// queued version
     /// was popped after its submission settled and has had its handle-keyed
     /// records forgotten, and no rename takes it again, so no command of a
     /// submission in flight or being built can name it: destroying it a
@@ -882,9 +906,21 @@ impl<V> TextureVersions<V> {
             .iter()
             .sum::<usize>()
             .div_ceil(DESTROY_SPREAD_DRAINS);
-        let batch = MIN_DESTROYS_PER_DRAIN
+        let mut batch = MIN_DESTROYS_PER_DRAIN
             .max(rate + self.doomed.len().div_ceil(DESTROY_SPREAD_DRAINS))
             .min(self.doomed.len());
+        // Under pressure, at least the excess goes in this one batch.
+        let mut covered: u64 = self
+            .doomed
+            .iter()
+            .take(batch)
+            .map(|&(_, bytes)| bytes)
+            .sum();
+        while covered < self.relieve_bytes && batch < self.doomed.len() {
+            covered += self.doomed[batch].1;
+            batch += 1;
+        }
+        self.relieve_bytes = 0;
         let mut taken = Vec::with_capacity(batch);
         for (views, bytes) in self.doomed.drain(..batch) {
             self.doomed_bytes -= bytes;

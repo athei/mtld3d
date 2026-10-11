@@ -191,7 +191,7 @@ fn a_shape_change_discards_the_spares_of_the_old_shape() {
     assert_eq!(versions.parked_bytes(), 2 * SPRITE_BYTES);
 }
 
-/// 4096x4096 BGRA8: 64 MiB a version, so sixteen fill the 1 GiB backstop.
+/// 4096x4096 BGRA8: 64 MiB a version, so sixteen fill the 1 GiB cap.
 fn big() -> VersionShape {
     VersionShape::of(&desc(4096, 4096, 1, PixelFormat::Bgra8Unorm))
 }
@@ -201,7 +201,7 @@ const LABELS: [&str; 17] = [
 ];
 
 #[test]
-fn the_backstop_destroys_what_would_take_the_pool_past_it() {
+fn the_cap_destroys_what_would_take_the_pool_past_it() {
     assert_eq!(big().bytes() * 16, VERSION_POOL_CEILING_BYTES);
     let mut versions = TextureVersions::new(budget());
     assert!(versions.take_spare(id(1), big(), false, 0).is_none());
@@ -219,7 +219,7 @@ fn the_backstop_destroys_what_would_take_the_pool_past_it() {
 }
 
 #[test]
-fn versions_waiting_to_be_destroyed_do_not_count_toward_the_backstop() {
+fn versions_waiting_to_be_destroyed_do_not_count_toward_the_cap() {
     let mut versions = TextureVersions::new(budget());
     assert!(versions.take_spare(id(1), big(), false, 0).is_none());
     for (seq, label) in (1..).zip(LABELS[..16].iter().copied()) {
@@ -249,8 +249,8 @@ fn drain(versions: &mut TextureVersions<&'static str>, now: u64) -> usize {
 }
 
 #[test]
-fn sustained_inflow_past_the_backstop_does_not_turn_the_pool_off() {
-    // 2048 sprites fill the backstop; 600 versions retire per submission,
+fn sustained_inflow_past_the_cap_does_not_turn_the_pool_off() {
+    // 2048 sprites fill the cap; 600 versions retire per submission,
     // more than it holds over the age bound, as after a long GPU stall.
     assert_eq!(SPRITE_BYTES * 2048, VERSION_POOL_CEILING_BYTES);
     let mut versions = TextureVersions::new(budget());
@@ -869,8 +869,8 @@ fn under_pressure_nothing_parks_and_spares_go_back_oldest_first() {
     versions.retire(id(1), "1 at 5", 5);
     assert_eq!(reclaim(&mut versions, 5), vec!["1 at 5"]);
     assert_eq!(versions.parked_bytes(), 2 * SPRITE_BYTES);
-    // Back under it, parking resumes and the newest spares are still there.
-    versions.note_allocated(line - 1);
+    // Below the resume mark, parking resumes and the newest spares are still there.
+    versions.note_allocated(budget().resume_below() - 1);
     versions.retire(id(1), "1 at 6", 6);
     assert!(reclaim(&mut versions, 6).is_empty());
     let spare = versions.take_spare(id(1), sprite(), false, 7);
@@ -896,4 +896,45 @@ fn queued_destroys_count_toward_the_excess() {
     versions.note_allocated(line + 2 * SPRITE_BYTES);
     assert_eq!(versions.parked_bytes(), 0);
     assert_eq!(versions.take_doomed(), vec!["released", "kept"]);
+}
+
+#[test]
+fn a_process_hovering_at_the_pressure_line_does_not_park_and_destroy_in_turn() {
+    let line = budget().pressure_above();
+    assert_eq!(budget().resume_below(), line - VERSION_POOL_CEILING_BYTES);
+    let mut versions = TextureVersions::new(budget());
+    assert!(versions.take_spare(id(1), sprite(), false, 0).is_none());
+    versions.note_allocated(line + 1);
+    // Just under and just over the line in turn: nothing parks, so there is
+    // no spare for the next crossing to destroy.
+    for seq in 1..=8 {
+        let allocated = if seq % 2 == 0 { line + 1 } else { line - 1 };
+        versions.note_allocated(allocated);
+        versions.retire(id(1), "v", seq);
+        assert_eq!(reclaim(&mut versions, seq), vec!["v"], "at {seq}");
+        assert_eq!(versions.parked_bytes(), 0, "at {seq}");
+    }
+    // Below the resume mark parking comes back.
+    versions.note_allocated(budget().resume_below() - 1);
+    versions.retire(id(1), "parked", 9);
+    assert!(reclaim(&mut versions, 9).is_empty());
+    assert_eq!(versions.parked_bytes(), SPRITE_BYTES);
+}
+
+#[test]
+fn the_excess_over_the_pressure_line_is_handed_out_in_one_batch() {
+    let line = budget().pressure_above();
+    let mut versions = TextureVersions::new(budget());
+    assert!(versions.take_spare(id(1), sprite(), false, 0).is_none());
+    for _ in 0..200 {
+        versions.retire(id(1), "spare", 1);
+    }
+    assert!(reclaim(&mut versions, 1).is_empty());
+    assert_eq!(versions.parked_bytes(), 200 * SPRITE_BYTES);
+    // 150 sprites over: a burst of that size would go over several drains,
+    // but the excess goes at once.
+    versions.note_allocated(line + 150 * SPRITE_BYTES);
+    assert_eq!(versions.take_doomed().len(), 150);
+    assert_eq!(versions.pending_destroy_bytes(), 0);
+    assert_eq!(versions.parked_bytes(), 50 * SPRITE_BYTES);
 }

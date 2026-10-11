@@ -6833,7 +6833,7 @@ impl FrameEncoder {
         }
         self.texture_versions.trim(self.current_submit_seq);
         // A bounded batch: a burst of versions to destroy (a drain that
-        // reclaims several frames of renames past the backstop, a texture
+        // reclaims several frames of renames past the cap, a texture
         // released with many spares) spreads over the next drains instead
         // of stalling this one. Every queued version is already out of every
         // command, so a later destroy is as safe as this one.
