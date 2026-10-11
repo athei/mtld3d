@@ -155,6 +155,33 @@ fn releasing_the_paced_presents_wakes_the_waiter() {
     drop(mark);
 }
 
+/// Releasing through a sequence resolves the paced presents at or below it and wakes the waiter.
+///
+/// What a present dropped because its window is covered does: the presents
+/// behind it stay owed until the presenter holds each to the window's pace.
+#[test]
+fn releasing_through_a_present_keeps_the_later_ones_owed() {
+    let draw = shared_counter();
+    let floor = AtomicU64::new(0);
+    let signal = attached(&floor);
+    let early = signal.note_submission(3, Some(PACING)).expect("a mark");
+    let dropped = signal.note_submission(5, Some(PACING)).expect("a mark");
+    let behind = signal.note_submission(7, Some(PACING)).expect("a mark");
+    draw.store(7, Ordering::Release);
+    let waiter = spawn_waiter(&signal, &draw, 5);
+    signal.release_paced_through(5);
+    assert_eq!(waiter.recv_timeout(WOKEN), Ok(FrameWait::Finished));
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        6,
+        "the present behind the release still holds the floor"
+    );
+    drop(behind);
+    assert_eq!(floor.load(Ordering::Acquire), 7);
+    drop(early);
+    drop(dropped);
+}
+
 /// A failure that ends the encoder wakes the waiter of a frame that never committed.
 #[test]
 fn an_ended_encoder_wakes_the_waiter() {

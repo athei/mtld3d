@@ -4,10 +4,12 @@
 //! unfinished: at the end of `Present(k)` the API thread waits until frame
 //! `k - L` has finished. A frame finishes when its draw command buffer has
 //! ended on the GPU, which the device's draw counter says, and, when its
-//! present is paced (a visible window whose present carries a minimum
-//! duration: vsync, a divided interval or the frame cap), once that present
-//! has reached the screen or been discarded. A hidden or occluded window and
-//! an `IMMEDIATE` present count GPU completion alone.
+//! present is paced (it carries a minimum duration: vsync, a divided
+//! interval or the frame cap), once that present has reached the screen or
+//! been discarded. Into a window the compositor does not show, the presenter
+//! holds each paced present to that duration on its own clock before it
+//! skips the drawable, or acquires one under `debug.presentOccluded`. An
+//! `IMMEDIATE` present without a frame cap counts GPU completion alone.
 //!
 //! The paced half is the device's [`FrameSignal`]: the submit thread notes
 //! each submission before its draw buffer commits, the presenter resolves a
@@ -162,14 +164,26 @@ impl FrameSignal {
     ///
     /// A `Reset` calls it once it has drained presentation, since the layer
     /// the presents were waiting on may be replaced. The presenter calls it
-    /// when it drops a present because the window is covered or no drawable
-    /// came: the compositor has stopped showing this layer's drawables, so
-    /// the ones already committed may not be shown for as long as that
-    /// lasts, and a `Present` waiting on one of them has to go on.
+    /// when it drops a present because no drawable came: the compositor has
+    /// stopped handing this layer drawables, so the ones already committed
+    /// may not be shown for as long as that lasts, and a `Present` waiting on
+    /// one of them has to go on.
     pub fn release_paced(&self) {
         let mut state = self.lock();
         state.paced.clear();
         self.publish(&state);
+        drop(state);
+    }
+
+    /// Resolve the paced presents at or below `seq`, and keep the ones after it owed.
+    ///
+    /// The presenter calls it when it drops the present of `seq` because the
+    /// window is covered: the drawables committed before it may not be shown
+    /// while that lasts, and the presents behind it are still to be held to
+    /// the window's pace, one by one, when the presenter reaches them.
+    pub fn release_paced_through(&self, seq: u64) {
+        let mut state = self.lock();
+        self.release_through(&mut state, seq);
         drop(state);
     }
 
@@ -223,8 +237,7 @@ impl FrameSignal {
                     "frame latency: a paced present was not shown {cap:?} after its frame's GPU \
                      work finished; Present goes on without it",
                 );
-                state.paced.retain(|&paced| paced > target);
-                self.publish(&state);
+                self.release_through(&mut state, target);
                 break FrameWait::Finished;
             }
             state = self
@@ -246,6 +259,12 @@ impl FrameSignal {
         state.paced.remove(index);
         self.publish(&state);
         drop(state);
+    }
+
+    /// Resolve the paced presents at or below `seq` and publish, under the state's lock.
+    fn release_through(&self, state: &mut SignalState, seq: u64) {
+        state.paced.retain(|&paced| paced > seq);
+        self.publish(state);
     }
 
     /// Publish the floor and wake the waiters, under the state's lock.

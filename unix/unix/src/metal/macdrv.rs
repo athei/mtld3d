@@ -1156,6 +1156,13 @@ pub fn attach_metal_layer(
         },
     );
     att.set_min_present_duration(min_present_duration);
+    // One line per attach: the pace a present into this window is held to,
+    // by the display when the window is shown and by the presenter when not.
+    info!(
+        target: LOG_TARGET,
+        "present: minimum present duration {min_present_duration:.5}s (panel {:.0} Hz)",
+        hint.panel_max_hz,
+    );
     // Start occlusion tracking for this window so presents skip the
     // `nextDrawable` timeout while it is fully covered/minimised.
     install_occlusion_tracking(&att);

@@ -35,7 +35,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::{
     sync::{Arc, LazyLock, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
@@ -182,6 +182,14 @@ pub struct Attachment {
     /// reconciliation, which re-derives it for the panel the window is on
     /// now whenever the display or the pacing a Reset latched moved.
     min_present_duration_bits: AtomicU64,
+    /// When the presenter last released a paced present the compositor did not show.
+    ///
+    /// Nanoseconds after `attached_at`, `0` = none yet. The display paces a
+    /// shown window per layer, so the presenter's own pace for an unshown one
+    /// lives on the record too, and two swap chains presenting into two
+    /// hidden windows keep a pace each. Written only by the presenter of the
+    /// device that owns the view.
+    unshown_release_ns: AtomicU64,
     /// Present pacing latched from the PE side, encoded by `pack_pacing`.
     ///
     /// Attach and the D3D9 Reset path both write it, and the display-follow
@@ -227,6 +235,7 @@ impl Attachment {
             headroom_refresh_pending: AtomicBool::new(false),
             presents_since_headroom_refresh: AtomicU64::new(HEADROOM_REFRESH_PRESENTS),
             min_present_duration_bits: AtomicU64::new(0),
+            unshown_release_ns: AtomicU64::new(0),
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
@@ -404,6 +413,24 @@ impl Attachment {
             .store(seconds.to_bits(), Ordering::Relaxed);
     }
 
+    /// When the next paced present into this window may go while the compositor shows none of it.
+    ///
+    /// What [`next_unshown_release`] answers for the previous release and the
+    /// time the frame was `ready`; the answer then replaces the previous one.
+    pub fn unshown_release_at(&self, ready: Instant, duration: Duration) -> Instant {
+        let last = match self.unshown_release_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => self.attached_at.checked_add(Duration::from_nanos(ns)),
+        };
+        let at = next_unshown_release(last, ready, duration);
+        let ns = at.saturating_duration_since(self.attached_at).as_nanos();
+        self.unshown_release_ns.store(
+            u64::try_from(ns).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
+        at
+    }
+
     /// The pacing word `pack_pacing` produced.
     #[must_use]
     pub fn pacing_bits(&self) -> u64 {
@@ -443,6 +470,27 @@ fn lock() -> std::sync::MutexGuard<'static, FxHashMap<usize, Arc<Attachment>>> {
 fn is_live(map: &FxHashMap<usize, Arc<Attachment>>, att: &Arc<Attachment>) -> bool {
     map.get(&att.view)
         .is_some_and(|live| Arc::ptr_eq(live, att))
+}
+
+/// When a paced present into a window the compositor does not show may go.
+///
+/// `presentDrawable:afterMinimumDuration:` counts a present's minimum
+/// duration from the time the previous drawable was displayed, so in a window
+/// that displays nothing the duration has no reference, and the presenter
+/// keeps the pace itself: one `duration` after the previous release `last`,
+/// or when the frame was `ready` if that is later.
+///
+/// Counting from readiness rather than from when the presenter got to the
+/// frame matters when its timed wait wakes late. A process macOS runs in the
+/// background (a minimised game; a test launched from a service) has its
+/// timers coalesced, and a hold can end a hundred milliseconds past its
+/// deadline. The frames that became ready meanwhile then go at once, on the
+/// schedule they missed, so the pace holds on average. A game slower than the
+/// pace has its frames ready after the deadline and goes at its own rate,
+/// with no burst.
+pub fn next_unshown_release(last: Option<Instant>, ready: Instant, duration: Duration) -> Instant {
+    last.and_then(|last| last.checked_add(duration))
+        .map_or(ready, |at| at.max(ready))
 }
 
 /// Create the record for a freshly attached view and make it live.

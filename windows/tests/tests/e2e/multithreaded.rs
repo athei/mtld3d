@@ -14,9 +14,9 @@ use mtld3d_tests::{Harness, HarnessConfig, Vertex, assert_pixel_eq, spawn_scoped
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DCULL_CCW, D3DCULL_CW,
     D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
-    D3DISSUE_END, D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
-    D3DQUERYTYPE_OCCLUSION, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DSBT_ALL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_WRITEONLY, E_NOINTERFACE, Guid,
+    D3DISSUE_END, D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DSBT_ALL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, E_NOINTERFACE, Guid,
 };
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
@@ -50,9 +50,14 @@ const fn solid_triangle(color: u32) -> [Vertex; 3] {
     ]
 }
 
+/// A multithreaded device presenting `IMMEDIATE`.
+///
+/// A hidden window is held to the pace a vsync request sets, and these
+/// races want their frames as dense as the threads can make them.
 fn multithreaded_harness() -> Harness {
     Harness::create(&HarnessConfig {
         behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     })
 }

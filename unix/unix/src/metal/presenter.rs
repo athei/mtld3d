@@ -37,7 +37,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use block2::RcBlock;
@@ -95,6 +95,12 @@ bitflags::bitflags! {
         const HURRY = 1 << 0;
         /// The queue is going away: drop every packet, wake every waiter.
         const STOP = 1 << 1;
+        /// An idle wait is draining the queue: a held present goes at once.
+        ///
+        /// Set by [`wait_for_present_idle`] for the length of its wait, so a
+        /// `Reset`, a teardown or a capture behind a backlog of unshown
+        /// presents does not sit out their pace; nothing of them is shown.
+        const DRAIN = 1 << 2;
     }
 }
 
@@ -170,6 +176,13 @@ pub struct PresentPacket {
     view: usize,
     /// The frame-latency mark of a paced present, resolved when it is presented or dropped.
     mark: Option<PacedMark>,
+    /// When the frame was ready to present: the submit thread built the packet.
+    ///
+    /// Before the submit waits for the previous present to commit, so a
+    /// hold that ends late does not move it, and the frames that were ready
+    /// meanwhile keep the schedule an unshown window's pace set
+    /// ([`attachment::next_unshown_release`]).
+    ready_at: Instant,
 }
 
 impl PresentPacket {
@@ -194,6 +207,7 @@ impl PresentPacket {
             slot: None,
             view,
             mark: None,
+            ready_at: Instant::now(),
         }
     }
 
@@ -242,6 +256,21 @@ impl Drop for Slot {
     fn drop(&mut self) {
         texture::destroy_texture(self.texture.raw());
     }
+}
+
+/// How long a present into `attachment`'s window is paced for, `None` if it is not.
+///
+/// A present is paced when the attachment carries a minimum present duration:
+/// vsync, a divided interval or the frame cap. Into a window the compositor
+/// shows, the display enforces the duration and the present finishes its
+/// frame once it reached the screen. Into a hidden, minimised or fully covered
+/// window, or any window behind a locked screen, nothing is displayed and so
+/// nothing measures the duration: the presenter releases one such present per
+/// duration on its own clock ([`attachment::next_unshown_release`]) and the
+/// present finishes its frame then. Any other frame finishes with its GPU work.
+pub fn pacing(attachment: Option<&attachment::Attachment>) -> Option<Duration> {
+    let duration = attachment?.min_present_duration_sec();
+    (duration > 0.0).then(|| Duration::from_secs_f64(duration))
 }
 
 /// What a submit does about the pending present that reads the back buffer.
@@ -321,20 +350,6 @@ impl PresentState {
     /// The device's frame-latency signal.
     pub const fn frame_signal(&self) -> &Arc<FrameSignal> {
         &self.frame_signal
-    }
-
-    /// How long a present into `attachment`'s window waits for the display, `None` if it does not.
-    ///
-    /// It waits when the presenter will acquire a drawable for it (the window
-    /// is not occluded, or `debug.presentOccluded` presents anyway) and the
-    /// attachment carries a minimum present duration: vsync, a divided
-    /// interval or the frame cap. Such a present finishes its frame only once
-    /// it reached the screen; any other frame finishes with its GPU work.
-    pub fn pacing(&self, attachment: Option<&attachment::Attachment>) -> Option<Duration> {
-        let attachment = attachment?;
-        let duration = attachment.min_present_duration_sec();
-        ((!attachment.window_occluded() || self.present_occluded) && duration > 0.0)
-            .then(|| Duration::from_secs_f64(duration))
     }
 
     /// Dump the recent crumb ring on each edge of this device's stall condition.
@@ -531,14 +546,19 @@ pub fn set_wait_policy(state: &PresentState, policy: PresentWaitPolicy) {
 pub fn wait_for_present_idle(record: &DeviceRecord) {
     let state = record.present();
     let presented = {
-        let inner = state.lock();
-        let inner = state
+        let mut inner = state.lock();
+        inner.flags.insert(PresenterFlags::DRAIN);
+        state.presenter_cv.notify_all();
+        inner = state
             .submit_cv
             .wait_while(inner, |inner| {
                 !inner.pending.is_empty() && !inner.flags.contains(PresenterFlags::STOP)
             })
             .unwrap_or_else(PoisonError::into_inner);
-        inner.presented_seq
+        inner.flags.remove(PresenterFlags::DRAIN);
+        let presented = inner.presented_seq;
+        drop(inner);
+        presented
     };
     command::wait_for_gpu_retire(
         record.pending(),
@@ -765,15 +785,54 @@ fn drop_front(state: &PresentState, seq: u64) {
     state.submit_cv.notify_all();
 }
 
-/// Drop the front packet because the compositor is not showing this layer, and release the rest.
+/// Drop the front packet because no drawable came, and release the rest.
 ///
-/// A covered window or a drawable that did not come means the drawables
-/// already committed may not be shown either until that ends, so every
-/// paced present still owed is resolved with this one: a `Present` waiting
-/// on one of them goes on, as the frames do.
+/// A drawable that did not come means the drawables already committed may
+/// not be shown either until that ends, so every paced present still owed is
+/// resolved with this one: a `Present` waiting on one of them goes on, as the
+/// frames do.
 fn drop_unshown(state: &PresentState, seq: u64) {
     drop_front(state, seq);
     state.frame_signal.release_paced();
+}
+
+/// Drop the front packet because its window is occluded, and release the presents before it.
+///
+/// The drawables committed while the window was shown may not be shown
+/// until it is again, so the paced presents at or below `seq` are resolved.
+/// The ones behind it stay owed: each is held to its window's pace when the
+/// presenter reaches it, which is what keeps the frame-latency bound pacing
+/// the game.
+fn drop_occluded(state: &PresentState, seq: u64) {
+    drop_front(state, seq);
+    state.frame_signal.release_paced_through(seq);
+}
+
+/// Park the presenter until `at`; `false` when the queue stopped meanwhile.
+///
+/// Waits on the presenter's condition variable, which a stop and an idle
+/// wait notify: a stop ends the hold, and an idle wait releases the present
+/// at once, so neither sits out a slow frame cap. A push wakes it too, and
+/// the wait goes on.
+fn hold_until(state: &PresentState, at: Instant) -> bool {
+    let mut inner = state.lock();
+    loop {
+        if inner.flags.contains(PresenterFlags::STOP) {
+            return false;
+        }
+        if inner.flags.contains(PresenterFlags::DRAIN) {
+            return true;
+        }
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        inner = state
+            .presenter_cv
+            .wait_timeout(inner, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
 }
 
 /// The presenter thread's body.
@@ -790,7 +849,7 @@ fn presenter_main(record: &Arc<DeviceRecord>, queue: MetalHandle<MTLCommandQueue
 /// `false` once the state is stopped and every packet dropped.
 fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLCommandQueue>) -> bool {
     let state = record.present();
-    let (seq, layer, view, gate) = {
+    let (seq, layer, view, gate, ready_at) = {
         let inner = state.lock();
         let mut inner = state
             .presenter_cv
@@ -813,7 +872,13 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             return false;
         }
         let front = inner.pending.front().expect("the wait ended on a packet");
-        (front.seq, front.layer, front.view, inner.gate.clone())
+        (
+            front.seq,
+            front.layer,
+            front.view,
+            inner.gate.clone(),
+            front.ready_at,
+        )
     };
     if let Some(gate) = gate {
         while gate.exists() {
@@ -831,6 +896,15 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
              occluded, headroom 1.0, unthrottled, stretch route",
         );
     }
+    // Nothing of an occluded window is displayed, so nothing enforces its
+    // present's minimum duration: the presenter holds the present to it.
+    if let Some(att) = attachment.as_deref().filter(|att| att.window_occluded())
+        && let Some(duration) = pacing(Some(att))
+        && !hold_until(state, att.unshown_release_at(ready_at, duration))
+    {
+        return true;
+    }
+    // Read again after the hold: a window shown meanwhile takes this present.
     if attachment.as_ref().is_some_and(|att| att.window_occluded()) && !state.present_occluded {
         // Window fully occluded: the compositor is not recycling drawables,
         // so `nextDrawable` would block its full timeout for nothing that
@@ -838,7 +912,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         // is simply not shown. `debug.presentOccluded` presents anyway, so
         // the test suite, whose windows stay hidden, runs this path.
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
-        drop_unshown(state, seq);
+        drop_occluded(state, seq);
         return true;
     }
     let Some(layer) = IntoRetainedLayer::into_retained(layer) else {

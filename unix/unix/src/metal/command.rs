@@ -750,7 +750,7 @@ fn encode_frame(
     // noted; a present that will wait for the display carries the mark that
     // holds the frame unfinished until it is shown.
     let pacing = packet.as_ref().and_then(|_| {
-        record.present().pacing(
+        super::presenter::pacing(
             attachment::find(
                 usize::try_from(params.present_view.raw())
                     .expect("a 64-bit host addresses every view pointer"),

@@ -29,6 +29,7 @@ fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
         slot,
         view: 0,
         mark: None,
+        ready_at: Instant::now(),
     }
 }
 
@@ -504,5 +505,110 @@ fn an_unshown_drop_releases_a_committed_paced_present() {
     );
     drop_unshown(&state, 4);
     assert_eq!(floor.load(Ordering::Acquire), 4, "the drop released both");
+    drop(committed);
+}
+
+/// A present into an occluded window is paced by its duration, as one into a shown window is.
+///
+/// The display enforces the duration only for a window it shows; the
+/// presenter holds the rest to it, so the frame-latency bound needs the mark
+/// either way. Only a present with no duration at all goes unpaced.
+#[test]
+fn an_occluded_window_keeps_its_pace() {
+    let view = super::attachment::test_address_block();
+    let att = super::attachment::register(
+        view,
+        view + 8,
+        &super::attachment::AttachLatches {
+            hwnd: 0x40,
+            flags: super::attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let cap = 1.0 / 30.0;
+    att.set_min_present_duration(cap);
+    att.set_window_occluded(false);
+    assert_eq!(pacing(Some(&att)), Some(Duration::from_secs_f64(cap)));
+    att.set_window_occluded(true);
+    assert_eq!(
+        pacing(Some(&att)),
+        Some(Duration::from_secs_f64(cap)),
+        "an occluded window is paced too"
+    );
+    att.set_min_present_duration(0.0);
+    assert_eq!(pacing(Some(&att)), None, "no duration, no pace");
+    assert_eq!(pacing(None), None, "no attachment, no pace");
+    super::attachment::unregister(view);
+}
+
+/// A hold lasts until its deadline, and a stop ends it early.
+#[test]
+fn a_hold_ends_at_its_deadline_or_at_a_stop() {
+    let state = state_with(empty_inner());
+    let start = Instant::now();
+    assert!(hold_until(&state, start + PACING), "the deadline passes");
+    assert!(start.elapsed() >= PACING, "the hold lasted its duration");
+
+    let holder = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || hold_until(&state, Instant::now() + Duration::from_secs(30)))
+    };
+    thread::sleep(Duration::from_millis(50));
+    state.lock().flags.insert(PresenterFlags::STOP);
+    state.presenter_cv.notify_all();
+    assert!(!holder.join().unwrap(), "the stop ended the hold");
+}
+
+/// An idle wait releases a held present at once rather than sitting out its pace.
+#[test]
+fn an_idle_wait_releases_a_held_present() {
+    let state = state_with(empty_inner());
+    let holder = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || hold_until(&state, Instant::now() + Duration::from_secs(30)))
+    };
+    thread::sleep(Duration::from_millis(50));
+    state.lock().flags.insert(PresenterFlags::DRAIN);
+    state.presenter_cv.notify_all();
+    assert!(holder.join().unwrap(), "the drain released the present");
+}
+
+/// An occluded drop releases the presents at or below it and keeps the ones behind it owed.
+///
+/// The present committed while the window was shown is released, since the
+/// display may not show it now. The packet behind the dropped one still has
+/// to be held to the window's pace when the presenter reaches it, so its
+/// mark keeps the frame-latency floor below it.
+#[test]
+fn an_occluded_drop_keeps_the_presents_behind_it_owed() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    // Committed and handed to its drawable's handler: held outside any packet.
+    let committed = state.frame_signal().note_submission(3, Some(PACING));
+    for seq in [4, 5] {
+        let mut next = packet(seq, None);
+        next.set_mark(state.frame_signal().note_submission(seq, Some(PACING)));
+        state.lock().pending.push_back(next);
+    }
+    assert_eq!(floor.load(Ordering::Acquire), 2);
+    drop_occluded(&state, 4);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        4,
+        "the committed present and the dropped one are released, the next one is not"
+    );
+    drop_front(&state, 5);
+    assert_eq!(floor.load(Ordering::Acquire), 5);
     drop(committed);
 }
