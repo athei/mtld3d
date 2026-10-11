@@ -7,7 +7,7 @@
 //! `debug.capsAll` fill is pinned as a superset that leaves shader versions and SM2.x caps alone.
 //! The texture-operation caps are also checked against the fixed-function emitter's output for
 //! every operation value, through the unimplemented-operation answer the stage-state setter warns
-//! from.
+//! from. `build`, the value the `GetDeviceCaps` entry points copy out, is pinned to `fill`.
 
 use mtld3d_types::{
     AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, D3DTA_CURRENT, D3DTA_DIFFUSE,
@@ -18,8 +18,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, fill_default, texture_extent_fits,
-    texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
+    FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, build, fill, fill_default,
+    texture_extent_fits, texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
 };
 use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
 
@@ -778,6 +778,28 @@ fn volume_extent_fits_the_3d_limit_unless_one_slice_deep() {
         assert!(
             !volume_extent_fits(extent[0], extent[1], extent[2]),
             "{extent:?}"
+        );
+    }
+}
+
+/// `build` answers exactly what `fill` writes into a zeroed struct, for each flag combination.
+#[test]
+fn build_matches_fill() {
+    for (caps_all, sampler_border) in [(false, false), (false, true), (true, false), (true, true)] {
+        // SAFETY: D3DCAPS9 is POD (integer and float fields, no Drop); zero is a valid state.
+        let mut filled: D3DCAPS9 = unsafe { core::mem::zeroed() };
+        fill(&mut filled, caps_all, sampler_border);
+        let built = build(caps_all, sampler_border);
+        let bytes = |c: &D3DCAPS9| -> Vec<u8> {
+            let start = core::ptr::from_ref(c).cast::<u8>();
+            // SAFETY: `c` is a live `D3DCAPS9`, viewed as its bytes.
+            let view = unsafe { core::slice::from_raw_parts(start, size_of::<D3DCAPS9>()) };
+            view.to_vec()
+        };
+        assert_eq!(
+            bytes(&built),
+            bytes(&filled),
+            "caps_all={caps_all} border={sampler_border}"
         );
     }
 }

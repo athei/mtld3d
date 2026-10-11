@@ -35,6 +35,7 @@ pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
     VolumeVertex,
 };
+pub use vtbl::deref_vtbl;
 pub use win32::{
     GuardedSlice, HARNESS_PROBE_REPLY, MemorySample, Rect, WM_ACTIVATEAPP, WM_HARNESS_PROBE,
     WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, create_window, cursor_is_live,

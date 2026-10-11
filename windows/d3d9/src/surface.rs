@@ -11,7 +11,7 @@ use mtld3d_core::{
     surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
 };
 use mtld3d_shared::{
-    BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
+    BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn, VtableThis,
     mtl_handle::MTLTextureKind,
 };
 use mtld3d_types::{
@@ -2153,8 +2153,9 @@ extern "system" fn surface_set_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per ABI.
@@ -2178,8 +2179,9 @@ extern "system" fn surface_get_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per ABI.
@@ -2194,8 +2196,9 @@ extern "system" fn surface_get_private_data(
 extern "system" fn surface_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per ABI.
@@ -2321,25 +2324,28 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
     if desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DSURFACE_DESC` slot owned by the caller.
-    let out = unsafe { &mut *desc };
     if inner.parent_texture.is_null() {
         // Implicit surfaces resolve format + dims live from the device (see
         // `ImplicitKind`); ordinary standalone surfaces read their snapshot.
-        out.format = inner.live_format();
-        out.resource_type = D3DRTYPE_SURFACE;
-        out.usage = inner.standalone_usage;
-        // A standalone surface reports its creation pool: RT / depth-stencil /
-        // backbuffer / lockable-RT are `D3DPOOL_DEFAULT`; a system-memory
-        // offscreen-plain surface reports the pool it was created with
-        // (`D3DPOOL_SYSTEMMEM` or `D3DPOOL_SCRATCH`).
-        out.pool = inner.standalone_pool;
         let ms = inner.live_multi_sample();
-        out.multi_sample_type = ms.multi_sample_type;
-        out.multi_sample_quality = ms.multi_sample_quality;
-        out.width = inner.live_width();
-        out.height = inner.live_height();
+        let standalone = D3DSURFACE_DESC {
+            format: inner.live_format(),
+            resource_type: D3DRTYPE_SURFACE,
+            usage: inner.standalone_usage,
+            // A standalone surface reports its creation pool: RT / depth-stencil /
+            // backbuffer / lockable-RT are `D3DPOOL_DEFAULT`; a system-memory
+            // offscreen-plain surface reports the pool it was created with
+            // (`D3DPOOL_SYSTEMMEM` or `D3DPOOL_SCRATCH`).
+            pool: inner.standalone_pool,
+            multi_sample_type: ms.multi_sample_type,
+            multi_sample_quality: ms.multi_sample_quality,
+            width: inner.live_width(),
+            height: inner.live_height(),
+        };
+        // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI
+        // points to a writable `D3DSURFACE_DESC` slot owned by the caller;
+        // alignment is not assumed.
+        unsafe { OutPtr::write_opt(desc, standalone) };
         return 0; // S_OK
     }
     // SAFETY: `inner.parent_texture` is non-null (checked above) and
@@ -2349,16 +2355,21 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
     let ti = tex.inner();
     let level = inner.mip_level as usize;
 
-    out.format = tex.d3d_format();
-    out.resource_type = D3DRTYPE_SURFACE;
-    // A texture-level surface reports its parent texture's usage and pool, not
-    // 0/0 — SetRenderTarget / SetDepthStencilSurface gate on them.
-    out.usage = tex.d3d_usage();
-    out.pool = tex.d3d_pool();
-    out.multi_sample_type = 0;
-    out.multi_sample_quality = 0;
-    out.width = ti.mip_width(level);
-    out.height = ti.mip_height(level);
+    let level_desc = D3DSURFACE_DESC {
+        format: tex.d3d_format(),
+        resource_type: D3DRTYPE_SURFACE,
+        // A texture-level surface reports its parent texture's usage and pool, not
+        // 0/0 — SetRenderTarget / SetDepthStencilSurface gate on them.
+        usage: tex.d3d_usage(),
+        pool: tex.d3d_pool(),
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        width: ti.mip_width(level),
+        height: ti.mip_height(level),
+    };
+    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI points to
+    // a writable `D3DSURFACE_DESC` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(desc, level_desc) };
     0 // S_OK
 }
 
@@ -2689,12 +2700,14 @@ fn backbuffer_map_for_write(
         inner.readback = None;
         return D3DERR_INVALIDCALL;
     };
+    let locked = D3DLOCKED_RECT {
+        pitch: bytes_per_row.cast_signed(),
+        bits: page.as_mut_slice()[offset..].as_mut_ptr().cast::<c_void>(),
+    };
     // SAFETY: `locked_rect` is non-null (checked by the caller before
     // entry) and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`
-    // slot owned by the caller.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = bytes_per_row.cast_signed();
-    out.bits = page.as_mut_slice()[offset..].as_mut_ptr().cast::<c_void>();
+    // slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     D3D_OK
 }
 
@@ -2795,12 +2808,14 @@ fn backbuffer_read_into_lock(
         return D3DERR_INVALIDCALL;
     }
 
+    let locked = D3DLOCKED_RECT {
+        pitch: bytes_per_row.cast_signed(),
+        bits: page.as_mut_ptr().cast::<c_void>(),
+    };
     // SAFETY: `locked_rect` is non-null (checked by the caller before
     // entry) and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`
-    // slot owned by the caller.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = bytes_per_row.cast_signed();
-    out.bits = page.as_mut_ptr().cast::<c_void>();
+    // slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
     D3D_OK
 }
@@ -3026,14 +3041,16 @@ fn systemmem_lock_rect(
     let Some(page) = inner.system_memory.as_mut() else {
         return D3DERR_INVALIDCALL;
     };
-    // SAFETY: `locked_rect` is non-null (checked by the caller before entry)
-    // and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = pitch.cast_signed();
     // Integer pointer arithmetic: the raw offset may land outside the
     // allocation for an out-of-bounds rect, which is the documented
     // accept-invalid contract (the caller does not dereference it).
-    out.bits = page.as_mut_ptr().wrapping_offset(offset).cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: page.as_mut_ptr().wrapping_offset(offset).cast::<c_void>(),
+    };
+    // SAFETY: `locked_rect` is non-null (checked by the caller before entry)
+    // and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     D3D_OK
 }
 
@@ -3105,13 +3122,15 @@ fn lockable_rt_lock_rect(
         return D3DERR_INVALIDCALL;
     };
     inner.lock_flags = flags;
-    // SAFETY: `locked_rect` is non-null (checked by the caller before entry)
-    // and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = pitch.cast_signed();
     // Integer pointer arithmetic: an out-of-bounds rect lands outside the
     // allocation (accept-invalid; the caller does not dereference it).
-    out.bits = page.as_mut_ptr().wrapping_offset(offset).cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: page.as_mut_ptr().wrapping_offset(offset).cast::<c_void>(),
+    };
+    // SAFETY: `locked_rect` is non-null (checked by the caller before entry)
+    // and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     D3D_OK
 }
 
@@ -3743,9 +3762,8 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // A `GetDC` counts toward the resource map count (per D3D9), so a
     // subsequent `GetDC`/`LockRect` on any face is rejected until `ReleaseDC`.
     dc_lock.map_count += 1;
-    // SAFETY: `hdc` is non-null (checked above) and per the D3D9 ABI points to a
-    // writable `HDC` out-slot owned by the caller; written only on success.
-    unsafe { *hdc = desc.h_dc };
+    // Written only on success; `hdc` is non-null (checked above).
+    crate::write_out(hdc, desc.h_dc);
     D3D_OK
 }
 

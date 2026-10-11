@@ -29,7 +29,7 @@
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
 use mtld3d_core::api_lock::ApiGuard;
-use mtld3d_shared::{InPtr, VtableThis};
+use mtld3d_shared::{InPtr, OutPtr, ValueIn, VtableThis};
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, Guid};
 
 use crate::device::{
@@ -381,8 +381,7 @@ pub unsafe fn com_get_device<T: ComChild>(this: *mut c_void, device: *mut *mut c
         return D3DERR_INVALIDCALL;
     }
     device_wrapper_add_ref(wrapper);
-    // SAFETY: non-null (checked) and writable per the ABI.
-    unsafe { *device = wrapper };
+    crate::write_out(device, wrapper);
     D3D_OK
 }
 
@@ -430,12 +429,12 @@ pub unsafe fn com_get_function(bytecode: &[u32], data: *mut c_void, size_of_data
         return D3DERR_INVALIDCALL;
     };
     if data.is_null() {
-        // SAFETY: non-null (checked) and writable per the ABI.
-        unsafe { *size_of_data = need_u32 };
+        // SAFETY: non-null (checked) and writable per the ABI; alignment is not assumed.
+        unsafe { OutPtr::write_opt(size_of_data, need_u32) };
         return D3D_OK;
     }
-    // SAFETY: non-null (checked) and readable per the ABI.
-    if unsafe { *size_of_data } < need_u32 {
+    // SAFETY: non-null (checked) and readable per the ABI; alignment is not assumed.
+    if unsafe { ValueIn::<u32>::read_opt(size_of_data.cast()) }.is_none_or(|have| have < need_u32) {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: the caller's buffer holds at least `need` bytes per the check
@@ -566,14 +565,14 @@ pub unsafe fn com_query_interface(
     add_ref: extern "system" fn(*mut c_void) -> u32,
     name: &'static str,
 ) -> i32 {
-    // SAFETY: `riid` is the caller's read-only GUID pointer per the contract.
-    let iid = unsafe { mtld3d_shared::InPtr::<Guid>::opt(riid.cast()) };
+    // SAFETY: `riid` is the caller's read-only GUID pointer per the contract;
+    // alignment is not assumed.
+    let iid = unsafe { ValueIn::<Guid>::read_opt(riid.cast()) };
     let riid_lo = iid.as_ref().map_or(0, |g| g.data1);
     log::trace!(target: crate::LOG_TARGET, "{name}::QueryInterface(riid_lo={riid_lo:#010x})");
     let matched = iid.is_some_and(|iid| accepted.contains(&iid));
     if matched && !ppv.is_null() {
-        // SAFETY: validated writable out pointer per the contract.
-        unsafe { *ppv = this };
+        crate::write_out(ppv, this);
         add_ref(this);
         return D3D_OK;
     }

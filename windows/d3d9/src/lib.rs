@@ -410,11 +410,7 @@ fn log_identity(instance: *mut c_void) {
 /// instead of stack garbage, which would otherwise read as a bogus COM
 /// `this` pointer.
 fn null_out(out: *mut *mut c_void) {
-    if !out.is_null() {
-        // SAFETY: `out` is non-null and per the COM ABI points to a writable
-        // `*mut c_void` slot owned by the caller.
-        unsafe { *out = core::ptr::null_mut() };
-    }
+    write_out(out, core::ptr::null_mut());
 }
 
 /// Write a COM `**out` parameter, the success counterpart of [`null_out`].

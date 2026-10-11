@@ -73,6 +73,15 @@ windows/d3d9/src/vertex_shader.rs
 windows/d3d9/src/pixel_shader.rs'
 API_LOCK_EXEMPT='cursor_wnd_proc'
 
+# A pointer the application hands a PE entry point promises no alignment, so
+# the entry point reaches it only through the alignment-free helpers of
+# `mtld3d_shared::ffi_boundary`. The vectored exception handler is the one
+# `extern "system" fn` whose pointers come from the system instead.
+APP_POINTER_DIR=windows/d3d9/src
+APP_POINTER_EXEMPT='windows/d3d9/src/crash.rs'
+APP_POINTER_INPTR='InPtr(Mut)?::<(mtld3d_types::)?(D3D|Guid|LUID)'
+APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it with ValueIn, write it with OutPtr'
+
 status=0
 
 # Report a finding and name the section of docs/CONVENTIONS.md it comes from,
@@ -195,6 +204,54 @@ api_lock_first() {
             if ($0 !~ /^    let _api = /)
                 printf "%s:%d: %s does not open with `let _api = ...;`\n", FILENAME, hdr, name
             state = 0
+        }
+    ' "$@"
+}
+
+# A pointer parameter of an `extern "system" fn` turned into a reference, read
+# or written through `*p`, `p.read()` or `p.write()`, or made a typed slice,
+# in that function's body. A byte view (`p.cast::<u8>()`) and a cast to one of
+# the layer's own COM wrappers (`Direct3D...`) are exempt: bytes have no
+# alignment, and a wrapper is an object the layer made.
+app_pointer_derefs() {
+    awk '
+        function flag(line, name,    w) {
+            if (line ~ ("[^A-Za-z0-9_]" name "\\.cast::<(u8|Direct3D[A-Za-z0-9]*)>")) return 0
+            w = "(^|[^A-Za-z0-9_])"
+            if (line ~ ("&(mut )?\\*" name "([^A-Za-z0-9_]|$)")) return 1
+            if (line ~ (w "\\*" name "[ \t]*(=[^=]|\\.cast|\\.add|\\)|;|})")) return 1
+            if (line ~ (w name "\\.(cast[^.]*\\.)?(read|write)\\(")) return 1
+            if (line ~ ("from_raw_parts(_mut)?\\([ \t]*" name "([^A-Za-z0-9_]|$)")) return 1
+            if (line ~ ("ptr::(read|write)\\([ \t]*" name "[.,)]")) return 1
+            if (line ~ ("copy(_nonoverlapping)?\\(.*[^A-Za-z0-9_.]" name "[,)]")) return 1
+            return 0
+        }
+        FNR == 1 { state = 0 }
+        state == 0 && /extern "system" fn / { sig = ""; state = 1; hdr = FNR }
+        state == 1 {
+            sig = sig " " $0
+            if ($0 ~ /\{[ \t]*$/) {
+                n = 0
+                s = sig
+                sub(/^[^(]*\(/, "", s)
+                while (match(s, /[a-z_][a-z_0-9]*: \*(mut|const) /)) {
+                    p = substr(s, RSTART, RLENGTH)
+                    sub(/:.*/, "", p)
+                    if (p != "this" && p !~ /^_/) names[++n] = p
+                    s = substr(s, RSTART + RLENGTH)
+                }
+                state = (n > 0) ? 2 : 0
+            }
+            next
+        }
+        state == 2 {
+            if ($0 ~ /^}/) { state = 0; next }
+            if ($0 ~ /^[ \t]*\/\//) next
+            for (i = 1; i <= n; i++)
+                if (flag($0, names[i])) {
+                    printf "%s:%d: `%s` in %s\n", FILENAME, FNR, names[i], $0
+                    break
+                }
         }
     ' "$@"
 }
@@ -328,6 +385,18 @@ case "${1:-}" in
         ;;
     esac
     case $file in
+    "$APP_POINTER_DIR"/*.rs)
+        if [ "$file" != "$APP_POINTER_EXEMPT" ]; then
+            findings=$(app_pointer_derefs "$file")
+            [ -z "$findings" ] || report "An application's pointer promises no alignment" \
+                'typed access to an entry point pointer parameter: use ValueIn, OutPtr, slice_from_caller or slice_to_caller' \
+                "$findings"
+            banned "$APP_POINTER_INPTR" "An application's pointer promises no alignment" \
+                "$APP_POINTER_INPTR_MESSAGE" "$file"
+        fi
+        ;;
+    esac
+    case $file in
     windows/*.rs)
         if ! printf '%s\n' "$file" | grep -qE "$PE_JOIN_EXEMPT"; then
             banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
@@ -408,6 +477,20 @@ if [ -n "$pe_sources" ]; then
     # shellcheck disable=SC2086
     banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
         "$PE_JOIN_MESSAGE" $pe_sources
+fi
+
+app_sources=$(git ls-files "$APP_POINTER_DIR/*.rs" | grep -vxF "$APP_POINTER_EXEMPT" || true)
+if [ -n "$app_sources" ]; then
+    # shellcheck disable=SC2086
+    findings=$(app_pointer_derefs $app_sources)
+    if [ -n "$findings" ]; then
+        report "An application's pointer promises no alignment" \
+            'typed access to an entry point pointer parameter: use ValueIn, OutPtr, slice_from_caller or slice_to_caller' \
+            "$findings"
+    fi
+    # shellcheck disable=SC2086
+    banned "$APP_POINTER_INPTR" "An application's pointer promises no alignment" \
+        "$APP_POINTER_INPTR_MESSAGE" $app_sources
 fi
 
 modules=$(git ls-files '*/mod.rs' || true)
