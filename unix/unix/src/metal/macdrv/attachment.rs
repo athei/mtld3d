@@ -54,6 +54,15 @@ use crate::metal::command::{GeometryStreak, PresentGeometry};
 /// refresh somewhere between one second and a tenth of one.
 pub const HEADROOM_REFRESH_PRESENTS: u64 = 32;
 
+/// Paced presents in a row the display did not show before a visible window counts as unshown.
+///
+/// A window that has just come on screen leaves its first four or five
+/// drawables undisplayed on a 120 Hz panel, and one being covered a few
+/// until the occlusion notification lands, so the run has to be longer than
+/// those. A window that never shows a drawable reaches it in about 130 ms at
+/// that panel's rate, the most it presents unpaced.
+pub const UNDISPLAYED_PACED_LIMIT: u32 = 16;
+
 /// The live records, keyed by the raw `NSView*` address attach created.
 ///
 /// `LazyLock` because the map's constructor is not `const`.
@@ -190,6 +199,15 @@ pub struct Attachment {
     /// hidden windows keep a pace each. Written only by the presenter of the
     /// device that owns the view.
     unshown_release_ns: AtomicU64,
+    /// Paced presents in a row whose drawable the display did not show.
+    ///
+    /// Counted by the drawables' presented handlers, which Metal runs on a
+    /// thread of its own, for presents into the window while it reads
+    /// visible: a drawable whose `presentedTime` is 0 adds one, a displayed
+    /// one sets it back to 0. At [`UNDISPLAYED_PACED_LIMIT`] the
+    /// window counts as unshown although it reads visible
+    /// ([`Attachment::displays_nothing`]).
+    undisplayed_paced: AtomicU32,
     /// Present pacing latched from the PE side, encoded by `pack_pacing`.
     ///
     /// Attach and the D3D9 Reset path both write it, and the display-follow
@@ -236,6 +254,7 @@ impl Attachment {
             presents_since_headroom_refresh: AtomicU64::new(HEADROOM_REFRESH_PRESENTS),
             min_present_duration_bits: AtomicU64::new(0),
             unshown_release_ns: AtomicU64::new(0),
+            undisplayed_paced: AtomicU32::new(0),
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
@@ -431,6 +450,36 @@ impl Attachment {
         at
     }
 
+    /// Count one paced present the display showed (`displayed`) or let go unshown.
+    ///
+    /// Returns the change it made to [`Self::displays_nothing`]: `Some(true)`
+    /// when this present completed the run of undisplayed ones, `Some(false)`
+    /// when a displayed one ended such a run, `None` otherwise.
+    pub fn note_paced_present(&self, displayed: bool) -> Option<bool> {
+        let before = if displayed {
+            self.undisplayed_paced.swap(0, Ordering::Relaxed)
+        } else {
+            let (Ok(run) | Err(run)) =
+                self.undisplayed_paced
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
+                        Some(run.saturating_add(1))
+                    });
+            run
+        };
+        undisplayed_run_edge(before, displayed)
+    }
+
+    /// Whether the window displays nothing although it reads visible.
+    ///
+    /// True once [`UNDISPLAYED_PACED_LIMIT`] paced presents in a row came
+    /// back with `presentedTime` 0, until a displayed one: nothing enforces
+    /// such a window's present duration, so the presenter holds its paced
+    /// presents to it as it does an occluded window's.
+    #[must_use]
+    pub fn displays_nothing(&self) -> bool {
+        self.undisplayed_paced.load(Ordering::Relaxed) >= UNDISPLAYED_PACED_LIMIT
+    }
+
     /// The pacing word `pack_pacing` produced.
     #[must_use]
     pub fn pacing_bits(&self) -> u64 {
@@ -491,6 +540,25 @@ fn is_live(map: &FxHashMap<usize, Arc<Attachment>>, att: &Arc<Attachment>) -> bo
 pub fn next_unshown_release(last: Option<Instant>, ready: Instant, duration: Duration) -> Instant {
     last.and_then(|last| last.checked_add(duration))
         .map_or(ready, |at| at.max(ready))
+}
+
+/// How one paced present moves a run of undisplayed ones that stood at `before`.
+///
+/// `Some(true)` when an undisplayed present makes the run reach
+/// [`UNDISPLAYED_PACED_LIMIT`], `Some(false)` when a displayed one ends a run
+/// that had reached it, `None` when the window's state does not change.
+pub const fn undisplayed_run_edge(before: u32, displayed: bool) -> Option<bool> {
+    if displayed {
+        if before >= UNDISPLAYED_PACED_LIMIT {
+            Some(false)
+        } else {
+            None
+        }
+    } else if before.saturating_add(1) == UNDISPLAYED_PACED_LIMIT {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Create the record for a freshly attached view and make it live.

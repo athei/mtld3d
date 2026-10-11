@@ -1037,8 +1037,10 @@ pub fn attach_metal_layer(
     // AppKit owns the view's window and screen relationships on the main
     // thread; the view is retained for as long as the device holds it. The
     // same hop takes the layer off winemac's `nextDrawable` override, which
-    // walks the view from the presenter thread, and reads a hosted view's
-    // client surface, which the override would have presented.
+    // walks the view from the presenter thread, reads a hosted view's
+    // client surface, which the override would have presented, and takes
+    // the fade out of the window's order-out, so the layer can move on at
+    // once when the window goes.
     let mut hint = None;
     let mut layer_class = client_surface::LayerClass::Plain;
     let mut surface = 0;
@@ -1046,6 +1048,13 @@ pub fn attach_metal_layer(
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
         layer_class = client_surface::bypass_present_hook(layer, mtm);
+        if !order_out_without_fade(view, mtm) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: a metal view is in no window at attach; the window it joins later \
+                 keeps its order-out fade until the view is parked",
+            );
+        }
         if retained.is_none() {
             surface = client_surface::client_surface_of(view, mtm);
         }
@@ -1398,6 +1407,40 @@ fn window_did_draw_content(window: &NSWindow, _mtm: MainThreadMarker) {
              has content",
         );
     }
+}
+
+/// Have the window `view` sits in order out without `AppKit`'s fade. **Main thread only.**
+///
+/// A window with the default animation behaviour fades when it is ordered
+/// out or closed, and `AppKit` finishes ordering it out only when the fade
+/// ends, about a quarter of a second later. A layer the window showed that
+/// moves into another window before then, as a kept view does when an
+/// application destroys its device window and creates the next one at once
+/// ([`adopt_metal_view`]), never has a drawable displayed in its new window:
+/// every presented handler reports a `presentedTime` of 0 while the window
+/// reads visible. Without the fade the order-out is immediate and the moved
+/// layer displays. Attach sets it, and the park again for a view that was in
+/// no window then; the window keeps it after its device leaves, since it
+/// still holds the kept view. `false` when the view is in no window.
+fn order_out_without_fade(view: *mut c_void, _mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::NSWindowAnimationBehavior;
+
+    if view.is_null() {
+        return false;
+    }
+    // SAFETY: the view is a retained one attach or the park holds, created
+    // by Wine or kept since; the retain taken here covers the walk to its
+    // window.
+    let Some(view) = (unsafe { Retained::retain(view.cast::<NSView>()) }) else {
+        return false;
+    };
+    let Some(window) = view.window() else {
+        return false;
+    };
+    if window.animationBehavior() != NSWindowAnimationBehavior::None {
+        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    }
+    true
 }
 
 /// Wine's record for `hwnd`, with a client surface created for the window on every call.
@@ -1782,7 +1825,7 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
     // Before the park publishes the view, not after: a device that took it
     // back in between would present into the shrunk drawable until its own
     // attach put the layer's geometry back.
-    shrink_parked_layer(record.layer());
+    shrink_parked_layer(view, record.layer());
     let displaced = PARKED_METAL_VIEW
         .lock()
         .expect("metal view park mutex poisoned")
@@ -1813,10 +1856,15 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
 ///
 /// Synchronous, because the caller is about to publish the view to the park:
 /// the write has to land before another device can take the view back.
-fn shrink_parked_layer(layer: usize) {
+///
+/// The same hop takes the fade out of the order-out of the window the view
+/// still sits in ([`order_out_without_fade`]), for a view attach found in no
+/// window.
+fn shrink_parked_layer(view: usize, layer: usize) {
     run_on_main_thread_sync(|| {
         let mtm = MainThreadMarker::new().expect("the parked layer is shrunk on the main thread");
         shrink_layer_drawable(layer, mtm);
+        order_out_without_fade(view as *mut c_void, mtm);
     });
 }
 

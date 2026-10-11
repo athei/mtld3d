@@ -1086,6 +1086,31 @@ pub fn foreground_window(hwnd: usize) -> bool {
     unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
+/// Put a window above every window that is not topmost, without moving or activating it.
+///
+/// A window a background process shows opens behind the active application's
+/// windows, which can leave it fully covered; a topmost one stays above them
+/// while its process is inactive.
+pub fn make_topmost(hwnd: usize) {
+    const HWND_TOPMOST: usize = usize::MAX;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+    let ok = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+        )
+    };
+    assert!(ok != 0, "SetWindowPos(HWND_TOPMOST) failed");
+}
+
 /// Wait up to `timeout` for a message another thread sends to this thread's windows, and answer it.
 ///
 /// For a thread that owns a window and waits for something it cannot wait

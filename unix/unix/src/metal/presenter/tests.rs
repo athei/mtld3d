@@ -546,6 +546,51 @@ fn an_occluded_window_keeps_its_pace() {
     super::attachment::unregister(view);
 }
 
+/// The presenter keeps the pace of an occluded window and of a visible one that displays nothing.
+///
+/// A visible window whose paced presents the display shows is paced by the
+/// display alone; one whose last paced presents all came back undisplayed is
+/// held on the presenter's clock as an occluded one is, until one is shown.
+#[test]
+fn the_presenter_paces_a_window_that_displays_nothing() {
+    let view = super::attachment::test_address_block();
+    let att = super::attachment::register(
+        view,
+        view + 8,
+        &super::attachment::AttachLatches {
+            hwnd: 0x41,
+            flags: super::attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let cap = Duration::from_secs_f64(1.0 / 30.0);
+    att.set_min_present_duration(cap.as_secs_f64());
+    assert_eq!(
+        own_clock_pace(&att),
+        None,
+        "a shown window is paced by the display"
+    );
+    att.set_window_occluded(true);
+    assert_eq!(own_clock_pace(&att), Some(cap), "an occluded window");
+    att.set_window_occluded(false);
+    for _ in 0..super::attachment::UNDISPLAYED_PACED_LIMIT {
+        att.note_paced_present(false);
+    }
+    assert_eq!(
+        own_clock_pace(&att),
+        Some(cap),
+        "a visible window that displayed none of its last paced presents"
+    );
+    att.note_paced_present(true);
+    assert_eq!(own_clock_pace(&att), None, "until one is displayed");
+    super::attachment::unregister(view);
+}
+
 /// A hold lasts until its deadline, and a stop ends it early.
 #[test]
 fn a_hold_ends_at_its_deadline_or_at_a_stop() {

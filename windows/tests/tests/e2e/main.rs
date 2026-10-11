@@ -47,6 +47,7 @@ mod format_agreement;
 mod format_query;
 mod frame_latency;
 mod implicit_surface;
+mod kept_view_display;
 mod lock_lifetime;
 mod mrt;
 mod msaa;

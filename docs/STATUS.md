@@ -104,7 +104,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   slower `present.maxFps`. A hidden, minimised or covered window shows
   nothing, so the display does not pace it; mtld3d holds its paced presents
   to the same pace itself, so such a window presents no faster than a shown
-  one.
+  one. So it does for a window that reads visible while the display shows
+  none of its last paced presents, until it shows one.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.
