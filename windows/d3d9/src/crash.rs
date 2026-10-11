@@ -386,9 +386,10 @@ fn thread_name(buf: &mut [u8; THREAD_NAME_CAPACITY]) -> &str {
     }
     let mut units = 0;
     while units < THREAD_DESCRIPTION_SCAN {
+        let unit = description.wrapping_add(units);
         // SAFETY: the description is NUL-terminated and the scan stops at
         // the terminator, so every unit read lies inside it.
-        if unsafe { description.add(units).read() } == 0 {
+        if unsafe { unit.read() } == 0 {
             break;
         }
         units += 1;
