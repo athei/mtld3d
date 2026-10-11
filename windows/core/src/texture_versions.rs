@@ -18,7 +18,9 @@
 //! spare no rename takes within [`SPARE_MAX_IDLE_SUBMITS`] submissions is
 //! destroyed, and so is a version whose texture is gone or changed shape, a
 //! released texture's spares, and a version whose parking would take the
-//! spares past [`VERSION_POOL_BACKSTOP_BYTES`]. Those destroys wait in a
+//! spares past the [`VersionBudget`] cap or that retires while the process
+//! is short of GPU memory, when spares are given back oldest first as well.
+//! Those destroys wait in a
 //! queue the caller takes a batch from per drain
 //! ([`TextureVersions::take_doomed`]): the recent rate of arrivals plus an
 //! eighth of the queue, so a steady stream never keeps a queue and a burst
@@ -72,17 +74,84 @@ use crate::{format::FormatMapping, ids::TextureId};
 /// reallocated about 110 versions a frame there, and 512 MiB still 45.
 pub const SPARE_MAX_IDLE_SUBMITS: u64 = 8;
 
-/// Bytes of texture storage the pool may hold as spares.
+/// Most bytes of texture storage the pool holds as spares on any device.
 ///
-/// A backstop, not the bound that normally acts: [`SPARE_MAX_IDLE_SUBMITS`]
-/// does. It is the age bound's own worst case in the busiest measured scene
-/// (eight submissions of 134 MiB of retired versions, about 1 GiB) and
-/// catches a pool that would grow past it. Versions already queued to be
-/// destroyed do not count: they are committed, leave within a few drains,
-/// and counting them would keep the pool turning versions away for as long
-/// as that queue fed itself. The storage is `Private` GPU memory, outside
-/// the 32-bit guest address space.
-pub const VERSION_POOL_BACKSTOP_BYTES: u64 = 1 << 30;
+/// Not the bound that normally acts: [`SPARE_MAX_IDLE_SUBMITS`] does. It is
+/// the age bound's own worst case in the busiest measured scene (eight
+/// submissions of 134 MiB of retired versions, about 1 GiB). Measured there,
+/// the spares held 267 to 534 MiB while the scene ran and reached 1 GiB only
+/// once the GPU caught up with every submission at its end. Versions already
+/// queued to be destroyed do not count: they are committed, leave within a
+/// few drains, and counting them would keep the pool turning versions away
+/// for as long as that queue fed itself.
+pub const VERSION_POOL_CEILING_BYTES: u64 = 1 << 30;
+
+/// Divisor of the device's recommended working set that gives the spares' cap below the ceiling.
+///
+/// An eighth keeps the pool's share of a small machine's GPU memory small:
+/// about 683 MiB of an 8 GB Apple silicon Mac's 5.3 GiB, 192 MiB of an
+/// integrated Intel GPU's 1.5 GiB and 512 MiB of a 4 GB discrete GPU, while
+/// every machine with a working set of 8 GiB or more (a 16 GB Mac and up)
+/// reaches [`VERSION_POOL_CEILING_BYTES`].
+pub const VERSION_POOL_WORKING_SET_DIVISOR: u64 = 8;
+
+/// Quarters of the device's recommended working set the process may allocate before spares go.
+///
+/// Above three quarters of it the process is close to where Metal starts to
+/// page or fail allocations, and spares are the cheapest memory to give
+/// back: nothing names them, and losing one costs the next rename an
+/// allocation and a whole copy, what it cost before the pool.
+pub const VERSION_POOL_PRESSURE_QUARTERS: u64 = 3;
+
+/// How much GPU memory the pool may use, from the device's recommended working set.
+///
+/// Read once when the device is created. The cap is the smaller of
+/// [`VERSION_POOL_CEILING_BYTES`] and the working set divided by
+/// [`VERSION_POOL_WORKING_SET_DIVISOR`]; past the pressure line,
+/// [`VERSION_POOL_PRESSURE_QUARTERS`] of the working set, the pool parks
+/// nothing and gives its spares back. A working set of 0, which Metal does
+/// not report for a real device, leaves the ceiling as the cap and no
+/// pressure line.
+pub struct VersionBudget {
+    /// Most bytes of spares the pool parks.
+    spare_cap: u64,
+    /// Process-wide allocated bytes above which the pool gives its spares back.
+    pressure_above: u64,
+}
+
+impl VersionBudget {
+    /// The budget for a device whose recommended working set is `working_set` bytes.
+    #[must_use]
+    pub const fn from_working_set(working_set: u64) -> Self {
+        if working_set == 0 {
+            return Self {
+                spare_cap: VERSION_POOL_CEILING_BYTES,
+                pressure_above: u64::MAX,
+            };
+        }
+        let share = working_set / VERSION_POOL_WORKING_SET_DIVISOR;
+        Self {
+            spare_cap: if share < VERSION_POOL_CEILING_BYTES {
+                share
+            } else {
+                VERSION_POOL_CEILING_BYTES
+            },
+            pressure_above: working_set / 4 * VERSION_POOL_PRESSURE_QUARTERS,
+        }
+    }
+
+    /// Most bytes of spares the pool parks.
+    #[must_use]
+    pub const fn spare_cap(&self) -> u64 {
+        self.spare_cap
+    }
+
+    /// Process-wide allocated bytes above which the pool gives its spares back.
+    #[must_use]
+    pub const fn pressure_above(&self) -> u64 {
+        self.pressure_above
+    }
+}
 
 /// Submissions a texture with no spares may go without a rename before it stops being tracked.
 ///
@@ -416,11 +485,15 @@ pub struct TextureVersions<V> {
     /// waits behind a younger one. An entry whose epoch no longer matches its
     /// texture's state belongs to a state that is gone.
     idle: BTreeSet<(u64, u64, u64)>,
+    /// What the pool may hold; see [`VersionBudget`].
+    budget: VersionBudget,
+    /// The last [`Self::note_allocated`] found the process past the pressure line.
+    pressed: bool,
 }
 
 impl<V> TextureVersions<V> {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(budget: VersionBudget) -> Self {
         Self {
             textures: FxHashMap::default(),
             retiring: VecDeque::new(),
@@ -433,6 +506,8 @@ impl<V> TextureVersions<V> {
             next_epoch: 1,
             with_spares: FxHashSet::default(),
             idle: BTreeSet::new(),
+            budget,
+            pressed: false,
         }
     }
 
@@ -677,7 +752,8 @@ impl<V> TextureVersions<V> {
     ///
     /// It is queued when its texture is gone or changed shape since it
     /// retired, or when parking it would take the spares past
-    /// [`VERSION_POOL_BACKSTOP_BYTES`]. `failed` is
+    /// the budget's cap, or while the last [`Self::note_allocated`] found the
+    /// process short of GPU memory. `failed` is
     /// the highest submission the GPU aborted (0 for none), read with the
     /// counter the pop was gated on: a version live through an aborted
     /// submission may lack a copy or an upload that submission carried, so
@@ -693,12 +769,17 @@ impl<V> TextureVersions<V> {
             self.doom(entry.views, entry.bytes);
             return;
         };
-        if self.parked_bytes + state.bytes > VERSION_POOL_BACKSTOP_BYTES {
+        if self.pressed {
+            let bytes = state.bytes;
+            self.doom(entry.views, bytes);
+            return;
+        }
+        if self.parked_bytes + state.bytes > self.budget.spare_cap {
             mtld3d_shared::log_once_info!(
                 target: crate::LOG_TARGET,
-                "texture versions: the rename pool reached its {} MiB backstop; retired \
+                "texture versions: the rename pool reached its {} MiB cap; retired \
                  versions past it are destroyed until spares are taken or age out",
-                VERSION_POOL_BACKSTOP_BYTES >> 20,
+                self.budget.spare_cap >> 20,
             );
             let bytes = state.bytes;
             self.doom(entry.views, bytes);
@@ -714,6 +795,69 @@ impl<V> TextureVersions<V> {
             held_writes: (!aborted).then_some(entry.held_writes),
             parked_seq: now,
         });
+    }
+
+    /// Note the process's allocated GPU bytes, once per drain before parking.
+    ///
+    /// Past the budget's pressure line the pool parks nothing until a later
+    /// drain finds it below again, and queues spares to be destroyed, oldest
+    /// first, until what waits in the destroy queue covers the excess: the
+    /// queue's versions are still allocated, so they count toward it.
+    pub fn note_allocated(&mut self, allocated: u64) {
+        self.pressed = allocated > self.budget.pressure_above;
+        if !self.pressed {
+            return;
+        }
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture versions: {} MiB of GPU memory allocated, past the {} MiB pressure \
+             line; the rename pool parks nothing and gives its spares back",
+            allocated >> 20,
+            self.budget.pressure_above >> 20,
+        );
+        let excess = allocated - self.budget.pressure_above;
+        if self.doomed_bytes >= excess {
+            return;
+        }
+        let mut oldest: Vec<(u64, TextureId, u64)> = Vec::new();
+        for id in &self.with_spares {
+            if let Some(state) = self.textures.get(id) {
+                oldest.extend(
+                    state
+                        .spares
+                        .iter()
+                        .map(|spare| (spare.parked_seq, *id, state.bytes)),
+                );
+            }
+        }
+        oldest.sort_unstable_by_key(|&(seq, id, _)| (seq, id.raw()));
+        let mut freed = self.doomed_bytes;
+        let mut counts: FxHashMap<TextureId, usize> = FxHashMap::default();
+        for (_, id, bytes) in oldest {
+            if freed >= excess {
+                break;
+            }
+            freed += bytes;
+            *counts.entry(id).or_default() += 1;
+        }
+        for (id, count) in counts {
+            let Some(state) = self.textures.get_mut(&id) else {
+                continue;
+            };
+            self.parked_bytes -= state.bytes * count as u64;
+            self.doomed_bytes += state.bytes * count as u64;
+            self.doomed_since_take += count;
+            let bytes = state.bytes;
+            self.doomed.extend(
+                state
+                    .spares
+                    .drain(..count)
+                    .map(|spare| (spare.into_views(), bytes)),
+            );
+            if state.spares.is_empty() {
+                self.with_spares.remove(&id);
+            }
+        }
     }
 
     /// Hand back the next batch of versions to destroy.
@@ -877,12 +1021,6 @@ impl<V> TextureVersions<V> {
     #[cfg(test)]
     fn doomed(&self) -> usize {
         self.doomed.len()
-    }
-}
-
-impl<V> Default for TextureVersions<V> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

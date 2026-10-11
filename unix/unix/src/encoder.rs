@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use log::{Level, debug, error, log_enabled, trace};
+use log::{Level, debug, error, info, log_enabled, trace};
 pub use mtld3d_core::encoder_data::FrameDataFlags;
 use mtld3d_core::{
     async_compile::{ClearHistory, ClearPlanes, DeferredPipelineId, JobTicket, TicketSource},
@@ -49,8 +49,8 @@ use mtld3d_core::{
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
     texture_versions::{
-        TexelRect, TextureVersions, UploadFootprint, VersionShape, records_every_write,
-        upload_written_rect,
+        TexelRect, TextureVersions, UploadFootprint, VersionBudget, VersionShape,
+        records_every_write, upload_written_rect,
     },
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
@@ -1604,6 +1604,17 @@ impl FrameEncoder {
             .device_handle
             .into_retained()
             .ok_or_else(|| std::io::Error::other("encoder: missing Metal device"))?;
+        // The rename pool's share of GPU memory, read once for the device.
+        let working_set = device.recommendedMaxWorkingSetSize();
+        let version_budget = VersionBudget::from_working_set(working_set);
+        info!(
+            target: LOG_TARGET,
+            "texture versions: rename pool cap {} MiB, gives spares back past {} MiB \
+             allocated, of a {} MiB recommended working set",
+            version_budget.spare_cap() >> 20,
+            version_budget.pressure_above() >> 20,
+            working_set >> 20,
+        );
         let apple = GpuCaps::apple_silicon_default();
         if !gpu_caps.unified_memory
             || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
@@ -1734,7 +1745,7 @@ impl FrameEncoder {
             libraries: compile::libraries::StageLibraries::default(),
             texture_cache: FxHashMap::default(),
             snapshot_wrappers: FxHashMap::default(),
-            texture_versions: TextureVersions::new(),
+            texture_versions: TextureVersions::new(version_budget),
             #[cfg(debug_assertions)]
             versioned_handles: FxHashSet::default(),
             sampler_cache: FxHashMap::default(),
@@ -6809,6 +6820,10 @@ impl FrameEncoder {
     /// batch of that queue joins the drain's texture destroys; nothing names
     /// them, since a popped version is in no cache and no command.
     fn reclaim_texture_versions(&mut self, settled: u64, failed: u64, textures: &mut Vec<u64>) {
+        // Once per drain: past the pressure line nothing parks and spares
+        // go back first.
+        self.texture_versions
+            .note_allocated(u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX));
         while let Some(entry) = self.texture_versions.pop_retired(settled) {
             for handle in entry.views().owned_handles() {
                 self.retire_texture_handle(handle.raw());

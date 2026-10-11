@@ -455,18 +455,22 @@ answer for it from before. A spare no rename takes within 8 submissions of
 being parked is destroyed, which sizes the pool to the demand: the busiest
 measured scene retires about 134 MiB of versions a frame in one submission and
 parks them one to eight submissions later, while a 256 MiB cap there destroyed
-and reallocated about 110 of its 267 renames a frame. A 1 GiB backstop over
-the spares catches a pool that would grow past that, and a version of a
-released texture or of a changed shape is destroyed too. Those destroys wait
-in a queue the drain takes a batch from: the average queued per drain over the
-last eight drains plus an eighth of the queue, at least 64 versions. A steady
-stream leaves as fast as it arrives and a burst, which took 6 ms in one drain,
-spreads over about five drains; a queued version was popped after its
-submission settled and has left every record, so nothing in flight names it.
-`Reset` and shutdown queue every spare, retiring version and pending destroy
-before their GPU-idle wait. A texture with no spares and no rename for 120
-submissions stops being tracked, its write history with it, and its next
-rename starts it over.
+and reallocated about 110 of its 267 renames a frame. The spares are capped at
+the smaller of 1 GiB, the age bound's worst case in that scene, and an eighth
+of the device's `recommendedMaxWorkingSetSize` (about 683 MiB on an 8 GB Mac),
+read once when the device is created. When the GPU memory the process has
+allocated, sampled once per drain, passes three quarters of that working set,
+nothing parks and spares are destroyed oldest first until what waits to be
+destroyed covers the excess. A version of a released texture or of a changed
+shape is destroyed too. Those destroys wait in a queue the drain takes a batch
+from: the average queued per drain over the last eight drains plus an eighth
+of the queue, at least 64 versions. A steady stream leaves as fast as it
+arrives and a burst, which took 6 ms in one drain, spreads over about five
+drains; a queued version was popped after its submission settled and has left
+every record, so nothing in flight names it. `Reset` and shutdown queue every
+spare, retiring version and pending destroy before their GPU-idle wait. A
+texture with no spares and no rename for 120 submissions stops being tracked,
+its write history with it, and its next rename starts it over.
 
 A reused spare still has to receive what the texture changed after it retired.
 For a 2D or cube colour texture whose application usage is neither render
