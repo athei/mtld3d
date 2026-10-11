@@ -90,6 +90,17 @@ impl WindowSubclasses {
         let device = *subclass.devices.first()?;
         Some((device, subclass.original))
     }
+
+    /// Every device registered on `window`, oldest first; empty for a window no device holds.
+    ///
+    /// For what concerns each device on the window rather than the one that
+    /// receives its messages.
+    #[must_use]
+    pub fn devices_on(&self, window: usize) -> &[usize] {
+        self.windows
+            .get(&window)
+            .map_or(&[], |subclass| subclass.devices.as_slice())
+    }
 }
 
 #[cfg(test)]

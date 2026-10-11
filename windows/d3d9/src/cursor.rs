@@ -34,9 +34,9 @@ use mtld3d_core::{
     window_subclass::WindowSubclasses,
 };
 use mtld3d_shared::{
-    InPtr, MetalHandle, SetCursorOverlayParams,
+    InPtr, MetalHandle, PresentClientSurfaceParams, SetCursorOverlayParams,
     bounded_cache::BoundedCache,
-    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, CursorOverlayFlags},
+    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, ClientSurfaceRequest, CursorOverlayFlags},
     mtl_handle::NSViewKind,
 };
 use mtld3d_types::{
@@ -337,20 +337,22 @@ static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
 
 // ── CursorState ──
 
-/// The two words the unix side writes into from its main thread, at a stable address.
+/// The three words the unix side writes into from its main thread, at a stable address.
 ///
-/// `AttachMetalLayer` hands the unix side both addresses, and the record it
+/// `AttachMetalLayer` hands the unix side the addresses, and the record it
 /// keeps for the device's view writes through them outside any thunk: the
 /// backing scale at attach and whenever the display-follow reconciliation
 /// derives another, the cursor kick when the pointer comes back from another
-/// process. The box is created before the attach and owned by the device's
-/// `CursorState`, so the addresses hold for the device's lifetime. Ordering
-/// against teardown is what makes that enough: device release issues
-/// `DestroyCommandQueue` while the inner box is still alive, that thunk
-/// unregisters the record under the unix registry lock, every unix write
-/// into a sink runs under the same lock with a liveness check, and the inner
-/// box drops only after the thunk has returned. So a write lands before the
-/// record is gone or not at all.
+/// process, the client surface request when Wine hides the device's client
+/// view. The window procedure sets the request too, when the window's client
+/// area may have moved. The box is created before the attach and owned by
+/// the device's `CursorState`, so the addresses hold for the device's
+/// lifetime. Ordering against teardown is what makes that enough: device
+/// release issues `DestroyCommandQueue` while the inner box is still alive,
+/// that thunk unregisters the record under the unix registry lock, every
+/// unix write into a sink runs under the same lock with a liveness check, and
+/// the inner box drops only after the thunk has returned. So a write lands
+/// before the record is gone or not at all.
 pub struct DisplaySinks {
     /// Wine's retina factor for the layer (2 in retina mode, else 1); `0` until published.
     backing_scale: AtomicU32,
@@ -362,6 +364,15 @@ pub struct DisplaySinks {
     /// `WM_SETCURSOR` or `ShowCursor(TRUE)` and answers it with the
     /// null-then-set kick.
     cursor_kick: AtomicU32,
+    /// The `ClientSurfaceRequest` bits asked since the last `Present` took them.
+    ///
+    /// Some Wines hide the client view a device presents through whenever
+    /// they flush the window surface, and leave its frame where it was when
+    /// the window resizes, counting on winemac's `nextDrawable` override to
+    /// put both right; the layer presents without it. The next `Present`
+    /// takes the bits and sends `PresentClientSurface`, which has Wine show
+    /// the surface again, sized to the client area.
+    client_surface_request: AtomicU32,
 }
 
 impl DisplaySinks {
@@ -369,7 +380,33 @@ impl DisplaySinks {
         Self {
             backing_scale: AtomicU32::new(0),
             cursor_kick: AtomicU32::new(0),
+            client_surface_request: AtomicU32::new(0),
         }
+    }
+
+    /// The address `AttachMetalLayerParams::client_surface_request_ptr` carries.
+    pub fn client_surface_request_ptr(&self) -> u64 {
+        (&raw const self.client_surface_request) as u64
+    }
+
+    /// Ask the next `Present` to have Wine show the client surface again, for `reason`.
+    pub fn request_client_surface(&self, reason: ClientSurfaceRequest) {
+        self.client_surface_request
+            .fetch_or(reason.bits(), Ordering::Release);
+    }
+
+    /// Take the client surface request, empty when nothing asked since the last take.
+    ///
+    /// One relaxed load on a frame nothing asked on, which is every frame but
+    /// the ones after a resize or a hidden client view; the swap that takes
+    /// the bits pairs its `Acquire` with the writers' `Release`.
+    pub fn take_client_surface_request(&self) -> ClientSurfaceRequest {
+        if self.client_surface_request.load(Ordering::Relaxed) == 0 {
+            return ClientSurfaceRequest::empty();
+        }
+        ClientSurfaceRequest::from_bits_truncate(
+            self.client_surface_request.swap(0, Ordering::AcqRel),
+        )
     }
 
     /// The address `AttachMetalLayerParams::backing_scale_ptr` carries.
@@ -609,6 +646,41 @@ impl CursorState {
     /// Take the pending cursor re-apply request, if the unix side left one for this device.
     pub fn take_cursor_kick(&self) -> bool {
         self.sinks.take_cursor_kick()
+    }
+
+    /// Have Wine show this device's client surface again, sized to the client area, if asked.
+    ///
+    /// Called once per `Present`, on the API thread, a Wine thread, which
+    /// win32u's surface calls need. A frame nothing asked on pays one relaxed
+    /// load; one after the client view was hidden or the window's client area
+    /// moved sends `PresentClientSurface`.
+    pub fn present_client_surface_if_asked(&self) {
+        if self.view_handle.is_null() {
+            return;
+        }
+        let reasons = self.sinks.take_client_surface_request();
+        if reasons.is_empty() {
+            return;
+        }
+        let mut params = PresentClientSurfaceParams {
+            view_handle: self.view_handle,
+            reasons,
+            pad0: 0,
+        };
+        let status = unix_call(&mut params);
+        if status != 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "PresentClientSurface ({reasons:?}) failed (status={status:#x}); the client surface \
+                 stays as Wine left it",
+            );
+        }
+    }
+
+    /// Ask the next `Present` to show the client surface again: the client area may have moved.
+    pub fn request_client_surface(&self) {
+        self.sinks
+            .request_client_surface(ClientSurfaceRequest::CLIENT_AREA_CHANGED);
     }
 
     /// Re-scale the pointer after the window moved to a display of another backing scale.
@@ -1448,7 +1520,9 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
 /// waits on it. Native D3D9's `D3DCREATE_MULTITHREADED` critical section has
 /// the same hole, and applications keep the window thread out of D3D calls
 /// during `Reset`, so this is parity rather than a gap. What runs unlocked:
-/// the cursor latches on `WM_SETCURSOR` and `WM_ACTIVATE*`, the fullscreen
+/// the cursor latches on `WM_SETCURSOR` and `WM_ACTIVATE*`, the client
+/// surface request every device on the window gets on a `WM_WINDOWPOSCHANGED`
+/// that can move its client area, the fullscreen
 /// window lookup, the auto-resize on `WM_SIZE`, which flushes the current
 /// frame, the registry mode restore on deactivation, and the fullscreen
 /// re-cover and reactivation posted as `WM_APP_REASSERT_FULLSCREEN` and
@@ -1490,6 +1564,26 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // unaligned since the pointer came through an integer.
         let flags = unsafe { flags_at.cast::<u32>().read_unaligned() };
         crate::fullscreen::note_window_pos_changed(hwnd, flags);
+        // Win32's client rect is final by now, which a notification Cocoa
+        // posts for its own resize is not: Wine applies that resize to the
+        // window afterwards, on this thread. The next `Present` has Wine size
+        // the client surface to it, which some Wines leave to the present.
+        // Every device on the window is asked, not only the one the message
+        // routes to: whichever presents next has Wine present the newest
+        // device's surface.
+        if mtld3d_core::window_pos::moves_client_area(flags) {
+            let instances = DEVICE_INSTANCES
+                .lock()
+                .expect("device-instances mutex poisoned");
+            for &device in instances.devices_on(hwnd as usize) {
+                // SAFETY: `device` is registered on this window in
+                // `DEVICE_INSTANCES`, whose lock is held here, and a device's
+                // release unregisters it under that lock before it frees
+                // anything, so the device is alive for the atomic OR below.
+                let device = unsafe { &*(device as *const DeviceInner) };
+                device.cursor().request_client_surface();
+            }
+        }
     }
 
     // While the device itself is moving the window through a fullscreen

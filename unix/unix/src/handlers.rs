@@ -7,7 +7,8 @@ use mtld3d_shared::{
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
     GetDeviceInfoParams, InPtr, InPtrMut, LogLineKind, MetalHandle, OpenLogParams,
-    SetCursorOverlayParams, SetPresentWaitPolicyParams, WriteLogParams, identity,
+    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams, WriteLogParams,
+    identity,
     mtl::{CursorOverlayFlags, DestroyKind},
     mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
@@ -303,6 +304,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         color_space: params.color_space,
         backing_scale_sink_ptr: params.backing_scale_ptr,
         cursor_kick_sink_ptr: params.cursor_kick_ptr,
+        client_surface_request_sink_ptr: params.client_surface_request_ptr,
         software_cursor: params.software_cursor,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
@@ -356,6 +358,19 @@ pub extern "C" fn detach_metal_layer_handler(args: *mut c_void) -> i32 {
         "detached Metal layer (view {:#x})",
         params.view_handle.raw(),
     );
+    STATUS_SUCCESS
+}
+
+/// `PresentClientSurface`: have Wine show and size the client surface of a view's window.
+///
+/// Runs on the API thread, a Wine thread, as win32u's surface calls require,
+/// and only at a `Present` whose device found its request word set.
+pub extern "C" fn present_client_surface_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const PresentClientSurfaceParams.
+    let Some(params) = (unsafe { InPtr::<PresentClientSurfaceParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    metal::present_client_surface(params.view_handle, params.reasons);
     STATUS_SUCCESS
 }
 

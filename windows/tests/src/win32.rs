@@ -72,6 +72,8 @@ unsafe extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    fn GetDC(hwnd: usize) -> usize;
+    fn ReleaseDC(hwnd: usize, hdc: usize) -> i32;
 }
 
 // `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
@@ -110,7 +112,26 @@ unsafe extern "system" {
     fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) -> u32;
     fn GetBitmapBits(bitmap: *mut c_void, count: i32, bits: *mut c_void) -> i32;
     fn DeleteObject(object: *mut c_void) -> i32;
+    fn ChoosePixelFormat(hdc: usize, pfd: *const PixelFormatDescriptor) -> i32;
+    fn SetPixelFormat(hdc: usize, format: i32, pfd: *const PixelFormatDescriptor) -> i32;
 }
+
+/// `PIXELFORMATDESCRIPTOR`, its byte fields as one array.
+///
+/// The array is the run between `dwFlags` and `dwLayerMask`: byte 0 is
+/// `iPixelType`, 1 `cColorBits`, 15 `cDepthBits`; the rest stay zero.
+#[repr(C)]
+struct PixelFormatDescriptor {
+    size: u16,
+    version: u16,
+    flags: u32,
+    bytes: [u8; 20],
+    layer_mask: u32,
+    visible_mask: u32,
+    damage_mask: u32,
+}
+
+const _: () = assert!(size_of::<PixelFormatDescriptor>() == 40);
 
 /// `MEM_COMMIT`: the region's pages are committed.
 const MEM_COMMIT: u32 = 0x1000;
@@ -964,6 +985,56 @@ pub fn set_window_pos(hwnd: usize, x: i32, y: i32, width: i32, height: i32) {
     // geometry is plain scalars.
     let ok = unsafe { SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) };
     assert!(ok != 0, "SetWindowPos failed");
+}
+
+/// Give `hwnd` an OpenGL pixel format, as a game that opens a GL context on its window does.
+///
+/// Wine's Mac driver answers it with a client surface of the window's own
+/// for OpenGL, which it shows at once, hiding the window's other client
+/// view: the one a device's metal view sits in. A test uses it to have Wine
+/// hide that view the way a Wine does that hides it on a window surface
+/// flush.
+///
+/// `false` when the machine offers no OpenGL pixel format for the window at
+/// all, which a CI runner whose virtual GPU has no OpenGL does: the caller
+/// cannot have Wine hide the view this way there.
+///
+/// # Panics
+///
+/// Panics when the window has no device context, or when `SetPixelFormat`
+/// refuses the format `ChoosePixelFormat` offered.
+#[must_use]
+pub fn set_opengl_pixel_format(hwnd: usize) -> bool {
+    const PFD_DOUBLEBUFFER: u32 = 0x0000_0001;
+    const PFD_DRAW_TO_WINDOW: u32 = 0x0000_0004;
+    const PFD_SUPPORT_OPENGL: u32 = 0x0000_0020;
+    let mut bytes = [0_u8; 20];
+    bytes[1] = 32;
+    bytes[15] = 24;
+    let pfd = PixelFormatDescriptor {
+        size: 40,
+        version: 1,
+        flags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        bytes,
+        layer_mask: 0,
+        visible_mask: 0,
+        damage_mask: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+    let hdc = unsafe { GetDC(hwnd) };
+    assert_ne!(hdc, 0, "GetDC({hwnd:#x}) failed");
+    // SAFETY: GDI thunk; `hdc` is the live device context above and `pfd`
+    // a filled-in descriptor of the documented size.
+    let format = unsafe { ChoosePixelFormat(hdc, &raw const pfd) };
+    // SAFETY: as above, with the format `ChoosePixelFormat` answered.
+    let set = format != 0 && unsafe { SetPixelFormat(hdc, format, &raw const pfd) } != 0;
+    // SAFETY: Win32 thunk; gives back the device context `GetDC` handed out.
+    unsafe { ReleaseDC(hwnd, hdc) };
+    if format == 0 {
+        return false;
+    }
+    assert!(set, "SetPixelFormat({format}) refused for window {hwnd:#x}");
+    true
 }
 
 /// Read one pixel of a device context as a `COLORREF` (`0x00BBGGRR`).

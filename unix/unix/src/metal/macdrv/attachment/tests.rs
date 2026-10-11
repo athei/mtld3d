@@ -17,9 +17,11 @@
 //! re-pacing makes one record's reconciliation due at once, defers to a
 //! refresh already in flight, and leaves the other records' cadence alone.
 //! They also pin which client surface a window's departing device hands the
-//! window to: the newest live record's on that window that holds one, and
-//! when a window that reads visible counts as displaying nothing: after a run
-//! of undisplayed paced presents, until the next displayed one.
+//! window to: the newest live record's on that window that holds one, that
+//! only that record's device is asked to show it again when Wine hides its
+//! client view, and when a window that reads visible counts as displaying
+//! nothing: after a run of undisplayed paced presents, until the next
+//! displayed one.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -27,13 +29,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::ColorSpacePolicy;
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
 
 use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, UNDISPLAYED_PACED_LIMIT,
     find, find_by_layer, live, next_unshown_release, publish_backing_scale, register,
-    request_cursor_kick_all, retain_newest_surface_on, test_address_block, undisplayed_run_edge,
-    unregister,
+    request_client_surface, request_cursor_kick_all, retain_newest_surface_on, test_address_block,
+    undisplayed_run_edge, unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -62,6 +64,7 @@ fn latches(
         backing_scale,
         backing_scale_sink,
         cursor_kick_sink,
+        client_surface_request_sink: 0,
         client_surface: 0,
     }
 }
@@ -206,6 +209,7 @@ fn each_record_seeds_its_own_defaults() {
             backing_scale: 2,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
             client_surface: 0,
         },
     );
@@ -702,5 +706,89 @@ fn a_record_displays_nothing_from_the_limit_until_a_displayed_present() {
         "the first displayed present"
     );
     assert!(!att.displays_nothing());
+    unregister(view);
+}
+
+/// Latches for a record on `hwnd` holding `client_surface`, asking through `sink`.
+fn request_latches(hwnd: u64, client_surface: usize, sink: &AtomicU32) -> AttachLatches {
+    AttachLatches {
+        client_surface_request_sink: core::ptr::from_ref(sink) as usize,
+        ..surface_latches(hwnd, client_surface)
+    }
+}
+
+#[test]
+fn only_the_newest_record_with_a_surface_asks_for_it_again() {
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
+    let view_c = view_a + 0x2000;
+    let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
+
+    let sink_a = AtomicU32::new(0);
+    let sink_b = AtomicU32::new(0);
+    let sink_c = AtomicU32::new(0);
+    register(view_a, view_a + 8, &request_latches(hwnd, 0xa000, &sink_a));
+    assert!(
+        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        "the only device on the window asks"
+    );
+    assert!(
+        request_client_surface(view_a, ClientSurfaceRequest::CLIENT_AREA_CHANGED),
+        "and asks again for another reason"
+    );
+    assert_eq!(
+        sink_a.swap(0, Ordering::Acquire),
+        (ClientSurfaceRequest::VIEW_HIDDEN | ClientSurfaceRequest::CLIENT_AREA_CHANGED).bits(),
+        "the reasons accumulate until the device takes them"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    register(view_b, view_b + 8, &request_latches(hwnd, 0xb000, &sink_b));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    register(view_c, view_c + 8, &request_latches(hwnd, 0, &sink_c));
+    assert!(
+        !request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        "a device a newer one on its window outranks is hidden on purpose"
+    );
+    assert!(
+        !request_client_surface(view_c, ClientSurfaceRequest::VIEW_HIDDEN),
+        "a record without a surface has nothing to show"
+    );
+    assert!(request_client_surface(
+        view_b,
+        ClientSurfaceRequest::VIEW_HIDDEN
+    ));
+    assert_eq!(sink_a.load(Ordering::Acquire), 0);
+    assert_eq!(sink_c.load(Ordering::Acquire), 0);
+    assert_eq!(
+        sink_b.swap(0, Ordering::Acquire),
+        ClientSurfaceRequest::VIEW_HIDDEN.bits()
+    );
+
+    unregister(view_b);
+    assert!(
+        !request_client_surface(view_b, ClientSurfaceRequest::VIEW_HIDDEN),
+        "an unregistered record asks nothing"
+    );
+    assert_eq!(sink_b.load(Ordering::Acquire), 0);
+    assert!(
+        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        "the window's newest device again once the later one left"
+    );
+
+    unregister(view_a);
+    unregister(view_c);
+}
+
+#[test]
+fn a_record_without_a_request_word_asks_nothing() {
+    let view = test_address_block();
+    let hwnd = u64::try_from(view + 0x40).expect("a test address fits a u64");
+
+    register(view, view + 8, &surface_latches(hwnd, 0xf000));
+    assert!(!request_client_surface(
+        view,
+        ClientSurfaceRequest::VIEW_HIDDEN
+    ));
     unregister(view);
 }

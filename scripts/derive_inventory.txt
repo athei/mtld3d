@@ -23,6 +23,7 @@ unix/shared/src/mtl.rs BlockLayout Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs BorderColor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BufferKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs ClearQuadFlags Clone,Copy,Debug,PartialEq,Eq,Hash
+unix/shared/src/mtl.rs ClientSurfaceRequest Clone,Copy,Debug,Default,PartialEq,Eq
 unix/shared/src/mtl.rs ColorSpacePolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs ColorWriteMask Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs CompareFunc Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr

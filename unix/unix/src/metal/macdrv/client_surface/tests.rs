@@ -4,8 +4,9 @@
 //! subclass in the role of the hook class, which turns into a plain
 //! `CAMetalLayer` exactly once, and another subclass, which keeps its class.
 //! The field read is pinned on runtime-built classes carrying the field the
-//! way winemac's cocoa view does, and on classes that lack it or carry it
-//! under another type.
+//! way winemac's cocoa view does, under either name a Wine gives it (with
+//! `CrossOver`'s preferred when a class declares both), and on classes that
+//! lack it or carry it under another type.
 
 use core::ffi::c_void;
 
@@ -91,9 +92,20 @@ fn another_subclass_keeps_its_class() {
 }
 
 /// A runtime class named `name` over `superclass`, with the client surface field typed `T`.
+///
+/// The field carries `CrossOver`'s name, the first of [`CLIENT_SURFACE_IVARS`].
 fn class_with_field<T: Encode>(name: &CStr, superclass: &AnyClass) -> &'static AnyClass {
+    class_with_named_field::<T>(name, superclass, CLIENT_SURFACE_IVARS[0])
+}
+
+/// A runtime class named `name` over `superclass`, with a `T` field named `field`.
+fn class_with_named_field<T: Encode>(
+    name: &CStr,
+    superclass: &AnyClass,
+    field: &CStr,
+) -> &'static AnyClass {
     let mut builder = ClassBuilder::new(name, superclass).expect("the test class name is free");
-    builder.add_ivar::<T>(CLIENT_SURFACE_IVAR);
+    builder.add_ivar::<T>(field);
     builder.register()
 }
 
@@ -115,8 +127,13 @@ fn instance(class: &AnyClass) -> Retained<AnyObject> {
 
 /// Write the client surface field of `object`, which is laid out as `host`.
 fn set_field(object: &AnyObject, host: &AnyClass, surface: usize) {
+    set_named_field(object, host, CLIENT_SURFACE_IVARS[0], surface);
+}
+
+/// Write the pointer field `field` of `object`, which is laid out as `host`.
+fn set_named_field(object: &AnyObject, host: &AnyClass, field: &CStr, surface: usize) {
     let ivar = host
-        .instance_variable(CLIENT_SURFACE_IVAR)
+        .instance_variable(field)
         .expect("the host declares the field");
     // SAFETY: `object` is an instance of `host` or a subclass, which declares
     // the field.
@@ -141,6 +158,62 @@ fn the_field_names_the_surface_on_the_host_and_its_subclasses() {
 
     let unset = instance(host);
     assert_eq!(surface_field(&unset, host), 0, "a view showing no surface");
+}
+
+#[test]
+fn the_second_name_of_the_field_names_the_surface_too() {
+    let host = class_with_named_field::<*mut c_void>(
+        c"Mtld3dTestSecondNameContentView",
+        NSObject::class(),
+        CLIENT_SURFACE_IVARS[1],
+    );
+    let view = instance(host);
+    set_named_field(&view, host, CLIENT_SURFACE_IVARS[1], 0x9abc);
+    assert_eq!(surface_field(&view, host), 0x9abc);
+}
+
+#[test]
+fn the_crossover_name_wins_when_a_class_declares_both() {
+    let mut builder = ClassBuilder::new(c"Mtld3dTestBothContentView", NSObject::class())
+        .expect("the test class name is free");
+    builder.add_ivar::<*mut c_void>(CLIENT_SURFACE_IVARS[1]);
+    builder.add_ivar::<*mut c_void>(CLIENT_SURFACE_IVARS[0]);
+    let host = builder.register();
+    let view = instance(host);
+    set_named_field(&view, host, CLIENT_SURFACE_IVARS[1], 0x1111);
+    set_named_field(&view, host, CLIENT_SURFACE_IVARS[0], 0x2222);
+    assert_eq!(surface_field(&view, host), 0x2222);
+}
+
+#[test]
+fn the_hook_is_replaced_only_when_a_surface_can_be_read_and_presented() {
+    let first = class_with_field::<*mut c_void>(c"Mtld3dTestHookFirstName", NSObject::class());
+    let second = class_with_named_field::<*mut c_void>(
+        c"Mtld3dTestHookSecondName",
+        NSObject::class(),
+        CLIENT_SURFACE_IVARS[1],
+    );
+    let bare = class_without_field(c"Mtld3dTestHookBare", NSObject::class());
+    let mistyped = class_with_field::<u32>(c"Mtld3dTestHookMistyped", NSObject::class());
+
+    assert!(can_replace_hook(true, Some(first)));
+    assert!(can_replace_hook(true, Some(second)));
+    assert!(
+        !can_replace_hook(false, Some(first)),
+        "without win32u's exports nothing presents the surface"
+    );
+    assert!(
+        !can_replace_hook(true, Some(bare)),
+        "a class without the field names no surface"
+    );
+    assert!(
+        !can_replace_hook(true, Some(mistyped)),
+        "a field that is no pointer is not read"
+    );
+    assert!(
+        !can_replace_hook(true, None),
+        "a Wine without the cocoa view class"
+    );
 }
 
 #[test]

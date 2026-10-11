@@ -93,6 +93,7 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::SetCursorOverlay => arp!(handlers::set_cursor_overlay_handler),
         Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
         Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
+        Thunks::PresentClientSurface => arp!(handlers::present_client_surface_handler),
     }
 }
 

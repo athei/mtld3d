@@ -43,8 +43,8 @@ pub use params::{
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams, ExtraColorDesc,
     GetDeviceInfoParams, InitLoggerParams, LogLineKind, OpenLogParams, PassDescriptor,
-    SetCursorOverlayParams, SetPresentWaitPolicyParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WriteLogParams,
+    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams,
+    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WriteLogParams,
 };
 pub use record_handle::DeviceRecordHandle;
 
@@ -72,6 +72,7 @@ pub enum Thunks {
     EncoderControl,
     CreateShaderProgram,
     CancelShaderProgram,
+    PresentClientSurface,
 }
 
 pub trait Thunk {

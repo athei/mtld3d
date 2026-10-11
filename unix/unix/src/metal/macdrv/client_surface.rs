@@ -13,11 +13,16 @@
 //! ([`bypass_present_hook`]), and the one thing the override did for the
 //! layer is done here instead, on the thread that asks: the client surface
 //! the view sits in is read on the main thread ([`client_surface_of`]),
-//! retained, and presented through win32u's own `client_surface_present`
-//! when a device attaches to it and when a device leaves a window another
-//! live device still presents into. Wine showed the surface of whichever
-//! device presented last; this shows the surface of the newest device
-//! attached to the window.
+//! retained, and presented through win32u's own `client_surface_present`,
+//! which also sizes the surface's cocoa view to the window's client rect.
+//! That happens when a device attaches, when a device leaves a window another
+//! live device still presents into, and at the next `Present` after the
+//! client view was hidden or the window's client area changed (the device's
+//! `PresentClientSurface` request, see `client_view_watch`). Some Wines hide
+//! the client view whenever they flush the window surface, and some leave the
+//! surface out of the updates a window move or resize makes, counting on the
+//! override for both. Wine showed the surface of whichever device presented
+//! last; this shows the surface of the newest device attached to the window.
 //!
 //! The surface functions are win32u's exports, called on the API thread,
 //! which is a Wine thread: `client_surface_present` takes win32u's surface
@@ -26,11 +31,12 @@
 
 use core::ffi::{CStr, c_void};
 
-use log::info;
+use log::{debug, info};
+use mtld3d_shared::mtl::ClientSurfaceRequest;
 use objc2::{
     ClassType, Encode, MainThreadMarker,
     rc::Retained,
-    runtime::{AnyClass, AnyObject},
+    runtime::{AnyClass, AnyObject, Ivar},
 };
 use objc2_quartz_core::CAMetalLayer;
 
@@ -43,8 +49,12 @@ const HOOK_LAYER_CLASS: &CStr = c"WineMetalLayer";
 /// winemac's class for a client surface's cocoa view.
 const CLIENT_VIEW_CLASS: &CStr = c"WineContentView";
 
-/// The cocoa view's field that names the client surface it shows.
-const CLIENT_SURFACE_IVAR: &CStr = c"d3dmetal_client_surface";
+/// The names Wines give the cocoa view's field that names the client surface it shows.
+///
+/// `CrossOver`'s winemac uses the first name, and the `WineAndAqua` fork,
+/// which carries the same field for another Metal layer, the second. The
+/// first one the class declares is read.
+const CLIENT_SURFACE_IVARS: [&CStr; 2] = [c"d3dmetal_client_surface", c"dxmt_client_surface"];
 
 /// What [`bypass_present_hook`] found the layer to be.
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +65,8 @@ pub enum LayerClass {
     Plain,
     /// The layer is some other subclass, which is left as it is.
     Foreign,
+    /// The layer is the hook class and keeps it: nothing here can present its client surface.
+    Hooked,
 }
 
 /// One of win32u's client surface entry points.
@@ -68,10 +80,30 @@ type SurfaceFn = unsafe extern "C" fn(*mut c_void);
 /// moves. A layer of any other class, such as one a key-value observer has
 /// subclassed, keeps its class and is reported as [`LayerClass::Foreign`].
 /// A Wine without the hook class has nothing to bypass.
-pub fn bypass_present_hook(layer: *mut c_void, _mtm: MainThreadMarker) -> LayerClass {
+///
+/// The override is what has Wine show the client surface, and size it to the
+/// window's client area, as the layer presents; once it is gone, the attach
+/// and the device's later requests do that through win32u. So the layer keeps
+/// the override ([`LayerClass::Hooked`]) when they cannot: `can_present` is
+/// false when this Wine lacks win32u's surface exports, and a cocoa view class
+/// that declares none of [`CLIENT_SURFACE_IVARS`] names no surface to present.
+pub fn bypass_present_hook(
+    layer: *mut c_void,
+    can_present: bool,
+    _mtm: MainThreadMarker,
+) -> LayerClass {
     let Some(hook) = AnyClass::get(HOOK_LAYER_CLASS) else {
         return LayerClass::Plain;
     };
+    if !can_replace_hook(can_present, AnyClass::get(CLIENT_VIEW_CLASS)) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the metal layer keeps {HOOK_LAYER_CLASS:?}'s nextDrawable, which walks the \
+             view off the main thread: this Wine gives no way to show and size the client surface \
+             without it",
+        );
+        return LayerClass::Hooked;
+    }
     // SAFETY: `layer` is the layer of a metal view the caller holds, which
     // Wine retains for the view's lifetime; the retain keeps it for this call.
     let Some(layer) = (unsafe { Retained::retain(layer.cast::<CAMetalLayer>()) }) else {
@@ -172,10 +204,36 @@ impl SurfaceCalls {
         if surface == 0 {
             return;
         }
+        self.call_present(surface);
+        info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x}");
+    }
+
+    /// [`Self::present`] for a device's request, which can come every frame, logged quietly.
+    ///
+    /// win32u updates the surface's frame from the window's client rect before
+    /// it presents, which is what a resize needs on a Wine that leaves the
+    /// surface out of its own updates.
+    pub fn present_requested(&self, surface: usize, reasons: ClientSurfaceRequest) {
+        if surface == 0 {
+            return;
+        }
+        self.call_present(surface);
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: Wine shows client surface {surface:#x} again on the device's request \
+             ({reasons:?}); later requests are logged at debug",
+        );
+        debug!(
+            target: LOG_TARGET,
+            "present: Wine shows client surface {surface:#x} again ({reasons:?})",
+        );
+    }
+
+    /// win32u's `client_surface_present` on a surface the caller holds a reference on.
+    fn call_present(&self, surface: usize) {
         // SAFETY: the caller holds a reference on `surface`, so it is a live
         // client surface; win32u checks it is still attached under its lock.
         unsafe { (self.present)(surface as *mut c_void) };
-        info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x}");
     }
 
     /// Give back a reference [`Self::retain`] took; `0` does nothing.
@@ -185,6 +243,14 @@ impl SurfaceCalls {
             unsafe { (self.release)(surface as *mut c_void) };
         }
     }
+}
+
+/// Whether anything can replace the hook: win32u's calls and a surface field on `host`.
+///
+/// `can_present` says the surface exports loaded; `host` is the cocoa view
+/// class, `None` on a Wine without one.
+fn can_replace_hook(can_present: bool, host: Option<&'static AnyClass>) -> bool {
+    can_present && host.and_then(surface_ivar).is_some()
 }
 
 /// [`bypass_present_hook`] against a hook class the caller names.
@@ -217,7 +283,7 @@ fn bypass_hook_class(layer: &CAMetalLayer, hook: &AnyClass) -> LayerClass {
 }
 
 /// The client surface pointer `object` keeps in its field, when it is a `host`.
-fn surface_field(object: &AnyObject, host: &AnyClass) -> usize {
+fn surface_field(object: &AnyObject, host: &'static AnyClass) -> usize {
     let mut class = Some(object.class());
     while let Some(current) = class {
         if current == host {
@@ -228,23 +294,9 @@ fn surface_field(object: &AnyObject, host: &AnyClass) -> usize {
     if class.is_none() {
         return 0;
     }
-    let Some(ivar) = host.instance_variable(CLIENT_SURFACE_IVAR) else {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "present: this Wine's {CLIENT_VIEW_CLASS:?} keeps no {CLIENT_SURFACE_IVAR:?}; a \
-             window another device's surface hid stays on that surface",
-        );
+    let Some(ivar) = surface_ivar(host) else {
         return 0;
     };
-    let encoding = ivar.type_encoding().to_str().unwrap_or_default();
-    if !<*mut c_void>::ENCODING.equivalent_to_str(encoding) {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "present: {CLIENT_VIEW_CLASS:?}.{CLIENT_SURFACE_IVAR:?} is encoded {encoding:?}, not \
-             a pointer; it is not read",
-        );
-        return 0;
-    }
     // SAFETY: `object` is a `host`, which declares the field, and its
     // encoding is a pointer's. winemac writes the field once, on the Wine
     // thread inside the `get_win_data` that creates the cocoa view, before
@@ -254,6 +306,40 @@ fn surface_field(object: &AnyObject, host: &AnyClass) -> usize {
     // the window writes a new cocoa view's field, not this one.
     let surface = unsafe { *ivar.load::<*mut c_void>(object) };
     surface as usize
+}
+
+/// The field of `host` that names the client surface, under the first name `host` declares.
+///
+/// `None`, logged once, when `host` declares none of them or declares one
+/// that is not a pointer.
+fn surface_ivar(host: &'static AnyClass) -> Option<&'static Ivar> {
+    let Some((name, ivar)) = CLIENT_SURFACE_IVARS
+        .iter()
+        .find_map(|name| host.instance_variable(name).map(|ivar| (*name, ivar)))
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: this Wine's {:?} keeps none of {CLIENT_SURFACE_IVARS:?}, so no client \
+             surface is read from it",
+            host.name(),
+        );
+        return None;
+    };
+    let encoding = ivar.type_encoding().to_str().unwrap_or_default();
+    if !<*mut c_void>::ENCODING.equivalent_to_str(encoding) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: {:?}.{name:?} is encoded {encoding:?}, not a pointer; it is not read",
+            host.name(),
+        );
+        return None;
+    }
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "present: this Wine's {:?} names its client surface in {name:?}",
+        host.name(),
+    );
+    Some(ivar)
 }
 
 /// Resolve one of win32u's client surface functions, `None` with a warning when it is missing.

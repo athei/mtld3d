@@ -527,6 +527,7 @@ fn an_occluded_window_keeps_its_pace() {
             backing_scale: 1,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
             client_surface: 0,
         },
     );
@@ -565,6 +566,7 @@ fn the_presenter_paces_a_window_that_displays_nothing() {
             backing_scale: 1,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
             client_surface: 0,
         },
     );
