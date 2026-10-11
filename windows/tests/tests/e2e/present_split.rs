@@ -11,13 +11,16 @@
 //! gate inside the one thunk that replays, acquires and commits, the flush
 //! behind the read-back drains a submit thread parked there, the read-back
 //! never returns, and the harness reports the test as a timeout rather than
-//! as a wrong pixel. The same seam holds a read-back behind a full pipeline:
+//! as a wrong pixel. The same seam holds a read-back behind a full pipeline,
 //! every stage ahead of the presenter filled with a present, which is the
-//! most copies one read-back can need and what the slot array is sized for.
+//! most copies one read-back can need and what the slot array is sized for,
+//! and holds the present the frame-latency bound names until a parked paced
+//! frame is shown.
 
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    time::{Duration, Instant},
 };
 
 use mtld3d_tests::{Harness, HarnessConfig, assert_pixel_eq, spawn_scoped};
@@ -26,12 +29,30 @@ use mtld3d_types::{
 };
 
 use super::device::{
-    DRAWABLE_LOG_FILTER, PRESENT_OCCLUDED, await_acquired_drawables, run_in_private_log_child_with,
-    running_as,
+    DRAWABLE_LOG_FILTER, await_acquired_drawables, run_in_private_log_child_with, running_as,
 };
 
 /// The name the workload child of the full-pipeline test runs under.
 const FULL_PIPELINE_CHILD_NAME: &str = "present-full-pipeline.exe";
+
+/// The full-pipeline child's configuration: presents into its occluded windows, the bound at 30.
+///
+/// With the default bound of three the API thread could not queue five
+/// presents behind a parked paced one; 30 leaves only the native queues to
+/// stop it.
+const FULL_PIPELINE_ENTRIES: &str = "debug.presentOccluded=true;present.maxFrameLatency=30";
+
+/// The name the workload child of the frame-latency test runs under.
+const BOUND_CHILD_NAME: &str = "present-latency-bound.exe";
+
+/// The bound child's configuration: presents into its occluded windows, paced by a frame cap.
+///
+/// The cap gives every present a minimum duration whatever display the run
+/// has, so each one waits for the screen and holds its frame until shown.
+const BOUND_ENTRIES: &str = "debug.presentOccluded=true;present.maxFps=60";
+
+/// How long a present held by the bound is watched before the gate lifts.
+const HELD_PRESENT_WATCH: Duration = Duration::from_millis(500);
 
 /// A gate file of this test's own under the prefix's temp directory, and the entry naming it.
 ///
@@ -39,7 +60,7 @@ const FULL_PIPELINE_CHILD_NAME: &str = "present-full-pipeline.exe";
 /// The entry is leaked: `HarnessConfig::config_entries` is `&'static str`,
 /// and a test runs once per process. The path carries no `;`, the entry
 /// separator.
-fn gate_file(tag: &str) -> (PathBuf, &'static str) {
+pub fn gate_file(tag: &str) -> (PathBuf, &'static str) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock follows Unix epoch")
@@ -105,14 +126,16 @@ fn a_readback_completes_while_the_presenter_is_parked() {
 /// the API thread: the present the presenter holds at the gate, the submit
 /// parked in its wait for it, the payload in the work channel, the frame the
 /// encoder holds while it waits for a payload, and the frame in the channel
-/// to the encoder. The read-back's flush hurries all of them, and each copies
-/// the image of the present ahead of it into a slot before the partial frame
-/// copies the last; the slot array is sized for exactly this. One slot short,
-/// the last copy waits for the oldest present to commit, which the gate
-/// holds, and the harness reports a timeout. The workload runs in a process
-/// of its own that presents into occluded windows ([`PRESENT_OCCLUDED`]):
-/// once the gate lifts, every queued present, each from its slot, acquires a
-/// drawable under the suite's Main Thread Checker, and the log counts them.
+/// to the encoder. The frame-latency bound is raised to 30
+/// ([`FULL_PIPELINE_ENTRIES`]) so it lets the API thread run that far ahead.
+/// The read-back's flush hurries all of them, and each copies the image of
+/// the present ahead of it into a slot before the partial frame copies the
+/// last; the slot array is sized for exactly this. One slot short, the last
+/// copy waits for the oldest present to commit, which the gate holds, and
+/// the harness reports a timeout. The workload runs in a process of its own
+/// that presents into occluded windows (`debug.presentOccluded`): once the
+/// gate lifts, every queued present, each from its slot, acquires a drawable
+/// under the suite's Main Thread Checker, and the log counts them.
 #[test]
 fn a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked() {
     if running_as(FULL_PIPELINE_CHILD_NAME) {
@@ -123,7 +146,7 @@ fn a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked() {
         FULL_PIPELINE_CHILD_NAME,
         "present_split::a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked",
         DRAWABLE_LOG_FILTER,
-        PRESENT_OCCLUDED,
+        FULL_PIPELINE_ENTRIES,
     );
 }
 
@@ -133,32 +156,8 @@ fn full_pipeline_workload() {
     const LAST: u32 = 0xFFFF_00FF;
     let (gate, entry) = gate_file("pipeline");
     let h = Harness::with_config(entry);
-    for stage in 1..=STAGES {
-        assert_eq!(
-            h.clear_target(0xFF00_0000 | (stage * 0x0020_2020)),
-            D3D_OK,
-            "clear a frame that is presented"
-        );
-        assert_eq!(h.present(), D3D_OK, "present into a filling pipeline");
-    }
-    assert_eq!(
-        h.clear_target(LAST),
-        D3D_OK,
-        "clear the frame that is not presented"
-    );
-    {
-        let backbuffer = h.back_buffer(0);
-        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
-        assert_eq!(
-            locked.as_u32(1)[0],
-            LAST,
-            "the read-back shows the clear behind five unpresented frames"
-        );
-        assert!(
-            gate.exists(),
-            "nothing on the read-back path lifted the gate"
-        );
-    }
+    present_stages(&h, STAGES);
+    read_back_behind(&h, &gate, LAST, "five");
     std::fs::remove_file(&gate).expect("remove the gate file");
     for _ in 0..2 {
         h.render_once(LAST, |_| {});
@@ -168,6 +167,112 @@ fn full_pipeline_workload() {
     await_acquired_drawables(
         h.hwnd(),
         usize::try_from(STAGES + 2).expect("a present count fits usize"),
+    );
+}
+
+/// The present the frame-latency bound names waits for a parked paced frame to be shown.
+///
+/// The child paces its presents (a frame cap) into occluded windows it
+/// presents into anyway, at the default maximum frame latency of three
+/// ([`BOUND_ENTRIES`]), so a frame finishes only once its present is on
+/// screen, and the parked first present keeps the first frame unfinished.
+/// Three presents queue behind it without blocking the API thread; a read-back
+/// hurries all of them through their slots. A fourth present, from a worker
+/// of the `D3DCREATE_MULTITHREADED` device, waits for the first frame and so
+/// for the gate: it has not returned while the gate stands, and returns once
+/// it lifts. Every queued present then acquires a drawable, and the log
+/// counts them.
+#[test]
+fn the_bound_holds_a_present_behind_a_parked_paced_frame() {
+    if running_as(BOUND_CHILD_NAME) {
+        bound_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        BOUND_CHILD_NAME,
+        "present_split::the_bound_holds_a_present_behind_a_parked_paced_frame",
+        DRAWABLE_LOG_FILTER,
+        BOUND_ENTRIES,
+    );
+}
+
+/// Queue three paced presents behind a parked presenter, read back, and hold the fourth.
+fn bound_workload() {
+    const STAGES: u32 = 3;
+    const LAST: u32 = 0xFFFF_00FF;
+    let (gate, entry) = gate_file("bound");
+    let h = Harness::create(&HarnessConfig {
+        config_entries: entry,
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        ..HarnessConfig::default()
+    });
+    present_stages(&h, STAGES);
+    read_back_behind(&h, &gate, LAST, "three");
+    let shared = h.shared();
+    let returned = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = spawn_scoped(scope, || {
+            let hr = shared.present();
+            returned.store(true, Ordering::Release);
+            hr
+        });
+        let watch = Instant::now();
+        while watch.elapsed() < HELD_PRESENT_WATCH {
+            assert!(h.pump(), "WM_QUIT while the fourth present waits");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !returned.load(Ordering::Acquire),
+            "a fourth present waits for the first frame, whose present the gate holds"
+        );
+        assert!(gate.exists(), "nothing lifted the gate while it waited");
+        std::fs::remove_file(&gate).expect("remove the gate file");
+        assert_eq!(
+            worker.join().expect("the presenting worker panicked"),
+            D3D_OK,
+            "the held present returns once the gate lifts"
+        );
+    });
+    for _ in 0..2 {
+        h.render_once(LAST, |_| {});
+    }
+    assert_pixel_eq(h.read_pixel(1, 1), LAST, "after the gate was lifted");
+    // The three frames behind the gate, the held one and the two after it.
+    await_acquired_drawables(
+        h.hwnd(),
+        usize::try_from(STAGES + 3).expect("a present count fits usize"),
+    );
+}
+
+/// Clear and present `stages` frames, each a colour of its own.
+fn present_stages(h: &Harness, stages: u32) {
+    for stage in 1..=stages {
+        assert_eq!(
+            h.clear_target(0xFF00_0000 | (stage * 0x0020_2020)),
+            D3D_OK,
+            "clear a frame that is presented"
+        );
+        assert_eq!(h.present(), D3D_OK, "present into a filling pipeline");
+    }
+}
+
+/// Clear the frame that is not presented to `last` and read it back while the gate stands.
+fn read_back_behind(h: &Harness, gate: &std::path::Path, last: u32, queued: &str) {
+    assert_eq!(
+        h.clear_target(last),
+        D3D_OK,
+        "clear the frame that is not presented"
+    );
+    let backbuffer = h.back_buffer(0);
+    let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+    assert_eq!(
+        locked.as_u32(1)[0],
+        last,
+        "the read-back shows the clear behind {queued} unpresented frames"
+    );
+    assert!(
+        gate.exists(),
+        "nothing on the read-back path lifted the gate"
     );
 }
 

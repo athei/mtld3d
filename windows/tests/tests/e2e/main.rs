@@ -45,6 +45,7 @@ mod ff_vertex_pipeline;
 mod float_filter;
 mod format_agreement;
 mod format_query;
+mod frame_latency;
 mod implicit_surface;
 mod lock_lifetime;
 mod mrt;

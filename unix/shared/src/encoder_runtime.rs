@@ -30,6 +30,8 @@ pub struct CreateEncoderParams {
     pub upload_coherent_seq_ptr: u64,
     pub failed_submit_seq_ptr: u64,
     pub retained_bytes_ptr: u64,
+    /// The frame-latency floor: no display-paced present at or below it is outstanding.
+    pub paced_present_seq_ptr: u64,
 }
 
 #[repr(C, align(8))]
@@ -46,7 +48,7 @@ impl Thunk for DestroyEncoderParams {
 }
 
 const _: () = {
-    assert!(size_of::<CreateEncoderParams>() == 88);
+    assert!(size_of::<CreateEncoderParams>() == 96);
     assert!(align_of::<CreateEncoderParams>() == 8);
     assert!(core::mem::offset_of!(CreateEncoderParams, runtime) == 32);
     assert!(core::mem::offset_of!(CreateEncoderParams, source_clock_ptr) == 40);
@@ -55,6 +57,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CreateEncoderParams, upload_coherent_seq_ptr) == 64);
     assert!(core::mem::offset_of!(CreateEncoderParams, failed_submit_seq_ptr) == 72);
     assert!(core::mem::offset_of!(CreateEncoderParams, retained_bytes_ptr) == 80);
+    assert!(core::mem::offset_of!(CreateEncoderParams, paced_present_seq_ptr) == 88);
     assert!(size_of::<DestroyEncoderParams>() == 8);
 };
 
@@ -80,7 +83,7 @@ pub struct EncoderControlParams {
     pub argument: u64,
     pub textures_ptr: u64,
     pub textures_len: u32,
-    /// Zero drains retention, one intakes visibility, two resets resources.
+    /// The [`crate::encoder_protocol::EncoderControl`] to run, as its wire value.
     pub command: u32,
 }
 

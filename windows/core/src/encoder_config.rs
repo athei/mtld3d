@@ -44,6 +44,7 @@ impl WireValue for Mtld3dConfig {
         self.vram_budget_cap_bytes.write_wire(writer)?;
         self.pagebox_pool_cap_bytes.write_wire(writer)?;
         self.present_max_fps.write_wire(writer)?;
+        self.present_max_frame_latency.write_wire(writer)?;
         self.render_scale_percent.write_wire(writer)?;
         self.render_lod_bias.write_wire(writer)?;
         self.adapter_spoof.write_wire(writer)?;
@@ -79,6 +80,7 @@ impl WireValue for Mtld3dConfig {
             vram_budget_cap_bytes: <u64>::read_wire(reader)?,
             pagebox_pool_cap_bytes: <u64>::read_wire(reader)?,
             present_max_fps: <u32>::read_wire(reader)?,
+            present_max_frame_latency: <u32>::read_wire(reader)?,
             render_scale_percent: <u32>::read_wire(reader)?,
             render_lod_bias: <bool>::read_wire(reader)?,
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,

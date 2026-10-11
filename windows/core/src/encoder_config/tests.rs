@@ -45,6 +45,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.vram_budget_cap_bytes = u64::MAX - 123;
     value.pagebox_pool_cap_bytes = u64::MAX - 123;
     value.present_max_fps = 123;
+    value.present_max_frame_latency = 17;
     value.render_scale_percent = 123;
     value.render_lod_bias = !value.render_lod_bias;
     value.adapter_spoof = AdapterSpoof::Amd;

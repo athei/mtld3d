@@ -2624,6 +2624,10 @@ impl FrameEncoder {
             unsafe {
                 crate::encoder_service::publish_failure(self.runtime_failure_ptr);
             }
+            // The frame never commits; a `Present` waiting for it ends with the signal.
+            if let Some(record) = self.record.as_ref() {
+                record.present().frame_signal().end();
+            }
             self.last_submit_status = mtld3d_types::D3DERR_INVALIDCALL;
             // Submit thread is gone (only possible post-shutdown). Undo the
             // count so a later barrier doesn't wait forever.
@@ -9551,6 +9555,12 @@ fn encoder_thread_main(
                     enc.drain_submit_thread();
                     enc.drain_presentation();
                     enc.reset_cleanup(&retired_textures);
+                    // Presentation is drained, and the layer the paced presents
+                    // were waiting on may be replaced: none of them holds the
+                    // frame-latency bound across the reset.
+                    if let Some(record) = enc.record.as_ref() {
+                        record.present().frame_signal().release_paced();
+                    }
                     let _ = ack.send(());
                 }
                 Ok(EncoderMessage::Shutdown) | Err(_) => {
@@ -10071,6 +10081,11 @@ fn execute_submit(
         // SAFETY: the device retains its mailbox until the submit worker joins.
         unsafe {
             crate::encoder_service::publish_failure(failure_ptr);
+        }
+        // A failed submission ends the encoder; a `Present` waiting for a frame
+        // the failure leaves unfinished ends with the device's signal.
+        if let Some(record) = record {
+            record.present().frame_signal().end();
         }
     }
     let outcome = SubmitOutcome {

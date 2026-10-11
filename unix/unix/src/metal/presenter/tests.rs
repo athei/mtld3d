@@ -18,6 +18,9 @@ use objc2_metal::MTLPixelFormat;
 
 use super::*;
 
+/// The minimum present duration of the paced presents these tests note.
+const PACING: Duration = Duration::from_millis(16);
+
 fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
     PresentPacket {
         seq,
@@ -25,6 +28,7 @@ fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
         layer: MetalHandle::<CAMetalLayerKind>::NULL,
         slot,
         view: 0,
+        mark: None,
     }
 }
 
@@ -59,6 +63,7 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
         thread: Mutex::new(None),
         stalled: AtomicBool::new(false),
         present_occluded: false,
+        frame_signal: Arc::new(FrameSignal::new()),
     })
 }
 
@@ -412,4 +417,92 @@ fn a_push_takes_the_drawable_waits_committed_since_the_last_one() {
     state.lock().flags.insert(PresenterFlags::STOP);
     assert_eq!(push(&state, packet(3, None)), 5_000);
     assert_eq!(push(&state, packet(4, None)), 0);
+}
+
+/// A packet the presenter drops unpresented resolves its paced mark, so the frame can finish.
+#[test]
+fn a_dropped_paced_packet_finishes_its_frame() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    let mut paced = packet(4, None);
+    paced.set_mark(state.frame_signal().note_submission(4, Some(PACING)));
+    state.lock().pending.push_back(paced);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        3,
+        "the paced present holds the floor"
+    );
+    drop_front(&state, 4);
+    assert_eq!(floor.load(Ordering::Acquire), 4, "the drop resolved it");
+}
+
+/// Stopping the presenter, the queue's teardown, ends a frame-latency wait behind it.
+#[test]
+fn stop_ends_a_frame_latency_wait() {
+    use std::sync::mpsc;
+
+    use super::super::{frame_signal::FrameWait, submission::RetirementCounter};
+
+    let floor = AtomicU64::new(0);
+    let draw = Arc::new(AtomicU64::new(0));
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(state.frame_signal());
+        let draw = Arc::clone(&draw);
+        thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) };
+            let _ =
+                sender.send(signal.wait(draw, 2, super::super::frame_signal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    stop_and_join(&state);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Ended)
+    );
+    waiter.join().unwrap();
+}
+
+/// A present dropped unshown releases a paced present whose mark is no longer on a packet.
+///
+/// The mark of a committed paced present lives in its drawable's presented
+/// handler; a covered window or a missing drawable means that handler may
+/// not run for as long as the window stays so, and the drop of the next
+/// packet has to release it.
+#[test]
+fn an_unshown_drop_releases_a_committed_paced_present() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    // Committed and handed to its drawable's handler: held outside any packet.
+    let committed = state.frame_signal().note_submission(3, Some(PACING));
+    let mut next = packet(4, None);
+    next.set_mark(state.frame_signal().note_submission(4, Some(PACING)));
+    state.lock().pending.push_back(next);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        2,
+        "both paced presents hold the floor"
+    );
+    drop_unshown(&state, 4);
+    assert_eq!(floor.load(Ordering::Acquire), 4, "the drop released both");
+    drop(committed);
 }

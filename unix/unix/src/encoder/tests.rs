@@ -663,3 +663,88 @@ fn a_release_retires_a_levels_wrapper_once_per_backing() {
     }
     drop(first);
 }
+
+/// A submission that fails on the CPU ends the frame-latency wait of a `Present` behind it.
+///
+/// The failed frame publishes its sequence as retired, but it was never noted
+/// as submitted and never presents; the failure is what has to end the wait,
+/// and it reaches the device's mailbox too.
+#[test]
+fn a_failed_submission_ends_the_frame_latency_wait() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+
+    use mtld3d_shared::mtl::PresentDebugFlags;
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+
+    use crate::metal::{
+        DeviceRecord, FrameWait,
+        submission::{RetirementCounter, SubmitDescription},
+    };
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = device
+        .newCommandQueue()
+        .expect("a queue on the default device");
+    // SAFETY: the raw address carries this retain, which the record adopts and
+    // releases when it drops at the end of this test.
+    let handle = unsafe { MetalHandle::new(Retained::into_raw(queue) as u64) };
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
+    let failure = AtomicU32::new(0);
+    let floor = AtomicU64::new(0);
+    let draw = Arc::new(AtomicU64::new(0));
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    let floor_counter =
+        unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) };
+    record.present().frame_signal().attach(floor_counter);
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(record.present().frame_signal());
+        let draw = Arc::clone(&draw);
+        std::thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) };
+            let _ = sender.send(signal.wait(draw, 3, crate::metal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    // An upload prefix longer than the pass list fails the encode on the CPU.
+    let description = SubmitDescription {
+        blit_commands_need_encoder: false,
+        upload_pass_count: 1,
+        present_layer: MetalHandle::NULL,
+        present_texture: MetalHandle::NULL,
+        present_view: MetalHandle::NULL,
+        submit_seq: 3,
+        // SAFETY: the waiter's own reference keeps this atomic alive past the submission.
+        draw_retirement: unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) },
+        upload_retirement: RetirementCounter::NONE,
+        failed_submission: RetirementCounter::NONE,
+    };
+    let (_payload, outcome) = super::execute_submit(
+        Some(&record),
+        &description,
+        super::FramePayload::default(),
+        core::ptr::from_ref(&failure) as u64,
+    );
+    assert_ne!(outcome.status, 0, "the submission failed");
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Ended)
+    );
+    waiter.join().unwrap();
+    assert_eq!(
+        failure.load(Ordering::Acquire),
+        1,
+        "the mailbox holds the failure"
+    );
+}

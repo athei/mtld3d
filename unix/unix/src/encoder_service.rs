@@ -19,7 +19,15 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_OUTOFMEMORY};
 
-use crate::{LOG_TARGET, encoder::EncoderThread, shader_prewarm, shader_programs::ProgramRegistry};
+use crate::{
+    LOG_TARGET,
+    encoder::EncoderThread,
+    metal::{
+        DeviceRecord, FrameSignal, FrameWait, PACED_PRESENT_CAP, submission::RetirementCounter,
+    },
+    shader_prewarm,
+    shader_programs::ProgramRegistry,
+};
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +39,14 @@ pub struct EncoderService {
     prewarm: PrewarmHandle,
     failure_ptr: u64,
     calibration: CalibrationWorker,
+    /// What the frame-latency wait reads; `None` for a device created without a record.
+    latency: Option<FrameLatencyGate>,
+}
+
+/// The device's frame-latency signal and the draw counter its wait reads.
+struct FrameLatencyGate {
+    signal: Arc<FrameSignal>,
+    draw: RetirementCounter,
 }
 
 impl EncoderService {
@@ -54,6 +70,7 @@ impl EncoderService {
         };
         #[cfg(not(perf_tracking))]
         let _ = source_clock_ptr;
+        let latency = Self::attach_frame_latency(&context);
         let config = Arc::new(config);
         let (prewarm, receiver) = shader_prewarm::spawn(
             context.device_handle,
@@ -61,9 +78,55 @@ impl EncoderService {
             cache_path.clone(),
         );
         let startup = EncoderStartup { context, clocks };
-        Self::finish_startup(calibration, prewarm, receiver, |receiver| {
+        let service = Self::finish_startup(calibration, prewarm, receiver, |receiver| {
             EncoderThread::spawn(caps, config, receiver, cache_path, startup)
+        });
+        match service {
+            Ok(mut service) => {
+                service.latency = latency;
+                Ok(service)
+            }
+            Err(error) => {
+                if let Some(latency) = latency {
+                    latency.signal.end();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Point the device's frame-latency signal at this encoder's PE counters.
+    fn attach_frame_latency(context: &EncoderContext) -> Option<FrameLatencyGate> {
+        // SAFETY: creation retains the record its handle names for this call.
+        let record = unsafe { DeviceRecord::borrow(context.record_handle) }?;
+        let signal = Arc::clone(record.present().frame_signal());
+        // SAFETY: the PE device keeps the counter alive until native destruction
+        // returns, and destruction ends the signal first, so no publication
+        // outlives it.
+        let floor = unsafe { RetirementCounter::from_address(context.paced_present_seq_ptr) };
+        // SAFETY: as above; the wait that reads it runs inside `Present`, under
+        // the API lock that excludes destruction.
+        let draw = unsafe { RetirementCounter::from_address(context.coherent_seq_ptr) };
+        signal.attach(floor);
+        Some(FrameLatencyGate { signal, draw })
+    }
+
+    /// Wait until the frame submitted at `target` finished, or the encoder ended.
+    ///
+    /// The `Present` half of the frame-latency bound, run on the API thread.
+    /// An ended encoder answers at once: its failure already reached the
+    /// device's mailbox, which the PE side reports next.
+    pub fn await_frame(&self, target: u64) -> FrameWait {
+        self.latency.as_ref().map_or(FrameWait::Ended, |latency| {
+            latency.signal.wait(latency.draw, target, PACED_PRESENT_CAP)
         })
+    }
+
+    /// The device's frame-latency signal, for the frames this service admits.
+    fn frame_signal(&self) -> Option<Arc<FrameSignal>> {
+        self.latency
+            .as_ref()
+            .map(|latency| Arc::clone(&latency.signal))
     }
 
     fn finish_startup(
@@ -81,6 +144,7 @@ impl EncoderService {
                 prewarm,
                 failure_ptr: 0,
                 calibration,
+                latency: None,
             }),
             Err(error) => {
                 prewarm.cancel_and_join();
@@ -106,6 +170,11 @@ impl Drop for EncoderService {
         self.prewarm.cancel_and_join();
         self.calibration.join();
         self.encoder.shutdown();
+        // The PE side frees the counters the signal publishes into once this
+        // returns; ending it first stops every later write.
+        if let Some(latency) = &self.latency {
+            latency.signal.end();
+        }
     }
 }
 
@@ -117,6 +186,7 @@ pub struct EncoderContext {
     pub upload_coherent_seq_ptr: u64,
     pub failed_submit_seq_ptr: u64,
     pub retained_bytes_ptr: u64,
+    pub paced_present_seq_ptr: u64,
 }
 
 /// Inputs consumed once by the native encoder worker before admitting frames.
@@ -228,6 +298,7 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
             params.upload_coherent_seq_ptr,
             params.failed_submit_seq_ptr,
             params.retained_bytes_ptr,
+            params.paced_present_seq_ptr,
         ]
         .into_iter()
         .any(|pointer| pointer == 0 || pointer % 8 != 0)
@@ -264,6 +335,7 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
         upload_coherent_seq_ptr: params.upload_coherent_seq_ptr,
         failed_submit_seq_ptr: params.failed_submit_seq_ptr,
         retained_bytes_ptr: params.retained_bytes_ptr,
+        paced_present_seq_ptr: params.paced_present_seq_ptr,
     };
     match EncoderService::new(context, config, caps, path, params.source_clock_ptr) {
         Ok(mut service) => {
@@ -306,14 +378,23 @@ pub struct EncodedFrame {
     pub mode: EncoderSubmitMode,
     pub failure_ptr: u64,
     programs: Arc<ProgramRegistry>,
+    /// The device's frame-latency signal, which a failed frame ends.
+    signal: Option<Arc<FrameSignal>>,
 }
 
 impl EncodedFrame {
     /// Publish native admission/replay failure before acknowledging the frame.
+    ///
+    /// A failed frame never commits, so a `Present` waiting for it would wait
+    /// forever; the failure ends the device's frame-latency signal, which
+    /// wakes that wait.
     pub fn report_failure(&self) {
         // SAFETY: admission retains the device mailbox until encoder shutdown.
         unsafe {
             publish_failure(self.failure_ptr);
+        }
+        if let Some(signal) = &self.signal {
+            signal.end();
         }
     }
 
@@ -393,6 +474,7 @@ pub extern "C" fn submit_handler(args: *mut core::ffi::c_void) -> i32 {
         mode,
         failure_ptr: service.failure_ptr,
         programs: Arc::clone(&service.programs),
+        signal: service.frame_signal(),
     };
     let (done, done_rx) = if mode == EncoderSubmitMode::Queue {
         (None, None)
@@ -460,6 +542,14 @@ pub extern "C" fn control_handler(args: *mut core::ffi::c_void) -> i32 {
                 .to_vec()
             };
             service.encoder.reset(textures)
+        }
+        EncoderControl::AwaitFrame => {
+            if service.await_frame(params.argument) == FrameWait::Ended {
+                // The encoder failed: its mailbox holds the failure, which the
+                // PE side reports as the device's state after this call.
+                log::debug!(target: LOG_TARGET, "encoder: frame-latency wait ended by an encoder failure");
+            }
+            Ok(())
         }
     };
     match result {

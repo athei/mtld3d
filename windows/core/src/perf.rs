@@ -2227,10 +2227,6 @@ impl ApiPerfState {
         core::ptr::null_mut()
     }
     #[inline]
-    pub const fn note_present_in_flight(&mut self, _seq: u64, _retired: u64) -> u32 {
-        0
-    }
-    #[inline]
     pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
@@ -2439,8 +2435,6 @@ impl FramePerfPayload {
     }
     #[inline]
     pub const fn note_latency_wait(&mut self) {}
-    #[inline]
-    pub const fn set_frames_in_flight(&mut self, _frames: u32) {}
 }
 
 /// Identity tag for a shader at the encoder side.

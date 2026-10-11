@@ -535,17 +535,12 @@ record. A knob, where one makes sense, is named with its default.
   D3D9Ex application to a new device, is not used. No site observes the latch;
   Wine's suite never fails a frame. The `d3d9ex.c/test_lost_device` cluster
   and `d3d9ex.c/test_wndproc` 2957 carry the occlusion sites. No knob.
-- **The maximum frame latency is stored, not enforced.**
-  `SetMaximumFrameLatency` takes 0 to 30 and `GetMaximumFrameLatency` reports
-  what it stored, 3 until then. The frames the application can run ahead are
-  bounded by the encoder and submit queues, whose depth is fixed; holding
-  the application back further for a lower latency would cost the overlap
-  those queues buy. A value below 3 is logged once. No knob.
 - **`D3DPRESENT_*` flags are logged, not honoured.** `D3DPRESENT_DONOTWAIT`
   asks a present to fail with `D3DERR_WASSTILLDRAWING` rather than wait for
-  the queue, and `D3DPRESENT_FORCEIMMEDIATE` to present without waiting for
-  the display; both present here as a flagless present would. The overlay
-  flags have no overlay to act on. Each flag is logged once. No knob.
+  the queue or for the frame-latency bound, which it waits for here, and
+  `D3DPRESENT_FORCEIMMEDIATE` to present without waiting for the display;
+  both present here as a flagless present would. The overlay flags have no
+  overlay to act on. Each flag is logged once. No knob.
 - **`GetDisplayModeEx` reports the identity rotation, and the extended mode
   argument is not used.** The display is never rotated by the layer, so the
   identity is what a game can act on. `CreateDeviceEx` and `ResetEx` take a

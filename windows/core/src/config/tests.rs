@@ -45,6 +45,7 @@ fn defaults_match_documented_values() {
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     assert_eq!(d.present_max_fps, 0);
+    assert_eq!(d.present_max_frame_latency, 0, "auto");
     assert_eq!(d.render_scale_percent, 100);
 }
 
@@ -116,6 +117,40 @@ fn present_max_fps_zero_means_uncapped() {
 fn present_max_fps_garbage_keeps_default() {
     let cfg = parse(None, "present.maxFps = fast\n", None);
     assert_eq!(cfg.present_max_fps, 0);
+}
+
+#[test]
+fn present_max_frame_latency_takes_a_frame_count() {
+    assert_eq!(
+        parse(None, "present.maxFrameLatency = 1\n", None).present_max_frame_latency,
+        1
+    );
+    assert_eq!(
+        parse(None, "present.maxFrameLatency = 30\n", None).present_max_frame_latency,
+        30
+    );
+}
+
+#[test]
+fn present_max_frame_latency_auto_follows_the_game() {
+    let cfg = parse(
+        None,
+        "present.maxFrameLatency = 2\npresent.maxFrameLatency = AUTO\n",
+        None,
+    );
+    assert_eq!(cfg.present_max_frame_latency, 0);
+}
+
+#[test]
+fn present_max_frame_latency_out_of_range_or_garbage_keeps_the_value() {
+    for invalid in ["0", "31", "-1", "low"] {
+        let body = format!("present.maxFrameLatency = 4\npresent.maxFrameLatency = {invalid}\n");
+        assert_eq!(
+            parse(None, &body, None).present_max_frame_latency,
+            4,
+            "{invalid} is refused"
+        );
+    }
 }
 
 #[test]
