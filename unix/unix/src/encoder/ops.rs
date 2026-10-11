@@ -571,6 +571,23 @@ fn emit_stretch_rect_blit(
     // endpoint the game created keeps its own coordinates.
     let src_region = scale_stretch_region(src_info, src_region);
     let dst_region = scale_stretch_region(dst_info, dst_region);
+    // A texture-level destination may keep a write history (an extended
+    // device's whole-surface copy into a level that is no render target);
+    // every route below writes `dst_region` of it, or drops the copy, which a
+    // stamp only makes a later preserve copy larger for.
+    if dst_info.identity.kind == 0 {
+        enc.note_texture_blit_write(
+            TextureId::from_raw(dst_info.identity.texture.id),
+            (surface_slice(dst_info).unwrap_or(0), dst_info.mip_level),
+            &mtld3d_core::texture_versions::TexelRect::new(
+                dst_region.x,
+                dst_region.y,
+                dst_region.w,
+                dst_region.h,
+            ),
+            dst_info.present & 2 != 0,
+        );
+    }
     let (src_dims, dst_dims) = (
         (src_info.texture_width, src_info.texture_height),
         (dst_info.texture_width, dst_info.texture_height),

@@ -137,6 +137,30 @@ impl FormatMapping {
     pub const fn block_bytes(&self) -> u32 {
         self.block_bytes
     }
+
+    /// Whether a rectangle of a level is on the format's block grid.
+    ///
+    /// The rectangle is `size` texels at `origin` in a level `extent` texels
+    /// in size. Its origin must be a whole number of blocks in, and each
+    /// side a whole number of blocks long unless it ends at the level's
+    /// edge. Only such a rectangle of a compressed format can be copied as
+    /// itself; every rectangle of an uncompressed format (1x1 blocks) is on
+    /// the grid.
+    #[must_use]
+    pub const fn rect_on_block_grid(
+        &self,
+        origin: (u32, u32),
+        size: (u32, u32),
+        extent: (u32, u32),
+    ) -> bool {
+        let (bw, bh) = (self.block_width, self.block_height);
+        origin.0.is_multiple_of(bw)
+            && origin.1.is_multiple_of(bh)
+            && (size.0.is_multiple_of(bw)
+                || matches!(origin.0.checked_add(size.0), Some(end) if end == extent.0))
+            && (size.1.is_multiple_of(bh)
+                || matches!(origin.1.checked_add(size.1), Some(end) if end == extent.1))
+    }
 }
 
 /// Friendly name for a D3DFMT_* code.
