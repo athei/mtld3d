@@ -55,6 +55,7 @@ mod no_color_passes;
 mod non_uma;
 mod one_off_passes;
 mod packed10;
+mod panic_report;
 mod points;
 mod present_split;
 mod query;
