@@ -7,7 +7,9 @@
 //! The segment tests build Mach-O headers by hand: the layout Wine's loader
 //! links with, whose zero-fill segments `dladdr` attributes guest addresses
 //! to, a slid image, so the slide is applied, and a shared-cache image, whose
-//! `__TEXT` maps no file offset 0.
+//! `__TEXT` maps no file offset 0. The panic-line tests pin std's wording,
+//! the stand-in for a payload that is not a string, and the cut of a message
+//! too long for the buffer.
 
 use super::*;
 
@@ -295,5 +297,42 @@ fn no_report_waits_for_a_busy_sink() {
                 CrashRoute::Descriptor
             );
         }
+    }
+}
+
+#[test]
+fn a_panic_line_words_the_report_as_the_default_hook_does() {
+    let location = Location::caller();
+    let line = PanicLine::new("[t] PANIC: ", "worker", 2180, Some(location), Some("boom"));
+    assert_eq!(
+        core::str::from_utf8(line.bytes()).expect("the line is UTF-8"),
+        format!("[t] PANIC: thread 'worker' (2180) panicked at {location}:\nboom\n")
+    );
+}
+
+#[test]
+fn a_panic_line_names_a_payload_that_is_not_a_string_and_a_missing_location() {
+    let line = PanicLine::new("", "<unnamed>", 7, None, None);
+    assert_eq!(
+        core::str::from_utf8(line.bytes()).expect("the line is UTF-8"),
+        "thread '<unnamed>' (7) panicked at an unknown location:\nBox<dyn Any>\n"
+    );
+}
+
+#[test]
+fn a_panic_line_cuts_a_long_message_at_a_character_boundary_and_marks_it() {
+    // Two-byte characters, so the room left over is odd for one of the
+    // two prefixes and the cut has to step back off half a character.
+    let message = "\u{e9}".repeat(PANIC_LINE_CAPACITY);
+    for prefix in ["p", "pp"] {
+        let line = PanicLine::new(prefix, "t", 1, None, Some(&message));
+        let text = core::str::from_utf8(line.bytes()).expect("the cut keeps the line UTF-8");
+        assert!(line.bytes().len() <= PANIC_LINE_CAPACITY);
+        assert!(
+            line.bytes().len() > PANIC_LINE_CAPACITY - PANIC_LINE_TRUNCATED.len() - 2,
+            "the line fills the buffer up to the marker"
+        );
+        assert!(text.ends_with("\u{e9} [truncated]\n"), "{text}");
+        assert!(text.starts_with(&format!("{prefix}thread 't' (1) panicked at ")));
     }
 }
