@@ -33,16 +33,22 @@ struct NativeObjects {
 }
 
 impl NativeObjects {
-    fn new() -> Self {
+    /// Compiles a vertex function named `entry` and a pipeline that uses it.
+    ///
+    /// Each test passes its own `entry`. Metal returns the same `MTLFunction`
+    /// object for two libraries compiled from identical source, so tests that
+    /// shared one source would change each other's retain counts when they run
+    /// in parallel.
+    fn new(entry: &str) -> Self {
         let device = MTLCreateSystemDefaultDevice().expect("Metal device for ownership test");
-        let source = NSString::from_str(
-            "#include <metal_stdlib>\nusing namespace metal;\nvertex void ownership_probe(uint id [[vertex_id]]) {}",
-        );
+        let source = NSString::from_str(&format!(
+            "#include <metal_stdlib>\nusing namespace metal;\nvertex void {entry}(uint id [[vertex_id]]) {{}}",
+        ));
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .expect("library");
         let function = library
-            .newFunctionWithName(&NSString::from_str("ownership_probe"))
+            .newFunctionWithName(&NSString::from_str(entry))
             .expect("function");
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&function));
@@ -102,7 +108,7 @@ impl NativeObjects {
 #[test]
 fn failed_prewarm_send_releases_native_payload() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("failed_send_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);
@@ -120,7 +126,7 @@ fn failed_prewarm_send_releases_native_payload() {
 #[test]
 fn unread_prewarm_payload_releases_native_objects() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("unread_payload_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
         assert!(sender.send(objects.warm()).is_ok());
@@ -136,7 +142,7 @@ fn unread_prewarm_payload_releases_native_objects() {
 #[test]
 fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("adopted_prewarm_probe");
         let baseline = objects.counts();
         let mut source = objects.warm();
         let retained = objects.counts();
