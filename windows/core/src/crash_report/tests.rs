@@ -8,8 +8,8 @@
 //! links with, whose zero-fill segments `dladdr` attributes guest addresses
 //! to, a slid image, so the slide is applied, and a shared-cache image, whose
 //! `__TEXT` maps no file offset 0. The panic-line tests pin std's wording,
-//! the stand-in for a payload that is not a string, and the cut of a message
-//! too long for the buffer.
+//! the stand-in for a payload that is not a string, the cut of a message
+//! too long for the buffer, and that a finished line takes no more text.
 
 use super::*;
 
@@ -335,4 +335,46 @@ fn a_panic_line_cuts_a_long_message_at_a_character_boundary_and_marks_it() {
         assert!(text.ends_with("\u{e9} [truncated]\n"), "{text}");
         assert!(text.starts_with(&format!("{prefix}thread 't' (1) panicked at ")));
     }
+}
+
+#[test]
+fn a_full_cursor_refuses_more_text_and_still_ends_the_line() {
+    let mut buf = [0; PANIC_LINE_CAPACITY];
+    let mut cursor = LineCursor::new(&mut buf);
+    let fill = "x".repeat(PANIC_LINE_CAPACITY);
+    assert!(cursor.write_str(&fill).is_err(), "the fill does not fit");
+    assert!(
+        cursor.write_str("more").is_err(),
+        "a full cursor takes nothing"
+    );
+    assert!(cursor.write_str("").is_ok(), "an empty write fits anywhere");
+    let len = cursor.finish();
+    assert_eq!(len, PANIC_LINE_CAPACITY);
+    assert!(buf.ends_with(PANIC_LINE_TRUNCATED.as_bytes()));
+}
+
+/// Answers whether a type implements [`Write`], through the inherent method when it does.
+struct WriteProbe<T>(core::marker::PhantomData<T>);
+
+/// The fallback the probe's method call reaches for a type that is not [`Write`].
+trait NotWrite {
+    fn implements_write(&self) -> bool {
+        false
+    }
+}
+
+impl<T> NotWrite for WriteProbe<T> {}
+
+impl<T: Write> WriteProbe<T> {
+    /// Shadows [`NotWrite::implements_write`] for a type that is [`Write`].
+    const fn implements_write(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_finished_panic_line_takes_no_more_text() {
+    // Only the private cursor writes; the finished line has no writer of its own.
+    assert!(!WriteProbe::<PanicLine>(core::marker::PhantomData).implements_write());
+    assert!(WriteProbe::<LineCursor<'_>>(core::marker::PhantomData).implements_write());
 }
