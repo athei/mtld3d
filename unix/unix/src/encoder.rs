@@ -7220,15 +7220,12 @@ impl FrameEncoder {
         let texture_id = info.texture_id();
         let desc = self.texture_desc_from_view(&info);
         let records = records_every_write(&desc, info.usage_flags());
-        let (spare, discarded) = self.texture_versions.take_spare(
+        let spare = self.texture_versions.take_spare(
             texture_id,
             VersionShape::of(&desc),
             records,
             self.current_submit_seq,
         );
-        for stale in discarded {
-            self.retire_texture_views(&stale, MetalHandle::NULL);
-        }
         let (views, held_writes) = if let Some(spare) = spare {
             spare.into_parts()
         } else {
@@ -8524,11 +8521,10 @@ impl FrameEncoder {
             }
             self.retire_texture_views(&state.views, MetalHandle::NULL);
         }
-        // Its spares go behind this submission like its live version; its
-        // versions still retiring are destroyed when the drain pops them.
-        for spare in self.texture_versions.forget_texture(texture_id) {
-            self.retire_texture_views(&spare, MetalHandle::NULL);
-        }
+        // Its spares join the pool's destroy queue, which the drain takes
+        // in batches; its versions still retiring are destroyed when the
+        // drain pops them.
+        self.texture_versions.forget_texture(texture_id);
     }
 
     /// Retire the device buffer of a VB/IB released without a CPU backing.

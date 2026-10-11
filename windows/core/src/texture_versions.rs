@@ -16,11 +16,13 @@
 //! submission the caller pops it, forgets every handle-keyed record of it
 //! exactly as a destroy does, and parks it as a spare of its texture. A
 //! spare no rename takes within [`SPARE_MAX_IDLE_SUBMITS`] submissions is
-//! destroyed, and so is a version whose texture is gone or whose parking
-//! would take the pool past [`VERSION_POOL_BACKSTOP_BYTES`]. Those destroys
-//! wait in a queue the caller takes a bounded batch from per drain
-//! ([`TextureVersions::take_doomed`]), so a burst of them spreads over
-//! several drains. A texture with no spares that no rename touched for
+//! destroyed, and so is a version whose texture is gone or changed shape, a
+//! released texture's spares, and a version whose parking would take the
+//! spares past [`VERSION_POOL_BACKSTOP_BYTES`]. Those destroys wait in a
+//! queue the caller takes a batch from per drain
+//! ([`TextureVersions::take_doomed`]): the recent rate of arrivals plus an
+//! eighth of the queue, so a steady stream never keeps a queue and a burst
+//! spreads over several drains. A texture with no spares that no rename touched for
 //! [`STATE_MAX_IDLE_SUBMITS`] submissions stops being tracked: its next
 //! rename starts it over, write history included.
 //!
@@ -54,28 +56,32 @@ use crate::{format::FormatMapping, ids::TextureId};
 
 /// Submissions a spare may wait for a rename before it is destroyed.
 ///
-/// The bound that sizes the pool to the demand. A rename that retires a
-/// version is answered by a spare once the GPU has finished the version's
-/// submission, which in the busiest measured scene (a 512x512 A4R4G4B4
-/// sprite scratch rewritten 267 times a frame, about 134 MiB of versions
-/// retired per frame) comes one to three submissions later, with drains
-/// that reclaim up to about two and a half frames of versions at once.
-/// A texture still being renamed takes its spares back within those few
-/// submissions, so eight leaves room above the lag and still gives a
-/// texture that stopped being renamed its storage back within about 130 ms
-/// at 60 frames a second. A total-bytes cap does not size this: the pool a
+/// The bound that sizes the pool to the demand. A version is parked once
+/// the GPU has finished its submission: in the busiest measured scene (a
+/// 512x512 A4R4G4B4 sprite scratch rewritten 267 times a frame in one
+/// submission, about 134 MiB of versions retired per frame) one to eight
+/// submissions after it retired, three quarters of them four to eight. The
+/// age counts from parking, so that lag does not use it up, and a texture
+/// still being renamed takes its newest spares first, leaving the oldest
+/// to age out when it renames less. Eight gives a texture that stopped being renamed its
+/// storage back within about 130 ms at 60 frames a second. Counted from
+/// retiring instead, the same bound destroyed about 87 versions a frame
+/// there. A total-bytes cap does not size this: the pool a
 /// scene needs is the per-frame retire times the frames the GPU lags, and
 /// the lag grows as the CPU outruns the GPU; a 256 MiB cap destroyed and
 /// reallocated about 110 versions a frame there, and 512 MiB still 45.
 pub const SPARE_MAX_IDLE_SUBMITS: u64 = 8;
 
-/// Bytes of texture storage the pool may hold, parked or waiting to be destroyed.
+/// Bytes of texture storage the pool may hold as spares.
 ///
 /// A backstop, not the bound that normally acts: [`SPARE_MAX_IDLE_SUBMITS`]
 /// does. It is the age bound's own worst case in the busiest measured scene
 /// (eight submissions of 134 MiB of retired versions, about 1 GiB) and
-/// catches a pool that would grow past it. The storage is `Private` GPU
-/// memory, outside the 32-bit guest address space.
+/// catches a pool that would grow past it. Versions already queued to be
+/// destroyed do not count: they are committed, leave within a few drains,
+/// and counting them would keep the pool turning versions away for as long
+/// as that queue fed itself. The storage is `Private` GPU memory, outside
+/// the 32-bit guest address space.
 pub const VERSION_POOL_BACKSTOP_BYTES: u64 = 1 << 30;
 
 /// Submissions a texture with no spares may go without a rename before it stops being tracked.
@@ -91,12 +97,17 @@ pub const STATE_MAX_IDLE_SUBMITS: u64 = 120;
 
 /// Fewest destroyed versions handed to the caller per drain, when that many wait.
 ///
-/// The batch is the larger of this and an eighth of the queue, so a burst
-/// spreads over about eight drains while a queue that keeps growing is
-/// still emptied geometrically. A drain that destroyed 1357 handles at once
-/// (678 versions of two views each) took 6.1 ms, about 4.5 us a handle, so
-/// 64 versions cost about 0.6 ms.
+/// See [`TextureVersions::take_doomed`] for the batch. A drain that
+/// destroyed 1357 handles at once (678 versions of two views each) took
+/// 6.1 ms, about 4.5 us a handle, so 64 versions cost about 0.6 ms.
 pub const MIN_DESTROYS_PER_DRAIN: usize = 64;
+
+/// Drains over which the destroy queue's arrival rate is averaged, and the queue's divisor.
+///
+/// A burst raises the averaged rate for this many drains and is handed out
+/// over about five of them: the 678 versions of the 6.1 ms drain go as
+/// 170, 149, 130, 114, 100 and 15.
+pub const DESTROY_SPREAD_DRAINS: usize = 8;
 
 /// Smallest tile edge of a write-history grid, in texels.
 ///
@@ -377,8 +388,14 @@ pub struct TextureVersions<V> {
     parked_bytes: u64,
     /// Versions to destroy, with their bytes, oldest first; see [`Self::take_doomed`].
     doomed: VecDeque<(V, u64)>,
-    /// Bytes of the versions in `doomed`, which count toward the backstop until destroyed.
+    /// Bytes of the versions in `doomed`, still allocated until destroyed.
     doomed_bytes: u64,
+    /// Versions queued in `doomed` since the last [`Self::take_doomed`].
+    doomed_since_take: usize,
+    /// Versions queued between each of the last [`DESTROY_SPREAD_DRAINS`] takes, a ring.
+    doomed_arrivals: [usize; DESTROY_SPREAD_DRAINS],
+    /// Slot of `doomed_arrivals` the next take writes.
+    arrival_slot: usize,
     /// The epoch the next tracking state gets; 0 is never handed out.
     ///
     /// Every state, a texture's first and every one after a shape change
@@ -410,6 +427,9 @@ impl<V> TextureVersions<V> {
             parked_bytes: 0,
             doomed: VecDeque::new(),
             doomed_bytes: 0,
+            doomed_since_take: 0,
+            doomed_arrivals: [0; DESTROY_SPREAD_DRAINS],
+            arrival_slot: 0,
             next_epoch: 1,
             with_spares: FxHashSet::default(),
             idle: BTreeSet::new(),
@@ -420,6 +440,12 @@ impl<V> TextureVersions<V> {
     #[must_use]
     pub const fn parked_bytes(&self) -> u64 {
         self.parked_bytes
+    }
+
+    /// Bytes of storage queued to be destroyed and still allocated.
+    #[must_use]
+    pub const fn pending_destroy_bytes(&self) -> u64 {
+        self.doomed_bytes
     }
 
     /// Whether `id` keeps a write history, so its writes must be reported.
@@ -437,10 +463,9 @@ impl<V> TextureVersions<V> {
     /// [`records_every_write`]). History starts empty: every version from
     /// here on holds whatever was written before, so only later writes are
     /// stamped. When `shape` differs from the shape the texture's spares
-    /// were made for, those spares come back in the second value for the
-    /// caller to destroy behind the current submission, and the texture
-    /// starts over under the new shape; versions of the old shape still
-    /// retiring are destroyed when they are popped. `seq` is the submission
+    /// were made for, those spares are queued to be destroyed, and the
+    /// texture starts over under the new shape; versions of the old shape
+    /// still retiring are destroyed when they are popped. `seq` is the submission
     /// the rename belongs to, which keeps the texture tracked for another
     /// [`STATE_MAX_IDLE_SUBMITS`] submissions.
     pub fn take_spare(
@@ -449,8 +474,7 @@ impl<V> TextureVersions<V> {
         shape: VersionShape,
         records_writes: bool,
         seq: u64,
-    ) -> (Option<Spare<V>>, Vec<V>) {
-        let mut discarded = Vec::new();
+    ) -> Option<Spare<V>> {
         let epoch = self.next_epoch;
         let state = match self.textures.entry(id) {
             Entry::Vacant(slot) => {
@@ -462,7 +486,11 @@ impl<V> TextureVersions<V> {
                 let state = slot.into_mut();
                 if state.shape != shape {
                     self.parked_bytes -= state.bytes * state.spares.len() as u64;
-                    discarded.extend(state.spares.drain(..).map(Spare::into_views));
+                    self.doomed_bytes += state.bytes * state.spares.len() as u64;
+                    self.doomed_since_take += state.spares.len();
+                    let bytes = state.bytes;
+                    self.doomed
+                        .extend(state.spares.drain(..).map(|spare| (spare.views, bytes)));
                     self.next_epoch += 1;
                     self.idle.insert((seq, id.raw(), epoch));
                     *state = VersionState::new(shape, epoch, records_writes);
@@ -478,7 +506,7 @@ impl<V> TextureVersions<V> {
         if state.spares.is_empty() {
             self.with_spares.remove(&id);
         }
-        (spare, discarded)
+        spare
     }
 
     /// The copies that bring a rename's new version up to the live one.
@@ -648,8 +676,8 @@ impl<V> TextureVersions<V> {
     /// Park a popped version as its texture's newest spare, or queue it to be destroyed.
     ///
     /// It is queued when its texture is gone or changed shape since it
-    /// retired, or when parking it would take the pool, spares and queued
-    /// destroys together, past [`VERSION_POOL_BACKSTOP_BYTES`]. `failed` is
+    /// retired, or when parking it would take the spares past
+    /// [`VERSION_POOL_BACKSTOP_BYTES`]. `failed` is
     /// the highest submission the GPU aborted (0 for none), read with the
     /// counter the pop was gated on: a version live through an aborted
     /// submission may lack a copy or an upload that submission carried, so
@@ -665,7 +693,7 @@ impl<V> TextureVersions<V> {
             self.doom(entry.views, entry.bytes);
             return;
         };
-        if self.parked_bytes + self.doomed_bytes + state.bytes > VERSION_POOL_BACKSTOP_BYTES {
+        if self.parked_bytes + state.bytes > VERSION_POOL_BACKSTOP_BYTES {
             mtld3d_shared::log_once_info!(
                 target: crate::LOG_TARGET,
                 "texture versions: the rename pool reached its {} MiB backstop; retired \
@@ -690,15 +718,28 @@ impl<V> TextureVersions<V> {
 
     /// Hand back the next batch of versions to destroy.
     ///
-    /// The larger of [`MIN_DESTROYS_PER_DRAIN`] and an eighth of the queue,
-    /// oldest first; the rest wait for the next drain. Every queued version
+    /// The average number queued per take over the last
+    /// [`DESTROY_SPREAD_DRAINS`] takes plus that fraction of the queue, at
+    /// least [`MIN_DESTROYS_PER_DRAIN`], oldest first; the rest wait for the
+    /// next drain. A steady stream is handed out at the rate it arrives and
+    /// whatever queued while the average caught up shrinks every drain, so
+    /// no queue persists; a burst raises the average for a few drains and
+    /// is spread over them. Every queued version
     /// was popped after its submission settled and has had its handle-keyed
     /// records forgotten, and no rename takes it again, so no command of a
     /// submission in flight or being built can name it: destroying it a
     /// drain or several later is as safe as destroying it at once.
     pub fn take_doomed(&mut self) -> Vec<V> {
+        self.doomed_arrivals[self.arrival_slot] = self.doomed_since_take;
+        self.arrival_slot = (self.arrival_slot + 1) % DESTROY_SPREAD_DRAINS;
+        self.doomed_since_take = 0;
+        let rate = self
+            .doomed_arrivals
+            .iter()
+            .sum::<usize>()
+            .div_ceil(DESTROY_SPREAD_DRAINS);
         let batch = MIN_DESTROYS_PER_DRAIN
-            .max(self.doomed.len().div_ceil(8))
+            .max(rate + self.doomed.len().div_ceil(DESTROY_SPREAD_DRAINS))
             .min(self.doomed.len());
         let mut taken = Vec::with_capacity(batch);
         for (views, bytes) in self.doomed.drain(..batch) {
@@ -711,6 +752,7 @@ impl<V> TextureVersions<V> {
     /// Queue `views`, of `bytes` bytes, for [`Self::take_doomed`].
     fn doom(&mut self, views: V, bytes: u64) {
         self.doomed_bytes += bytes;
+        self.doomed_since_take += 1;
         self.doomed.push_back((views, bytes));
     }
 
@@ -728,7 +770,11 @@ impl<V> TextureVersions<V> {
     pub fn trim(&mut self, now: u64) {
         let spare_aged = |seq: u64| seq + SPARE_MAX_IDLE_SUBMITS < now;
         let (textures, parked_bytes) = (&mut self.textures, &mut self.parked_bytes);
-        let (doomed, doomed_bytes) = (&mut self.doomed, &mut self.doomed_bytes);
+        let (doomed, doomed_bytes, doomed_since_take) = (
+            &mut self.doomed,
+            &mut self.doomed_bytes,
+            &mut self.doomed_since_take,
+        );
         self.with_spares.retain(|id| {
             let Some(state) = textures.get_mut(id) else {
                 return false;
@@ -740,6 +786,7 @@ impl<V> TextureVersions<V> {
                 .count();
             *parked_bytes -= state.bytes * old as u64;
             *doomed_bytes += state.bytes * old as u64;
+            *doomed_since_take += old;
             let bytes = state.bytes;
             doomed.extend(
                 state
@@ -777,18 +824,22 @@ impl<V> TextureVersions<V> {
         }
     }
 
-    /// Stop tracking a released texture, handing back its spares.
+    /// Stop tracking a released texture, queueing its spares to be destroyed.
     ///
-    /// Its versions still retiring stay queued and are destroyed when
+    /// A spare was popped after its submission settled and has left every
+    /// handle-keyed record, so it can wait in the destroy queue like any
+    /// other. Its versions still retiring stay queued and are destroyed when
     /// popped: a texture that comes back under the same id starts a state
     /// of a new epoch, which they do not match.
-    pub fn forget_texture(&mut self, id: TextureId) -> Vec<V> {
+    pub fn forget_texture(&mut self, id: TextureId) {
         let Some(state) = self.textures.remove(&id) else {
-            return Vec::new();
+            return;
         };
         self.with_spares.remove(&id);
         self.parked_bytes -= state.bytes * state.spares.len() as u64;
-        state.spares.into_iter().map(Spare::into_views).collect()
+        for spare in state.spares {
+            self.doom(spare.views, state.bytes);
+        }
     }
 
     /// Take every spare, retiring version and queued destroy, leaving the textures tracked.
@@ -799,6 +850,8 @@ impl<V> TextureVersions<V> {
         let mut all: Vec<V> = self.retiring.drain(..).map(|entry| entry.views).collect();
         all.extend(self.doomed.drain(..).map(|(views, _)| views));
         self.doomed_bytes = 0;
+        self.doomed_since_take = 0;
+        self.doomed_arrivals = [0; DESTROY_SPREAD_DRAINS];
         for id in self.with_spares.drain() {
             if let Some(state) = self.textures.get_mut(&id) {
                 all.extend(state.spares.drain(..).map(Spare::into_views));
