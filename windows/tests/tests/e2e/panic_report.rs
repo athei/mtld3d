@@ -29,15 +29,21 @@ const LOG_PANIC_PREFIX: &str = "[mtld3d::d3d9] PANIC: ";
 /// The line that opens the crumb trail, which the panic line must precede.
 const CRUMB_TRAIL_LINE: &str = "[mtld3d::d3d9] PANIC - dumping crumb trail:";
 
+/// What the child prints on stdout ahead of its worker's name.
+const WORKER_NAME_LABEL: &str = "panic worker name: ";
+
 /// A panic in an entry point writes std's panic line and message into the process log.
 ///
 /// The child calls `IDirect3D9::AddRef` with a null `this` on a named worker
 /// thread and dies. Its stderr carries the default hook's report,
 /// `thread '<name>' (<id>) panicked at <file>:<line>:<column>:` and the
-/// message on the next line; the log must carry the same two lines behind
-/// the layer's prefix, ahead of the crumb trail, so the thread name, the
-/// thread id, the location and the message all reach a log a remote report
-/// attaches.
+/// message on the next line, from `d3d9.dll`'s own copy of std, which never
+/// saw the name the test executable's std gave the worker and so prints
+/// `<unnamed>`. The log must carry the same two lines behind the layer's
+/// prefix, ahead of the crumb trail, with the worker's name in place of
+/// `<unnamed>`: the thread's Win32 description, which std sets when it names
+/// a thread, carries it across images. So the thread name, the thread id,
+/// the location and the message all reach a log a remote report attaches.
 #[test]
 fn a_panic_in_an_entry_point_writes_its_message_to_the_process_log() {
     if running_as(CHILD_NAME) {
@@ -52,32 +58,39 @@ fn a_panic_in_an_entry_point_writes_its_message_to_the_process_log() {
     );
     let log = private_log(&dir);
     std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "the child outlived a null-this AddRef: {stderr}"
     );
+    let worker = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(WORKER_NAME_LABEL))
+        .unwrap_or_else(|| panic!("the child named no worker: {stdout}"));
 
     let lines: Vec<&str> = stderr.lines().collect();
     let header_at = lines
         .iter()
         .position(|line| line.starts_with("thread '") && line.contains(" panicked at "))
         .unwrap_or_else(|| panic!("no panic report on the child's stderr: {stderr}"));
-    let header = lines[header_at];
     let message = lines
         .get(header_at + 1)
         .unwrap_or_else(|| panic!("the panic report on stderr has no message: {stderr}"));
     assert!(
-        !header.starts_with("thread '<unnamed>'"),
-        "the worker carries a name, so the report names it: {header}"
-    );
-    assert!(
         message.contains("this=null"),
         "the panic is the null-this one: {message}"
     );
+    // `thread '<name>' (<id>) panicked at <location>:`, the name dropped:
+    // the id, the location and everything after them stay as stderr has them.
+    let after_name = lines[header_at]
+        .strip_prefix("thread '")
+        .and_then(|rest| rest.split_once("' ("))
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("an unexpected panic header: {}", lines[header_at]));
 
     let log_lines: Vec<&str> = log.lines().collect();
-    let expected = format!("{LOG_PANIC_PREFIX}{header}");
+    let expected = format!("{LOG_PANIC_PREFIX}thread '{worker}' ({after_name}");
     let logged_at = log_lines
         .iter()
         .position(|line| *line == expected)
@@ -99,14 +112,18 @@ fn a_panic_in_an_entry_point_writes_its_message_to_the_process_log() {
 
 /// Call `IDirect3D9::AddRef` with a null `this` on a named worker, which ends the process.
 ///
-/// The worker is named after the test, so the report names a thread. Should
-/// the call return, the worker ends and the test passes in the child, which
-/// the parent reads as the panic not happening.
+/// The worker is named after the test and prints its name on stdout first,
+/// so the parent knows what the log should call it. Should the call return,
+/// the worker ends and the test passes in the child, which the parent reads
+/// as the panic not happening.
 fn panic_in_layer_workload() {
     let h = Harness::factory_only();
     let factory = h.factory() as usize;
     std::thread::scope(|scope| {
         spawn_scoped(scope, || {
+            let current = std::thread::current();
+            let name = current.name().expect("a test's worker carries a name");
+            println!("{WORKER_NAME_LABEL}{name}");
             let interface = factory as *mut c_void;
             // SAFETY: `interface` is the live `IDirect3D9` the harness created,
             // whose first word is its vtable.
