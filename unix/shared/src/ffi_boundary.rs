@@ -7,9 +7,9 @@
 //! (validity, lifetime, and alignment for the wrappers that hand out a
 //! reference). [`ValueIn`], [`OutPtr`] and the slice helpers copy instead and
 //! assume no alignment, since an application's pointer promises none. Methods
-//! on the newtype are safe because
-//! the invariant is type-encoded and the abstract lifetime `'a` is bound to
-//! the call frame via `PhantomData<&'a …>`, preventing escape.
+//! on the newtype are safe because the invariant is type-encoded and the
+//! abstract lifetime `'a` is bound to the call frame via `PhantomData<&'a …>`,
+//! preventing escape.
 //!
 //! A safe `pub fn` that accepts an arbitrary raw pointer and hands back a
 //! reference synthesises an unbounded lifetime, which is unsound by strict

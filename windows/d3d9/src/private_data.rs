@@ -9,7 +9,7 @@
 
 use core::ffi::c_void;
 
-use mtld3d_shared::{OutPtr, ValueIn};
+use mtld3d_shared::OutPtr;
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DSPD_IUNKNOWN, Guid,
 };
@@ -147,7 +147,7 @@ impl PrivateDataStore {
         };
         // SAFETY: caller asserts `size_inout` is a readable `u32`, non-null per the check
         // above; alignment is not assumed.
-        let avail = unsafe { ValueIn::<u32>::read_opt(size_inout.cast()) }.unwrap_or(0);
+        let avail = unsafe { size_inout.read_unaligned() };
         // (3) report the needed size.
         // SAFETY: caller asserts `size_inout` is writable; alignment is not assumed.
         unsafe { OutPtr::write_opt(size_inout, needed) };

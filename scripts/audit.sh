@@ -79,7 +79,7 @@ API_LOCK_EXEMPT='cursor_wnd_proc'
 # `extern "system" fn` whose pointers come from the system instead.
 APP_POINTER_DIR=windows/d3d9/src
 APP_POINTER_EXEMPT='windows/d3d9/src/crash.rs'
-APP_POINTER_INPTR='InPtr(Mut)?::<(mtld3d_types::)?(D3D|Guid|LUID)'
+APP_POINTER_INPTR="InPtr(Mut)?(::)?<('[a-z_]+, *)?(mtld3d_types::)?(D3D|Guid|LUID)"
 APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it with ValueIn, write it with OutPtr'
 
 status=0
@@ -208,8 +208,9 @@ api_lock_first() {
     ' "$@"
 }
 
-# A pointer parameter of an `extern "system" fn` turned into a reference, read
-# or written through `*p`, `p.read()` or `p.write()`, or made a typed slice,
+# A pointer parameter of an `extern "system" fn` turned into a reference (`&*p`,
+# `p.as_ref()`, `p.as_mut()`), read or written through `*p`, `p.read()` or
+# `p.write()`, or made a typed slice,
 # in that function's body. A byte view (`p.cast::<u8>()`) and a cast to one of
 # the layer's own COM wrappers (`Direct3D...`) are exempt: bytes have no
 # alignment, and a wrapper is an object the layer made.
@@ -220,7 +221,7 @@ app_pointer_derefs() {
             w = "(^|[^A-Za-z0-9_])"
             if (line ~ ("&(mut )?\\*" name "([^A-Za-z0-9_]|$)")) return 1
             if (line ~ (w "\\*" name "[ \t]*(=[^=]|\\.cast|\\.add|\\)|;|})")) return 1
-            if (line ~ (w name "\\.(cast[^.]*\\.)?(read|write)\\(")) return 1
+            if (line ~ (w name "\\.(cast[^.]*\\.)?(read|write|as_ref|as_mut)\\(")) return 1
             if (line ~ ("from_raw_parts(_mut)?\\([ \t]*" name "([^A-Za-z0-9_]|$)")) return 1
             if (line ~ ("ptr::(read|write)\\([ \t]*" name "[.,)]")) return 1
             if (line ~ ("copy(_nonoverlapping)?\\(.*[^A-Za-z0-9_.]" name "[,)]")) return 1

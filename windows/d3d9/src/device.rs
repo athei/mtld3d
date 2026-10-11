@@ -4881,27 +4881,44 @@ extern "system" fn device_get_creation_parameters(this: *mut c_void, params: *mu
 /// Report resolved back-buffer geometry through the caller's present parameters.
 ///
 /// `CreateDevice`, `CreateAdditionalSwapChain` and `Reset` write the resolved
-/// width, height, count and format back and leave every other field as the
-/// caller set it. The caller's struct promises no alignment, so the four
-/// fields go back in one copy of `request`, the struct as it was read, with
-/// them replaced, and no reference to the caller's memory is formed.
+/// width, height, format and count back and leave every other field alone, so
+/// a field the application changes while the call runs (from a `WM_SIZE` the
+/// window-mode code sends it, say) keeps the application's value. The caller's
+/// struct promises no alignment, so each of the four fields is written on its
+/// own with an unaligned store, and no reference to the caller's memory is
+/// formed.
 ///
 /// # Safety
-/// `present_params` is the non-null pointer `request` was read from, writable
-/// for one `D3DPRESENT_PARAMETERS` for the call.
+/// `present_params` is non-null and writable for one `D3DPRESENT_PARAMETERS`
+/// for the call.
 pub unsafe fn report_resolved_geometry(
     present_params: *mut c_void,
-    request: D3DPRESENT_PARAMETERS,
     resolved: &D3DPRESENT_PARAMETERS,
 ) {
-    let mut written = request;
-    written.back_buffer_width = resolved.back_buffer_width;
-    written.back_buffer_height = resolved.back_buffer_height;
-    written.back_buffer_count = resolved.back_buffer_count;
-    written.back_buffer_format = resolved.back_buffer_format;
-    // SAFETY: the caller's contract: `present_params` is writable for one
-    // `D3DPRESENT_PARAMETERS`; alignment is not assumed.
-    unsafe { OutPtr::write_opt(present_params.cast::<D3DPRESENT_PARAMETERS>(), written) };
+    let base = present_params.cast::<u8>();
+    for (offset, value) in [
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_width),
+            resolved.back_buffer_width,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_height),
+            resolved.back_buffer_height,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_format),
+            resolved.back_buffer_format,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_count),
+            resolved.back_buffer_count,
+        ),
+    ] {
+        let field = base.wrapping_add(offset);
+        // SAFETY: the caller's contract makes the `u32` field at `offset` writable;
+        // alignment is not assumed.
+        unsafe { field.cast::<u32>().write_unaligned(value) };
+    }
 }
 
 extern "system" fn device_create_additional_swap_chain(
@@ -4967,9 +4984,9 @@ extern "system" fn device_create_additional_swap_chain(
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
-    // SAFETY: `present_params` is the non-null pointer `pp_in` was read from, writable
-    // per the ABI.
-    unsafe { report_resolved_geometry(present_params, pp_in, &pp) };
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { report_resolved_geometry(present_params, &pp) };
     // The stored copy resolves hDeviceWindow so GetPresentParameters reports the
     // real target window even when the caller passed NULL.
     pp.device_window = target_window;
@@ -5280,9 +5297,9 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
 
     // Report resolved geometry only after validation. The caller's window
     // and mode flags stay as supplied.
-    // SAFETY: `present_params` is the non-null pointer `pp_in` was read from, writable
-    // per the ABI.
-    unsafe { report_resolved_geometry(present_params, pp_in, &pp) };
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { report_resolved_geometry(present_params, &pp) };
 
     // Captured before the configuration below changes what the held
     // surfaces resolve to.
@@ -11223,9 +11240,7 @@ extern "system" fn device_set_clip_plane(this: *mut c_void, index: u32, plane: *
     };
     // SAFETY: `plane` is non-null (checked) and per the D3D9 ABI points to the
     // 4 readable f32 plane-equation coefficients (A, B, C, D); alignment is not assumed.
-    let Some(coeffs) = (unsafe { ValueIn::<[f32; 4]>::read_opt(plane.cast()) }) else {
-        return D3DERR_INVALIDCALL;
-    };
+    let coeffs = unsafe { plane.cast::<[f32; 4]>().read_unaligned() };
     let dev = obj.inner();
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::ClipPlane {
@@ -14154,12 +14169,7 @@ extern "system" fn device_create_vertex_declaration(
         let e_ptr = unsafe { elements.cast::<mtld3d_types::D3DVERTEXELEMENT9>().add(len) };
         // SAFETY: `e_ptr` addresses a readable `D3DVERTEXELEMENT9` of the caller's
         // array; alignment is not assumed.
-        let Some(e) =
-            (unsafe { ValueIn::<mtld3d_types::D3DVERTEXELEMENT9>::read_opt(e_ptr.cast()) })
-        else {
-            null_out(decl);
-            return D3DERR_INVALIDCALL;
-        };
+        let e = unsafe { e_ptr.read_unaligned() };
         len += 1;
         if e.stream == mtld3d_types::D3DDECL_END_STREAM {
             break;
@@ -14411,7 +14421,7 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
     const MAX_TOKENS: usize = 65536;
     // SAFETY: both callers reject a null `pFunction` before reaching here, and
     // a non-null token stream is at least its version word; alignment is not assumed.
-    let version = unsafe { ValueIn::<u32>::read_opt(ptr.cast()) }?;
+    let version = unsafe { ptr.read_unaligned() };
     match (version >> 16) & 0xFFFF {
         0xFFFE | 0xFFFF => {}
         _ => {
@@ -14433,7 +14443,7 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
         let tok_ptr = unsafe { ptr.add(len) };
         // SAFETY: `tok_ptr` addresses a readable `u32` of the token stream;
         // alignment is not assumed.
-        let tok = unsafe { ValueIn::<u32>::read_opt(tok_ptr.cast()) }?;
+        let tok = unsafe { tok_ptr.read_unaligned() };
         len += 1;
         let opcode = (tok & 0xFFFF) as u16;
         if opcode == 0xFFFF {
@@ -14452,7 +14462,7 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
                 let peek_ptr = unsafe { ptr.add(len + n) };
                 // SAFETY: the bound above keeps `len + n` inside the same
                 // stream the loop is already reading; alignment is not assumed.
-                unsafe { ValueIn::<u32>::read_opt(peek_ptr.cast()) }
+                Some(unsafe { peek_ptr.read_unaligned() })
             });
         }
     }

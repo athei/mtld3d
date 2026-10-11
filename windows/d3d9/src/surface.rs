@@ -2359,7 +2359,7 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
         format: tex.d3d_format(),
         resource_type: D3DRTYPE_SURFACE,
         // A texture-level surface reports its parent texture's usage and pool, not
-        // 0/0 — SetRenderTarget / SetDepthStencilSurface gate on them.
+        // 0/0, since SetRenderTarget / SetDepthStencilSurface gate on them.
         usage: tex.d3d_usage(),
         pool: tex.d3d_pool(),
         multi_sample_type: 0,

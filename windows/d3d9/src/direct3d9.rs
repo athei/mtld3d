@@ -1065,7 +1065,7 @@ pub unsafe fn write_display_mode_ex(
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: the caller's contract: `mode` is a `D3DDISPLAYMODEEX` whose `size` the caller
-    // set, non-null per the check above.
+    // set, non-null per the check above; alignment is not assumed.
     let size =
         unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, size)) };
     if size != D3DDISPLAYMODEEX_SIZE {
@@ -1092,14 +1092,15 @@ pub unsafe fn write_display_mode_ex(
 ///
 /// # Safety
 /// `mode` is null or points to a readable `D3DDISPLAYMODEEX`.
-pub unsafe fn read_display_mode_ex_size(mode: *const c_void) -> Option<(u32, u32)> {
+pub const unsafe fn read_display_mode_ex_size(mode: *const c_void) -> Option<(u32, u32)> {
     if mode.is_null() {
         return None;
     }
-    // SAFETY: the caller's contract, with `mode` non-null per the check above.
+    // SAFETY: the caller's contract, with `mode` non-null per the check above; alignment
+    // is not assumed.
     let width =
         unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, width)) };
-    // SAFETY: as above.
+    // SAFETY: as above; alignment is not assumed.
     let height =
         unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, height)) };
     Some((width, height))
@@ -1110,10 +1111,10 @@ pub unsafe fn read_display_mode_ex_size(mode: *const c_void) -> Option<(u32, u32
 /// # Safety
 /// `mode` is non-null and points to a readable `D3DDISPLAYMODEEX`, and `offset` is the offset
 /// of one of its `u32` fields.
-unsafe fn display_mode_ex_field(mode: *const c_void, offset: usize) -> u32 {
-    let field = mode.cast::<u8>().wrapping_add(offset).cast::<c_void>();
+const unsafe fn display_mode_ex_field(mode: *const c_void, offset: usize) -> u32 {
+    let field = mode.cast::<u8>().wrapping_add(offset);
     // SAFETY: the caller's contract puts a readable `u32` at `field`; alignment is not assumed.
-    unsafe { ValueIn::<u32>::read_opt(field) }.unwrap_or(0)
+    unsafe { field.cast::<u32>().read_unaligned() }
 }
 
 /// Read the adapter LUID the driver reports, or allocate one when it reports none.
@@ -2213,9 +2214,9 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
     };
     // Report the resolved geometry back to the caller. D3D9 leaves hDeviceWindow
     // and the mode flags as the caller set them.
-    // SAFETY: `present_params` is the non-null pointer `pp_in` was read from, writable
-    // per the ABI.
-    unsafe { crate::device::report_resolved_geometry(present_params, pp_in, &pp) };
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { crate::device::report_resolved_geometry(present_params, &pp) };
     // SAFETY: vtable out-param; `device` is *mut *mut c_void per IDirect3D9 ABI; alignment is not
     // assumed.
     unsafe { OutPtr::write_opt(device, dev_ptr.cast::<c_void>()) };

@@ -8,16 +8,21 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, RhwVertex, assert_pixel_eq, deref_vtbl};
+use mtld3d_tests::{Factory, Harness, HarnessConfig, RhwVertex, assert_pixel_eq, deref_vtbl};
 use mtld3d_types::{
-    D3D_OK, D3DBOX, D3DCAPS9, D3DCLEAR_TARGET, D3DCOLORVALUE, D3DDECL_END_STREAM,
-    D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION, D3DDISPLAYMODE, D3DFMT_A8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLIGHT_POINT, D3DLIGHT9, D3DLOCK_READONLY, D3DLOCKED_BOX,
-    D3DLOCKED_RECT, D3DMATERIAL9, D3DMATRIX, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_AMBIENT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
-    D3DSAMP_ADDRESSU, D3DSURFACE_DESC, D3DTADDRESS_CLAMP, D3DTOP_SELECTARG1, D3DTS_WORLD,
-    D3DTSS_COLOROP, D3DVECTOR, D3DVERTEXELEMENT9, D3DVIEWPORT9, D3DVOLUME_DESC, Guid,
-    IDirect3DCubeTexture9Vtbl, IDirect3DDevice9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
+    D3D_OK, D3DADAPTER_IDENTIFIER9, D3DBOX, D3DCAPS9, D3DCLEAR_TARGET, D3DCOLORVALUE,
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3,
+    D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION, D3DDEVICE_CREATION_PARAMETERS, D3DDEVTYPE_HAL,
+    D3DDISPLAYMODE, D3DDISPLAYMODEEX, D3DDISPLAYMODEEX_SIZE, D3DDISPLAYROTATION_IDENTITY,
+    D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLIGHT_POINT, D3DLIGHT9,
+    D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DMATERIAL9, D3DMATRIX, D3DPOOL_MANAGED,
+    D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
+    D3DRECT, D3DRS_AMBIENT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
+    D3DSCANLINEORDERING_PROGRESSIVE, D3DSURFACE_DESC, D3DSWAPEFFECT_DISCARD, D3DTADDRESS_CLAMP,
+    D3DTOP_SELECTARG1, D3DTS_WORLD, D3DTSS_COLOROP, D3DVECTOR, D3DVERTEXELEMENT9, D3DVIEWPORT9,
+    D3DVOLUME_DESC, Guid, IDirect3D9Vtbl, IDirect3DCubeTexture9Vtbl, IDirect3DDevice9ExVtbl,
+    IDirect3DDevice9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DSurface9Vtbl,
+    IDirect3DSwapChain9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
     IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolumeTexture9Vtbl,
     IID_IDIRECT3DTEXTURE9,
 };
@@ -40,12 +45,12 @@ const VS_PASSTHROUGH: [u32; 8] = [
 /// Scratch memory whose usable bytes start one byte past a 16-byte boundary.
 #[repr(C, align(16))]
 struct Odd {
-    bytes: [u8; 1024],
+    bytes: [u8; 2048],
 }
 
 impl Odd {
     const fn new() -> Self {
-        Self { bytes: [0; 1024] }
+        Self { bytes: [0; 2048] }
     }
 
     /// The misaligned address, typed as `T`.
@@ -803,4 +808,252 @@ fn draws_read_misaligned_vertex_and_rect_arrays() {
         "inside the misaligned clear rect",
     );
     assert_pixel_eq(h.read_pixel(30, 30), RED, "outside the clear rect");
+}
+
+/// `CreateAdditionalSwapChain` writes four resolved fields into misaligned present parameters.
+///
+/// A windowed request with zero width, height, count and format comes back with the resolved
+/// four and every other field as the caller set it, and the chain's `GetPresentParameters`
+/// fills a misaligned struct with the same geometry.
+#[test]
+fn additional_swap_chain_resolves_misaligned_present_parameters() {
+    let h = Harness::new();
+    let vt = device_vtbl(&h);
+    let request = D3DPRESENT_PARAMETERS {
+        back_buffer_width: 0,
+        back_buffer_height: 0,
+        back_buffer_format: 0,
+        back_buffer_count: 0,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        swap_effect: D3DSWAPEFFECT_DISCARD,
+        device_window: 0,
+        windowed: 1,
+        enable_auto_depth_stencil: 0,
+        auto_depth_stencil_format: 0,
+        flags: 0,
+        full_screen_refresh_rate_in_hz: 0,
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
+    };
+    let mut params = Odd::new();
+    let mut chain: *mut c_void = core::ptr::null_mut();
+    // SAFETY: vtable thunk; the struct is live scratch and `chain` a writable slot.
+    let hr = unsafe {
+        (vt.create_additional_swap_chain)(h.device(), params.put(&[request]).cast(), &raw mut chain)
+    };
+    assert_eq!(
+        hr, D3D_OK,
+        "CreateAdditionalSwapChain from a misaligned D3DPRESENT_PARAMETERS"
+    );
+    // SAFETY: the call wrote the struct: integers only.
+    let got: D3DPRESENT_PARAMETERS = unsafe { params.get(0) };
+    assert!(
+        got.back_buffer_width > 0 && got.back_buffer_height > 0,
+        "the zero size resolves to the window's client area, got {}x{}",
+        got.back_buffer_width,
+        got.back_buffer_height,
+    );
+    assert_ne!(
+        got.back_buffer_format, 0,
+        "the unknown format resolves to the display's"
+    );
+    assert_eq!(got.back_buffer_count, 1, "a zero count resolves to one");
+    assert_eq!(
+        (
+            got.swap_effect,
+            got.device_window,
+            got.windowed,
+            got.presentation_interval
+        ),
+        (D3DSWAPEFFECT_DISCARD, 0, 1, D3DPRESENT_INTERVAL_IMMEDIATE),
+        "the fields D3D9 does not resolve stay as the caller set them",
+    );
+
+    // SAFETY: the swap chain was just created.
+    let svt = unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(chain) };
+    let mut stored = Odd::new();
+    // SAFETY: vtable thunk on a live swap chain; the out struct has room.
+    let hr = unsafe {
+        (svt.get_present_parameters)(chain, stored.ptr::<D3DPRESENT_PARAMETERS>().cast())
+    };
+    assert_eq!(
+        hr, D3D_OK,
+        "GetPresentParameters into a misaligned D3DPRESENT_PARAMETERS"
+    );
+    // SAFETY: the getter wrote the struct: integers only.
+    let kept: D3DPRESENT_PARAMETERS = unsafe { stored.get(0) };
+    assert_eq!(
+        (
+            kept.back_buffer_width,
+            kept.back_buffer_height,
+            kept.back_buffer_count
+        ),
+        (got.back_buffer_width, got.back_buffer_height, 1),
+        "the chain reports the geometry it resolved",
+    );
+    // SAFETY: balances the reference CreateAdditionalSwapChain returned.
+    unsafe { (svt.release)(chain) };
+}
+
+/// The factory and device queries fill misaligned structs.
+///
+/// `IDirect3D9::GetDeviceCaps` byte for byte against the aligned call, `GetAdapterIdentifier`,
+/// `GetCreationParameters`, the gamma ramp both ways, and the vertex and index buffer `Lock`
+/// out-slot.
+#[test]
+fn factory_and_device_queries_through_misaligned_structs() {
+    let h = Harness::new();
+    let vt = device_vtbl(&h);
+    let dev = h.device();
+    let mut slot = Odd::new();
+    // SAFETY: vtable thunk; the slot has room.
+    let hr = unsafe { (vt.get_direct3d)(dev, slot.ptr()) };
+    assert_eq!(hr, D3D_OK, "GetDirect3D into a misaligned slot");
+    // SAFETY: GetDirect3D wrote a pointer.
+    let d3d = unsafe { slot.get::<*mut c_void>(0) };
+    // SAFETY: GetDirect3D returned a live interface with a reference of its own.
+    let fvt = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d) };
+
+    let mut caps = Odd::new();
+    // SAFETY: vtable thunk on a live interface; the out struct has room.
+    let hr = unsafe { (fvt.get_device_caps)(d3d, 0, D3DDEVTYPE_HAL, caps.ptr()) };
+    assert_eq!(
+        hr, D3D_OK,
+        "IDirect3D9::GetDeviceCaps into a misaligned D3DCAPS9"
+    );
+    let aligned = h.device_caps();
+    let start = core::ptr::from_ref(&aligned).cast::<u8>();
+    // SAFETY: the aligned caps are a live value, viewed as its bytes.
+    let want = unsafe { core::slice::from_raw_parts(start, size_of::<D3DCAPS9>()) };
+    assert_eq!(
+        &caps.bytes[1..=size_of::<D3DCAPS9>()],
+        want,
+        "the factory caps land whole"
+    );
+
+    let mut ident = Odd::new();
+    // SAFETY: vtable thunk on a live interface; the out struct has room.
+    let hr = unsafe { (fvt.get_adapter_identifier)(d3d, 0, 0, ident.ptr()) };
+    assert_eq!(
+        hr, D3D_OK,
+        "GetAdapterIdentifier into a misaligned D3DADAPTER_IDENTIFIER9"
+    );
+    // SAFETY: the getter wrote the struct: byte arrays and integers.
+    let id: D3DADAPTER_IDENTIFIER9 = unsafe { ident.get(0) };
+    assert_ne!(id.vendor_id, 0, "the identifier names a vendor");
+    assert_ne!(
+        id.device_name[0], 0,
+        "the identifier names the display device"
+    );
+    // SAFETY: balances the reference GetDirect3D added.
+    unsafe { (fvt.release)(d3d) };
+
+    let mut creation = Odd::new();
+    // SAFETY: vtable thunk; the out struct has room.
+    let hr = unsafe {
+        (vt.get_creation_parameters)(dev, creation.ptr::<D3DDEVICE_CREATION_PARAMETERS>().cast())
+    };
+    assert_eq!(hr, D3D_OK, "GetCreationParameters into a misaligned struct");
+    // SAFETY: the getter wrote the struct: integers only.
+    let c: D3DDEVICE_CREATION_PARAMETERS = unsafe { creation.get(0) };
+    assert_eq!(
+        (c.adapter_ordinal, c.device_type),
+        (0, D3DDEVTYPE_HAL),
+        "the creation adapter and type",
+    );
+    assert_ne!(
+        c.behavior_flags & D3DCREATE_HARDWARE_VERTEXPROCESSING,
+        0,
+        "the behaviour flags"
+    );
+
+    // Red, green and blue each rise end to end, blue less steeply, so the channels differ.
+    let mut ramp = [0u16; 768];
+    for (i, entry) in ramp.iter_mut().enumerate() {
+        let step = u16::try_from(i % 256).expect("a ramp index fits u16");
+        *entry = if i < 512 { step * 256 } else { step * 200 };
+    }
+    let mut set = Odd::new();
+    let mut get = Odd::new();
+    // SAFETY: vtable thunk; the 768 entries are live scratch.
+    unsafe { (vt.set_gamma_ramp)(dev, 0, 0, set.put(&ramp).cast()) };
+    // SAFETY: vtable thunk; room for 768 entries.
+    unsafe { (vt.get_gamma_ramp)(dev, 0, get.ptr::<u16>().cast()) };
+    for (i, want) in ramp.iter().enumerate() {
+        // SAFETY: GetGammaRamp wrote 768 integers.
+        let got = unsafe { get.get::<u16>(i) };
+        assert_eq!(got, *want, "gamma ramp entry {i}");
+    }
+
+    let vb = h.create_vertex_buffer(64, 0, 0, D3DPOOL_MANAGED);
+    // SAFETY: the buffer is live for the test.
+    let bvt = unsafe { deref_vtbl::<IDirect3DVertexBuffer9Vtbl>(vb.as_ptr()) };
+    let ib = h.create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
+    // SAFETY: the buffer is live for the test.
+    let ivt = unsafe { deref_vtbl::<IDirect3DIndexBuffer9Vtbl>(ib.as_ptr()) };
+    for (flags, write) in [(0, true), (D3DLOCK_READONLY, false)] {
+        // SAFETY: vtable thunk on a live buffer; the slot has room.
+        let hr = unsafe { (bvt.lock)(vb.as_ptr(), 8, 4, slot.ptr(), flags) };
+        assert_eq!(hr, D3D_OK, "vertex buffer Lock into a misaligned slot");
+        // SAFETY: Lock wrote a pointer.
+        let data = unsafe { slot.get::<*mut c_void>(0) }.cast::<u32>();
+        // SAFETY: vtable thunk on a live buffer; the slot has room.
+        let hr = unsafe { (ivt.lock)(ib.as_ptr(), 8, 4, slot.ptr(), flags) };
+        assert_eq!(hr, D3D_OK, "index buffer Lock into a misaligned slot");
+        // SAFETY: Lock wrote a pointer.
+        let indices = unsafe { slot.get::<*mut c_void>(0) }.cast::<u32>();
+        if write {
+            // SAFETY: four bytes of each locked range.
+            unsafe { data.write_unaligned(MARK) };
+            // SAFETY: as above.
+            unsafe { indices.write_unaligned(!MARK) };
+        } else {
+            // SAFETY: four bytes of each locked range.
+            let read = (unsafe { data.read_unaligned() }, unsafe {
+                indices.read_unaligned()
+            });
+            assert_eq!(
+                read,
+                (MARK, !MARK),
+                "the buffers keep what the first locks wrote"
+            );
+        }
+        // SAFETY: vtable thunk on a live, locked buffer.
+        let hr = unsafe { (bvt.unlock)(vb.as_ptr()) };
+        assert_eq!(hr, D3D_OK, "vertex buffer Unlock");
+        // SAFETY: as above.
+        let hr = unsafe { (ivt.unlock)(ib.as_ptr()) };
+        assert_eq!(hr, D3D_OK, "index buffer Unlock");
+    }
+}
+
+/// An extended device's `GetDisplayModeEx` reads a misaligned `Size` and fills the struct.
+#[test]
+fn display_mode_ex_through_misaligned_structs() {
+    let h = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        ..HarnessConfig::default()
+    });
+    // SAFETY: the harness made an extended device, live for the harness lifetime.
+    let vt = unsafe { deref_vtbl::<IDirect3DDevice9ExVtbl>(h.device()) };
+    let mut mode = Odd::new();
+    let mut rotation = Odd::new();
+    let seeded = mode.put(&[D3DDISPLAYMODEEX_SIZE, 0, 0, 0, 0, 0]);
+    // SAFETY: vtable thunk; the mode and rotation are live scratch.
+    let hr = unsafe { (vt.get_display_mode_ex)(h.device(), 0, seeded.cast(), rotation.ptr()) };
+    assert_eq!(
+        hr, D3D_OK,
+        "GetDisplayModeEx into a misaligned D3DDISPLAYMODEEX"
+    );
+    // SAFETY: the getter wrote the struct: integers only.
+    let got: D3DDISPLAYMODEEX = unsafe { mode.get(0) };
+    assert_eq!(got.size, D3DDISPLAYMODEEX_SIZE, "the size field");
+    assert!(got.width > 0 && got.height > 0, "the mode has a size");
+    assert_eq!(
+        got.scan_line_ordering, D3DSCANLINEORDERING_PROGRESSIVE,
+        "progressive"
+    );
+    // SAFETY: the getter wrote an integer.
+    let rot = unsafe { rotation.get::<u32>(0) };
+    assert_eq!(rot, D3DDISPLAYROTATION_IDENTITY, "the rotation");
 }

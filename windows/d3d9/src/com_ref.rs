@@ -434,7 +434,7 @@ pub unsafe fn com_get_function(bytecode: &[u32], data: *mut c_void, size_of_data
         return D3D_OK;
     }
     // SAFETY: non-null (checked) and readable per the ABI; alignment is not assumed.
-    if unsafe { ValueIn::<u32>::read_opt(size_of_data.cast()) }.is_none_or(|have| have < need_u32) {
+    if unsafe { size_of_data.read_unaligned() } < need_u32 {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: the caller's buffer holds at least `need` bytes per the check
