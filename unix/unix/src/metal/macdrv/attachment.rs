@@ -466,6 +466,23 @@ pub fn unregister(view: usize) -> Option<Arc<Attachment>> {
     lock().remove(&view)
 }
 
+/// A block of `0x1_0000` addresses that no other caller in this process is handed.
+///
+/// The registry is one map for the process and the unit tests that fill it
+/// run in parallel, so a test takes the view and layer addresses it
+/// registers, and any window it looks records up by, from a block of its own
+/// rather than from a constant another test may pick too. Block `0` is never
+/// handed out: address `0` is what a device that never attached carries.
+#[cfg(test)]
+pub fn test_address_block() -> usize {
+    /// The next block to hand out.
+    ///
+    /// A static because the resource is process-wide: the blocks partition
+    /// the key space of the one registry map, which every test shares.
+    static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(1);
+    NEXT_BLOCK.fetch_add(1, Ordering::Relaxed) << 16
+}
+
 /// The live record for `view`, if any.
 #[must_use]
 pub fn find(view: usize) -> Option<Arc<Attachment>> {

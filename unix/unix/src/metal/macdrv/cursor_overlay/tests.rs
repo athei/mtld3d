@@ -196,13 +196,13 @@ fn request(hash: u64) -> mtld3d_shared::SetCursorOverlayParams {
 #[test]
 fn concurrent_updates_keep_owner_mode_and_sprite_together() {
     use std::sync::Mutex;
-    const A: usize = 0xc0_0000;
-    const B: usize = 0xc0_1000;
-    let a = attachment(A);
-    let b = attachment(B);
+    let view_a = super::attachment::test_address_block();
+    let view_b = view_a + 0x1000;
+    let a = attachment(view_a);
+    let b = attachment(view_b);
     let shared = Mutex::new(super::Shared::default());
     std::thread::scope(|scope| {
-        for (view, hash) in [(A, 10), (B, 20)] {
+        for (view, hash) in [(view_a, 10), (view_b, 20)] {
             let shared = &shared;
             scope.spawn(move || {
                 for _ in 0..500 {
@@ -230,71 +230,71 @@ fn concurrent_updates_keep_owner_mode_and_sprite_together() {
             }
         }
     });
-    assert!(super::attachment::unregister(A).is_some());
-    assert!(super::attachment::unregister(B).is_some());
+    assert!(super::attachment::unregister(view_a).is_some());
+    assert!(super::attachment::unregister(view_b).is_some());
     assert!(!std::sync::Arc::ptr_eq(&a, &b));
 }
 
 #[test]
 fn detached_owner_cannot_clear_a_new_owner_or_a_reused_address() {
-    const A: usize = 0xc1_0000;
-    const B: usize = 0xc1_1000;
-    let a = attachment(A);
-    let b = attachment(B);
+    let view_a = super::attachment::test_address_block();
+    let view_b = view_a + 0x1000;
+    let a = attachment(view_a);
+    let b = attachment(view_b);
     let mut shared = super::Shared::default();
-    assert!(shared.update(A, &request(1), Some(&[1; 4])));
-    let retired = super::attachment::unregister(A).unwrap();
-    assert!(shared.update(B, &request(2), Some(&[2; 4])));
+    assert!(shared.update(view_a, &request(1), Some(&[1; 4])));
+    let retired = super::attachment::unregister(view_a).unwrap();
+    assert!(shared.update(view_b, &request(2), Some(&[2; 4])));
     assert!(!shared.detach(&retired));
     assert!(std::sync::Arc::ptr_eq(shared.owner.as_ref().unwrap(), &b));
-    let new_a = attachment(A);
-    assert!(shared.update(A, &request(3), Some(&[3; 4])));
+    let new_a = attachment(view_a);
+    assert!(shared.update(view_a, &request(3), Some(&[3; 4])));
     assert!(!shared.detach(&a));
     assert!(std::sync::Arc::ptr_eq(
         shared.owner.as_ref().unwrap(),
         &new_a
     ));
     assert_eq!(shared.hash, 3);
-    super::attachment::unregister(A);
-    super::attachment::unregister(B);
+    super::attachment::unregister(view_a);
+    super::attachment::unregister(view_b);
 }
 
 #[test]
 fn admission_after_unregister_fails_and_hardware_takeover_clears_the_sprite() {
     use mtld3d_shared::mtl::CursorOverlayFlags;
-    const A: usize = 0xc2_0000;
-    const B: usize = 0xc2_1000;
-    let a = attachment(A);
-    attachment(B);
+    let view_a = super::attachment::test_address_block();
+    let view_b = view_a + 0x1000;
+    let a = attachment(view_a);
+    attachment(view_b);
     let mut shared = super::Shared::default();
-    assert!(shared.update(A, &request(1), Some(&[1; 4])));
+    assert!(shared.update(view_a, &request(1), Some(&[1; 4])));
     let mut hardware = request(0);
     hardware.flags |= CursorOverlayFlags::HARDWARE;
-    assert!(shared.update(B, &hardware, None));
+    assert!(shared.update(view_b, &hardware, None));
     let snapshot = shared.snapshot();
     assert!(snapshot.flags.contains(CursorOverlayFlags::HARDWARE));
     assert!(snapshot.sprite.is_none());
     assert_eq!(snapshot.hash, 0);
     assert!(!shared.detach(&a));
     // An unchanged software hash must retake ownership after a hardware takeover.
-    assert!(shared.update(A, &request(1), None));
+    assert!(shared.update(view_a, &request(1), None));
     assert!(shared.snapshot().sprite.is_some());
-    super::attachment::unregister(A);
-    assert!(!shared.update(A, &request(1), None));
+    super::attachment::unregister(view_a);
+    assert!(!shared.update(view_a, &request(1), None));
     assert!(shared.detach(&a));
-    super::attachment::unregister(B);
+    super::attachment::unregister(view_b);
 }
 
 #[test]
 fn rejected_upload_preserves_the_previous_request_and_reentrant_apply_stays_pending() {
-    const A: usize = 0xc3_0000;
-    attachment(A);
+    let view_a = super::attachment::test_address_block();
+    attachment(view_a);
     let mut shared = super::Shared::default();
-    assert!(shared.update(A, &request(1), Some(&[1; 4])));
+    assert!(shared.update(view_a, &request(1), Some(&[1; 4])));
     let first = shared.snapshot();
-    assert!(!shared.update(A, &request(2), None));
+    assert!(!shared.update(view_a, &request(2), None));
     assert_eq!(shared.hash, 1);
-    assert!(shared.update(A, &request(2), Some(&[2; 4])));
+    assert!(shared.update(view_a, &request(2), Some(&[2; 4])));
     shared.applied(first.revision, true);
     assert!(
         shared.pending,
@@ -307,26 +307,26 @@ fn rejected_upload_preserves_the_previous_request_and_reentrant_apply_stays_pend
     );
     shared.applied(shared.revision, true);
     assert!(!shared.pending);
-    super::attachment::unregister(A);
+    super::attachment::unregister(view_a);
 }
 
 #[test]
 fn identical_requests_preserve_retries_without_resubmitting_completed_state() {
-    const A: usize = 0xc4_0000;
-    const B: usize = 0xc4_1000;
-    attachment(A);
-    attachment(B);
+    let view_a = super::attachment::test_address_block();
+    let view_b = view_a + 0x1000;
+    attachment(view_a);
+    attachment(view_b);
     let mut shared = super::Shared::default();
-    assert!(shared.update(A, &request(1), Some(&[1; 4])));
+    assert!(shared.update(view_a, &request(1), Some(&[1; 4])));
     let first = shared.revision;
-    assert!(shared.update(A, &request(1), None));
+    assert!(shared.update(view_a, &request(1), None));
     assert!(shared.pending, "the first apply still needs to complete");
     assert_eq!(shared.revision, first);
     shared.applied(first, false);
-    assert!(shared.update(A, &request(1), None));
+    assert!(shared.update(view_a, &request(1), None));
     assert!(shared.pending, "an unchanged request retries failed work");
     shared.applied(first, true);
-    assert!(shared.update(A, &request(1), None));
+    assert!(shared.update(view_a, &request(1), None));
     assert!(
         !shared.pending,
         "completed identical state needs no dispatch"
@@ -335,60 +335,60 @@ fn identical_requests_preserve_retries_without_resubmitting_completed_state() {
     hidden
         .flags
         .remove(mtld3d_shared::mtl::CursorOverlayFlags::VISIBLE);
-    assert!(shared.update(A, &hidden, None));
-    assert!(shared.update(A, &request(1), None));
+    assert!(shared.update(view_a, &hidden, None));
+    assert!(shared.update(view_a, &request(1), None));
     assert!(shared.pending, "a coalesced hide and show still applies");
     let revision = shared.revision;
-    assert!(shared.update(B, &request(1), None));
+    assert!(shared.update(view_b, &request(1), None));
     assert!(
         shared.revision > revision,
         "the same hash can have a new owner"
     );
-    super::attachment::unregister(A);
-    super::attachment::unregister(B);
+    super::attachment::unregister(view_a);
+    super::attachment::unregister(view_b);
 }
 
 #[test]
 fn hardware_only_visibility_needs_no_overlay_but_software_handoff_does() {
     use mtld3d_shared::mtl::CursorOverlayFlags;
-    const A: usize = 0xc5_0000;
-    let owner = attachment(A);
+    let view_a = super::attachment::test_address_block();
+    let owner = attachment(view_a);
     let mut shared = super::Shared::default();
     let mut hardware = request(0);
     hardware.flags |= CursorOverlayFlags::HARDWARE;
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     assert!(!shared.pending);
     hardware.flags.remove(CursorOverlayFlags::VISIBLE);
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     assert!(!shared.pending);
     assert!(std::sync::Arc::ptr_eq(
         shared.owner.as_ref().unwrap(),
         &owner
     ));
-    assert!(shared.update(A, &request(1), Some(&[1; 4])));
+    assert!(shared.update(view_a, &request(1), Some(&[1; 4])));
     shared.applied(shared.revision, false); // The old software draw may need clearing.
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     assert!(
         shared.pending,
         "hardware takeover must clear the software overlay"
     );
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     assert!(
         shared.pending,
         "unchanged hardware state retries a failed clear"
     );
-    super::attachment::unregister(A);
+    super::attachment::unregister(view_a);
 }
 
 #[test]
 fn native_hide_without_a_sprite_wakes_main_and_retires_with_its_device() {
     use mtld3d_shared::mtl::CursorOverlayFlags;
-    const A: usize = 0xc6_0000;
-    let owner = attachment(A);
+    let view_a = super::attachment::test_address_block();
+    let owner = attachment(view_a);
     let mut shared = super::Shared::default();
     let mut native = request(0);
     native.flags = CursorOverlayFlags::HARDWARE | CursorOverlayFlags::NATIVE_HIDDEN;
-    assert!(shared.update(A, &native, None));
+    assert!(shared.update(view_a, &native, None));
     assert!(
         shared.pending,
         "a native hide must wake main without an overlay"
@@ -399,7 +399,7 @@ fn native_hide_without_a_sprite_wakes_main_and_retires_with_its_device() {
     shared.applied(snapshot.revision, true);
     assert!(!shared.pending);
     native.flags = CursorOverlayFlags::HARDWARE;
-    assert!(shared.update(A, &native, None));
+    assert!(shared.update(view_a, &native, None));
     assert!(
         shared.pending,
         "show must reconcile pointer capture on main"
@@ -407,7 +407,7 @@ fn native_hide_without_a_sprite_wakes_main_and_retires_with_its_device() {
     assert!(shared.detach(&owner));
     assert!(shared.snapshot().flags.is_empty());
     assert!(shared.pending, "detach must reconcile the retired owner");
-    super::attachment::unregister(A);
+    super::attachment::unregister(view_a);
 }
 
 fn content(hash: u64) -> super::Content {
@@ -548,20 +548,20 @@ fn same_mode_color_handoffs_compare_profile_format_and_edr_independently() {
 #[test]
 fn hardware_show_is_not_overwritten_by_a_stale_native_hide() {
     use mtld3d_shared::mtl::CursorOverlayFlags;
-    const A: usize = 0xcf_0000;
-    let _owner = attachment(A);
+    let view_a = super::attachment::test_address_block();
+    let _owner = attachment(view_a);
     let mut shared = super::Shared::default();
     let mut hardware = request(0);
     hardware.flags = CursorOverlayFlags::HARDWARE | CursorOverlayFlags::NATIVE_HIDDEN;
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     let hidden = shared.snapshot();
 
     // The game has shown its HCURSOR, but Present has not sampled that yet.
     hardware.flags |= CursorOverlayFlags::VISIBLE;
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     let shown_before_poll = shared.snapshot();
     hardware.flags.remove(CursorOverlayFlags::NATIVE_HIDDEN);
-    assert!(shared.update(A, &hardware, None));
+    assert!(shared.update(view_a, &hardware, None));
     let shown_after_poll = shared.snapshot();
 
     for snapshot in [hidden, shown_before_poll, shown_after_poll] {
@@ -571,7 +571,7 @@ fn hardware_show_is_not_overwritten_by_a_stale_native_hide() {
             "a delayed hardware snapshot must never replace Wine's cursor"
         );
     }
-    super::attachment::unregister(A);
+    super::attachment::unregister(view_a);
 }
 
 #[test]
