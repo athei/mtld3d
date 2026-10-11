@@ -8,8 +8,10 @@
 //! interval or the frame cap), once that present has reached the screen or
 //! been discarded. Into a window the compositor does not show, the presenter
 //! holds each paced present to that duration on its own clock before it
-//! skips the drawable, or acquires one under `debug.presentOccluded`. An
-//! `IMMEDIATE` present without a frame cap counts GPU completion alone.
+//! skips the drawable, or acquires one under `debug.presentOccluded`; into a
+//! visible window whose recent paced presents all came back undisplayed it
+//! holds them the same way and still presents them. An `IMMEDIATE` present
+//! without a frame cap counts GPU completion alone.
 //!
 //! The paced half is the device's [`FrameSignal`]: the submit thread notes
 //! each submission before its draw buffer commits, the presenter resolves a

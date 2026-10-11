@@ -17,7 +17,9 @@
 //! re-pacing makes one record's reconciliation due at once, defers to a
 //! refresh already in flight, and leaves the other records' cadence alone.
 //! They also pin which client surface a window's departing device hands the
-//! window to: the newest live record's on that window that holds one.
+//! window to: the newest live record's on that window that holds one, and
+//! when a window that reads visible counts as displaying nothing: after a run
+//! of undisplayed paced presents, until the next displayed one.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -28,9 +30,10 @@ use std::{
 use mtld3d_shared::mtl::ColorSpacePolicy;
 
 use super::{
-    AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, find, find_by_layer, live,
-    next_unshown_release, publish_backing_scale, register, request_cursor_kick_all,
-    retain_newest_surface_on, test_address_block, unregister,
+    AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, UNDISPLAYED_PACED_LIMIT,
+    find, find_by_layer, live, next_unshown_release, publish_backing_scale, register,
+    request_cursor_kick_all, retain_newest_surface_on, test_address_block, undisplayed_run_edge,
+    unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -622,4 +625,82 @@ fn each_record_keeps_its_own_unshown_pace() {
     assert_eq!(a.unshown_release_at(now, pace), now + pace * 2);
     unregister(view_a);
     unregister(view_b);
+}
+
+/// The run of undisplayed paced presents changes the window's state only at its limit and its end.
+#[test]
+fn an_undisplayed_run_changes_the_state_at_the_limit_and_at_its_end() {
+    assert_eq!(
+        undisplayed_run_edge(0, false),
+        None,
+        "one undisplayed present"
+    );
+    assert_eq!(
+        undisplayed_run_edge(UNDISPLAYED_PACED_LIMIT - 1, false),
+        Some(true),
+        "the present that completes the run"
+    );
+    assert_eq!(
+        undisplayed_run_edge(UNDISPLAYED_PACED_LIMIT, false),
+        None,
+        "a run past the limit"
+    );
+    assert_eq!(
+        undisplayed_run_edge(u32::MAX, false),
+        None,
+        "a run saturated at the top"
+    );
+    assert_eq!(
+        undisplayed_run_edge(UNDISPLAYED_PACED_LIMIT - 1, true),
+        None,
+        "a displayed present ends a run short of the limit"
+    );
+    assert_eq!(
+        undisplayed_run_edge(UNDISPLAYED_PACED_LIMIT, true),
+        Some(false),
+        "a displayed present ends a run that reached it"
+    );
+    assert_eq!(
+        undisplayed_run_edge(0, true),
+        None,
+        "displayed after displayed"
+    );
+}
+
+/// A record displays nothing after the limit of undisplayed paced presents, until one is displayed.
+#[test]
+fn a_record_displays_nothing_from_the_limit_until_a_displayed_present() {
+    let view = test_address_block();
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
+    for _ in 0..4 {
+        assert_eq!(att.note_paced_present(false), None);
+    }
+    assert_eq!(
+        att.note_paced_present(true),
+        None,
+        "a displayed present resets a short run"
+    );
+    for _ in 1..UNDISPLAYED_PACED_LIMIT {
+        assert_eq!(att.note_paced_present(false), None);
+        assert!(!att.displays_nothing(), "short of the limit");
+    }
+    assert_eq!(
+        att.note_paced_present(false),
+        Some(true),
+        "the run reached the limit"
+    );
+    assert!(att.displays_nothing());
+    assert_eq!(
+        att.note_paced_present(false),
+        None,
+        "no second edge past it"
+    );
+    assert!(att.displays_nothing());
+    assert_eq!(
+        att.note_paced_present(true),
+        Some(false),
+        "the first displayed present"
+    );
+    assert!(!att.displays_nothing());
+    unregister(view);
 }

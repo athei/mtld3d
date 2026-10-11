@@ -267,10 +267,29 @@ impl Drop for Slot {
 /// window, or any window behind a locked screen, nothing is displayed and so
 /// nothing measures the duration: the presenter releases one such present per
 /// duration on its own clock ([`attachment::next_unshown_release`]) and the
-/// present finishes its frame then. Any other frame finishes with its GPU work.
+/// present finishes its frame then. A window that reads visible while its
+/// paced presents keep coming back undisplayed
+/// ([`attachment::Attachment::displays_nothing`]) is held the same way, but
+/// its presents still go to the display, and such a frame finishes when the
+/// drawable's presented handler reports; the first one shown ends the hold.
+/// Any other frame finishes with its GPU work.
 pub fn pacing(attachment: Option<&attachment::Attachment>) -> Option<Duration> {
     let duration = attachment?.min_present_duration_sec();
     (duration > 0.0).then(|| Duration::from_secs_f64(duration))
+}
+
+/// The pace the presenter holds a present into `att`'s window to itself, `None` if it does not.
+///
+/// A paced present into an occluded window, or into a visible one whose
+/// recent paced presents the display all let go unshown, has nothing on
+/// screen to count its duration from, so the presenter keeps it on its own
+/// clock. Into a window that displays, the display keeps the pace.
+fn own_clock_pace(att: &attachment::Attachment) -> Option<Duration> {
+    if att.window_occluded() || att.displays_nothing() {
+        pacing(Some(att))
+    } else {
+        None
+    }
 }
 
 /// What a submit does about the pending present that reads the back buffer.
@@ -896,10 +915,11 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
              occluded, headroom 1.0, unthrottled, stretch route",
         );
     }
-    // Nothing of an occluded window is displayed, so nothing enforces its
+    // Nothing of an occluded window is displayed, nor of a visible one whose
+    // paced presents keep coming back undisplayed, so nothing enforces their
     // present's minimum duration: the presenter holds the present to it.
-    if let Some(att) = attachment.as_deref().filter(|att| att.window_occluded())
-        && let Some(duration) = pacing(Some(att))
+    if let Some(att) = attachment.as_deref()
+        && let Some(duration) = own_clock_pace(att)
         && !hold_until(state, att.unshown_release_at(ready_at, duration))
     {
         return true;
@@ -985,15 +1005,15 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         },
     );
     // A present that waits for the display finishes its frame once it is on
-    // screen: its mark moves into the drawable's presented handler. Any other
-    // mark stays on the packet and resolves when the packet drops below.
-    if paced
-        && let Some(mark) = inner
+    // screen: its mark moves into the drawable's presented handler, which
+    // also tells the window's record whether the display showed it. Any
+    // other mark stays on the packet and resolves when the packet drops below.
+    if paced {
+        let mark = inner
             .pending
             .front_mut()
-            .and_then(|packet| packet.mark.take())
-    {
-        resolve_when_presented(&drawable, mark);
+            .and_then(|packet| packet.mark.take());
+        resolve_when_presented(&drawable, mark, attachment);
     }
     super::upscale::retire_evicted(&cb, record.upscale());
     let present_ptr = state.present_retired_ptr();
@@ -1042,14 +1062,61 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
 ///
 /// The handler runs once Metal has shown or skipped the drawable. A handler
 /// Metal releases without calling it drops the mark, which resolves it too,
-/// so the frame stays unfinished no longer than the drawable lives.
-fn resolve_when_presented(drawable: &ProtocolObject<dyn CAMetalDrawable>, mark: PacedMark) {
+/// so the frame stays unfinished no longer than the drawable lives. It also
+/// counts the present on `attachment` while the window reads visible,
+/// displayed when its `presentedTime` is not 0, which is how a visible window
+/// that shows nothing comes to be paced like an occluded one
+/// ([`attachment::Attachment::displays_nothing`]).
+fn resolve_when_presented(
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    mark: Option<PacedMark>,
+    attachment: Option<Arc<attachment::Attachment>>,
+) {
     let handler = RcBlock::new(
-        move |_drawable: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| mark.resolve(),
+        move |drawable: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // A window that reads occluded displays nothing by design and is
+            // held for that already; only a visible one's presents count.
+            if let Some(att) = attachment.as_deref().filter(|att| !att.window_occluded()) {
+                // SAFETY: Metal invokes the block with the presented
+                // drawable; the pointer is valid for the handler's duration.
+                let displayed = unsafe { drawable.as_ref() }.presentedTime() > 0.0;
+                count_paced_present(att, displayed);
+            }
+            if let Some(mark) = &mark {
+                mark.resolve();
+            }
+        },
     );
     // SAFETY: objc2 typed binding; Metal copies (retains) the block on
     // registration, so the local `handler` may drop when this returns.
     unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
+}
+
+/// Count one paced present on `att`, and log when the window starts or stops displaying nothing.
+fn count_paced_present(att: &attachment::Attachment, displayed: bool) {
+    match att.note_paced_present(displayed) {
+        Some(true) => {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "presenter: window {:#x} reads visible, yet its last {} paced presents were not \
+                 displayed; its presents are held to their duration on the presenter's clock \
+                 until one is",
+                att.hwnd(),
+                attachment::UNDISPLAYED_PACED_LIMIT,
+            );
+            log::debug!(
+                target: LOG_TARGET,
+                "presenter: window {:#x} displays nothing; paced on the presenter's clock",
+                att.hwnd(),
+            );
+        }
+        Some(false) => log::debug!(
+            target: LOG_TARGET,
+            "presenter: window {:#x} displays its presents again",
+            att.hwnd(),
+        ),
+        None => {}
+    }
 }
 
 /// Pop the front packet under the caller's lock and consume it unpresented.

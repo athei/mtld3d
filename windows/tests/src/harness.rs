@@ -3224,6 +3224,11 @@ impl Harness {
         win32::foreground_window(self.hwnd())
     }
 
+    /// Keep this harness's shown window above every window that is not topmost.
+    pub fn make_topmost(&self) {
+        win32::make_topmost(self.hwnd());
+    }
+
     /// `ShowCursor(show)`.
     ///
     /// Returns the previous visibility state as reported by the device (BOOL).
