@@ -5155,8 +5155,10 @@ enum SnapshotRoom {
     Waited,
     /// The frame being recorded reads the oldest chunk, which no wait can free.
     Recording,
-    /// No wait applies: the arena is not at its cap with its oldest chunk
-    /// read, an earlier wait already covered that chunk, or the wait failed.
+    /// No wait applies, or the wait failed.
+    ///
+    /// The arena is not at its cap with its oldest chunk read, or an earlier
+    /// wait already covered that chunk's sequence.
     NoWait,
 }
 
