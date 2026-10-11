@@ -86,8 +86,10 @@ fn a_panic_in_an_entry_point_writes_its_message_to_the_process_log() {
     let after_name = lines[header_at]
         .strip_prefix("thread '")
         .and_then(|rest| rest.split_once("' ("))
-        .map(|(_, rest)| rest)
-        .unwrap_or_else(|| panic!("an unexpected panic header: {}", lines[header_at]));
+        .map_or_else(
+            || panic!("an unexpected panic header: {}", lines[header_at]),
+            |(_, rest)| rest,
+        );
 
     let log_lines: Vec<&str> = log.lines().collect();
     let expected = format!("{LOG_PANIC_PREFIX}thread '{worker}' ({after_name}");
