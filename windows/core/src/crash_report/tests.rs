@@ -353,28 +353,35 @@ fn a_full_cursor_refuses_more_text_and_still_ends_the_line() {
     assert!(buf.ends_with(PANIC_LINE_TRUNCATED.as_bytes()));
 }
 
-/// Answers whether a type implements [`Write`], through the inherent method when it does.
+/// Asks whether `T` implements [`Write`]: a method call on `&WriteProbe<T>` picks [`ViaWrite`].
+///
+/// [`ViaWrite`] is implemented for the probe itself and so applies to the
+/// call's receiver as written when `T` is [`Write`]; [`NotWrite`], on the
+/// probe's reference, is reached only by the extra borrow the compiler tries
+/// next, so it answers for every other `T`.
 struct WriteProbe<T>(core::marker::PhantomData<T>);
 
-/// The fallback the probe's method call reaches for a type that is not [`Write`].
+/// The answer for a probed type that implements [`Write`].
+trait ViaWrite {
+    fn implements_write(&self) -> bool {
+        true
+    }
+}
+
+impl<T: Write> ViaWrite for WriteProbe<T> {}
+
+/// The answer for a probed type that does not.
 trait NotWrite {
     fn implements_write(&self) -> bool {
         false
     }
 }
 
-impl<T> NotWrite for WriteProbe<T> {}
-
-impl<T: Write> WriteProbe<T> {
-    /// Shadows [`NotWrite::implements_write`] for a type that is [`Write`].
-    const fn implements_write(&self) -> bool {
-        true
-    }
-}
+impl<T> NotWrite for &WriteProbe<T> {}
 
 #[test]
 fn a_finished_panic_line_takes_no_more_text() {
     // Only the private cursor writes; the finished line has no writer of its own.
-    assert!(!WriteProbe::<PanicLine>(core::marker::PhantomData).implements_write());
-    assert!(WriteProbe::<LineCursor<'_>>(core::marker::PhantomData).implements_write());
+    assert!(!(&WriteProbe::<PanicLine>(core::marker::PhantomData)).implements_write());
+    assert!((&WriteProbe::<LineCursor<'_>>(core::marker::PhantomData)).implements_write());
 }
