@@ -4797,8 +4797,8 @@ extern "system" fn device_get_direct3d(this: *mut c_void, ppd3d9: *mut *mut c_vo
     let vtbl = unsafe { &*parent_obj.vtbl };
     (vtbl.add_ref)(parent);
     // SAFETY: `ppd3d9` is non-null (checked above) and per the D3D9
-    // ABI points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *ppd3d9 = parent };
+    // ABI points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(ppd3d9, parent) };
     D3D_OK
 }
 
@@ -4813,13 +4813,13 @@ extern "system" fn device_get_device_caps(this: *mut c_void, caps: *mut D3DCAPS9
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // SAFETY: `caps` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DCAPS9` slot owned by the caller.
-    caps::fill(
-        unsafe { &mut *caps },
+    let filled = caps::build(
         obj.inner().config().caps_all,
         crate::direct3d9::sampler_border_supported(),
     );
+    // SAFETY: `caps` is non-null (checked above) and per the D3D9 ABI points to
+    // a writable `D3DCAPS9` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(caps, filled) };
     0 // S_OK
 }
 
@@ -4840,10 +4840,12 @@ extern "system" fn device_get_display_mode(
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: `mode` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DDISPLAYMODE` slot owned by the caller.
+    // points to a writable `D3DDISPLAYMODE` slot owned by the caller; alignment is not assumed.
     unsafe {
-        *mode.cast::<D3DDISPLAYMODE>() =
-            crate::direct3d9::reported_display_mode(obj.inner().present_params());
+        OutPtr::write_opt(
+            mode.cast::<D3DDISPLAYMODE>(),
+            crate::direct3d9::reported_display_mode(obj.inner().present_params()),
+        );
     }
     D3D_OK
 }
@@ -4861,16 +4863,62 @@ extern "system" fn device_get_creation_parameters(this: *mut c_void, params: *mu
     };
     // SAFETY: `params` is non-null (checked above) and per the D3D9
     // ABI points to a writable `D3DDEVICE_CREATION_PARAMETERS` slot
-    // owned by the caller.
+    // owned by the caller; alignment is not assumed.
     unsafe {
-        *params.cast::<D3DDEVICE_CREATION_PARAMETERS>() = D3DDEVICE_CREATION_PARAMETERS {
-            adapter_ordinal: obj.inner().creation_adapter,
-            device_type: obj.inner().creation_device_type,
-            focus_window: obj.inner().creation_focus_window,
-            behavior_flags: obj.inner().creation_behavior_flags,
-        };
+        OutPtr::write_opt(
+            params.cast::<D3DDEVICE_CREATION_PARAMETERS>(),
+            D3DDEVICE_CREATION_PARAMETERS {
+                adapter_ordinal: obj.inner().creation_adapter,
+                device_type: obj.inner().creation_device_type,
+                focus_window: obj.inner().creation_focus_window,
+                behavior_flags: obj.inner().creation_behavior_flags,
+            },
+        );
     }
     D3D_OK
+}
+
+/// Report resolved back-buffer geometry through the caller's present parameters.
+///
+/// `CreateDevice`, `CreateAdditionalSwapChain` and `Reset` write the resolved
+/// width, height, format and count back and leave every other field alone, so
+/// a field the application changes while the call runs (from a `WM_SIZE` the
+/// window-mode code sends it, say) keeps the application's value. The caller's
+/// struct promises no alignment, so each of the four fields is written on its
+/// own with an unaligned store, and no reference to the caller's memory is
+/// formed.
+///
+/// # Safety
+/// `present_params` is non-null and writable for one `D3DPRESENT_PARAMETERS`
+/// for the call.
+pub unsafe fn report_resolved_geometry(
+    present_params: *mut c_void,
+    resolved: &D3DPRESENT_PARAMETERS,
+) {
+    let base = present_params.cast::<u8>();
+    for (offset, value) in [
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_width),
+            resolved.back_buffer_width,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_height),
+            resolved.back_buffer_height,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_format),
+            resolved.back_buffer_format,
+        ),
+        (
+            core::mem::offset_of!(D3DPRESENT_PARAMETERS, back_buffer_count),
+            resolved.back_buffer_count,
+        ),
+    ] {
+        let field = base.wrapping_add(offset);
+        // SAFETY: the caller's contract makes the `u32` field at `offset` writable;
+        // alignment is not assumed.
+        unsafe { field.cast::<u32>().write_unaligned(value) };
+    }
 }
 
 extern "system" fn device_create_additional_swap_chain(
@@ -4890,8 +4938,9 @@ extern "system" fn device_create_additional_swap_chain(
     null_out(swap_chain);
     // SAFETY: vtable in/out-param; `present_params` is *mut D3DPRESENT_PARAMETERS
     // per the IDirect3DDevice9 ABI — read for the request, written back with the
-    // resolved dimensions/count.
-    let Some(mut pp_in) = (unsafe { InPtrMut::<D3DPRESENT_PARAMETERS>::opt(present_params) })
+    // resolved dimensions/count; alignment is not assumed.
+    let Some(pp_in) =
+        (unsafe { ValueIn::<D3DPRESENT_PARAMETERS>::read_opt(present_params.cast_const()) })
     else {
         return D3DERR_INVALIDCALL;
     };
@@ -4900,7 +4949,7 @@ extern "system" fn device_create_additional_swap_chain(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    let mut pp = *pp_in;
+    let mut pp = pp_in;
     // D3D9 only allows windowed additional swapchains, and none at all while
     // the device itself is fullscreen (the implicit swapchain owns the screen).
     if pp.windowed == 0 || dev.is_fullscreen() {
@@ -4935,10 +4984,9 @@ extern "system" fn device_create_additional_swap_chain(
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
-    pp_in.back_buffer_width = pp.back_buffer_width;
-    pp_in.back_buffer_height = pp.back_buffer_height;
-    pp_in.back_buffer_count = pp.back_buffer_count;
-    pp_in.back_buffer_format = pp.back_buffer_format;
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { report_resolved_geometry(present_params, &pp) };
     // The stored copy resolves hDeviceWindow so GetPresentParameters reports the
     // real target window even when the caller passed NULL.
     pp.device_window = target_window;
@@ -5050,9 +5098,10 @@ impl ResetLog {
 fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -> i32 {
     // SAFETY: vtable in/out-param; per the D3D9 ABI `present_params` points to a
     // readable+writable `D3DPRESENT_PARAMETERS` owned by the caller — Reset
-    // resolves and reports the effective geometry back through it.
-    let Some(mut pp_in) =
-        (unsafe { InPtrMut::<mtld3d_types::D3DPRESENT_PARAMETERS>::opt(present_params) })
+    // resolves and reports the effective geometry back through it; alignment is
+    // not assumed.
+    let Some(pp_in) =
+        (unsafe { ValueIn::<D3DPRESENT_PARAMETERS>::read_opt(present_params.cast_const()) })
     else {
         return D3DERR_INVALIDCALL;
     };
@@ -5088,7 +5137,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
             (pp_in.back_buffer_width, pp_in.back_buffer_height),
         )
     {
-        let pp = *pp_in;
+        let pp = pp_in;
         let reason = match mode {
             Some((width, height)) if pp.windowed != 0 => {
                 format!("a windowed request names display mode {width}x{height}")
@@ -5116,7 +5165,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     // dimensions ("use the device window's client rect") and
     // `D3DFMT_UNKNOWN` ("use the display format"); a zero back-buffer count
     // resolves to one. D3D9 reports the resolved values back to the caller.
-    let mut pp = *pp_in;
+    let mut pp = pp_in;
     // Reject invalid swap-effect / back-buffer-count / presentation-interval
     // before touching any device state, so a rejected Reset leaves the device
     // intact and resettable.
@@ -5248,10 +5297,9 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
 
     // Report resolved geometry only after validation. The caller's window
     // and mode flags stay as supplied.
-    pp_in.back_buffer_width = pp.back_buffer_width;
-    pp_in.back_buffer_height = pp.back_buffer_height;
-    pp_in.back_buffer_count = pp.back_buffer_count;
-    pp_in.back_buffer_format = pp.back_buffer_format;
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { report_resolved_geometry(present_params, &pp) };
 
     // Captured before the configuration below changes what the held
     // surfaces resolve to.
@@ -6020,8 +6068,9 @@ extern "system" fn device_get_back_buffer(
     let add_ref = unsafe { (*surf).vtbl().add_ref };
     // SAFETY: calling the surface's AddRef thunk; D3D9 mandates AddRef on return.
     unsafe { add_ref(surf.cast::<c_void>()) };
-    // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
-    unsafe { *surface = surf.cast::<c_void>() };
+    // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI; alignment
+    // is not assumed.
+    unsafe { OutPtr::write_opt(surface, surf.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -6083,8 +6132,11 @@ extern "system" fn device_set_gamma_ramp(
         return;
     };
     // SAFETY: per the ABI `ramp` points at one readable `D3DGAMMARAMP` for
-    // the call; it is non-null per the branch above and read, never retained.
-    let ramp = unsafe { &*ramp.cast::<D3DGAMMARAMP>() };
+    // the call; it is non-null per the branch above and copied, never retained.
+    // `read_unaligned` assumes no alignment: the ramp is not `Copy`, so it does
+    // not go through `ValueIn`.
+    let ramp = unsafe { core::ptr::read_unaligned(ramp.cast::<D3DGAMMARAMP>()) };
+    let ramp = &ramp;
     if !mtld3d_core::gamma::is_usable(ramp) {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
@@ -6120,10 +6172,8 @@ extern "system" fn device_get_gamma_ramp(this: *mut c_void, swap_chain: u32, ram
         return;
     };
     // SAFETY: per the ABI `ramp` points at one writable `D3DGAMMARAMP` for
-    // the call; it is non-null per the branch above.
-    unsafe {
-        core::ptr::write(ramp.cast::<D3DGAMMARAMP>(), obj.inner().gamma_ramp());
-    }
+    // the call; it is non-null per the branch above, and alignment is not assumed.
+    unsafe { OutPtr::write_opt(ramp.cast::<D3DGAMMARAMP>(), obj.inner().gamma_ramp()) };
 }
 
 extern "system" fn device_create_texture(
@@ -10395,8 +10445,9 @@ extern "system" fn device_get_render_target(
     let bound = inner.bound_rt().render_target(slot);
     let surf = if bound.is_null() {
         if slot != 0 {
-            // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI.
-            unsafe { *surface = core::ptr::null_mut() };
+            // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI; alignment is not
+            // assumed.
+            unsafe { OutPtr::write_opt(surface, core::ptr::null_mut()) };
             return crate::D3DERR_NOTFOUND;
         }
         inner.get_or_create_implicit_render_target()
@@ -10409,8 +10460,8 @@ extern "system" fn device_get_render_target(
     let add_ref = unsafe { (*surf).vtbl().add_ref };
     // SAFETY: calling the surface's AddRef thunk; D3D9 mandates AddRef on return.
     unsafe { add_ref(surf.cast::<c_void>()) };
-    // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI.
-    unsafe { *surface = surf.cast::<c_void>() };
+    // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI; alignment is not assumed.
+    unsafe { OutPtr::write_opt(surface, surf.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -10675,8 +10726,8 @@ extern "system" fn device_get_depth_stencil_surface(
     };
     if surf.is_null() {
         // SAFETY: `surface` is non-null (checked above) and per the D3D9 ABI
-        // points to a writable `*mut c_void` slot owned by the caller.
-        unsafe { *surface = core::ptr::null_mut() };
+        // points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(surface, core::ptr::null_mut()) };
         return crate::D3DERR_NOTFOUND;
     }
     // SAFETY: `surf` is non-null: either the live bound depth-stencil (the
@@ -10685,8 +10736,9 @@ extern "system" fn device_get_depth_stencil_surface(
     let add_ref = unsafe { (*surf).vtbl().add_ref };
     // SAFETY: calling the surface's AddRef thunk; D3D9 mandates AddRef on return.
     unsafe { add_ref(surf.cast::<c_void>()) };
-    // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
-    unsafe { *surface = surf.cast::<c_void>() };
+    // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI; alignment
+    // is not assumed.
+    unsafe { OutPtr::write_opt(surface, surf.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -10734,9 +10786,10 @@ fn clear_target_rects(count: u32, rects: *const c_void) -> Vec<(i32, i32, i32, i
         return Vec::new();
     }
     // SAFETY: per the Clear ABI, `rects` points to `count` contiguous, caller-
-    // owned `D3DRECT`s when non-null (checked above); read-only access here.
+    // owned `D3DRECT`s when non-null (checked above); read-only access here, and
+    // alignment is not assumed.
     let slice = unsafe {
-        core::slice::from_raw_parts(rects.cast::<mtld3d_types::D3DRECT>(), count as usize)
+        mtld3d_shared::slice_from_caller(rects.cast::<mtld3d_types::D3DRECT>(), count as usize)
     };
     slice.iter().map(|r| (r.x1, r.y1, r.x2, r.y2)).collect()
 }
@@ -10963,9 +11016,9 @@ extern "system" fn device_get_transform(this: *mut c_void, state: u32, matrix: *
         .copied()
         .unwrap_or(D3DMATRIX::IDENTITY);
     // SAFETY: `matrix` is non-null (checked above) and per the D3D9
-    // ABI points to a writable `D3DMATRIX` slot owned by the caller.
+    // ABI points to a writable `D3DMATRIX` slot owned by the caller; alignment is not assumed.
     unsafe {
-        *matrix.cast::<D3DMATRIX>() = m;
+        OutPtr::write_opt(matrix.cast::<D3DMATRIX>(), m);
     }
     0 // S_OK
 }
@@ -11120,9 +11173,9 @@ extern "system" fn device_get_light(this: *mut c_void, index: u32, light: *mut c
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: `light` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DLIGHT9` slot owned by the caller.
+    // points to a writable `D3DLIGHT9` slot owned by the caller; alignment is not assumed.
     unsafe {
-        *light.cast::<D3DLIGHT9>() = l;
+        OutPtr::write_opt(light.cast::<D3DLIGHT9>(), l);
     }
     0 // S_OK
 }
@@ -11170,10 +11223,8 @@ extern "system" fn device_get_light_enable(this: *mut c_void, index: u32, enable
         0
     };
     // SAFETY: `enable` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `BOOL` (i32) slot owned by the caller.
-    unsafe {
-        *enable = enabled;
-    }
+    // points to a writable `BOOL` (i32) slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(enable, enabled) };
     0 // S_OK
 }
 
@@ -11188,8 +11239,8 @@ extern "system" fn device_set_clip_plane(this: *mut c_void, index: u32, plane: *
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: `plane` is non-null (checked) and per the D3D9 ABI points to the
-    // 4 readable f32 plane-equation coefficients (A, B, C, D).
-    let coeffs = unsafe { *plane.cast::<[f32; 4]>() };
+    // 4 readable f32 plane-equation coefficients (A, B, C, D); alignment is not assumed.
+    let coeffs = unsafe { plane.cast::<[f32; 4]>().read_unaligned() };
     let dev = obj.inner();
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::ClipPlane {
@@ -11214,8 +11265,8 @@ extern "system" fn device_get_clip_plane(this: *mut c_void, index: u32, plane: *
     };
     let coeffs = obj.inner().clip_plane(index);
     // SAFETY: `plane` is non-null (checked) and per the D3D9 ABI points to 4
-    // writable f32 slots owned by the caller.
-    unsafe { *plane.cast::<[f32; 4]>() = coeffs };
+    // writable f32 slots owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(plane.cast::<[f32; 4]>(), coeffs) };
     0 // S_OK
 }
 
@@ -11282,8 +11333,8 @@ extern "system" fn device_get_render_state(this: *mut c_void, state: u32, value:
     if state == 0 || (state as usize) >= RENDER_STATE_COUNT {
         warn_unnamed_render_state_read(state);
         // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
-        // points to a writable `u32` slot owned by the caller.
-        unsafe { *value = 0 };
+        // points to a writable `u32` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(value, 0) };
         return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -11292,8 +11343,8 @@ extern "system" fn device_get_render_state(this: *mut c_void, state: u32, value:
     };
     let dev = obj.inner();
     // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `u32` slot owned by the caller.
-    unsafe { *value = dev.render_state(state as usize) };
+    // points to a writable `u32` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(value, dev.render_state(state as usize)) };
     0 // S_OK
 }
 
@@ -11448,9 +11499,9 @@ extern "system" fn device_get_texture(
     let vertex_slot = vertex_sampler_slot(stage);
     if vertex_slot.is_none() && stage as usize >= STAGE_COUNT {
         warn_invalid_sampler("GetTexture", stage);
-        // SAFETY: `texture` is non-null (checked above) and per the D3D9
-        // ABI points to a writable `*mut c_void` slot owned by the caller.
-        unsafe { *texture = core::ptr::null_mut() };
+        // SAFETY: `texture` is non-null (checked above) and per the D3D9 ABI points to a writable
+        // `*mut c_void` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(texture, core::ptr::null_mut()) };
         return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -11472,8 +11523,8 @@ extern "system" fn device_get_texture(
         unsafe { add_ref(tex_ptr.cast::<c_void>()) };
     }
     // SAFETY: `texture` is non-null (checked above) and per the D3D9
-    // ABI points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *texture = tex_ptr.cast::<c_void>() };
+    // ABI points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     0 // S_OK
 }
 
@@ -11657,11 +11708,13 @@ extern "system" fn device_get_texture_stage_state(
     };
     let dev = obj.inner();
     // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `u32` slot owned by the caller.
+    // points to a writable `u32` slot owned by the caller; alignment is not assumed.
     unsafe {
-        *value = dev
-            .ff_state()
-            .texture_stage_state(stage as usize, type_ as usize);
+        OutPtr::write_opt(
+            value,
+            dev.ff_state()
+                .texture_stage_state(stage as usize, type_ as usize),
+        );
     }
     0 // S_OK
 }
@@ -11731,8 +11784,8 @@ extern "system" fn device_get_sampler_state(
     if vertex_slot.is_none() && sampler as usize >= STAGE_COUNT {
         warn_invalid_sampler("GetSamplerState", sampler);
         // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
-        // points to a writable `u32` slot owned by the caller.
-        unsafe { *value = 0 };
+        // points to a writable `u32` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(value, 0) };
         return D3D_OK;
     }
     if type_ as usize >= SAMPLER_STATE_COUNT {
@@ -11751,10 +11804,8 @@ extern "system" fn device_get_sampler_state(
         |slot| dev.vertex_sampler_states[slot][type_ as usize],
     );
     // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `u32` slot owned by the caller.
-    unsafe {
-        *value = read;
-    }
+    // points to a writable `u32` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(value, read) };
     0 // S_OK
 }
 
@@ -11893,8 +11944,9 @@ extern "system" fn device_validate_device(this: *mut c_void, num_passes: *mut u3
     // one pass and succeed. Returning INVALIDCALL would wrongly push games onto
     // a multi-pass / capability-fallback path.
     if !num_passes.is_null() {
-        // SAFETY: caller-supplied writable `u32` out-param per the D3D9 ABI.
-        unsafe { *num_passes = 1 };
+        // SAFETY: caller-supplied writable `u32` out-param per the D3D9 ABI; alignment is not
+        // assumed.
+        unsafe { OutPtr::write_opt(num_passes, 1) };
     }
     mtld3d_shared::log_once_info!(target: crate::LOG_TARGET, "IDirect3DDevice9::ValidateDevice: single-pass valid under Metal → S_OK (1 pass)");
     D3D_OK
@@ -12009,9 +12061,9 @@ extern "system" fn device_get_scissor_rect(this: *mut c_void, rect: *mut c_void)
     let scissor = dev.scissor_rect();
     // SAFETY: `rect` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `RECT` (alias for `D3DRECT`) owned by the
-    // caller.
+    // caller; alignment is not assumed.
     unsafe {
-        *rect.cast::<D3DRECT>() = scissor;
+        OutPtr::write_opt(rect.cast::<D3DRECT>(), scissor);
     }
     D3D_OK
 }
@@ -14115,8 +14167,9 @@ extern "system" fn device_create_vertex_declaration(
         // SAFETY: `elements + len * size_of::<D3DVERTEXELEMENT9>()` stays within
         // the caller-provided array; the `MAX_ELEMENTS` bound above guards `len`.
         let e_ptr = unsafe { elements.cast::<mtld3d_types::D3DVERTEXELEMENT9>().add(len) };
-        // SAFETY: `e_ptr` is a valid, aligned `D3DVERTEXELEMENT9` pointer.
-        let e = unsafe { *e_ptr };
+        // SAFETY: `e_ptr` addresses a readable `D3DVERTEXELEMENT9` of the caller's
+        // array; alignment is not assumed.
+        let e = unsafe { e_ptr.read_unaligned() };
         len += 1;
         if e.stream == mtld3d_types::D3DDECL_END_STREAM {
             break;
@@ -14134,7 +14187,7 @@ extern "system" fn device_create_vertex_declaration(
     // above advanced `len` exactly to the `D3DDECL_END` terminator, so
     // `len` `D3DVERTEXELEMENT9` entries are readable.
     let slice = unsafe {
-        core::slice::from_raw_parts(elements.cast::<mtld3d_types::D3DVERTEXELEMENT9>(), len)
+        mtld3d_shared::slice_from_caller(elements.cast::<mtld3d_types::D3DVERTEXELEMENT9>(), len)
     };
     // Trace-only probe — surface the decl shape under
     // `RUST_LOG=mtld3d::d3d9::state=trace` for bring-up enumeration. Not a
@@ -14165,7 +14218,7 @@ extern "system" fn device_create_vertex_declaration(
     };
     Direct3DVertexDeclaration9::new(&VertexDeclCreateInfo {
         device_inner: obj.inner_ptr(),
-        elements: slice,
+        elements: &slice,
         fvf: 0,
     })
     .map_or_else(
@@ -14258,8 +14311,8 @@ extern "system" fn device_get_vertex_declaration(this: *mut c_void, decl: *mut *
         unsafe { (vtbl.add_ref)(current.cast::<c_void>()) };
     }
     // SAFETY: `decl` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *decl = current.cast::<c_void>() };
+    // points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(decl, current.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -14347,8 +14400,8 @@ extern "system" fn device_get_fvf(this: *mut c_void, fvf: *mut u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: `fvf` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `u32` slot owned by the caller.
-    unsafe { *fvf = obj.inner().fvf() };
+    // points to a writable `u32` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(fvf, obj.inner().fvf()) };
     0 // S_OK
 }
 
@@ -14367,8 +14420,8 @@ extern "system" fn device_get_fvf(this: *mut c_void, fvf: *mut u32) -> i32 {
 fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
     const MAX_TOKENS: usize = 65536;
     // SAFETY: both callers reject a null `pFunction` before reaching here, and
-    // a non-null token stream is at least its version word.
-    let version = unsafe { *ptr };
+    // a non-null token stream is at least its version word; alignment is not assumed.
+    let version = unsafe { ptr.read_unaligned() };
     match (version >> 16) & 0xFFFF {
         0xFFFE | 0xFFFF => {}
         _ => {
@@ -14388,8 +14441,9 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
         // SAFETY: `ptr + len` stays within the caller-provided token stream;
         // the `MAX_TOKENS` bound above guards `len`.
         let tok_ptr = unsafe { ptr.add(len) };
-        // SAFETY: `tok_ptr` is a valid, aligned `u32` pointer.
-        let tok = unsafe { *tok_ptr };
+        // SAFETY: `tok_ptr` addresses a readable `u32` of the token stream;
+        // alignment is not assumed.
+        let tok = unsafe { tok_ptr.read_unaligned() };
         len += 1;
         let opcode = (tok & 0xFFFF) as u16;
         if opcode == 0xFFFF {
@@ -14407,16 +14461,16 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
                 // `MAX_TOKENS` bound.
                 let peek_ptr = unsafe { ptr.add(len + n) };
                 // SAFETY: the bound above keeps `len + n` inside the same
-                // stream the loop is already reading.
-                Some(unsafe { *peek_ptr })
+                // stream the loop is already reading; alignment is not assumed.
+                Some(unsafe { peek_ptr.read_unaligned() })
             });
         }
     }
     // SAFETY: `ptr` is the caller-supplied DXSO token stream; the
     // walk above advanced `len` exactly to the End opcode position,
-    // so `len` u32 tokens are readable from `ptr`.
-    let bc = unsafe { core::slice::from_raw_parts(ptr, len) };
-    Some(bc.to_vec())
+    // so `len` u32 tokens are readable from `ptr`; alignment is not assumed.
+    let bc = unsafe { mtld3d_shared::slice_from_caller(ptr, len) };
+    Some(bc.into_owned())
 }
 
 /// Optional on-disk dump of DXSO bytecode.
@@ -14700,8 +14754,8 @@ extern "system" fn device_get_vertex_shader(this: *mut c_void, shader: *mut *mut
         unsafe { add_ref(vs.cast::<c_void>()) };
     }
     // SAFETY: `shader` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *shader = vs.cast::<c_void>() };
+    // points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(shader, vs.cast::<c_void>()) };
     0
 }
 
@@ -14771,19 +14825,25 @@ extern "system" fn device_set_vertex_shader_constant_f(
     0
 }
 
-/// Copy `mirror[start..]` into `out`, clamping to the mirror's length.
+/// Copy `mirror[start..]` into the caller's `count` values at `out`, clamped to the mirror.
 ///
 /// Shared by every `Get*ShaderConstant*` thunk. Out-of-range tail rows are
 /// left as the caller supplied them — the Set/Get pair clamps to the same
 /// fixed register file, so an in-range round-trip is exact, which is all the
-/// D3D9 ABI promises here.
-fn copy_constants_out<T: Copy>(mirror: &[T], start: u32, out: &mut [T]) {
+/// D3D9 ABI promises here. The copy runs over bytes: the caller's array
+/// promises no alignment.
+///
+/// # Safety
+/// `out` is non-null and writable for `count` `T`s; alignment is not required.
+unsafe fn copy_constants_out<T: Copy>(mirror: &[T], start: u32, out: *mut T, count: usize) {
     let start = start as usize;
-    let end = (start + out.len()).min(mirror.len());
+    let end = (start + count).min(mirror.len());
     if start >= end {
         return;
     }
-    out[..end - start].copy_from_slice(&mirror[start..end]);
+    // SAFETY: the caller's contract covers `count` values, at least `end - start`; the
+    // mirror is device memory, so the two do not overlap, and alignment is not assumed.
+    unsafe { mtld3d_shared::slice_to_caller(out, &mirror[start..end]) };
 }
 
 /// How many registers an integer or boolean constant call moves, or the `HRESULT` refusing it.
@@ -14862,12 +14922,16 @@ extern "system" fn device_get_vertex_shader_constant_f(
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().vs_constants_copy();
-    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `f32`s are writable.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(constant_data.cast::<[f32; 4]>(), count as usize)
-    };
-    copy_constants_out(&mirror, start_register, out);
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above); per the D3D9
+    // ABI the caller guarantees `count * 4` `f32`s are writable; alignment is not assumed.
+    unsafe {
+        copy_constants_out(
+            &mirror,
+            start_register,
+            constant_data.cast::<[f32; 4]>(),
+            count as usize,
+        );
+    }
     0
 }
 
@@ -14946,9 +15010,16 @@ extern "system" fn device_get_vertex_shader_constant_i(
     };
     let mirror = obj.inner().shader_bindings().vs_constants_i_copy();
     // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count) };
-    copy_constants_out(&mirror, start_register, out);
+    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable; alignment is not
+    // assumed.
+    unsafe {
+        copy_constants_out(
+            &mirror,
+            start_register,
+            constant_data.cast::<[i32; 4]>(),
+            count,
+        );
+    }
     0
 }
 
@@ -15026,9 +15097,9 @@ extern "system" fn device_get_vertex_shader_constant_b(
     };
     let mirror = obj.inner().shader_bindings().vs_constants_b_copy();
     // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
-    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count) };
-    copy_constants_out(&mirror, start_register, out);
+    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable; alignment is not
+    // assumed.
+    unsafe { copy_constants_out(&mirror, start_register, constant_data, count) };
     0
 }
 
@@ -15111,15 +15182,15 @@ extern "system" fn device_get_stream_source(
         unsafe { add_ref(vb_ptr.cast::<c_void>()) };
     }
     // SAFETY: `stream_data` is non-null (checked) and the D3D9 ABI guarantees a
-    // writable `*mut c_void` slot.
-    unsafe { *stream_data = vb_ptr.cast::<c_void>() };
+    // writable `*mut c_void` slot; alignment is not assumed.
+    unsafe { OutPtr::write_opt(stream_data, vb_ptr.cast::<c_void>()) };
     if !offset_in_bytes.is_null() {
-        // SAFETY: caller-supplied writable `u32` slot per the D3D9 ABI.
-        unsafe { *offset_in_bytes = offset };
+        // SAFETY: caller-supplied writable `u32` slot per the D3D9 ABI; alignment is not assumed.
+        unsafe { OutPtr::write_opt(offset_in_bytes, offset) };
     }
     if !stride.is_null() {
-        // SAFETY: caller-supplied writable `u32` slot per the D3D9 ABI.
-        unsafe { *stride = vb_stride };
+        // SAFETY: caller-supplied writable `u32` slot per the D3D9 ABI; alignment is not assumed.
+        unsafe { OutPtr::write_opt(stride, vb_stride) };
     }
     0 // S_OK
 }
@@ -15170,8 +15241,8 @@ extern "system" fn device_get_stream_source_freq(
     // The raw word round-trips, flags included.
     let value = obj.inner().bound_buffers().stream_freq(stream as usize);
     // SAFETY: `setting` is non-null (checked) and per the D3D9 ABI points to a
-    // writable `u32` slot owned by the caller.
-    unsafe { *setting = value };
+    // writable `u32` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(setting, value) };
     D3D_OK
 }
 
@@ -15216,8 +15287,8 @@ extern "system" fn device_get_indices(this: *mut c_void, index_data: *mut *mut c
         unsafe { add_ref(ib_ptr.cast::<c_void>()) };
     }
     // SAFETY: `index_data` is non-null (checked) and the D3D9 ABI guarantees a
-    // writable `*mut c_void` slot.
-    unsafe { *index_data = ib_ptr.cast::<c_void>() };
+    // writable `*mut c_void` slot; alignment is not assumed.
+    unsafe { OutPtr::write_opt(index_data, ib_ptr.cast::<c_void>()) };
     0 // S_OK
 }
 
@@ -15357,8 +15428,8 @@ extern "system" fn device_get_pixel_shader(this: *mut c_void, shader: *mut *mut 
         unsafe { add_ref(ps.cast::<c_void>()) };
     }
     // SAFETY: `shader` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *shader = ps.cast::<c_void>() };
+    // points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(shader, ps.cast::<c_void>()) };
     0
 }
 
@@ -15445,12 +15516,16 @@ extern "system" fn device_get_pixel_shader_constant_f(
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().ps_constants_copy();
-    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `f32`s are writable.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(constant_data.cast::<[f32; 4]>(), count as usize)
-    };
-    copy_constants_out(&mirror, start_register, out);
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above); per the D3D9
+    // ABI the caller guarantees `count * 4` `f32`s are writable; alignment is not assumed.
+    unsafe {
+        copy_constants_out(
+            &mirror,
+            start_register,
+            constant_data.cast::<[f32; 4]>(),
+            count as usize,
+        );
+    }
     0
 }
 
@@ -15526,9 +15601,16 @@ extern "system" fn device_get_pixel_shader_constant_i(
     };
     let mirror = obj.inner().shader_bindings().ps_constants_i_copy();
     // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count) };
-    copy_constants_out(&mirror, start_register, out);
+    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable; alignment is not
+    // assumed.
+    unsafe {
+        copy_constants_out(
+            &mirror,
+            start_register,
+            constant_data.cast::<[i32; 4]>(),
+            count,
+        );
+    }
     0
 }
 
@@ -15603,9 +15685,9 @@ extern "system" fn device_get_pixel_shader_constant_b(
     };
     let mirror = obj.inner().shader_bindings().ps_constants_b_copy();
     // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
-    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count) };
-    copy_constants_out(&mirror, start_register, out);
+    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable; alignment is not
+    // assumed.
+    unsafe { copy_constants_out(&mirror, start_register, constant_data, count) };
     0
 }
 

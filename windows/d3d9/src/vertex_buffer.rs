@@ -28,7 +28,7 @@ use mtld3d_core::{
     ids::BufferId,
     page_box::PageBox,
 };
-use mtld3d_shared::{InPtr, InPtrMut};
+use mtld3d_shared::{InPtr, InPtrMut, OutPtr, ValueIn};
 use mtld3d_types::{
     D3DFMT_VERTEXDATA, D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY,
     D3DRTYPE_VERTEXBUFFER, D3DVERTEXBUFFER_DESC, Guid, IDirect3DVertexBuffer9Vtbl,
@@ -532,8 +532,9 @@ extern "system" fn vb_set_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
@@ -554,8 +555,9 @@ extern "system" fn vb_get_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
@@ -570,8 +572,9 @@ extern "system" fn vb_get_private_data(
 extern "system" fn vb_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
@@ -668,9 +671,9 @@ extern "system" fn vb_lock(
     };
     let inner = obj.inner_mut();
     if offset_to_lock > inner.length {
-        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
-        // ABI points to a writable `*mut c_void` slot owned by the caller.
-        unsafe { *pp_data = core::ptr::null_mut() };
+        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9 ABI points to a writable
+        // `*mut c_void` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(pp_data, core::ptr::null_mut()) };
         return D3DERR_INVALIDCALL;
     }
     if size_to_lock != 0 && offset_to_lock.saturating_add(size_to_lock) > inner.length {
@@ -848,17 +851,17 @@ extern "system" fn vb_lock(
     // allocated for `inner.length` bytes, so the offset lands inside it.
     let Some(ptr) = inner.backing.write_ptr_at(offset_to_lock as usize) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: no backing to map");
-        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
-        // ABI points to a writable `*mut c_void` slot owned by the caller.
-        unsafe { *pp_data = core::ptr::null_mut() };
+        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9 ABI points to a writable
+        // `*mut c_void` slot owned by the caller; alignment is not assumed.
+        unsafe { OutPtr::write_opt(pp_data, core::ptr::null_mut()) };
         return D3DERR_INVALIDCALL;
     };
     // Counted only once the pointer exists: a refused Lock maps nothing for
     // an Unlock to end.
     inner.lock_count = inner.lock_count.saturating_add(1);
     // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
-    // ABI points to a writable `*mut c_void` slot owned by the caller.
-    unsafe { *pp_data = ptr.cast::<c_void>() };
+    // ABI points to a writable `*mut c_void` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(pp_data, ptr.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -981,16 +984,19 @@ extern "system" fn vb_get_desc(this: *mut c_void, desc: *mut D3DVERTEXBUFFER_DES
     let inner = obj.inner();
     // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `D3DVERTEXBUFFER_DESC` slot owned by the
-    // caller.
+    // caller; alignment is not assumed.
     unsafe {
-        *desc = D3DVERTEXBUFFER_DESC {
-            format: D3DFMT_VERTEXDATA,
-            resource_type: D3DRTYPE_VERTEXBUFFER,
-            usage: inner.usage,
-            pool: inner.pool,
-            size: inner.length,
-            fvf: inner.fvf,
-        };
+        OutPtr::write_opt(
+            desc,
+            D3DVERTEXBUFFER_DESC {
+                format: D3DFMT_VERTEXDATA,
+                resource_type: D3DRTYPE_VERTEXBUFFER,
+                usage: inner.usage,
+                pool: inner.pool,
+                size: inner.length,
+                fvf: inner.fvf,
+            },
+        );
     }
     D3D_OK
 }

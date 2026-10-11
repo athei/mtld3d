@@ -9,6 +9,7 @@
 
 use core::ffi::c_void;
 
+use mtld3d_shared::OutPtr;
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DSPD_IUNKNOWN, Guid,
 };
@@ -144,11 +145,12 @@ impl PrivateDataStore {
             Entry::Blob(bytes) => u32::try_from(bytes.len()).unwrap_or(u32::MAX),
             Entry::Unknown(_) => ptr_size,
         };
-        // SAFETY: caller asserts `size_inout` is a readable `u32`.
-        let avail = unsafe { *size_inout };
+        // SAFETY: caller asserts `size_inout` is a readable `u32`, non-null per the check
+        // above; alignment is not assumed.
+        let avail = unsafe { size_inout.read_unaligned() };
         // (3) report the needed size.
-        // SAFETY: caller asserts `size_inout` is writable.
-        unsafe { *size_inout = needed };
+        // SAFETY: caller asserts `size_inout` is writable; alignment is not assumed.
+        unsafe { OutPtr::write_opt(size_inout, needed) };
         // (4) a NULL data buffer is a pure size query — succeeds regardless of the
         //     supplied size (BEFORE the MOREDATA check).
         if data.is_null() {
@@ -172,8 +174,9 @@ impl PrivateDataStore {
                     // SAFETY: the stored IUnknown is live; `AddRef` for caller.
                     unsafe { iunknown_add_ref(punk) };
                 }
-                // SAFETY: `data` is an `IUnknown**` of pointer width here.
-                unsafe { *data.cast::<*mut c_void>() = punk };
+                // SAFETY: `data` has room for an `IUnknown*` (checked above); a caller's
+                // buffer promises no alignment, and none is assumed.
+                unsafe { OutPtr::write_opt(data.cast::<*mut c_void>(), punk) };
             }
         }
         D3D_OK

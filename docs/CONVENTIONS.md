@@ -27,6 +27,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | Raw thread spawns (`.spawn(`, `.spawn_scoped(`, `thread::spawn(`, `thread::Builder`) = 0 under `windows/tests/tests/e2e/` | §Every end-to-end test names itself |
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
+| In an `extern "system" fn` under `windows/d3d9/src`, a pointer parameter turned into a reference, read or written through `*p`, `p.read()` or `p.write()`, or made a typed slice = 0, and `InPtr` / `InPtrMut` over a `D3D*`, `Guid` or `LUID` type = 0 | §An application's pointer promises no alignment |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -299,8 +300,9 @@ Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (
 
 - **`InPtr<'a, T>`** — borrowed input pointer. `unsafe fn opt(p)` filters null; safe `Deref` to `T`. Use at COM vtable entries (`this: *mut c_void` → `&Direct3DDevice9`) and read-only typed in-params.
 - **`InPtrMut<'a, T>`** — exclusive borrow. Same shape; `DerefMut` to `T`. Use at unix-call handler params written back to the caller.
-- **`ValueIn<'a, T: Copy>`** — by-value typed in-param read (`D3DRECT`, `D3DMATRIX`, …). `unsafe fn opt(p)`; safe `.read()` consumes self and returns `T`. One-shot convenience: `ValueIn::<T>::read_opt(p)`.
-- **`OutPtr<'a, T>`** — null-guarded typed out-param write. `unsafe fn opt(out)`; safe `.write(val)` consumes self. One-shot convenience: `OutPtr::write_opt(out, val)`.
+- **`ValueIn<'a, T: Copy>`**: by-value typed in-param read (`D3DRECT`, `D3DMATRIX`, …). `unsafe fn opt(p)`; safe `.read()` consumes self and returns `T`. One-shot convenience: `ValueIn::<T>::read_opt(p)`. The read assumes no alignment.
+- **`OutPtr<'a, T>`**: null-guarded typed out-param write. `unsafe fn opt(out)`; safe `.write(val)` consumes self. One-shot convenience: `OutPtr::write_opt(out, val)`. The write assumes no alignment.
+- **`slice_from_caller` / `slice_to_caller`**: an application's array, read (borrowed when aligned, copied otherwise) or filled (a byte copy), with no alignment assumed.
 - **`VtableThis<'a, T>`** — `IUnknown` vtable `this` cast. Crashes on null per D3D9 spec (preserves crash-on-refcount-miscount). `unsafe fn new(this)`; safe `Deref`/`DerefMut` to `T`. Used at `AddRef`/`Release`/`QueryInterface` thunks where silently filtering null would mask a refcount underflow.
 
 **Metal protocol handles** (`mtld3d_shared::mtl_handle` + `unix/unix/src/metal/handle.rs`):
@@ -312,6 +314,14 @@ Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (
 - **`CachedComPtr<T: ComUnknown, K: Ownership>`**: owning cached pointer with RAII refcount. `unsafe fn adopt(p)` takes a device-internal reference and `Drop` gives it back, so the application's public refcount never counts it. Use for every reference the device keeps on an external D3D9 COM object: `K = Bound` for bindings (bound RT/DS/VB/IB, textures, shaders, declaration), `K = Captured` for the objects a state block captures or records, which also keeps a `D3DPOOL_DEFAULT` object outstanding for `Reset`. Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
 
 Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
+
+### An application's pointer promises no alignment
+
+A pointer the application passes a COM entry point carries no alignment promise: an out-struct (`D3DLOCKED_RECT`, `D3DSURFACE_DESC`, `D3DCAPS9`), an in-struct (`D3DMATRIX`, `D3DPRESENT_PARAMETERS`, a GUID), a `DWORD`, `BOOL` or interface out-slot, an array of constants, rects or vertex elements. The D3D9 runtime copies through these pointers, so a caller that keeps the struct at an odd address, in a packed record or an odd stack slot, is inside the contract. A Rust reference to that place, a typed `read` or `write` through it, or a typed slice over it is undefined behaviour in every build, and a build with debug assertions panics on it with `misaligned pointer dereference`.
+
+So application memory is reached only through the alignment-free helpers of `mtld3d_shared::ffi_boundary`: `ValueIn` reads a value, `OutPtr` writes one, `slice_from_caller` reads an array and `slice_to_caller` fills one. A getter that fills a struct field by field builds the struct as a local value and writes it once. An in/out struct is read with `ValueIn`; the fields the call reports back are written one by one with unaligned stores, so a field the application changes during the call keeps its value. A type that is not `Copy` cannot go through `ValueIn`; it is read with `core::ptr::read_unaligned`, or field by field. `InPtr`, `InPtrMut` and `VtableThis` stay for the pointers whose alignment holds by construction: a COM `this`, an interface the application passes in (an object the layer or the system made), and the unix-call params the layer builds itself.
+
+`make audit` checks the shape in the entry points under `windows/d3d9/src`. In the body of an `extern "system" fn`, a pointer parameter may not become a reference (`&*p`, `&mut *p`, `p.as_ref()`, `p.as_mut()`), be read or written through `*p`, `p.read()` or `p.write()`, or become a typed slice, and no `InPtr` or `InPtrMut` may wrap a `D3D*`, `Guid` or `LUID` type, whether named in a turbofish or in a type annotation. A byte view (`p.cast::<u8>()`) and a cast to one of the layer's own COM wrappers (`p.cast::<Direct3D…>()`) are exempt, and so is `crash.rs`, whose vectored exception handler receives pointers from the system. A helper the entry point hands the pointer to, and a local the pointer is first cast into, are beyond the check's reach and keep the rule by review.
 
 ### Don't sprinkle — concentrate at three sites
 

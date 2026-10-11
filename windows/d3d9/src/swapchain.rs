@@ -435,8 +435,9 @@ extern "system" fn swapchain_get_back_buffer(
         let add_ref = unsafe { (*surf).vtbl().add_ref };
         // SAFETY: calling the surface AddRef thunk; D3D9 mandates AddRef on return.
         unsafe { add_ref(surf.cast::<c_void>()) };
-        // SAFETY: vtable out-param; `back_buffer` is *mut *mut c_void per the ABI.
-        unsafe { *back_buffer = surf.cast::<c_void>() };
+        // SAFETY: vtable out-param; `back_buffer` is *mut *mut c_void per the ABI; alignment is not
+        // assumed.
+        unsafe { OutPtr::write_opt(back_buffer, surf.cast::<c_void>()) };
         return D3D_OK;
     }
     // App-owned additional swapchain: return its cached, swapchain-owned
@@ -487,9 +488,12 @@ extern "system" fn swapchain_get_display_mode(this: *mut c_void, mode: *mut c_vo
     // implicit swapchain stays in sync with the device.
     let pp = obj.inner().present_params;
     // SAFETY: `mode` is non-null (checked) and per the D3D9 ABI points to a
-    // writable `D3DDISPLAYMODE` slot owned by the caller.
+    // writable `D3DDISPLAYMODE` slot owned by the caller; alignment is not assumed.
     unsafe {
-        *mode.cast::<D3DDISPLAYMODE>() = crate::direct3d9::reported_display_mode(&pp);
+        OutPtr::write_opt(
+            mode.cast::<D3DDISPLAYMODE>(),
+            crate::direct3d9::reported_display_mode(&pp),
+        );
     }
     D3D_OK
 }
@@ -513,8 +517,13 @@ extern "system" fn swapchain_get_present_parameters(
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: `parameters` is non-null (checked) and points to a writable
-    // `D3DPRESENT_PARAMETERS` per the D3D9 ABI.
-    unsafe { *parameters.cast::<D3DPRESENT_PARAMETERS>() = obj.inner().present_params };
+    // `D3DPRESENT_PARAMETERS` per the D3D9 ABI; alignment is not assumed.
+    unsafe {
+        OutPtr::write_opt(
+            parameters.cast::<D3DPRESENT_PARAMETERS>(),
+            obj.inner().present_params,
+        );
+    }
     D3D_OK
 }
 

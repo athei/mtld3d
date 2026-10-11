@@ -22,8 +22,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
-    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
-    MetalHandle, OutPtr, ValueIn, VtableThis,
+    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, MetalHandle,
+    OutPtr, ValueIn, VtableThis,
     mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
@@ -635,7 +635,7 @@ extern "system" fn d3d9_get_adapter_identifier(
     this: *mut c_void,
     adapter: u32,
     _flags: u32,
-    id: *mut D3DADAPTER_IDENTIFIER9,
+    id_out: *mut D3DADAPTER_IDENTIFIER9,
 ) -> i32 {
     trace!(target: LOG_TARGET, "IDirect3D9::GetAdapterIdentifier(adapter={adapter})");
     if adapter != 0 {
@@ -645,13 +645,12 @@ extern "system" fn d3d9_get_adapter_identifier(
     let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // SAFETY: vtable out-param; `id` is *mut D3DADAPTER_IDENTIFIER9 per IDirect3D9 ABI.
-    let Some(mut id) = (unsafe { InPtrMut::<D3DADAPTER_IDENTIFIER9>::opt(id.cast()) }) else {
+    if id_out.is_null() {
         return D3DERR_INVALIDCALL;
-    };
+    }
     // SAFETY: D3DADAPTER_IDENTIFIER9 is a plain-data #[repr(C)] FFI struct
     // (fixed-size buffers + u32 fields); zeroed bytes are a valid value.
-    unsafe { core::ptr::write_bytes(std::ptr::from_mut::<D3DADAPTER_IDENTIFIER9>(&mut id), 0, 1) };
+    let mut id: D3DADAPTER_IDENTIFIER9 = unsafe { core::mem::zeroed() };
 
     id.driver[..7].copy_from_slice(b"mtld3d\0");
     id.vendor_id = 0x106B; // Apple
@@ -711,6 +710,9 @@ extern "system" fn d3d9_get_adapter_identifier(
         );
     }
 
+    // SAFETY: vtable out-param; `id_out` is *mut D3DADAPTER_IDENTIFIER9 per IDirect3D9 ABI,
+    // non-null per the check above; alignment is not assumed.
+    unsafe { OutPtr::write_opt(id_out, id) };
     0 // S_OK
 }
 
@@ -1055,28 +1057,64 @@ pub unsafe fn write_display_mode_ex(
     rotation: *mut u32,
     current: &D3DDISPLAYMODE,
 ) -> i32 {
-    // SAFETY: the caller's contract: `mode` is null or a writable `D3DDISPLAYMODEEX`.
-    let Some(mut out) = (unsafe { InPtrMut::<D3DDISPLAYMODEEX>::opt(mode) }) else {
+    if mode.is_null() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject GetDisplayModeEx: null mode → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
-    };
-    if out.size != D3DDISPLAYMODEEX_SIZE {
+    }
+    // SAFETY: the caller's contract: `mode` is a `D3DDISPLAYMODEEX` whose `size` the caller
+    // set, non-null per the check above; alignment is not assumed.
+    let size =
+        unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, size)) };
+    if size != D3DDISPLAYMODEEX_SIZE {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {} is not {D3DDISPLAYMODEEX_SIZE} → \
-             INVALIDCALL",
-            out.size
+            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {size} is not \
+             {D3DDISPLAYMODEEX_SIZE} → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
     }
-    *out = display_mode_ex(current);
+    // SAFETY: the caller's contract: `mode` is a writable `D3DDISPLAYMODEEX`, non-null per
+    // the read above; alignment is not assumed.
+    unsafe { OutPtr::write_opt(mode.cast::<D3DDISPLAYMODEEX>(), display_mode_ex(current)) };
     // SAFETY: the caller's contract: `rotation` is null or a writable
     // `D3DDISPLAYROTATION`, which `write_opt` skips when null.
     unsafe { OutPtr::write_opt(rotation, D3DDISPLAYROTATION_IDENTITY) };
     D3D_OK
+}
+
+/// The `(width, height)` a caller's `D3DDISPLAYMODEEX` names, `None` for a null pointer.
+///
+/// Read field by field: the struct is not `Copy`, and the caller's pointer
+/// promises no alignment.
+///
+/// # Safety
+/// `mode` is null or points to a readable `D3DDISPLAYMODEEX`.
+pub const unsafe fn read_display_mode_ex_size(mode: *const c_void) -> Option<(u32, u32)> {
+    if mode.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract, with `mode` non-null per the check above; alignment
+    // is not assumed.
+    let width =
+        unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, width)) };
+    // SAFETY: as above; alignment is not assumed.
+    let height =
+        unsafe { display_mode_ex_field(mode, core::mem::offset_of!(D3DDISPLAYMODEEX, height)) };
+    Some((width, height))
+}
+
+/// Read the `u32` field at `offset` of a caller's `D3DDISPLAYMODEEX`.
+///
+/// # Safety
+/// `mode` is non-null and points to a readable `D3DDISPLAYMODEEX`, and `offset` is the offset
+/// of one of its `u32` fields.
+const unsafe fn display_mode_ex_field(mode: *const c_void, offset: usize) -> u32 {
+    let field = mode.cast::<u8>().wrapping_add(offset);
+    // SAFETY: the caller's contract puts a readable `u32` at `field`; alignment is not assumed.
+    unsafe { field.cast::<u32>().read_unaligned() }
 }
 
 /// Read the adapter LUID the driver reports, or allocate one when it reports none.
@@ -1529,11 +1567,13 @@ extern "system" fn d3d9_get_device_caps(
     let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // SAFETY: vtable out-param; `caps` is *mut D3DCAPS9 per IDirect3D9 ABI.
-    let Some(mut caps) = (unsafe { InPtrMut::<D3DCAPS9>::opt(caps.cast()) }) else {
+    if caps.is_null() {
         return D3DERR_INVALIDCALL;
-    };
-    caps::fill(&mut caps, d3d.config().caps_all, sampler_border_supported());
+    }
+    let filled = caps::build(d3d.config().caps_all, sampler_border_supported());
+    // SAFETY: vtable out-param; `caps` is *mut D3DCAPS9 per IDirect3D9 ABI, non-null per the
+    // check above; alignment is not assumed.
+    unsafe { OutPtr::write_opt(caps, filled) };
     0 // S_OK
 }
 
@@ -1766,18 +1806,19 @@ extern "system" fn d3d9_create_device_ex(
 ) -> i32 {
     null_out(device);
     // SAFETY: vtable in-param; `present_params` is null or a readable
-    // `D3DPRESENT_PARAMETERS` per the IDirect3D9Ex ABI.
+    // `D3DPRESENT_PARAMETERS` per the IDirect3D9Ex ABI; alignment is not assumed.
     let windowed_and_size =
-        unsafe { InPtr::<D3DPRESENT_PARAMETERS>::opt(present_params) }.map(|pp| {
-            (
-                pp.windowed != 0,
-                (pp.back_buffer_width, pp.back_buffer_height),
-            )
-        });
+        unsafe { ValueIn::<D3DPRESENT_PARAMETERS>::read_opt(present_params.cast_const()) }.map(
+            |pp| {
+                (
+                    pp.windowed != 0,
+                    (pp.back_buffer_width, pp.back_buffer_height),
+                )
+            },
+        );
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
-    // per the IDirect3D9Ex ABI.
-    let mode_size = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode.cast()) }
-        .map(|mode| (mode.width, mode.height));
+    // per the IDirect3D9Ex ABI; alignment is not assumed.
+    let mode_size = unsafe { read_display_mode_ex_size(mode.cast_const().cast()) };
     if let Some((windowed, size)) = windowed_and_size
         && !mtld3d_core::extended::reset_ex_mode_valid(windowed, mode_size, size)
     {
@@ -1835,15 +1876,16 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
     let cfg = d3d.config();
     // SAFETY: vtable in/out-param; per the D3D9 ABI `present_params` points to a
     // readable+writable `D3DPRESENT_PARAMETERS` — CreateDevice resolves and
-    // reports the effective geometry back through it.
-    let Some(mut pp_in) = (unsafe { InPtrMut::<D3DPRESENT_PARAMETERS>::opt(present_params) })
+    // reports the effective geometry back through it; alignment is not assumed.
+    let Some(pp_in) =
+        (unsafe { ValueIn::<D3DPRESENT_PARAMETERS>::read_opt(present_params.cast_const()) })
     else {
         return D3DERR_INVALIDCALL;
     };
     // Own a mutable copy so a windowed zero-dimension request can be resolved
     // against the device window's client area (below) and the resolved size
     // flows uniformly to the layer, backbuffer, and depth/stencil creates.
-    let mut pp = *pp_in;
+    let mut pp = pp_in;
 
     let extended = d3d.is_extended();
     // Reject invalid swap-effect / back-buffer-count / presentation-interval
@@ -2172,11 +2214,11 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
     };
     // Report the resolved geometry back to the caller. D3D9 leaves hDeviceWindow
     // and the mode flags as the caller set them.
-    pp_in.back_buffer_width = pp.back_buffer_width;
-    pp_in.back_buffer_height = pp.back_buffer_height;
-    pp_in.back_buffer_count = pp.back_buffer_count;
-    pp_in.back_buffer_format = pp.back_buffer_format;
-    // SAFETY: vtable out-param; `device` is *mut *mut c_void per IDirect3D9 ABI.
+    // SAFETY: `present_params` is the non-null pointer the request was read from, writable
+    // per the ABI; alignment is not assumed.
+    unsafe { crate::device::report_resolved_geometry(present_params, &pp) };
+    // SAFETY: vtable out-param; `device` is *mut *mut c_void per IDirect3D9 ABI; alignment is not
+    // assumed.
     unsafe { OutPtr::write_opt(device, dev_ptr.cast::<c_void>()) };
     if behavior_flags & mtld3d_types::D3DCREATE_MULTITHREADED != 0 {
         info!(

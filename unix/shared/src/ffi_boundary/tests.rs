@@ -4,7 +4,9 @@
 //! on `InPtr` and `OutPtr`, that reads and writes through `InPtr`, `InPtrMut`, `ValueIn`,
 //! `OutPtr` and `VtableThis` land on the original storage, and that `InPtr`, `Option<InPtr>`
 //! (which relies on the null-pointer niche), `OutPtr` and `VtableThis` are still exactly
-//! pointer-sized, so those four cost nothing at the call seam.
+//! pointer-sized, so those four cost nothing at the call seam. `ValueIn`, `OutPtr` and
+//! `slice_to_caller` are also driven through a pointer one byte off its type's alignment, the
+//! shape an application's odd stack slot hands the layer.
 
 use super::*;
 
@@ -146,4 +148,67 @@ fn a_zero_count_array_is_empty() {
     // SAFETY: a zero-length read of a live allocation.
     let got = unsafe { super::slice_from_caller(src.as_ptr(), 0) };
     assert!(got.is_empty());
+}
+
+/// A buffer with a `Point`'s bytes starting one byte past an aligned address.
+#[repr(C, align(8))]
+struct Misaligned {
+    bytes: [u8; 1 + size_of::<Point>() * 2],
+}
+
+impl Misaligned {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 1 + size_of::<Point>() * 2],
+        }
+    }
+
+    fn odd<T>(&mut self) -> *mut T {
+        let p = self.bytes[1..].as_mut_ptr().cast::<T>();
+        assert!(!p.is_aligned(), "the test needs a misaligned pointer");
+        p
+    }
+}
+
+/// A `ValueIn` reads a value whose pointer is not aligned for it.
+#[test]
+fn value_in_reads_through_a_misaligned_pointer() {
+    let mut buf = Misaligned::new();
+    let want = Point {
+        x: 0x0102_0304,
+        y: -9,
+    };
+    let mut bytes = [0u8; size_of::<Point>()];
+    bytes[..4].copy_from_slice(&want.x.to_ne_bytes());
+    bytes[4..].copy_from_slice(&want.y.to_ne_bytes());
+    buf.bytes[1..=size_of::<Point>()].copy_from_slice(&bytes);
+    let odd = buf.odd::<Point>();
+    // SAFETY: `odd` addresses the eight initialised bytes written above.
+    let got = unsafe { ValueIn::<Point>::read_opt(odd.cast_const().cast()) };
+    assert_eq!(got, Some(want));
+}
+
+/// An `OutPtr` writes a value whose pointer is not aligned for it.
+#[test]
+fn out_ptr_writes_through_a_misaligned_pointer() {
+    let mut buf = Misaligned::new();
+    let odd = buf.odd::<Point>();
+    // SAFETY: `odd` addresses eight writable bytes inside `buf`.
+    unsafe { OutPtr::write_opt(odd, Point { x: 7, y: -1 }) };
+    assert_eq!(&buf.bytes[1..5], &7i32.to_ne_bytes());
+    assert_eq!(&buf.bytes[5..9], &(-1i32).to_ne_bytes());
+    assert_eq!(buf.bytes[0], 0, "the byte before the slot is untouched");
+}
+
+/// `slice_to_caller` fills an array whose pointer is not aligned for its elements.
+#[test]
+fn slice_to_caller_fills_a_misaligned_array() {
+    let mut buf = Misaligned::new();
+    let odd = buf.odd::<Point>();
+    let values = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    // SAFETY: `buf` holds two `Point`s of writable bytes from `odd`, apart from `values`.
+    unsafe { super::slice_to_caller(odd, &values) };
+    let (words, _) = buf.bytes[1..].as_chunks::<4>();
+    let words: Vec<i32> = words.iter().map(|w| i32::from_ne_bytes(*w)).collect();
+    assert_eq!(words, [1, 2, 3, 4]);
 }

@@ -4,9 +4,12 @@
 //! PE side, unix-call handler params, typed in/out C struct pointers) is
 //! wrapped in a zero-cost newtype defined here. The newtype constructor is
 //! `unsafe fn` — that is the **one** place a caller asserts the ABI contract
-//! (alignment, validity, lifetime). Methods on the newtype are safe because
-//! the invariant is type-encoded and the abstract lifetime `'a` is bound to
-//! the call frame via `PhantomData<&'a …>`, preventing escape.
+//! (validity, lifetime, and alignment for the wrappers that hand out a
+//! reference). [`ValueIn`], [`OutPtr`] and the slice helpers copy instead and
+//! assume no alignment, since an application's pointer promises none. Methods
+//! on the newtype are safe because the invariant is type-encoded and the
+//! abstract lifetime `'a` is bound to the call frame via `PhantomData<&'a …>`,
+//! preventing escape.
 //!
 //! A safe `pub fn` that accepts an arbitrary raw pointer and hands back a
 //! reference synthesises an unbounded lifetime, which is unsound by strict
@@ -44,8 +47,9 @@ impl<T> InPtr<'_, T> {
     /// Caller asserts that any non-null `p` is a valid, properly-aligned,
     /// initialised `T*` whose underlying storage outlives the call frame.
     /// Common ABIs that satisfy this: COM vtable methods (the
-    /// `IDirect3DXxx9` ABI guarantees the typed pointer is valid for the
-    /// duration of the call) and typed FFI in-params from C.
+    /// `IDirect3DXxx9` ABI guarantees `this` is valid for the duration of
+    /// the call) and unix-call handler params. A struct the application
+    /// supplies promises no alignment, so it is read with [`ValueIn`].
     #[must_use]
     pub const unsafe fn opt(p: *const c_void) -> Option<Self> {
         match NonNull::new(p.cast::<T>().cast_mut()) {
@@ -134,7 +138,10 @@ impl<T> DerefMut for InPtrMut<'_, T> {
 
 /// Read-by-value typed FFI in-param (`D3DRECT`, `D3DMATRIX`, etc.).
 ///
-/// Filters null at `opt`; `read` consumes `self` and returns the value.
+/// Filters null at `opt`; `read` consumes `self` and returns the value. The read does not
+/// assume the pointer is aligned for `T`: an application passes these structs from wherever
+/// it keeps them, a packed record or an odd stack slot included, and the D3D9 runtime copies
+/// them, so a caller's misaligned pointer is inside the contract.
 pub struct ValueIn<'a, T: Copy>(NonNull<T>, PhantomData<&'a T>);
 
 impl<T: Copy> ValueIn<'_, T> {
@@ -142,8 +149,9 @@ impl<T: Copy> ValueIn<'_, T> {
     ///
     /// # Safety
     ///
-    /// Caller asserts that any non-null `p` is a properly-aligned pointer
-    /// to an initialised `T` (the D3D9 ABI for typed-struct in-params).
+    /// Caller asserts that any non-null `p` addresses an initialised `T`
+    /// that stays readable for the call frame (the D3D9 ABI for typed-struct
+    /// in-params). Alignment is not required.
     #[must_use]
     pub const unsafe fn opt(p: *const c_void) -> Option<Self> {
         match NonNull::new(p.cast::<T>().cast_mut()) {
@@ -155,8 +163,8 @@ impl<T: Copy> ValueIn<'_, T> {
     /// Consume `self` and return the pointee by value.
     #[must_use]
     pub const fn read(self) -> T {
-        // SAFETY: invariant carried from construction.
-        unsafe { self.0.as_ptr().read() }
+        // SAFETY: invariant carried from construction; `read_unaligned` assumes no alignment.
+        unsafe { self.0.as_ptr().read_unaligned() }
     }
 
     /// One-shot null-filtered read. Convenience for the `opt + read` pair.
@@ -175,8 +183,10 @@ impl<T: Copy> ValueIn<'_, T> {
 
 /// Null-guarded FFI out-param. `write` consumes `self`.
 ///
-/// Construction is `unsafe` (the caller asserts writeability and alignment);
-/// `write` is safe because the invariant is type-encoded.
+/// Construction is `unsafe` (the caller asserts writeability);
+/// `write` is safe because the invariant is type-encoded. The write does not assume the
+/// pointer is aligned for `T`, for the reason [`ValueIn`] gives: an application may hand over
+/// an out-struct at any address.
 pub struct OutPtr<'a, T>(NonNull<T>, PhantomData<&'a mut T>);
 
 impl<T> OutPtr<'_, T> {
@@ -184,8 +194,9 @@ impl<T> OutPtr<'_, T> {
     ///
     /// # Safety
     ///
-    /// Caller asserts that any non-null `out` is a writable, properly-aligned
-    /// `T*` valid for the call frame (the D3D9 ABI for typed out-params).
+    /// Caller asserts that any non-null `out` addresses `size_of::<T>()`
+    /// writable bytes valid for the call frame (the D3D9 ABI for typed
+    /// out-params). Alignment is not required.
     #[must_use]
     pub const unsafe fn opt(out: *mut T) -> Option<Self> {
         match NonNull::new(out) {
@@ -196,8 +207,8 @@ impl<T> OutPtr<'_, T> {
 
     /// Consume `self` and write `val` through the pointer.
     pub const fn write(self, val: T) {
-        // SAFETY: invariant carried from construction.
-        unsafe { self.0.as_ptr().write(val) };
+        // SAFETY: invariant carried from construction; `write_unaligned` assumes no alignment.
+        unsafe { self.0.as_ptr().write_unaligned(val) };
     }
 
     /// One-shot null-guarded write. Convenience for the `opt + write` pair.
@@ -296,6 +307,28 @@ pub unsafe fn slice_from_caller<'a, T: Copy>(data: *const T, count: usize) -> Co
     // SAFETY: the copy above initialised `count` elements.
     unsafe { owned.set_len(count) };
     Cow::Owned(owned)
+}
+
+/// Copy `values` into a caller's array, whatever the alignment of its pointer.
+///
+/// The out-parameter twin of [`slice_from_caller`]: an application hands over an array
+/// for the callee to fill, and nothing in the D3D9 contract promises the pointer is aligned
+/// for `T`, so the copy runs over bytes and never forms a typed slice of the caller's memory.
+///
+/// # Safety
+///
+/// `data` must be non-null and address `values.len() * size_of::<T>()` writable bytes in one
+/// allocation that do not overlap `values`; alignment is not required.
+pub const unsafe fn slice_to_caller<T: Copy>(data: *mut T, values: &[T]) {
+    // SAFETY: the caller guarantees the extent and that the regions do not overlap, and a
+    // byte copy has no alignment requirement on either side.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            values.as_ptr().cast::<u8>(),
+            data.cast::<u8>(),
+            core::mem::size_of_val(values),
+        );
+    }
 }
 
 #[cfg(test)]

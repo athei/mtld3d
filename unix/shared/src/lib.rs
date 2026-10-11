@@ -33,7 +33,9 @@ pub use commands::{
     BlitCommand, BlitCommandType, Command, CommandType, CopyBufferToBufferInfo,
     CopyBufferToTextureInfo, CopyTextureSubRectInfo, NullTextureKind,
 };
-pub use ffi_boundary::{InPtr, InPtrMut, OutPtr, ValueIn, VtableThis, slice_from_caller};
+pub use ffi_boundary::{
+    InPtr, InPtrMut, OutPtr, ValueIn, VtableThis, slice_from_caller, slice_to_caller,
+};
 pub use log_filter::{init_logger, init_logger_to, init_logger_to_filter};
 pub use mtl_handle::MetalHandle;
 pub use params::{

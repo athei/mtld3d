@@ -15,7 +15,7 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{InPtr, InPtrMut, OutPtr};
 use mtld3d_types::{
-    D3DDISPLAYMODEEX, D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
+    D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
     D3DUSAGE_RESTRICTED_CONTENT,
 };
 
@@ -336,8 +336,8 @@ pub extern "system" fn reset_ex(
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
-    // per the IDirect3DDevice9Ex ABI.
-    let mode = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode) }.map(|m| (m.width, m.height));
+    // per the IDirect3DDevice9Ex ABI; alignment is not assumed.
+    let mode = unsafe { crate::direct3d9::read_display_mode_ex_size(mode.cast_const()) };
     let hr = reset_impl(this, present_params, ResetCall::ResetEx { mode });
     reported_state_code(this, hr)
 }

@@ -3958,8 +3958,9 @@ extern "system" fn texture_set_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI (shared by the
@@ -3980,8 +3981,9 @@ extern "system" fn texture_get_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI.
@@ -3995,8 +3997,9 @@ extern "system" fn texture_get_private_data(
 extern "system" fn texture_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI.
@@ -4226,20 +4229,22 @@ extern "system" fn texture_get_level_desc(
     if level >= ti.app_level_count() || desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DSURFACE_DESC` slot owned by the caller.
-    let out = unsafe { &mut *desc };
-    out.format = ti.d3d_format;
-    // A texture level is itself a surface, so its `D3DSURFACE_DESC.Type`
-    // reports `D3DRTYPE_SURFACE` even though `GetType` on the container texture
-    // returns `D3DRTYPE_TEXTURE`. Mirrors `surface_get_desc`.
-    out.resource_type = D3DRTYPE_SURFACE;
-    out.usage = ti.d3d_usage;
-    out.pool = ti.d3d_pool;
-    out.multi_sample_type = 0;
-    out.multi_sample_quality = 0;
-    out.width = ti.mip_width(level as usize);
-    out.height = ti.mip_height(level as usize);
+    let level_desc = D3DSURFACE_DESC {
+        format: ti.d3d_format,
+        // A texture level is itself a surface, so its `D3DSURFACE_DESC.Type`
+        // reports `D3DRTYPE_SURFACE` even though `GetType` on the container texture
+        // returns `D3DRTYPE_TEXTURE`. Mirrors `surface_get_desc`.
+        resource_type: D3DRTYPE_SURFACE,
+        usage: ti.d3d_usage,
+        pool: ti.d3d_pool,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        width: ti.mip_width(level as usize),
+        height: ti.mip_height(level as usize),
+    };
+    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI points to
+    // a writable `D3DSURFACE_DESC` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(desc, level_desc) };
     0 // S_OK
 }
 
@@ -4697,14 +4702,16 @@ extern "system" fn texture_lock_rect(
     ti.level_authority.staging_wrote(0, level_u);
     ti.stash_lock(level_u, read_only, no_dirty, dirty_rect);
 
-    // SAFETY: `out_locked_rect` is non-null (checked above) and per the
-    // D3D9 ABI points to a writable `D3DLOCKED_RECT` slot owned by the
-    // caller.
-    let out = unsafe { &mut *out_locked_rect };
     // D3DLOCKED_RECT.pitch is i32 by D3D9 spec but always non-negative —
     // bit-preserving cast.
-    out.pitch = pitch.cast_signed();
-    out.bits = ptr.cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: ptr.cast::<c_void>(),
+    };
+    // SAFETY: `out_locked_rect` is non-null (checked above) and per the
+    // D3D9 ABI points to a writable `D3DLOCKED_RECT` slot owned by the
+    // caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(out_locked_rect, locked) };
 
     mtld3d_shared::crumb!(
         "api:tex_lock",
@@ -5959,8 +5966,9 @@ extern "system" fn volume_get_level_desc(this: *mut c_void, level: u32, desc: *m
         height: inner.mip_height(lvl),
         depth: (inner.depth >> level).max(1),
     };
-    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI.
-    unsafe { desc.cast::<D3DVOLUME_DESC>().write(volume_desc) };
+    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(desc.cast::<D3DVOLUME_DESC>(), volume_desc) };
     D3D_OK
 }
 
@@ -5991,8 +5999,9 @@ extern "system" fn volume_get_volume_level(
         // creating call reported. The `obj` borrow ended above, so that forward
         // does not alias it.
         volume9_add_ref(vol);
-        // SAFETY: `volume` is non-null per the check at entry; the app owns the slot.
-        unsafe { *volume = vol };
+        // SAFETY: `volume` is non-null per the check at entry; the app owns the slot; alignment is
+        // not assumed.
+        unsafe { OutPtr::write_opt(volume, vol) };
         return D3D_OK;
     }
     let vol = Direct3DVolume9::new(this, level);
@@ -6000,8 +6009,9 @@ extern "system" fn volume_get_volume_level(
     // hands the same pointer back, and `finalize_texture` frees it.
     obj.inner_mut().cache_subresource(index, vol as u64); // last use of `obj`
     texture_add_ref(this);
-    // SAFETY: `volume` is non-null per the check above; the app owns the slot.
-    unsafe { *volume = vol.cast::<c_void>() };
+    // SAFETY: `volume` is non-null per the check above; the app owns the slot; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(volume, vol.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -6028,13 +6038,17 @@ extern "system" fn volume_lock_box(
     }
     // A rejected lock hands back a null `pBits` (the caller may have seeded
     // the struct with garbage); the success path overwrites this.
-    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
+    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI; alignment is
+    // not assumed.
     unsafe {
-        locked_box.write(D3DLOCKED_BOX {
-            row_pitch: 0,
-            slice_pitch: 0,
-            bits: core::ptr::null_mut(),
-        });
+        OutPtr::write_opt(
+            locked_box,
+            D3DLOCKED_BOX {
+                row_pitch: 0,
+                slice_pitch: 0,
+                bits: core::ptr::null_mut(),
+            },
+        );
     }
     // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`, so the
     // cast reads the shared `inner` correctly. InPtrMut so we can record the
@@ -6129,13 +6143,17 @@ extern "system" fn volume_lock_box(
     // validated above against the level dimensions and `lock_box` sized the
     // backing as `slice_pitch * depth`.
     let ptr = unsafe { ptr.add(offset) };
-    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
+    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI; alignment is
+    // not assumed.
     unsafe {
-        locked_box.write(D3DLOCKED_BOX {
-            row_pitch,
-            slice_pitch,
-            bits: ptr.cast::<c_void>(),
-        });
+        OutPtr::write_opt(
+            locked_box,
+            D3DLOCKED_BOX {
+                row_pitch,
+                slice_pitch,
+                bits: ptr.cast::<c_void>(),
+            },
+        );
     }
     D3D_OK
 }
@@ -6409,8 +6427,8 @@ extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_voi
         return D3DERR_INVALIDCALL;
     }
     crate::device::device_wrapper_add_ref(wrapper);
-    // SAFETY: non-null (checked at entry) and writable per the ABI.
-    unsafe { *device = wrapper };
+    // SAFETY: non-null (checked at entry) and writable per the ABI; alignment is not assumed.
+    unsafe { OutPtr::write_opt(device, wrapper) };
     D3D_OK
 }
 
@@ -6422,8 +6440,8 @@ extern "system" fn volume9_set_private_data(
     flags: u32,
 ) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 SetPrivateData thunk; `this` is the live wrapper.
@@ -6441,8 +6459,8 @@ extern "system" fn volume9_get_private_data(
     size: *mut u32,
 ) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 GetPrivateData thunk; `this` is the live wrapper.
@@ -6455,8 +6473,8 @@ extern "system" fn volume9_get_private_data(
 
 extern "system" fn volume9_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 FreePrivateData thunk; `this` is the live wrapper.
@@ -6484,9 +6502,8 @@ extern "system" fn volume9_get_container(
     // so it answers the texture's own interface IIDs with an owned reference
     // and `E_NOINTERFACE` for anything else (a volume is not its own
     // container).
-    // SAFETY: `riid` is a *const Guid per the QueryInterface ABI.
-    let matches_texture = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).is_some_and(|g| {
-        let g = *g;
+    // SAFETY: `riid` is a *const Guid per the QueryInterface ABI; alignment is not assumed.
+    let matches_texture = (unsafe { ValueIn::<Guid>::read_opt(riid.cast()) }).is_some_and(|g| {
         g == IID_IUNKNOWN
             || g == IID_IDIRECT3DRESOURCE9
             || g == IID_IDIRECT3DBASETEXTURE9
@@ -6500,8 +6517,9 @@ extern "system" fn volume9_get_container(
     // by the reference this volume forwards; the returned reference is the
     // caller's to release.
     texture_add_ref(obj.parent_texture);
-    // SAFETY: `container` is non-null (checked) and a writable out-pointer.
-    unsafe { *container = obj.parent_texture };
+    // SAFETY: `container` is non-null (checked) and a writable out-pointer; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(container, obj.parent_texture) };
     D3D_OK
 }
 
@@ -6516,17 +6534,21 @@ extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC
     };
     let inner = obj.parent().inner();
     let lvl = obj.level as usize;
-    // SAFETY: `desc` is non-null per the check above; D3DVOLUME_DESC is plain data.
+    // SAFETY: `desc` is non-null per the check above; D3DVOLUME_DESC is plain data, and
+    // alignment is not assumed.
     unsafe {
-        desc.write(D3DVOLUME_DESC {
-            format: inner.d3d_format,
-            resource_type: D3DRTYPE_VOLUME,
-            usage: inner.d3d_usage,
-            pool: inner.d3d_pool,
-            width: inner.mip_widths[lvl],
-            height: inner.mip_heights[lvl],
-            depth: (inner.depth >> obj.level).max(1),
-        });
+        OutPtr::write_opt(
+            desc,
+            D3DVOLUME_DESC {
+                format: inner.d3d_format,
+                resource_type: D3DRTYPE_VOLUME,
+                usage: inner.d3d_usage,
+                pool: inner.d3d_pool,
+                width: inner.mip_widths[lvl],
+                height: inner.mip_heights[lvl],
+                depth: (inner.depth >> obj.level).max(1),
+            },
+        );
     }
     D3D_OK
 }
@@ -6747,10 +6769,12 @@ pub extern "system" fn cube_lock_rect(
         flags & D3DLOCK_NO_DIRTY_UPDATE != 0,
         dirty_rect,
     );
-    // SAFETY: checked non-null and points to a writable ABI out-param.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = pitch.cast_signed();
-    out.bits = ptr.cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: ptr.cast::<c_void>(),
+    };
+    // SAFETY: checked non-null and points to a writable ABI out-param; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     D3D_OK
 }
 

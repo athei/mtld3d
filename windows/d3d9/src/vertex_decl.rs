@@ -10,7 +10,7 @@
 use core::ffi::c_void;
 
 use mtld3d_core::{convert::pack_vertex_decl, dxso::MAX_LINKED_INPUTS};
-use mtld3d_shared::InPtr;
+use mtld3d_shared::{InPtr, OutPtr};
 use mtld3d_types::{D3DVERTEXELEMENT9, Guid, IDirect3DVertexDeclaration9Vtbl};
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, com_ref::ComUnknown, device::DeviceInner};
@@ -266,16 +266,14 @@ extern "system" fn vd_get_declaration(
     let src = obj.inner().elements_with_end();
     let n = u32::try_from(src.len()).expect("D3D9 vertex decl ≤ 16 elements");
     // SAFETY: `num_elements` is non-null (checked above) and per the D3D9
-    // ABI points to a writable `u32` slot owned by the caller.
-    unsafe { *num_elements = n };
+    // ABI points to a writable `u32` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(num_elements, n) };
     if !out_elements.is_null() {
         // SAFETY: per D3D9 spec, `out_elements` points to a buffer sized
         // for at least `num_elements` `D3DVERTEXELEMENT9` entries; `src`
         // is a live slice on the wrapper's inner. Source and destination
-        // do not alias.
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), out_elements, src.len());
-        }
+        // do not alias, and alignment is not assumed.
+        unsafe { mtld3d_shared::slice_to_caller(out_elements, src) };
     }
     D3D_OK
 }

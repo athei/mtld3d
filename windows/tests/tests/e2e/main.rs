@@ -78,6 +78,7 @@ mod texture_stages;
 mod texture_versions;
 mod textures;
 mod transforms_ff;
+mod unaligned_pointers;
 mod unix_encoder;
 mod vertex_decl;
 mod wide_stretch;
