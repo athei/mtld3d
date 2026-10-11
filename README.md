@@ -21,10 +21,12 @@ and no game breaks, speed wins. Those trades are listed in
   translator.
 - **Multithreading.** The game's thread records each draw and state change into
   fixed records. Translation into Metal, submission and presentation run in a
-  three-thread pipeline in the native Unix library that stays a fixed one frame
-  ahead of the game, so latency is bounded. Those threads and the shader workers
-  take no address space from a 32-bit game, and under an arm64 Wine they run as
-  native arm64 code.
+  three-thread pipeline in the native Unix library. The game's `Present` waits
+  until no more than the device's maximum frame latency of frames, three by
+  default, are still on their way to the screen, so a GPU-bound game does not
+  run further ahead and its input latency stays bounded. Those threads and the
+  shader workers take no address space from a 32-bit game, and under an arm64
+  Wine they run as native arm64 code.
 - **Background shader builds.** Shaders and pipelines a game uses for the
   first time build on worker threads. A frame waits once for all the builds
   it needs, not once per draw, and a pipeline whose shaders are ready builds

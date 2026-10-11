@@ -49,12 +49,13 @@ use mtld3d_shared::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLOrigin, MTLPixelFormat, MTLResource, MTLSize, MTLTexture,
+    MTLCommandQueue, MTLDrawable, MTLOrigin, MTLPixelFormat, MTLResource, MTLSize, MTLTexture,
 };
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use super::{
     command::{self, PresentEncode, diagnostics},
+    frame_signal::{FrameSignal, PacedMark},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
     macdrv::attachment,
     record::DeviceRecord,
@@ -126,6 +127,8 @@ pub struct PresentState {
     /// Fixed at creation. Read only on the occluded branch of a present, so a
     /// present into a visible window never looks at it.
     present_occluded: bool,
+    /// The device's frame-latency signal, which the paced presents of this queue hold up.
+    frame_signal: Arc<FrameSignal>,
 }
 
 struct Inner {
@@ -165,6 +168,8 @@ pub struct PresentPacket {
     slot: Option<usize>,
     /// The `NSView*` the layer belongs to: the attachment record's key.
     view: usize,
+    /// The frame-latency mark of a paced present, resolved when it is presented or dropped.
+    mark: Option<PacedMark>,
 }
 
 impl PresentPacket {
@@ -188,7 +193,13 @@ impl PresentPacket {
             layer,
             slot: None,
             view,
+            mark: None,
         }
+    }
+
+    /// Give the packet the frame-latency mark of its paced present.
+    pub fn set_mark(&mut self, mark: Option<PacedMark>) {
+        self.mark = mark;
     }
 }
 
@@ -303,7 +314,27 @@ impl PresentState {
             thread: Mutex::new(None),
             stalled: AtomicBool::new(false),
             present_occluded,
+            frame_signal: Arc::new(FrameSignal::new()),
         }
+    }
+
+    /// The device's frame-latency signal.
+    pub const fn frame_signal(&self) -> &Arc<FrameSignal> {
+        &self.frame_signal
+    }
+
+    /// How long a present into `attachment`'s window waits for the display, `None` if it does not.
+    ///
+    /// It waits when the presenter will acquire a drawable for it (the window
+    /// is not occluded, or `debug.presentOccluded` presents anyway) and the
+    /// attachment carries a minimum present duration: vsync, a divided
+    /// interval or the frame cap. Such a present finishes its frame only once
+    /// it reached the screen; any other frame finishes with its GPU work.
+    pub fn pacing(&self, attachment: Option<&attachment::Attachment>) -> Option<Duration> {
+        let attachment = attachment?;
+        let duration = attachment.min_present_duration_sec();
+        ((!attachment.window_occluded() || self.present_occluded) && duration > 0.0)
+            .then(|| Duration::from_secs_f64(duration))
     }
 
     /// Dump the recent crumb ring on each edge of this device's stall condition.
@@ -448,6 +479,9 @@ pub fn spawn(record: &Arc<DeviceRecord>) -> bool {
 /// with a warning. A thread inside `nextDrawable` is joined once that call
 /// returns, within the layer's timeout.
 pub fn stop_and_join(state: &PresentState) {
+    // Nothing presents from here on, so no frame waiting on the latency
+    // bound will finish; the wait ends with the queue.
+    state.frame_signal.end();
     state.lock().flags.insert(PresenterFlags::STOP);
     state.presenter_cv.notify_all();
     state.submit_cv.notify_all();
@@ -731,6 +765,17 @@ fn drop_front(state: &PresentState, seq: u64) {
     state.submit_cv.notify_all();
 }
 
+/// Drop the front packet because the compositor is not showing this layer, and release the rest.
+///
+/// A covered window or a drawable that did not come means the drawables
+/// already committed may not be shown either until that ends, so every
+/// paced present still owed is resolved with this one: a `Present` waiting
+/// on one of them goes on, as the frames do.
+fn drop_unshown(state: &PresentState, seq: u64) {
+    drop_front(state, seq);
+    state.frame_signal.release_paced();
+}
+
 /// The presenter thread's body.
 fn presenter_main(record: &Arc<DeviceRecord>, queue: MetalHandle<MTLCommandQueueKind>) {
     let Some(queue) = queue.into_retained() else {
@@ -793,7 +838,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         // is simply not shown. `debug.presentOccluded` presents anyway, so
         // the test suite, whose windows stay hidden, runs this path.
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
-        drop_front(state, seq);
+        drop_unshown(state, seq);
         return true;
     }
     let Some(layer) = IntoRetainedLayer::into_retained(layer) else {
@@ -821,7 +866,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         // stall, or an occlusion signal that has not propagated yet. The
         // frame is dropped; its render work is committed already.
         mtld3d_shared::crumb!("present:nodrawable", seq, drawable_wait_ns);
-        drop_front(state, seq);
+        drop_unshown(state, seq);
         return true;
     };
 
@@ -853,7 +898,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     };
     let label = objc2_foundation::NSString::from_str(&format!("mtld3d-present-{seq:#x}"));
     cb.setLabel(Some(&label));
-    command::encode_present(
+    let paced = command::encode_present(
         &cb,
         &drawable,
         &PresentEncode {
@@ -865,6 +910,17 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             drawable_wait_ns,
         },
     );
+    // A present that waits for the display finishes its frame once it is on
+    // screen: its mark moves into the drawable's presented handler. Any other
+    // mark stays on the packet and resolves when the packet drops below.
+    if paced
+        && let Some(mark) = inner
+            .pending
+            .front_mut()
+            .and_then(|packet| packet.mark.take())
+    {
+        resolve_when_presented(&drawable, mark);
+    }
     super::upscale::retire_evicted(&cb, record.upscale());
     let present_ptr = state.present_retired_ptr();
     let owner = Arc::clone(record);
@@ -906,6 +962,20 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     state.submit_cv.notify_all();
     drop(packet);
     true
+}
+
+/// Resolve `mark` when `drawable` reaches the screen, or when Metal lets go of the handler.
+///
+/// The handler runs once Metal has shown or skipped the drawable. A handler
+/// Metal releases without calling it drops the mark, which resolves it too,
+/// so the frame stays unfinished no longer than the drawable lives.
+fn resolve_when_presented(drawable: &ProtocolObject<dyn CAMetalDrawable>, mark: PacedMark) {
+    let handler = RcBlock::new(
+        move |_drawable: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| mark.resolve(),
+    );
+    // SAFETY: objc2 typed binding; Metal copies (retains) the block on
+    // registration, so the local `handler` may drop when this returns.
+    unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
 }
 
 /// Pop the front packet under the caller's lock and consume it unpresented.

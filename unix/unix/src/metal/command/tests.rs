@@ -1594,3 +1594,65 @@ fn a_retirement_wait_publishes_uploads_through_the_draw_it_waited_for() {
     assert_eq!(upload.load(Ordering::Acquire), 2);
     assert!(record.pending().lock().is_empty());
 }
+
+/// A submitted frame finishes for the latency bound when its draw buffer's handler retires it.
+///
+/// Drives the real path: the submission notes itself on the device's signal
+/// before its draw buffer commits, and the completion handler wakes the
+/// `Present` waiting for it.
+#[test]
+fn a_committed_frame_wakes_the_frame_latency_wait() {
+    use std::{sync::mpsc, time::Duration};
+
+    use crate::metal::FrameWait;
+
+    let queue = test_queue();
+    let record = test_record(&queue);
+    let floor = AtomicU64::new(0);
+    let coherent = Arc::new(AtomicU64::new(0));
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    record
+        .present()
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(atomic_address(&floor)) });
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(record.present().frame_signal());
+        let coherent = Arc::clone(&coherent);
+        std::thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(atomic_address(&coherent)) };
+            let _ = sender.send(signal.wait(draw, 2, crate::metal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    let params = test_submit_params(&coherent, &upload, &failed);
+    let frame = FrameSubmission {
+        description: &params,
+        blits: &[],
+        passes: &[],
+    };
+    assert!(
+        submit_frame(&record, &frame).success,
+        "an empty frame submits"
+    );
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Finished)
+    );
+    waiter.join().unwrap();
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        2,
+        "the floor follows the noted submission"
+    );
+    wait_for_gpu_retire(
+        record.pending(),
+        2,
+        atomic_address(&coherent),
+        atomic_address(&upload),
+        atomic_address(&failed),
+    );
+}

@@ -44,6 +44,8 @@ pub struct EncoderCounters {
     upload_coherent_seq: Arc<AtomicU64>,
     failed_submit_seq: Arc<AtomicU64>,
     retained_bytes: Arc<AtomicU64>,
+    /// The frame-latency floor: no display-paced present at or below it is outstanding.
+    paced_present_seq: Arc<AtomicU64>,
 }
 
 impl EncoderCounters {
@@ -69,6 +71,7 @@ impl EncoderCounters {
             upload_coherent_seq: Arc::new(AtomicU64::new(0)),
             failed_submit_seq: Arc::new(AtomicU64::new(0)),
             retained_bytes: Arc::new(AtomicU64::new(0)),
+            paced_present_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -78,6 +81,7 @@ impl EncoderCounters {
         let _upload = Arc::into_raw(Arc::clone(&self.upload_coherent_seq));
         let _failed = Arc::into_raw(Arc::clone(&self.failed_submit_seq));
         let _retained = Arc::into_raw(Arc::clone(&self.retained_bytes));
+        let _paced = Arc::into_raw(Arc::clone(&self.paced_present_seq));
     }
 }
 
@@ -139,6 +143,7 @@ impl EncoderThread {
             upload_coherent_seq_ptr: Arc::as_ptr(&counters.upload_coherent_seq) as u64,
             failed_submit_seq_ptr: Arc::as_ptr(&counters.failed_submit_seq) as u64,
             retained_bytes_ptr: Arc::as_ptr(&counters.retained_bytes) as u64,
+            paced_present_seq_ptr: Arc::as_ptr(&counters.paced_present_seq) as u64,
             config_ptr: settings.as_bytes().as_ptr() as u64,
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,
@@ -384,6 +389,30 @@ impl EncoderThread {
         }
         self.maintain_pending();
         self.status()
+    }
+
+    /// Whether the frame submitted at `target` finished for the frame-latency bound.
+    ///
+    /// Its draw buffer has ended and, when its present waits for the display,
+    /// that present reached the screen: both counters stand at or past it.
+    /// Two atomic loads, so a `Present` whose target finished long ago, the
+    /// usual case for a CPU-bound game, never crosses into native code.
+    pub fn frame_finished(&self, target: u64) -> bool {
+        mtld3d_core::frame_latency::frame_finished(
+            target,
+            self.counters.coherent_seq.load(Ordering::Acquire),
+            self.counters.paced_present_seq.load(Ordering::Acquire),
+        )
+    }
+
+    /// Wait until the frame submitted at `target` finished, or the encoder failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the latched HRESULT when the device has failed, before or
+    /// during the wait.
+    pub fn await_frame(&self, target: u64) -> Result<(), i32> {
+        self.control(EncoderControl::AwaitFrame, target, &[])
     }
 
     pub fn drain_retired_now(&self) -> Result<(), i32> {

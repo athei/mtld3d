@@ -570,11 +570,8 @@ pub struct DeviceInner {
     /// device's own bind slots never count. `Reset` fails with
     /// `D3DERR_INVALIDCALL` while it is non-zero, as D3D9 requires.
     outstanding_reset_blockers: AtomicU32,
-    /// What `SetMaximumFrameLatency` last stored, which `GetMaximumFrameLatency` reports.
-    ///
-    /// Reported, not enforced: the encoder's own queue depth bounds how far
-    /// the application runs ahead of the GPU.
-    max_frame_latency: u32,
+    /// The frame-latency bound `Present` enforces, and what `GetMaximumFrameLatency` reports.
+    frame_latency: mtld3d_core::frame_latency::FrameLatency,
     /// Monotonic submit seq.
     ///
     /// Each `present()` bumps this before stamping it onto the outgoing
@@ -2173,6 +2170,29 @@ impl DeviceInner {
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
         drop(stall);
+        #[cfg(perf_tracking)]
+        {
+            let retired = self.coherent_seq.load(Ordering::Acquire);
+            let in_flight = self.perf_mut().note_present_in_flight(seq, retired);
+            self.current_frame
+                .perf_mut()
+                .set_frames_in_flight(in_flight);
+        }
+        // The frame-latency bound: before the game records another frame, the
+        // frame the device's maximum latency counts back from this one has to
+        // have finished. A CPU-bound game finds it finished and pays two loads.
+        if let Some(target) = self.frame_latency.record_present(seq)
+            && !self.encoder.frame_finished(target)
+        {
+            let waited =
+                CycleSetTimer::start(self.current_frame.perf_mut().latency_wait_cycles_ptr());
+            let result = self.encoder.await_frame(target);
+            drop(waited);
+            self.current_frame.perf_mut().note_latency_wait();
+            if let Err(hr) = result {
+                return hr;
+            }
+        }
         // Outside the stall. The address-space walk runs on the watch thread;
         // this only hands it a sample and answers its request for figures.
         self.mem_watch_present();
@@ -3487,6 +3507,14 @@ impl Direct3DDevice9 {
         let upload_coherent_seq = counters.upload_coherent_seq();
         let failed_submit_seq = counters.failed_submit_seq();
         let vbib_retained_bytes = counters.retained_bytes();
+        if info.config.present_max_frame_latency != 0 {
+            log::info!(
+                target: LOG_TARGET,
+                "frame latency: present.maxFrameLatency = {latency} replaces what the game \
+                 asks for; this device keeps at most {latency} presented frames outstanding",
+                latency = info.config.present_max_frame_latency,
+            );
+        }
 
         let inner = Box::into_raw(Box::new(DeviceInner {
             device_handle: info.device_handle,
@@ -3503,7 +3531,9 @@ impl Direct3DDevice9 {
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
             flags: info.initial_flags,
-            max_frame_latency: mtld3d_core::extended::DEFAULT_FRAME_LATENCY,
+            frame_latency: mtld3d_core::frame_latency::FrameLatency::new(
+                info.config.present_max_frame_latency,
+            ),
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
@@ -3789,14 +3819,14 @@ impl DeviceInner {
         mtld3d_core::extended::state_code(hr, self.is_extended())
     }
 
-    /// The frame latency `GetMaximumFrameLatency` reports.
-    pub const fn max_frame_latency(&self) -> u32 {
-        self.max_frame_latency
+    /// The device's frame-latency bound.
+    pub const fn frame_latency(&self) -> &mtld3d_core::frame_latency::FrameLatency {
+        &self.frame_latency
     }
 
-    /// Store the frame latency `SetMaximumFrameLatency` validated.
-    pub const fn set_max_frame_latency(&mut self, latency: u32) {
-        self.max_frame_latency = latency;
+    /// The device's frame-latency bound, for `SetMaximumFrameLatency` and `Present`.
+    pub const fn frame_latency_mut(&mut self) -> &mut mtld3d_core::frame_latency::FrameLatency {
+        &mut self.frame_latency
     }
 
     /// `true` when the device is fullscreen.

@@ -106,7 +106,7 @@ impl ClockedSamples {
         sample.api_cyc = sample.counters.api_cycles_by_category.iter().sum();
         sample.api_work = sample
             .api_cyc
-            .saturating_sub(sample.timing.present_block_cycles);
+            .saturating_sub(sample.timing.present_stall_cycles());
         sample.outside_d3d9 = sample
             .timing
             .frame_total_cycles

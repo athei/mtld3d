@@ -93,6 +93,16 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   `TWO`, `THREE` and `FOUR` at the reported mode's refresh rate over two,
   three and four, and `IMMEDIATE` runs free. `present.maxFps` lowers any of
   them.
+- A maximum frame latency: `Present` returns only once the frame the
+  device's latency counts back from has finished, so at most that many
+  presented frames are outstanding: 3 by default, what an extended device's
+  `SetMaximumFrameLatency` sets (1 to 30), or what `present.maxFrameLatency`
+  names in place of either. A frame finishes when the GPU has finished its
+  work and, when its present waits for the display (vsync, a divided
+  interval or `present.maxFps`, on a window the present reaches), once that
+  present was shown or discarded, waited for at most a second after the GPU
+  work, or three present durations under a slower `present.maxFps`; a
+  hidden or covered window bounds its frames all the same.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.
@@ -357,8 +367,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   `S_PRESENT_OCCLUDED` or `S_PRESENT_MODE_CHANGED`: no exclusive mode is
   taken, and a present into a covered window already skips the drawable.
   No knob.
-- `SetMaximumFrameLatency` is stored and reported but not enforced; the
-  encoder's queue bounds the frames in flight. No knob.
 - The `D3DPRESENT_*` flags of `PresentEx` and `IDirect3DSwapChain9::Present`
   are logged and not honoured: `DONOTWAIT` waits and `FORCEIMMEDIATE`
   follows the presentation interval. No knob.

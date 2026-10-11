@@ -283,6 +283,15 @@ pub struct Mtld3dConfig {
     /// otherwise-unthrottled free-run. `0` = uncapped. Default: `0`.
     /// File key: `present.maxFps`.
     pub present_max_fps: u32,
+    /// Frames the GPU may fall behind `Present`, overriding the game's own request.
+    ///
+    /// `0` is `auto`: an extended device enforces what its
+    /// `SetMaximumFrameLatency` asked for, and every device 3 until then. A
+    /// number from 1 to 30 replaces the game's value in either direction, a
+    /// lower one for input latency, a higher one for smoothness in a game
+    /// whose frame times vary. Default: `auto`. File key:
+    /// `present.maxFrameLatency`.
+    pub present_max_frame_latency: u32,
     /// Render resolution as a percentage of the reported back buffer, `MetalFX`-upscaled.
     ///
     /// `100` (the default) renders at the size the game sees, which is an
@@ -403,6 +412,7 @@ impl Default for Mtld3dConfig {
             },
             pagebox_pool_cap_bytes: DEFAULT_PAGEBOX_POOL_CAP_BYTES,
             present_max_fps: 0,
+            present_max_frame_latency: 0,
             render_scale_percent: 100,
             render_lod_bias: true,
             adapter_spoof: AdapterSpoof::None,
@@ -588,6 +598,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: present.maxFrameLatency = {}",
+        frame_latency_label(cfg.present_max_frame_latency)
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: render.scale = {}",
         f64::from(cfg.render_scale_percent) / 100.0
     );
@@ -601,6 +616,16 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: caps.dfFormats = {}", cfg.df_formats
     );
+}
+
+/// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
+#[must_use]
+pub fn frame_latency_label(frames: u32) -> String {
+    if frames == 0 {
+        "auto".to_owned()
+    } else {
+        frames.to_string()
+    }
 }
 
 const fn color_space_label(p: ColorSpacePolicy) -> &'static str {
@@ -665,6 +690,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_cap_mb(source, key, value, &mut cfg.pagebox_pool_cap_bytes);
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
+        "present.maxFrameLatency" => {
+            assign_frame_latency(source, value, &mut cfg.present_max_frame_latency);
+        }
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
@@ -760,6 +788,24 @@ fn assign_max_fps(source: &str, value: &str, slot: &mut u32) {
             "{source}: 'present.maxFps = {value}' is not a non-negative integer (Hz) → kept {kept}",
             kept = *slot
         );
+    }
+}
+
+fn assign_frame_latency(source: &str, value: &str, slot: &mut u32) {
+    // `auto` (stored as 0) follows the game; a number replaces it.
+    if value.eq_ignore_ascii_case("auto") {
+        *slot = 0;
+        return;
+    }
+    match value.parse::<u32>() {
+        Ok(frames) if (1..=crate::extended::MAX_FRAME_LATENCY).contains(&frames) => *slot = frames,
+        _ => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'present.maxFrameLatency = {value}' is not 'auto' or a frame count from 1 \
+             to {max} → kept {kept}",
+            max = crate::extended::MAX_FRAME_LATENCY,
+            kept = frame_latency_label(*slot)
+        ),
     }
 }
 

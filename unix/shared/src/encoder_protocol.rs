@@ -85,6 +85,12 @@ pub enum EncoderControl {
     Reset = 2,
     /// Wait for the uploads through the submit sequence in `argument`, then drop their reads.
     RetireUploads = 3,
+    /// Wait on the calling thread until the frame submitted at the argument's sequence finished.
+    ///
+    /// The frame-latency bound's wait at the end of `Present`. It does not
+    /// pass through the encoder thread, whose queue holds the frames it waits
+    /// behind.
+    AwaitFrame = 4,
 }
 
 impl TryFrom<u16> for EncoderOpcode {

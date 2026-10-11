@@ -5,6 +5,7 @@ mod clear_quad;
 mod command;
 pub mod depth_transfer;
 mod device;
+mod frame_signal;
 mod gamma;
 mod gpu_time;
 pub mod handle;
@@ -28,6 +29,7 @@ pub use capture::{capture_layer_loaded, log_metal_tools, start_capture, stop_cap
 pub use clear_quad::ensure_clear_quad_pipeline;
 pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_retire};
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
+pub use frame_signal::{FrameSignal, FrameWait, PACED_PRESENT_CAP};
 pub use gamma::set_gamma_ramp;
 pub use macdrv::{
     LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,

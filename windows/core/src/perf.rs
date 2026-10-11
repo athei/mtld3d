@@ -208,6 +208,13 @@ const FRAME_SAMPLE_PERIOD: u8 = 16;
 #[cfg(perf_tracking)]
 const FIXED_FRAME_SEED: u32 = 0x2545_f491;
 
+/// Presents the frames-in-flight gauge looks back over, the one just handed over included.
+///
+/// Deeper than any bound the device enforces, so the gauge also measures a
+/// pipeline that nothing bounds.
+#[cfg(perf_tracking)]
+const IN_FLIGHT_WINDOW: usize = 64;
+
 /// A seed for the frame picks from the time-stamp counter, never 0.
 ///
 /// Xorshift stays at 0 once there, so the low bit is set.
@@ -1252,6 +1259,18 @@ struct FrameTiming {
     ///
     /// Bytes Rust's `Vec::push` memcpy'd when `FrameData.ops` doubled.
     op_vec_realloc_bytes: u64,
+    /// TSC cycles the API thread spent in `Present` waiting for the frame-latency bound.
+    ///
+    /// Zero when the frame the bound names had already finished.
+    latency_wait_cycles: u64,
+    /// One when that `Present` had to wait for the bound, zero otherwise.
+    latency_waits: u32,
+    /// Presented frames whose draw work had not completed when `Present` handed this one over.
+    ///
+    /// Counts the frame just presented and, of the 64 presents before it,
+    /// every one whose sequence the draw counter had not reached: the
+    /// frames the CPU ran ahead of the GPU, read before any wait.
+    frames_in_flight: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1269,7 +1288,16 @@ impl FrameTiming {
             frame_total_cycles: 0,
             op_vec_capacity_bytes: 0,
             op_vec_realloc_bytes: 0,
+            latency_wait_cycles: 0,
+            latency_waits: 0,
+            frames_in_flight: 0,
         }
+    }
+
+    /// The API thread's blocked time in `Present`: encoder backpressure and the latency bound.
+    const fn present_stall_cycles(&self) -> u64 {
+        self.present_block_cycles
+            .saturating_add(self.latency_wait_cycles)
     }
 }
 
@@ -1614,6 +1642,11 @@ pub struct ApiPerfState {
     ///
     /// 0 before the first line.
     pool_logged_tsc: u64,
+    /// Submit sequences of the last [`IN_FLIGHT_WINDOW`] presents, for the frames-in-flight gauge.
+    ///
+    /// A ring written at `presented_next`; zero in a slot no present has used.
+    presented_seqs: [u64; IN_FLIGHT_WINDOW],
+    presented_next: u8,
 }
 
 #[cfg(perf_tracking)]
@@ -1646,7 +1679,31 @@ impl ApiPerfState {
             untimed_frames: 0,
             pagebox_baseline: None,
             pool_logged_tsc: 0,
+            presented_seqs: [0; IN_FLIGHT_WINDOW],
+            presented_next: 0,
         }
+    }
+
+    /// Record the present of `seq` and count the presents whose draw work has not retired.
+    ///
+    /// `retired` is the draw counter's value: every draw command buffer up
+    /// to it has ended. The count covers this present and the ones the ring
+    /// still holds, so it reads how far the CPU runs ahead of the GPU, up to
+    /// `IN_FLIGHT_WINDOW`.
+    ///
+    /// # Panics
+    /// Never: the ring index and the count stay below `IN_FLIGHT_WINDOW` + 1.
+    pub fn note_present_in_flight(&mut self, seq: u64, retired: u64) -> u32 {
+        let next = usize::from(self.presented_next);
+        self.presented_seqs[next] = seq;
+        self.presented_next = u8::try_from((next + 1) % IN_FLIGHT_WINDOW)
+            .expect("the ring index stays below its length");
+        let outstanding = self
+            .presented_seqs
+            .iter()
+            .filter(|&&presented| presented > retired)
+            .count();
+        u32::try_from(outstanding).expect("the ring holds 64 presents")
     }
 
     /// Count only consumed uniform builds, without a timer or another key read.
@@ -2334,6 +2391,21 @@ impl FramePerfPayload {
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.timing.present_block_cycles
     }
+
+    /// Pointer the API thread's `CycleSetTimer` writes the frame-latency wait into.
+    pub const fn latency_wait_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.timing.latency_wait_cycles
+    }
+
+    /// Mark that the `Present` before this frame waited for the frame-latency bound.
+    pub const fn note_latency_wait(&mut self) {
+        self.timing.latency_waits = 1;
+    }
+
+    /// The presented frames whose draw work was outstanding at the `Present` before this frame.
+    pub const fn set_frames_in_flight(&mut self, frames: u32) {
+        self.timing.frames_in_flight = frames;
+    }
 }
 
 /// ZST twin of [`FramePerfPayload`] for `cfg(not(perf_tracking))`.
@@ -2357,6 +2429,12 @@ impl FramePerfPayload {
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
+    #[inline]
+    pub const fn latency_wait_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn note_latency_wait(&mut self) {}
 }
 
 /// Identity tag for a shader at the encoder side.
@@ -3044,7 +3122,7 @@ impl EncoderPerfState {
         let api_by = self.counters.api_cycles_by_category;
         let api_total: u64 = api_by.iter().sum();
         let outside_d3d9 = self.timing.frame_total_cycles.saturating_sub(api_total);
-        let api_work_cyc = api_total.saturating_sub(self.timing.present_block_cycles);
+        let api_work_cyc = api_total.saturating_sub(self.timing.present_stall_cycles());
 
         // Per-frame PageBox allocator traffic: delta of this runtime's
         // cumulative counters against the previous frame's snapshot. The
@@ -3592,6 +3670,12 @@ struct PerfWindow {
     api_cyc: Stat,
     api_work: Stat,
     present_block: Stat,
+    /// The `Present` wait for the frame-latency bound, per frame.
+    latency_wait: Stat,
+    /// Frames whose `Present` waited for the bound (sum only).
+    latency_waits: Stat,
+    /// Presented frames outstanding on the GPU at each `Present` (sum for the mean, and peak).
+    frames_in_flight: Stat,
     query_wait: Stat,
     enc_cyc: Stat,
     enc_work: Stat,
@@ -3891,6 +3975,10 @@ impl PerfWindow {
         self.api_cyc.add(s.api_cyc);
         self.api_work.add(s.api_work);
         self.present_block.add(s.timing.present_block_cycles);
+        self.latency_wait.add(s.timing.latency_wait_cycles);
+        self.latency_waits.add(u64::from(s.timing.latency_waits));
+        self.frames_in_flight
+            .add(u64::from(s.timing.frames_in_flight));
         self.query_wait.add(s.counters.query_wait_cycles);
         self.enc_cyc.add(s.enc_cyc);
         // Encoder-thread CPU = op + finalize. `enc_cyc` (= op + submit_cyc)
@@ -4126,7 +4214,7 @@ impl PerfWindow {
         );
         self.draw_snapshot_keys_leftover.peak(keys_leftover);
         let frame_other = s.counters.device_sub_cycles[DeviceSubCategory::Frame as usize]
-            .saturating_sub(s.timing.present_block_cycles);
+            .saturating_sub(s.timing.present_stall_cycles());
         self.frame_other.peak(frame_other);
         self.finalize.peak(
             s.enc
@@ -4153,11 +4241,12 @@ impl PerfWindow {
         *self = Self::new();
     }
 
-    /// Window sum of the `Frame` device sub-bucket less the present stall nested inside it.
+    /// Window sum of the `Frame` device sub-bucket less the two `Present` waits nested inside it.
     const fn frame_other_sum(&self) -> u64 {
         self.device_sub_by[DeviceSubCategory::Frame as usize]
             .sum
             .saturating_sub(self.present_block.sum)
+            .saturating_sub(self.latency_wait.sum)
     }
 
     /// Window sum of `draw_snapshot` less its five named sub-timers.
@@ -5113,8 +5202,20 @@ impl<'a> Summary<'a> {
                         peak: Some(cycles_to_ms(self.c.present_block.max)),
                     },
                 );
+                write_row(
+                    out,
+                    s,
+                    &Row {
+                        label: "│  │  │  ├─ GPU behind",
+                        bold_label: false,
+                        ms: Some(cycles_to_ms(w.latency_wait.sum / f)),
+                        aux: None,
+                        desc: Some("frame-latency bound"),
+                        peak: Some(cycles_to_ms(self.c.latency_wait.max)),
+                    },
+                );
                 // Make Frame's children sum to Frame: the remainder
-                // (Frame total − Send stall) is the non-blocking body
+                // (Frame total − Send stall − GPU behind) is the non-blocking body
                 // work of Present + Clear + BeginScene/EndScene +
                 // ColorFill. Derived by subtraction; peak tracked
                 // per-frame in `accumulate`.
@@ -6839,6 +6940,10 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         kv.total(format_args!("{base}_calls"), c.device_sub_calls_by[i].sum);
     }
     kv.every_frame_cycles("present_stall", &w.present_block, &c.present_block);
+    kv.every_frame_cycles("latency_wait", &w.latency_wait, &c.latency_wait);
+    kv.total("latency_waits", c.latency_waits.sum);
+    kv.total("frames_in_flight", c.frames_in_flight.sum);
+    kv.count("frames_in_flight_peak", c.frames_in_flight.max);
     kv.per_frame_ms("dev_frame_other", cycles_to_ms(w.frame_other_sum()));
     kv.peak_ms("dev_frame_other", cycles_to_ms(c.frame_other.max));
     kv.cycles("draw_snapshot", &w.draw_snapshot);
@@ -7172,13 +7277,16 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_waits) == 992);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_recording) == 996);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_cycles) == 1000);
-    assert!(size_of::<FrameTiming>() == 32);
+    assert!(size_of::<FrameTiming>() == 48);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 1040);
+    assert!(core::mem::offset_of!(FrameTiming, latency_wait_cycles) == 32);
+    assert!(core::mem::offset_of!(FrameTiming, latency_waits) == 40);
+    assert!(core::mem::offset_of!(FrameTiming, frames_in_flight) == 44);
+    assert!(size_of::<FramePerfPayload>() == 1056);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
     assert!(core::mem::offset_of!(FramePerfPayload, timing) == 1008);

@@ -27,6 +27,7 @@ impl FrameTiming {
     pub(super) fn rescale_durations(&mut self, source_hz: u64, target_hz: u64) {
         self.present_block_cycles.rescale(source_hz, target_hz);
         self.frame_total_cycles.rescale(source_hz, target_hz);
+        self.latency_wait_cycles.rescale(source_hz, target_hz);
     }
 }
 

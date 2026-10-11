@@ -566,6 +566,7 @@ fn retire_failed_submit(record: &DeviceRecord, params: &SubmitDescription) {
     params.failed_submission.publish(params.submit_seq);
     params.upload_retirement.publish(params.submit_seq);
     params.draw_retirement.publish(params.submit_seq);
+    record.present().frame_signal().retired();
 }
 
 /// Publish a submission without an upload buffer on the upload counter.
@@ -713,7 +714,7 @@ fn encode_frame(
     // addresses the PE side keeps valid until it has drained the submit thread
     // and waited for presentation to go idle, which every path that retires
     // them does first; the packet owns the retains from here on.
-    let packet = if params.present_layer.is_null() {
+    let mut packet = if params.present_layer.is_null() {
         None
     } else {
         mtld3d_shared::crumb!("submit:layerret", params.present_layer.raw());
@@ -743,6 +744,27 @@ fn encode_frame(
     super::presenter::resolve_present_conflict(record.present(), &queue, outcome, packet.is_some());
 
     super::upscale::retire_evicted(&cmd_buf, record.upscale());
+
+    // The frame-latency signal learns of the submission before its draw
+    // buffer commits, so a draw counter that reaches this sequence finds it
+    // noted; a present that will wait for the display carries the mark that
+    // holds the frame unfinished until it is shown.
+    let pacing = packet.as_ref().and_then(|_| {
+        record.present().pacing(
+            attachment::find(
+                usize::try_from(params.present_view.raw())
+                    .expect("a 64-bit host addresses every view pointer"),
+            )
+            .as_deref(),
+        )
+    });
+    let mark = record
+        .present()
+        .frame_signal()
+        .note_submission(params.submit_seq, pacing);
+    if let Some(packet) = packet.as_mut() {
+        packet.set_mark(mark);
+    }
 
     // Spans the frame buffer's handler install and both commits.
     let commit = NanosSetTimer::start(&raw mut outcome.timings.commit_ns);
@@ -805,12 +827,13 @@ pub struct PresentEncode<'a> {
 /// One of three routes (`present_route`) with their fallbacks, then the
 /// throttled `presentDrawable`. Runs on the presenter thread under its
 /// state's lock; reads the attachment record's atomics and touches no
-/// `AppKit` object.
+/// `AppKit` object. Returns whether the present waits for the display, i.e.
+/// carries a minimum duration (vsync, a divided interval or the frame cap).
 pub fn encode_present(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     drawable: &ProtocolObject<dyn CAMetalDrawable>,
     args: &PresentEncode<'_>,
-) {
+) -> bool {
     let attachment = args.attachment;
     let drawable_texture = drawable.texture();
 
@@ -997,6 +1020,7 @@ pub fn encode_present(
         );
         register_presented_probe(drawable, args.record, args.seq, args.drawable_wait_ns);
     }
+    min_duration > 0.0
 }
 
 /// Register `cb` for the retirement waits under `counter`, then commit it.
@@ -1086,6 +1110,7 @@ fn install_frame_handler(
                 failed_seq.address(),
                 "frame-retire",
             );
+            retiring.present().frame_signal().retired();
             mtld3d_shared::crumb!("submit:retire", seq);
         },
     );
