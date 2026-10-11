@@ -517,7 +517,7 @@ The record's `Arc` is what orders its teardown: the presenter thread holds one w
 
 ## One attachment record per device
 
-D3D9 allows several devices per process, and the e2e suite creates two live ones. Everything the display decides for one device's window therefore lives on a per-device record on the unix side (`metal/macdrv/attachment.rs`), not in process statics: whether the layer carries the HDR configuration, the live EDR headroom, the present throttle, the window's occlusion, the backing scale published to the PE side, and the present-geometry streak that gates the MetalFX route. `AttachMetalLayer` registers the record, keyed by the raw address of the metal view it created, which is the handle the device's later thunks already carry: the presenter looks its record up by the `present_view` each packet carries, once per present, `DestroyCommandQueue` retires it by `view_handle`, `SetDisplaySyncEnabled` finds it by `layer_handle`, and `SetCursorOverlay` names it by the `view_handle` it carries. A thunk whose view has no record warns once and, for a present, uses the defaults a session on no display would (not occluded, headroom 1.0, no throttle, the stretch route).
+D3D9 allows several devices per process, and the e2e suite creates two live ones. Everything the display decides for one device's window therefore lives on a per-device record on the unix side (`metal/macdrv/attachment.rs`), not in process statics: whether the layer carries the HDR configuration, the live EDR headroom, the present throttle, the window's occlusion, the backing scale published to the PE side, and the present-geometry streak that gates the MetalFX route. `AttachMetalLayer` registers the record, keyed by the raw address of the metal view it created, which is the handle the device's later thunks already carry: the presenter looks its record up by the `present_view` each packet carries, once per present, `DestroyCommandQueue` retires it by `view_handle`, `SetDisplaySyncEnabled` finds it by `layer_handle`, and `SetCursorOverlay` names it by the `view_handle` it carries. A thunk whose view has no record warns once and, for a present, uses the defaults a session on no display would (not occluded, headroom 1.0, no throttle, the shader route).
 
 The record is live exactly while it is in the registry map. The view and layer addresses and the three PE-side sink addresses it holds are valid only then: `DestroyCommandQueue` unregisters the record before it retires the view, and the PE side drops the box behind the sinks (`DisplaySinks`, owned by the device's `CursorState`) after that thunk returns. So every dereference of one of those addresses happens inside a registry helper that holds the map's lock and checks the record is still the one the map holds for its view, by `Arc` identity rather than by key, so a view address the allocator hands out again names a new record. The lock is held for a lookup plus one retain or one atomic store, never across `AppKit` work, and is taken nowhere else. Outside those helpers a record is plain data (atomics and immutable words) that the main-thread observers, the presenter thread and the API thread read freely.
 
@@ -527,17 +527,22 @@ A retired metal view is kept, not released (`retire_metal_view` in `metal/macdrv
 
 The MetalFX caches follow the same rule by another key: the scratch texture a readback resolve or an HDR present tone-maps into, and the `MTLFXSpatialScaler` that enlarges the frame, are both cached per command queue and geometry (`metal/upscale.rs`), the queue being the device identity every readback and every submit carries, and `DestroyCommandQueue` retires the queue's entries of both after its shutdown fence. Metal orders command buffers within one queue only, so a scratch shared by geometry alone let one device's resolve land between another's resolve and its blit, and each read the other's frame. A scaler is stateful on top of that, since its colour and output textures are properties the encode that follows reads, so a shared one let two devices presenting at one window size write each other's drawables; the cache lock is held across those property writes and the encode so that the separation does not rest on how many threads one device encodes from. Both caches are bounded per queue (`MAX_CACHED_SCALERS` and `MAX_CACHED_SCRATCH`, each sized for one window being resized, which walks through a new geometry for every size the window rests at), and so is the deferred release of an eviction: a scaler or scratch texture evicted by one queue is released from a completed handler on a command buffer of that same queue, which is the only ordering Metal offers.
 
-A scaler entry also owns its optional Private output texture. Presentation
-uses the drawable directly only when its actual storage and usage satisfy the
-scaler. Otherwise MetalFX writes this intermediate at the drawable's exact
-extent and format, then a blit copies it into the drawable in the same command
-buffer. The intermediate follows its scaler through the per-queue eight-entry
-bound, eviction completion and shutdown retirement; it never enters the
-separate scratch cache. Preflight evictions are retired on fallback submissions
-too. Scaler texture bindings are cleared after encoding so idle cache entries
-do not hold drawables out of the layer's pool. SDR uses Perceptual mode; HDR
-still tone-maps at render size before scaling in HDR mode. A preparation or
-copy failure returns to the original source's SDR or HDR present shader.
+A scaler entry also owns its Private output texture. The drawable is
+framebuffer-only, which the scaler cannot write, so MetalFX always writes this
+intermediate at the drawable's exact extent and format, with shader reads
+added to the scaler's output usage, and a nearest-texel render pass
+(`encode_exact_copy`) copies it onto the drawable in the same command buffer.
+Only the entry a lookup lands on keeps its intermediate: the lookup moves
+every other entry's output to the eviction list, so a queue holds one
+drawable-sized intermediate however many geometries a resize walked through.
+A detached output is released like an evicted scaler, once a later command
+buffer of the same queue completes, and that queue ran the copy that read it
+first. The intermediate never enters the separate scratch cache. Preflight
+evictions are retired on fallback submissions too. Scaler texture bindings are
+cleared after encoding so idle cache entries hold no source texture. SDR uses
+Perceptual mode; HDR still tone-maps at render size before scaling in HDR
+mode. A preparation or copy failure returns to the original source's SDR or
+HDR present shader.
 
 
 A Reset that changes `PresentationInterval` reaches the record through `SetDisplaySyncEnabled` on the encoder thread, whether it flips the vsync request (`IMMEDIATE` against the rest) or only moves the frame-rate ceiling (`ONE` against `TWO`, `THREE` or `FOUR`, which the PE side resolves to the reported refresh rate over N and folds with `present.maxFps` into the one ceiling the thunk carries). The thunk latches the new pacing on the record and queues that same reconciliation, so the throttle is re-derived on the main thread for the panel under the window within one present and nothing on the encoder thread reads a screen.
@@ -546,15 +551,15 @@ The process-lifetime observers walk the records rather than a latch: the occlusi
 
 ## The cursor overlay window
 
-With `cursor.software` resolved on (the default under HDR), the PE side keeps a
-blank HCURSOR realized over the client area. `SetCursorProperties`, `ShowCursor`
-and retargets reconcile the software sprite and effective visibility, including
-unchanged hashes. Pixels are sent until the Unix side acknowledges the upload;
-a rejected hash-only update gets one full-pixel retry. Both cursor modes validate
-A8R8G8B8 format, dimensions, scaling arithmetic, pointer and row pitch before
-reading the bitmap. The pure validation lives in `mtld3d-core`; the PE wrapper
-balances each successful COM lock with an unlock and preserves the previous
-cursor on rejected input.
+With `cursor.software` resolved on (it is off by default, and `auto` turns it
+on under HDR), the PE side keeps a blank HCURSOR realized over the client area.
+`SetCursorProperties`, `ShowCursor` and retargets reconcile the software sprite
+and effective visibility, including unchanged hashes. Pixels are sent until
+the Unix side acknowledges the upload; a rejected hash-only update gets one
+full-pixel retry. Both cursor modes validate A8R8G8B8 format, dimensions,
+scaling arithmetic, pointer and row pitch before reading the bitmap. The pure
+validation lives in `mtld3d-core`; the PE wrapper balances each successful COM
+lock with an unlock and preserves the previous cursor on rejected input.
 
 An identical accepted request preserves pending retries but does not dispatch
 another apply once that state has completed. The pre-commit observer and the
@@ -747,7 +752,9 @@ mip dimensions before encoding the copy. Array slices remain separate in
 
 That is what makes the composite pass a 1:1 copy. A drawable that is not the size of the layer's backing store gets rescaled by the compositor, on top of whatever present already did, and the phase of that second resample is not ours to control: a ratio near 1.0 shows up as the whole frame, interface included, sitting a pixel off where it was drawn. Re-syncing per present rather than per `Reset` is what covers the frames between a window resize and the guest reacting to it. The same reasoning is why `contentsGravity` is inert here rather than load-bearing.
 
-So every back-buffer-to-drawable difference is resolved by the presenter's present buffer, by exactly one of three routes (`present_route` in `command.rs`): a 1:1 blit at matching extents, `MTLFXSpatialScaler` when the drawable is larger in both axes and the GPU has MetalFX, and the present shader's filtered stretch for everything else. Only the third covers any ratio, so it is also the backstop when a scaler declines — `MTLBlitCommandEncoder` cannot resample, and a partial copy would leave the rest of the drawable undefined.
+So every back-buffer-to-drawable difference is resolved by the presenter's present buffer, by exactly one of two routes (`present_route` in `command.rs`): `MTLFXSpatialScaler` when the drawable is larger in both axes and the GPU has MetalFX, and the present shader for everything else, a bit-exact copy at matching extents and a filtered stretch otherwise. Only the shader covers any ratio, so it is also the backstop when a scaler declines.
+
+The layer is `framebufferOnly`, so no blit and no scaler writes the drawable: every route ends in a render pass. Nothing needs to read it either, since every guest read of the frame goes to the persistent back-buffer texture. A framebuffer-only drawable stays compressible and eligible for direct-to-display, where one that is not keeps an EDR layer in the compositor. `MTLFXSpatialScaler` writes a Private intermediate of the drawable's extent and format, and a nearest-texel copy pass (`encode_exact_copy`) carries it onto the drawable. A frame no pass could encode presents a cleared drawable, logged once.
 
 ## Adding new thunks
 

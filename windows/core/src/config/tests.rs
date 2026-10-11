@@ -31,7 +31,7 @@ fn defaults_match_documented_values() {
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
-    assert_eq!(d.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(d.cursor_software, SoftwareCursorPolicy::Off);
     assert!(d.shader_cache_enable);
     assert!(d.shader_async_compile);
     assert!(d.log_dir.is_empty());
@@ -297,21 +297,21 @@ fn cursor_software_accepts_all_three_values_case_insensitive() {
     let cfg = parse(None, "cursor.software = TRUE\n", None);
     assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::On);
 
-    let cfg = parse(None, "cursor.software = False\n", None);
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
+    let cfg = parse(None, "cursor.software = Auto\n", None);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
 
     let cfg = parse(
         None,
-        "cursor.software = true\ncursor.software = auto\n",
+        "cursor.software = true\ncursor.software = False\n",
         None,
     );
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
 }
 
 #[test]
 fn cursor_software_garbage_keeps_default() {
     let cfg = parse(None, "cursor.software = maybe\n", None);
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
 }
 
 #[test]

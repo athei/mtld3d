@@ -1190,8 +1190,9 @@ pub fn attach_metal_layer(
         calls.present(surface);
     }
     attachment::publish_backing_scale(&att, backing_scale);
-    // The software cursor rides the same decision: the overlay window
-    // is a compositing cost an EDR layer already pays.
+    // `Auto` turns the software cursor on under HDR, where the hardware
+    // cursor reads dim. The overlay window costs the game window its
+    // direct-to-display path in either mode.
     let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
     info!(
         target: LOG_TARGET,
@@ -2622,10 +2623,13 @@ fn configure_metal_layer_inner(
     layer.setContentsGravity(gravity);
     let backdrop = CGColor::new_generic_gray(0.0, 1.0);
     layer.setBackgroundColor(Some(&backdrop));
-    // `framebufferOnly = false` is slower than `true`, but required for
-    // guest compat: D3D9 games commonly GetBackBuffer + StretchRect,
-    // lock, or read the backbuffer.
-    layer.setFramebufferOnly(false);
+    // Nothing reads the drawable. Every guest read of the frame (a lock,
+    // `GetRenderTargetData`, `StretchRect`, `GetFrontBufferData`) goes to the
+    // persistent back-buffer texture, and present only writes the drawable,
+    // through render passes. A framebuffer-only drawable stays compressible
+    // and eligible for direct-to-display; one that is not keeps an EDR layer
+    // in the compositor.
+    layer.setFramebufferOnly(true);
     // We always disable Metal-side vsync and instead throttle presents
     // via `presentDrawable:afterMinimumDuration:` set to `1/panel_max_hz`
     // when the guest asked for vsync. On a fixed-Hz panel that matches

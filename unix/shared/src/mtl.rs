@@ -861,11 +861,12 @@ pub enum ColorSpacePolicy {
 
 /// `cursor.software` policy crossing PE→Unix on `AttachMetalLayerParams`.
 ///
-/// Picked from `mtld3d.conf` (`cursor.software = auto | true | false`). The
-/// unix side resolves it against the layer mode it just configured and answers
-/// with `software_cursor_active`: `Auto` follows the HDR present path, because
-/// the overlay window sends the game window through the compositor, a cost an
-/// EDR layer already pays and an SDR direct-to-display window does not.
+/// Picked from `mtld3d.conf` (`cursor.software = auto | true | false`, default
+/// `false`). The unix side resolves it against the layer mode it just
+/// configured and answers with `software_cursor_active`. The overlay window
+/// sends the game window through the compositor in both modes, so it is off
+/// unless asked for. `Auto` turns it on under HDR, where the hardware cursor
+/// reads dim because macOS has no HDR cursor; `On` forces it.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
 pub enum SoftwareCursorPolicy {

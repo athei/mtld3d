@@ -912,7 +912,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "presenter: view {view:#x} has no attachment record; presenting as not \
-             occluded, headroom 1.0, unthrottled, stretch route",
+             occluded, headroom 1.0, unthrottled, shader route",
         );
     }
     // Nothing of an occluded window is displayed, nor of a visible one whose
@@ -999,7 +999,6 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             record,
             attachment: attachment.as_ref(),
             source: &source,
-            source_raw: source_handle.raw(),
             seq,
             drawable_wait_ns,
         },

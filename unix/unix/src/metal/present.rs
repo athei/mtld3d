@@ -1,14 +1,14 @@
 //! Present-time render pass: the game's back buffer onto the drawable.
 //!
-//! Every present that is not a 1:1 copy of a `BGRA8` back buffer onto a
-//! `BGRA8` drawable comes through here. One fullscreen triangle, three
-//! fragment entry points, one for each thing present has to do:
+//! Every present that `MetalFX` does not upscale comes through here, matching
+//! extents included: the drawable is framebuffer-only, so no blit can write
+//! it. One fullscreen triangle, three fragment entry points, one for each
+//! thing present has to do:
 //!
 //! - **SDR at any ratio**: sample and write. Exact at matching extents, a
 //!   filtered stretch otherwise. This is the route that guarantees every
 //!   drawable pixel is written whatever the geometry, which
-//!   `MTLBlitCommandEncoder` cannot do (it only copies 1:1) and
-//!   `MTLFXSpatialScaler` cannot do either (it only enlarges).
+//!   `MTLFXSpatialScaler` cannot do (it only enlarges).
 //! - **HDR without headroom**: sRGB → linear, no tone mapping.
 //! - **HDR with headroom**: sRGB → linear plus SDR→HDR inverse tone
 //!   mapping in **`ICtCp`** (BT.2100 perceptual color space).
@@ -313,7 +313,8 @@ struct ReadbackKey {
 /// The pipeline that resamples a texture of `format` into a scratch of `format` for a readback.
 ///
 /// `nearest` selects the nearest-texel copy over the filtered one, for the
-/// single-precision float formats. Compiled on first use per key and cached
+/// single-precision float formats and for the exact copy that carries a
+/// `MetalFX` output onto the drawable. Compiled on first use per key and cached
 /// for the process; `None` when the library, a function or the pipeline
 /// state could not be created, logged at the point of failure.
 pub fn ensure_readback_pipeline(
@@ -386,14 +387,13 @@ fn ensure_library(
 
 /// Lazily compile + cache the present-pass library + pipelines.
 ///
-/// Called from `submit_frame` on the encoder thread the first time present
-/// needs a render pass rather than a 1:1 blit. The first call compiles MSL
-/// (~1–2 ms); subsequent calls are pointer loads.
+/// Called on the presenter thread by the first present, and by the cursor
+/// overlay on the main thread. The first call compiles MSL (~1–2 ms);
+/// subsequent calls are pointer loads.
 ///
 /// Returns `None` (with an error at the failure site) if MSL compilation
-/// or pipeline creation fails. The HDR caller then falls back to the blit
-/// so the game still renders, just without the EDR boost; the SDR caller
-/// has no fallback that can resample and drops the frame.
+/// or pipeline creation fails. The present caller then clears the drawable:
+/// no blit can write a framebuffer-only drawable.
 pub fn ensure_resources(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
     if let Some(r) = PIPELINES.get() {
         return Some(*r);
