@@ -20,14 +20,17 @@
 //! window to: the newest live record's on that window that holds one.
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
 
 use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, find, find_by_layer, live,
-    publish_backing_scale, register, request_cursor_kick_all, retain_newest_surface_on,
-    test_address_block, unregister,
+    next_unshown_release, publish_backing_scale, register, request_cursor_kick_all,
+    retain_newest_surface_on, test_address_block, unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -539,4 +542,84 @@ fn the_newest_live_record_on_the_window_names_the_surface() {
     assert_eq!(retain_newest_surface_on(hwnd, retained), None);
     unregister(view_c);
     unregister(view_other);
+}
+
+/// The unshown pace releases one present per duration, counted from the schedule.
+///
+/// A frame ready before its slot waits for it, even when the presenter gets
+/// to the frame late, so a late wake does not slow the pace; a frame ready
+/// after its slot goes when it is ready, so a slow game does not burst.
+#[test]
+fn the_unshown_pace_releases_one_present_per_duration() {
+    let pace = Duration::from_millis(16);
+    let start = Instant::now();
+    assert_eq!(
+        next_unshown_release(None, start, pace),
+        start,
+        "the first present goes when it is ready"
+    );
+    assert_eq!(
+        next_unshown_release(Some(start), start, pace),
+        start + pace,
+        "the next one a duration after the previous release"
+    );
+    assert_eq!(
+        next_unshown_release(Some(start + pace), start + pace / 2, pace),
+        start + pace * 2,
+        "counted from the previous release, not from when the frame was ready"
+    );
+    let late = start + pace * 10;
+    assert_eq!(
+        next_unshown_release(Some(start), late, pace),
+        late,
+        "a frame ready after its slot goes when it is ready"
+    );
+}
+
+/// Frames queued during a late wake keep one slot each on the schedule.
+///
+/// A background process has its timers coalesced, so the presenter reaches
+/// frames well past their slots; the slot depends on when each frame was
+/// ready and on the previous slot, never on when the presenter asks. Three
+/// frames ready early get the next three slots, which are already past by
+/// then, so they go at once and the average pace holds.
+#[test]
+fn frames_queued_during_a_late_wake_keep_their_slots() {
+    let pace = Duration::from_millis(33);
+    let start = Instant::now();
+    let ready = start + pace / 2;
+    let mut slot = start;
+    for n in 1..=3 {
+        slot = next_unshown_release(Some(slot), ready, pace);
+        assert_eq!(
+            slot,
+            start + pace * n,
+            "frame {n} takes its slot on the schedule"
+        );
+    }
+}
+
+/// Each record keeps its own unshown pace, as the display paces each layer on its own.
+#[test]
+fn each_record_keeps_its_own_unshown_pace() {
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
+    let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
+    let pace = Duration::from_millis(16);
+    let now = Instant::now() + Duration::from_secs(1);
+    assert_eq!(a.unshown_release_at(now, pace), now);
+    assert_eq!(
+        a.unshown_release_at(now, pace),
+        now + pace,
+        "the record kept its release"
+    );
+    assert_eq!(
+        b.unshown_release_at(now, pace),
+        now,
+        "the other record starts its own"
+    );
+    assert_eq!(a.unshown_release_at(now, pace), now + pace * 2);
+    unregister(view_a);
+    unregister(view_b);
 }

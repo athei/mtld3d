@@ -22,8 +22,8 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8R8G8B8, D3DFVF_XYZ,
-    D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
-    D3DQUERYTYPE_OCCLUSION, D3DVERTEXTEXTURESAMPLER0,
+    D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPOOL_MANAGED, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION, D3DVERTEXTEXTURESAMPLER0,
 };
 
 use super::shaders::{PS_COLOR_PASSTHROUGH, centered_triangle, vs_fetch_to_color};
@@ -142,8 +142,11 @@ fn two_devices_on_two_threads_wait_for_their_own_frames() {
     const RED: u32 = 0xFFFF_0000;
     const GREEN: u32 = 0xFF00_FF00;
 
+    // `IMMEDIATE`: a hidden window is held to the pace a vsync request sets,
+    // and the collision wants the frames as dense as the threads make them.
     let config = HarnessConfig {
         behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     };
     let first = Harness::create(&config);
@@ -263,9 +266,11 @@ fn two_scaled_devices_on_two_threads_read_back_their_own_pixels() {
     const RED: u32 = 0xFFFF_0000;
     const GREEN: u32 = 0xFF00_FF00;
 
+    // `IMMEDIATE` for dense frames, as in the test above.
     let config = HarnessConfig {
         behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
         config_entries: "render.scale=0.5",
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     };
     let first = Harness::create(&config);

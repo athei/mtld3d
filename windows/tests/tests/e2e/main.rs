@@ -81,6 +81,7 @@ mod textures;
 mod transforms_ff;
 mod unaligned_pointers;
 mod unix_encoder;
+mod unshown_pacing;
 mod vertex_decl;
 mod wide_stretch;
 mod window_lifecycle;

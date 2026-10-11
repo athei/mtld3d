@@ -98,11 +98,13 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   presented frames are outstanding: 3 by default, what an extended device's
   `SetMaximumFrameLatency` sets (1 to 30), or what `present.maxFrameLatency`
   names in place of either. A frame finishes when the GPU has finished its
-  work and, when its present waits for the display (vsync, a divided
-  interval or `present.maxFps`, on a window the present reaches), once that
-  present was shown or discarded, waited for at most a second after the GPU
-  work, or three present durations under a slower `present.maxFps`; a
-  hidden or covered window bounds its frames all the same.
+  work and, when its present is paced (vsync, a divided interval or
+  `present.maxFps`), once that present was shown or discarded, waited for at
+  most a second after the GPU work, or three present durations under a
+  slower `present.maxFps`. A hidden, minimised or covered window shows
+  nothing, so the display does not pace it; mtld3d holds its paced presents
+  to the same pace itself, so such a window presents no faster than a shown
+  one.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.
