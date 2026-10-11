@@ -376,22 +376,35 @@ preserve; a marked level's box off the compressed block grid or over a chunk
 reads it too, which the summary's `snapshot` row counts as `declined`, since
 the next partial lock of that level renames it again.
 
-The arena is a queue of 256 KiB PE page chunks, at most 64 of them. A
-snapshot is appended at the next 16-byte offset of the active chunk; a chunk
-that cannot fit one goes to the back of the queue, leaving its tail unused,
-and the chunk at the front starts over from offset zero once `has_readers`
-says nothing reads it. Otherwise a new chunk is allocated, and past the cap the
-upload reads the staging, which logs once and counts as `full` in the
-summary's `snapshot` row. The
-chunks are not a ring stamped by submit sequence because an aborted
-submission's sequence retires while its uploads still wait to be replayed from
-the same bytes, and they are PE pages, not native memory like the encoder's
-upload ring for inline draw data, because the upload record, its page lease
-and its replay already carry PE pages across the boundary: a snapshot reaches
-the encoder exactly as staging does, under the record's `SNAPSHOT` flag with
-its `source_offset` into the chunk. The encoder caches one wrapper per chunk,
-keyed by the chunk's page generation, and notifies and retains only the
-snapshot's span of it.
+The arena is a queue of 256 KiB PE page chunks, at most 64 of them (16 MiB,
+sized in `MAX_CHUNKS` from the frames a chunk stays read in a window that
+presents), allocated as a workload first needs them. A snapshot is appended at
+the next 16-byte offset of the active chunk; a chunk that cannot fit one goes to
+the back of the queue, leaving its tail unused, and the chunk at the front
+starts over from offset zero once `has_readers` says nothing reads it. Otherwise
+a new chunk is allocated. At the cap, the upload waits for the oldest chunk
+rather than reading the staging, since one wait frees a whole chunk of snapshots
+while reading the staging costs a whole-level copy at every later partial lock
+of the level. Each chunk carries the submit sequence of the frame that wrote its
+newest snapshot, and the API thread hurries presentation and asks the encoder
+(`EncoderControl::RetireUploads`) to wait until the draw and upload command
+buffers through that sequence have retired and to release the blit-source reads,
+the retention entries and the acknowledged upload jobs that held the chunk, then
+writes again. A chunk the frame being recorded still reads is never waited for,
+since nothing has submitted that frame: the upload reads the staging, which logs
+once and counts as `recording`. A write that still finds no room after the wait
+(an upload replayed after an aborted submit keeps its read) reads the staging,
+and the arena does not ask for a second wait on the same sequence; that, and a
+chunk the allocator refuses, log once and count as `full`. The summary's
+`snapshot` row shows the waits and the time they blocked. The chunks are not a
+ring stamped by submit sequence because an aborted submission's sequence retires
+while its uploads still wait to be replayed from the same bytes, and they are PE
+pages, not native memory like the encoder's upload ring for inline draw data,
+because the upload record, its page lease and its replay already carry PE pages
+across the boundary: a snapshot reaches the encoder exactly as staging does,
+under the record's `SNAPSHOT` flag with its `source_offset` into the chunk. The
+encoder caches one wrapper per chunk, keyed by the chunk's page generation, and
+notifies and retains only the snapshot's span of it.
 
 Page allocation is infallible: a box the allocator refuses ends the process,
 because past creation there is nothing to give back that the retention cap and
@@ -1093,6 +1106,7 @@ in its row, and every family carries the suffixes its row names.
 | `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak); the recycles and parked bytes are the encoder's own pool's. |
 | `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. `in-place` counts partial locks written in place over an upload of the frame being recorded that no GPU operation has seen. |
 | `tex_snapshot_total`, `tex_snapshot_bytes_total`, `tex_snapshot_full_total`, `tex_snapshot_declined_total` | Texture `snapshot`: partial uploads that copied their box into the upload-snapshot arena, the bytes copied, the snapshots the arena had no room for (`full`), and the uploads of marked levels whose box it cannot take (`declined`: off the compressed block grid, or over a chunk). Both of the last two read the staging. |
+| `tex_snapshot_waits_total`, `tex_snapshot_wait_ms`, `tex_snapshot_wait_recording_total` | Texture `snapshot` `waits`: a full arena's waits for its oldest chunk's uploads to retire and the API-thread time they blocked, and the full arenas whose oldest chunk the frame being recorded reads (`recording`), which read the staging without waiting and are not counted as `full`. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
 | `tex_wrapper_create_total`, `tex_wrapper_retire_total` | Texture `churn`: staging wrappers created, per level and one per chunk of the texture upload-snapshot arena, and queued for their destroy (at a backing change, an upload that releases its level's staging, or the texture's release; a chunk's wrapper lives until shutdown). |

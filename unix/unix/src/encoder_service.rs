@@ -434,6 +434,7 @@ pub extern "C" fn control_handler(args: *mut core::ffi::c_void) -> i32 {
     let result = match command {
         EncoderControl::DrainRetention => service.encoder.drain_retired_now(),
         EncoderControl::IntakeVisibility => service.encoder.intake_visibility_for(params.argument),
+        EncoderControl::RetireUploads => service.encoder.retire_uploads_through(params.argument),
         EncoderControl::Reset => {
             if params.textures_len != 0
                 && (params.textures_ptr == 0

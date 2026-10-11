@@ -392,6 +392,9 @@ impl EncoderThread {
     pub fn intake_visibility_for(&self, seq: u64) -> Result<(), i32> {
         self.control(EncoderControl::IntakeVisibility, seq, &[])
     }
+    pub fn retire_uploads_through(&self, seq: u64) -> Result<(), i32> {
+        self.control(EncoderControl::RetireUploads, seq, &[])
+    }
     pub fn reset(&self, textures: &[u64]) -> Result<(), i32> {
         self.control(EncoderControl::Reset, 0, textures)
     }

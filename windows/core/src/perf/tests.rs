@@ -385,27 +385,41 @@ fn staged_upload_byte_totals_are_wide_and_saturating() {
 ///
 /// First-frame `frame_total` must be 0 (no predecessor TSC yet);
 /// subsequent drains report a delta.
-/// The snapshot counters keep their three outcomes apart and leave with the drain.
+/// The snapshot counters keep their outcomes apart and leave with the drain.
 ///
-/// A copied box adds its bytes, an arena with no room counts as `full`, and
-/// a box of the wrong shape counts as `declined`, so a perf run tells the
-/// arena's cap from the boxes it can never take.
+/// A copied box adds its bytes, an arena with no room counts as `full`, a
+/// box of the wrong shape counts as `declined`, and a full arena's wait for
+/// its oldest chunk counts apart from one the frame being recorded blocks,
+/// so a perf run tells the arena's cap from the boxes it can never take and
+/// a wait that freed room from one that could not.
 #[test]
-fn snapshot_counters_split_copies_full_and_declined() {
+fn snapshot_counters_split_copies_full_declined_and_waits() {
     let mut api = ApiPerfState::new();
     api.bump_texture_snapshot(4096);
     api.bump_texture_snapshot(2048);
     api.bump_texture_snapshot_full();
     api.bump_texture_snapshot_declined();
     api.bump_texture_snapshot_declined();
+    api.bump_texture_snapshot_wait();
+    api.bump_texture_snapshot_wait();
+    api.bump_texture_snapshot_wait_recording();
+    let wait = api.texture_snapshot_wait_cycles_ptr();
+    // SAFETY: the pointer names this live state's counter, and nothing
+    // else borrows it while the test writes through it.
+    unsafe { *wait += 500 };
     let mut p = FramePerfPayload::new();
     api.drain_into_payload(&mut p, true);
     assert_eq!(p.counters.texture_snapshot_uploads, 2);
     assert_eq!(p.counters.texture_snapshot_bytes, 6144);
     assert_eq!(p.counters.texture_snapshot_full, 1);
     assert_eq!(p.counters.texture_snapshot_declined, 2);
+    assert_eq!(p.counters.texture_snapshot_waits, 2);
+    assert_eq!(p.counters.texture_snapshot_wait_recording, 1);
+    assert_eq!(p.counters.texture_snapshot_wait_cycles, 500);
     assert_eq!(api.counters.texture_snapshot_uploads, 0);
     assert_eq!(api.counters.texture_snapshot_declined, 0);
+    assert_eq!(api.counters.texture_snapshot_waits, 0);
+    assert_eq!(api.counters.texture_snapshot_wait_cycles, 0);
 }
 
 #[test]
@@ -706,7 +720,7 @@ fn summary_golden_layout() {
         "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level Lock over a reader, partial over a seen or older upload)\n",
         "in-place    0                                                   API: partial Lock over an upload of this frame no GPU use has seen, handed back live\n",
         "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
-        "snapshot    2 6 KB                  full=1 declined=1           API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape)\n",
+        "snapshot    2 6 KB                  full=1 declined=1 waits=1 (0.50 ms) recording=1  API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape, waits = a full arena waiting for its oldest chunk, recording = one the frame being recorded reads)\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
@@ -905,7 +919,9 @@ fn kv_golden_line() {
         " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
         " tex_preserve_cpu_total=1",
         " tex_in_place_total=0 tex_snapshot_total=2 tex_snapshot_bytes_total=6144",
-        " tex_snapshot_full_total=1 tex_snapshot_declined_total=1",
+        " tex_snapshot_full_total=1 tex_snapshot_declined_total=1 tex_snapshot_waits_total=1",
+        " tex_snapshot_wait_ms=0.500 tex_snapshot_wait_peak_ms=0.500",
+        " tex_snapshot_wait_recording_total=1",
         " tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
@@ -1348,6 +1364,11 @@ fn sample_window() -> PerfWindow {
             texture_snapshot_uploads: 2,
             texture_snapshot_full: 1,
             texture_snapshot_declined: 1,
+            // One full arena waited 0.5 ms for its oldest chunk; one other
+            // found that chunk read by the frame being recorded.
+            texture_snapshot_waits: 1,
+            texture_snapshot_wait_recording: 1,
+            texture_snapshot_wait_cycles: 500_000,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,

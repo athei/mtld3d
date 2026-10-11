@@ -1121,7 +1121,9 @@ struct FrameCounters {
     /// Snapshots the arena could not take: every chunk read and at its cap, or no memory.
     ///
     /// Each such upload read the level's staging instead, so the next
-    /// partial lock of the level may rename it again.
+    /// partial lock of the level may rename it again. An arena whose oldest
+    /// chunk the frame being recorded reads counts in
+    /// `texture_snapshot_wait_recording` instead, never in both.
     texture_snapshot_full: u32,
     /// Partial uploads of a level marked for snapshots whose box the arena cannot take.
     ///
@@ -1129,6 +1131,20 @@ struct FrameCounters {
     /// rows the staging does not hold. Each read the staging, so the next
     /// partial lock of the level renames it again.
     texture_snapshot_declined: u32,
+    /// Times a full arena waited for the GPU to retire the uploads that read its oldest chunk.
+    ///
+    /// Each wait is one encoder round trip that blocks the API thread until
+    /// the submission the chunk's last snapshot rode in has retired; the
+    /// snapshot that asked for it is then taken again.
+    texture_snapshot_waits: u32,
+    /// Full arenas whose oldest chunk is read by the frame being recorded, so no wait can free it.
+    ///
+    /// The frame has not been submitted, so nothing would retire those
+    /// uploads; the snapshot reads the staging as a full arena's does, but
+    /// counts here and not in `texture_snapshot_full`.
+    texture_snapshot_wait_recording: u32,
+    /// TSC cycles the API thread spent blocked in `texture_snapshot_waits`.
+    texture_snapshot_wait_cycles: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -1155,6 +1171,9 @@ impl FrameCounters {
             texture_snapshot_uploads: 0,
             texture_snapshot_full: 0,
             texture_snapshot_declined: 0,
+            texture_snapshot_waits: 0,
+            texture_snapshot_wait_recording: 0,
+            texture_snapshot_wait_cycles: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1662,6 +1681,17 @@ impl ApiPerfState {
         }
     }
 
+    /// Pointer the `CycleAddTimer` around a full snapshot arena's wait writes into.
+    ///
+    /// Null in an untimed frame, like [`Self::query_wait_cycles_ptr`].
+    pub const fn texture_snapshot_wait_cycles_ptr(&mut self) -> *mut u64 {
+        if self.untimed_frames == 0 {
+            &raw mut self.counters.texture_snapshot_wait_cycles
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
     /// Pointer the `CycleAddTimer` writes into for the Draw-internal snapshot phase.
     ///
     /// Accumulated (multiple calls per frame), one shared bucket for all
@@ -1989,6 +2019,20 @@ impl ApiPerfState {
             self.counters.texture_snapshot_declined.saturating_add(1);
     }
 
+    /// One wait of a full arena for its oldest chunk's uploads to retire.
+    pub const fn bump_texture_snapshot_wait(&mut self) {
+        self.counters.texture_snapshot_waits =
+            self.counters.texture_snapshot_waits.saturating_add(1);
+    }
+
+    /// One full arena whose oldest chunk the frame being recorded still reads.
+    pub const fn bump_texture_snapshot_wait_recording(&mut self) {
+        self.counters.texture_snapshot_wait_recording = self
+            .counters
+            .texture_snapshot_wait_recording
+            .saturating_add(1);
+    }
+
     /// Subset of `bump_texture_rename` that took the no-preserve branch.
     ///
     /// A whole-level `D3DLOCK_DISCARD` on a default-pool texture,
@@ -2122,6 +2166,10 @@ impl ApiPerfState {
         core::ptr::null_mut()
     }
     #[inline]
+    pub const fn texture_snapshot_wait_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
     pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
@@ -2211,6 +2259,10 @@ impl ApiPerfState {
     pub const fn bump_texture_snapshot_full(&mut self) {}
     #[inline]
     pub const fn bump_texture_snapshot_declined(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_wait(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_wait_recording(&mut self) {}
     #[inline]
     pub const fn bump_texture_discard(&mut self) {}
     #[inline]
@@ -3697,6 +3749,11 @@ struct PerfWindow {
     texture_snapshot_full: Stat,
     /// Uploads of marked levels whose box cannot be snapshotted.
     texture_snapshot_declined: Stat,
+    /// Waits of a full arena for its oldest chunk, and the cycles they blocked.
+    texture_snapshot_waits: Stat,
+    texture_snapshot_wait: Stat,
+    /// Full arenas whose oldest chunk the frame being recorded still read.
+    texture_snapshot_wait_recording: Stat,
     texture_destroys: Stat,
     texture_blit_uploads: Stat,
     texture_blit_padded_uploads: Stat,
@@ -3977,6 +4034,12 @@ impl PerfWindow {
             .add(u64::from(s.counters.texture_snapshot_full));
         self.texture_snapshot_declined
             .add(u64::from(s.counters.texture_snapshot_declined));
+        self.texture_snapshot_waits
+            .add(u64::from(s.counters.texture_snapshot_waits));
+        self.texture_snapshot_wait
+            .add(s.counters.texture_snapshot_wait_cycles);
+        self.texture_snapshot_wait_recording
+            .add(u64::from(s.counters.texture_snapshot_wait_recording));
         self.texture_destroys.add(u64::from(s.enc.texture_destroys));
         self.texture_blit_uploads
             .add(u64::from(s.enc.texture_blit_uploads));
@@ -6047,11 +6110,14 @@ impl<'a> Summary<'a> {
                 kb = w.texture_snapshot_bytes.sum / 1024,
             ),
             Some(&format!(
-                "full={f} declined={d}",
+                "full={f} declined={d} waits={n} ({ms:.2} ms) recording={r}",
                 f = w.texture_snapshot_full.sum,
                 d = w.texture_snapshot_declined.sum,
+                n = w.texture_snapshot_waits.sum,
+                ms = cycles_to_ms(w.texture_snapshot_wait.sum),
+                r = w.texture_snapshot_wait_recording.sum,
             )),
-            "API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape)",
+            "API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape, waits = a full arena waiting for its oldest chunk, recording = one the frame being recorded reads)",
         );
         // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
@@ -6922,6 +6988,12 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("tex_snapshot_bytes", c.texture_snapshot_bytes.sum);
     kv.total("tex_snapshot_full", c.texture_snapshot_full.sum);
     kv.total("tex_snapshot_declined", c.texture_snapshot_declined.sum);
+    kv.total("tex_snapshot_waits", c.texture_snapshot_waits.sum);
+    kv.cycles("tex_snapshot_wait", &w.texture_snapshot_wait);
+    kv.total(
+        "tex_snapshot_wait_recording",
+        c.texture_snapshot_wait_recording.sum,
+    );
     kv.total("tex_uploads", c.texture_blit_uploads.sum);
     kv.total("tex_uploads_raw", c.raw_texture_uploads());
     kv.total("tex_uploads_padded", c.texture_blit_padded_uploads.sum);
@@ -7034,7 +7106,7 @@ const _: () = {
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 992);
+    assert!(size_of::<FrameCounters>() == 1008);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -7097,14 +7169,17 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_uploads) == 980);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_full) == 984);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_declined) == 988);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_waits) == 992);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_recording) == 996);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_cycles) == 1000);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 1024);
+    assert!(size_of::<FramePerfPayload>() == 1040);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 992);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 1008);
 };
