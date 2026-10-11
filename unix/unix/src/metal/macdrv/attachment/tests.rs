@@ -1,11 +1,13 @@
 //! Unit tests for the attachment registry: one record per attached view.
 //!
 //! No `AppKit` runs here. The view, layer and window addresses are opaque
-//! constants the registry only ever compares, and the PE-side sinks are
+//! numbers the registry only ever compares, and the PE-side sinks are
 //! local `AtomicU32`s whose addresses stand in for the device-owned box, so
 //! the publish helpers write into real words the test can read back. Every
-//! test uses its own address range, since the registry is one map for the
-//! process and the tests run in parallel.
+//! test takes the addresses it registers from a block `test_address_block`
+//! hands it alone, and the test that looks records up by window takes that
+//! window from its block too, since the registry is one map for the process
+//! and the tests run in parallel.
 //!
 //! What they pin is that two records coexist and are torn down one at a
 //! time, that each record seeds and carries its own derived state, that the
@@ -24,7 +26,8 @@ use mtld3d_shared::mtl::ColorSpacePolicy;
 
 use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, find, find_by_layer, live,
-    publish_backing_scale, register, request_cursor_kick_all, retain_newest_surface_on, unregister,
+    publish_backing_scale, register, request_cursor_kick_all, retain_newest_surface_on,
+    test_address_block, unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -63,60 +66,60 @@ fn is_same(a: &Arc<Attachment>, b: &Arc<Attachment>) -> bool {
 
 #[test]
 fn two_attachments_coexist() {
-    const VIEW_A: usize = 0x1_0000;
-    const VIEW_B: usize = 0x1_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
-    let a = register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 2, None));
-    assert!(is_same(&find(VIEW_A).expect("A is live"), &a));
-    assert!(is_same(&find(VIEW_B).expect("B is live"), &b));
+    let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 2, None));
+    assert!(is_same(&find(view_a).expect("A is live"), &a));
+    assert!(is_same(&find(view_b).expect("B is live"), &b));
     let live_views: Vec<usize> = live().iter().map(|att| att.view()).collect();
-    assert!(live_views.contains(&VIEW_A) && live_views.contains(&VIEW_B));
+    assert!(live_views.contains(&view_a) && live_views.contains(&view_b));
     assert_eq!(a.backing_scale(), 1, "A keeps what its own attach latched");
     assert_eq!(b.backing_scale(), 2, "B keeps what its own attach latched");
 
-    unregister(VIEW_A);
-    unregister(VIEW_B);
+    unregister(view_a);
+    unregister(view_b);
 }
 
 #[test]
 fn detaching_the_first_leaves_the_second() {
-    const VIEW_A: usize = 0x2_0000;
-    const VIEW_B: usize = 0x2_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
-    register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     assert!(
-        unregister(VIEW_A).is_some(),
+        unregister(view_a).is_some(),
         "the first device's teardown finds its record"
     );
-    assert!(find(VIEW_A).is_none(), "the first record is gone");
+    assert!(find(view_a).is_none(), "the first record is gone");
     assert!(
-        is_same(&find(VIEW_B).expect("the second record is untouched"), &b),
+        is_same(&find(view_b).expect("the second record is untouched"), &b),
         "the second device keeps its own record"
     );
 
-    unregister(VIEW_B);
+    unregister(view_b);
 }
 
 #[test]
 fn detaching_the_second_leaves_the_first() {
-    const VIEW_A: usize = 0x3_0000;
-    const VIEW_B: usize = 0x3_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
     let a = register(
-        VIEW_A,
-        VIEW_A + 8,
+        view_a,
+        view_a + 8,
         &latches(AttachFlags::HDR_ACTIVE, 2, None),
     );
-    register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     a.set_window_occluded(true);
     a.set_headroom(4.0);
     assert!(
-        unregister(VIEW_B).is_some(),
+        unregister(view_b).is_some(),
         "the second device's teardown finds its record"
     );
-    let still_a = find(VIEW_A).expect("the first record is untouched");
+    let still_a = find(view_a).expect("the first record is untouched");
     assert!(is_same(&still_a, &a));
     assert!(
         still_a.hdr_active(),
@@ -129,66 +132,66 @@ fn detaching_the_second_leaves_the_first() {
     assert_eq!(still_a.headroom().to_bits(), 4.0_f32.to_bits());
     assert_eq!(still_a.backing_scale(), 2);
 
-    unregister(VIEW_A);
+    unregister(view_a);
 }
 
 #[test]
 fn an_unknown_view_detaches_nothing() {
-    const VIEW: usize = 0x4_0000;
+    let view = test_address_block();
 
-    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
     assert!(
-        unregister(VIEW + 16).is_none(),
+        unregister(view + 16).is_none(),
         "another device's teardown finds no record"
     );
     assert!(
         unregister(0).is_none(),
         "a device that never attached finds no record"
     );
-    assert!(is_same(&find(VIEW).expect("the record is untouched"), &att));
+    assert!(is_same(&find(view).expect("the record is untouched"), &att));
 
-    unregister(VIEW);
+    unregister(view);
 }
 
 #[test]
 fn lookup_by_layer_finds_its_own_record() {
-    const VIEW_A: usize = 0x5_0000;
-    const LAYER_A: usize = 0x5_0100;
-    const VIEW_B: usize = 0x5_1000;
-    const LAYER_B: usize = 0x5_1100;
+    let view_a = test_address_block();
+    let layer_a = view_a + 0x100;
+    let view_b = view_a + 0x1000;
+    let layer_b = view_b + 0x100;
 
-    let a = register(VIEW_A, LAYER_A, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, LAYER_B, &latches(AttachFlags::empty(), 1, None));
-    assert!(is_same(&find_by_layer(LAYER_A).expect("A by layer"), &a));
-    assert!(is_same(&find_by_layer(LAYER_B).expect("B by layer"), &b));
+    let a = register(view_a, layer_a, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, layer_b, &latches(AttachFlags::empty(), 1, None));
+    assert!(is_same(&find_by_layer(layer_a).expect("A by layer"), &a));
+    assert!(is_same(&find_by_layer(layer_b).expect("B by layer"), &b));
     assert!(
-        find_by_layer(LAYER_B + 8).is_none(),
+        find_by_layer(layer_b + 8).is_none(),
         "an unattached layer has no record"
     );
-    unregister(VIEW_A);
+    unregister(view_a);
     assert!(
-        find_by_layer(LAYER_A).is_none(),
+        find_by_layer(layer_a).is_none(),
         "a detached layer has no record"
     );
     assert!(is_same(
-        &find_by_layer(LAYER_B).expect("B is untouched"),
+        &find_by_layer(layer_b).expect("B is untouched"),
         &b
     ));
 
-    unregister(VIEW_B);
+    unregister(view_b);
 }
 
 #[test]
 fn each_record_seeds_its_own_defaults() {
-    const VIEW: usize = 0x6_0000;
+    let view = test_address_block();
 
     let pacing = PresentPacing {
         vsync_requested: false,
         max_fps: 144,
     };
     let att = register(
-        VIEW,
-        VIEW + 8,
+        view,
+        view + 8,
         &AttachLatches {
             hwnd: 0x40,
             flags: AttachFlags::HDR_ENABLE_REQUESTED | AttachFlags::HDR_ACTIVE,
@@ -240,23 +243,23 @@ fn each_record_seeds_its_own_defaults() {
     assert_eq!(att.color_space(), ColorSpacePolicy::Accurate);
     assert_eq!(att.window(), 0, "no window until the main thread finds one");
 
-    unregister(VIEW);
+    unregister(view);
 }
 
 #[test]
 fn derived_state_is_per_record() {
-    const VIEW_A: usize = 0x7_0000;
-    const VIEW_B: usize = 0x7_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
-    let a = register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     a.set_hdr_active(true);
     a.set_window_occluded(true);
     a.set_headroom(2.5);
     a.set_last_logged_headroom(2.5);
     a.set_min_present_duration(1.0 / 120.0);
     a.set_backing_scale(2);
-    a.set_window(0x7_0F00);
+    a.set_window(view_a + 0xF00);
     a.set_pacing_bits(pack_pacing(&PresentPacing {
         vsync_requested: false,
         max_fps: 0,
@@ -287,19 +290,19 @@ fn derived_state_is_per_record() {
         (1.0_f64 / 120.0).to_bits()
     );
     assert_eq!(a.backing_scale(), 2);
-    assert_eq!(a.window(), 0x7_0F00);
+    assert_eq!(a.window(), view_a + 0xF00);
 
-    unregister(VIEW_A);
-    unregister(VIEW_B);
+    unregister(view_a);
+    unregister(view_b);
 }
 
 #[test]
 fn geometry_streaks_are_independent() {
-    const VIEW_A: usize = 0x8_0000;
-    const VIEW_B: usize = 0x8_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
-    let a = register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     let enlarged = PresentGeometry {
         src: (640, 480),
         dst: (1280, 960),
@@ -323,18 +326,18 @@ fn geometry_streaks_are_independent() {
         "B is two presents in, untouched by A"
     );
 
-    unregister(VIEW_A);
-    unregister(VIEW_B);
+    unregister(view_a);
+    unregister(view_b);
 }
 
 #[test]
 fn a_detached_record_publishes_nowhere() {
-    const VIEW: usize = 0x9_0000;
+    let view = test_address_block();
 
     let sinks = (AtomicU32::new(0), AtomicU32::new(0));
     let att = register(
-        VIEW,
-        VIEW + 8,
+        view,
+        view + 8,
         &latches(AttachFlags::empty(), 1, Some(&sinks)),
     );
     publish_backing_scale(&att, 2);
@@ -350,7 +353,7 @@ fn a_detached_record_publishes_nowhere() {
         "a live record is kicked"
     );
 
-    assert!(unregister(VIEW).is_some());
+    assert!(unregister(view).is_some());
     sinks.0.store(0, Ordering::Relaxed);
     sinks.1.store(0, Ordering::Relaxed);
     publish_backing_scale(&att, 3);
@@ -369,19 +372,19 @@ fn a_detached_record_publishes_nowhere() {
 
 #[test]
 fn a_reregistered_view_address_is_a_new_record() {
-    const VIEW: usize = 0xA_0000;
+    let view = test_address_block();
 
     let sinks = (AtomicU32::new(0), AtomicU32::new(0));
     let first = register(
-        VIEW,
-        VIEW + 8,
+        view,
+        view + 8,
         &latches(AttachFlags::empty(), 1, Some(&sinks)),
     );
-    assert!(unregister(VIEW).is_some());
-    let second = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    assert!(unregister(view).is_some());
+    let second = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
     assert!(!is_same(&first, &second), "the address names a new record");
     assert!(is_same(
-        &find(VIEW).expect("the new record is live"),
+        &find(view).expect("the new record is live"),
         &second
     ));
     // The old record's handle is stale even though its key is live again:
@@ -392,15 +395,15 @@ fn a_reregistered_view_address_is_a_new_record() {
         0,
         "the stale record publishes nowhere"
     );
-    assert!(unregister(VIEW).is_some());
-    assert!(find(VIEW).is_none());
+    assert!(unregister(view).is_some());
+    assert!(find(view).is_none());
 }
 
 #[test]
 fn a_reset_makes_the_refresh_due_at_once() {
-    const VIEW: usize = 0xB_0000;
+    let view = test_address_block();
 
-    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
     assert!(
         att.begin_headroom_refresh(),
         "the first present queues the attach-time refresh"
@@ -420,14 +423,14 @@ fn a_reset_makes_the_refresh_due_at_once() {
         "the Reset's refresh was the one refresh; the interval restarted with it"
     );
 
-    unregister(VIEW);
+    unregister(view);
 }
 
 #[test]
 fn a_reset_during_a_refresh_in_flight_defers_to_the_next_present() {
-    const VIEW: usize = 0xC_0000;
+    let view = test_address_block();
 
-    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
     assert!(att.begin_headroom_refresh(), "the poll queued a refresh");
     assert!(
         !att.request_refresh(),
@@ -439,16 +442,16 @@ fn a_reset_during_a_refresh_in_flight_defers_to_the_next_present() {
         "the next present queues another, which reads the pacing the Reset latched"
     );
 
-    unregister(VIEW);
+    unregister(view);
 }
 
 #[test]
 fn a_reset_repaces_one_record_only() {
-    const VIEW_A: usize = 0xD_0000;
-    const VIEW_B: usize = 0xD_1000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
 
-    let a = register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
-    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     // Both records are past their attach-time refresh.
     assert!(a.begin_headroom_refresh());
     a.end_headroom_refresh();
@@ -476,8 +479,8 @@ fn a_reset_repaces_one_record_only() {
     );
     a.end_headroom_refresh();
 
-    unregister(VIEW_A);
-    unregister(VIEW_B);
+    unregister(view_a);
+    unregister(view_b);
 }
 
 /// Latches for a record on `hwnd` holding a reference on `client_surface`.
@@ -491,49 +494,49 @@ fn surface_latches(hwnd: u64, client_surface: usize) -> AttachLatches {
 
 #[test]
 fn the_newest_live_record_on_the_window_names_the_surface() {
-    const HWND: u64 = 0x7_0040;
-    const VIEW_A: usize = 0x7_0000;
-    const VIEW_B: usize = 0x7_1000;
-    const VIEW_C: usize = 0x7_2000;
-    const VIEW_OTHER: usize = 0x7_3000;
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
+    let view_c = view_a + 0x2000;
+    let view_other = view_a + 0x3000;
+    let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
 
     let retained = |surface: usize| surface;
     assert_eq!(
-        retain_newest_surface_on(HWND, retained),
+        retain_newest_surface_on(hwnd, retained),
         None,
         "no record yet"
     );
 
-    register(VIEW_A, VIEW_A + 8, &surface_latches(HWND, 0xa000));
+    register(view_a, view_a + 8, &surface_latches(hwnd, 0xa000));
     std::thread::sleep(std::time::Duration::from_millis(2));
-    register(VIEW_B, VIEW_B + 8, &surface_latches(HWND, 0xb000));
+    register(view_b, view_b + 8, &surface_latches(hwnd, 0xb000));
     std::thread::sleep(std::time::Duration::from_millis(2));
-    register(VIEW_C, VIEW_C + 8, &surface_latches(HWND, 0));
+    register(view_c, view_c + 8, &surface_latches(hwnd, 0));
     register(
-        VIEW_OTHER,
-        VIEW_OTHER + 8,
-        &surface_latches(HWND + 1, 0xd000),
+        view_other,
+        view_other + 8,
+        &surface_latches(hwnd + 1, 0xd000),
     );
     assert_eq!(
-        retain_newest_surface_on(HWND, retained),
+        retain_newest_surface_on(hwnd, retained),
         Some(0xb000),
         "the newest record holding a surface, on this window only"
     );
 
-    unregister(VIEW_B);
+    unregister(view_b);
     assert_eq!(
-        retain_newest_surface_on(HWND, retained),
+        retain_newest_surface_on(hwnd, retained),
         Some(0xa000),
         "an unregistered record names nothing"
     );
     assert_eq!(
-        retain_newest_surface_on(HWND, |_| 0),
+        retain_newest_surface_on(hwnd, |_| 0),
         None,
         "a surface the retain refuses is not handed back"
     );
 
-    unregister(VIEW_A);
-    assert_eq!(retain_newest_surface_on(HWND, retained), None);
-    unregister(VIEW_C);
-    unregister(VIEW_OTHER);
+    unregister(view_a);
+    assert_eq!(retain_newest_surface_on(hwnd, retained), None);
+    unregister(view_c);
+    unregister(view_other);
 }
