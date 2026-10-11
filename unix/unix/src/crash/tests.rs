@@ -111,11 +111,17 @@ const BAD_ADDR: usize = 0xdead_beef;
 ///
 /// `extern "C"` and never inlined so the argument really travels in the
 /// first-argument register and the return address really is a caller frame.
+/// The pointer and the value read both go through `black_box`: an optimised
+/// build otherwise moves the read into the caller, or deletes it along with
+/// the discarded result. The read is one byte wide so it has no alignment
+/// precondition. Callers pass the pointer through `black_box` too, or a
+/// constant argument is folded into the body and never travels in the register.
 #[inline(never)]
-extern "C" fn deref_this(this: *const u64) -> u64 {
+extern "C" fn deref_this(this: *const u64) -> u8 {
+    let this = std::hint::black_box(this).cast::<u8>();
     // SAFETY: deliberately unsound; this is the fault under test, taken in
     // a child process that never returns from the handler.
-    unsafe { this.read() }
+    std::hint::black_box(unsafe { this.read() })
 }
 
 /// The saved-register decode names the faulting frame on the running arch.
@@ -127,7 +133,7 @@ extern "C" fn deref_this(this: *const u64) -> u64 {
 fn fault_report_decodes_registers() {
     if std::env::var_os(SELFTEST_ENV).is_some() {
         super::install();
-        let _ = deref_this(BAD_ADDR as *const u64);
+        let _ = deref_this(std::hint::black_box(BAD_ADDR as *const u64));
         unreachable!("the read above must fault");
     }
 
@@ -816,7 +822,7 @@ fn only_the_image_file_name_decides_whether_a_fault_is_ours() {
 fn foreign_image_under_our_directory_forwards_fault() {
     if std::env::var_os(FOREIGN_SELFTEST_ENV).is_some() {
         super::install();
-        let _ = deref_this(BAD_ADDR as *const u64);
+        let _ = deref_this(std::hint::black_box(BAD_ADDR as *const u64));
         unreachable!("the read above must fault");
     }
 
