@@ -18,6 +18,7 @@ the reason for each one.
 | Kane & Lynch: Dead Men | Plays |
 | LEGO Indiana Jones 2: The Adventure Continues | Plays |
 | League of Legends 4.20 | Plays |
+| Need for Speed: Underground | Plays, 32-bit, with the Widescreen Fix |
 | Need for Speed: Underground 2 | Plays, with the Widescreen Fix, ExtraOptions and XtendedInput |
 | Need for Speed: Most Wanted (2005) | Plays, with the Widescreen Fix and ExtraOptions |
 | Need for Speed: Carbon | Plays, with the Widescreen Fix |
