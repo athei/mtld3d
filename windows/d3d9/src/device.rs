@@ -2173,6 +2173,11 @@ impl DeviceInner {
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
         drop(stall);
+        let retired = self.coherent_seq.load(Ordering::Acquire);
+        let in_flight = self.perf_mut().note_present_in_flight(seq, retired);
+        self.current_frame
+            .perf_mut()
+            .set_frames_in_flight(in_flight);
         // Outside the stall. The address-space walk runs on the watch thread;
         // this only hands it a sample and answers its request for figures.
         self.mem_watch_present();

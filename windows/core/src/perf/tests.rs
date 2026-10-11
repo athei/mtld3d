@@ -606,6 +606,7 @@ fn summary_golden_layout() {
         "│  ├─ Device            0.30 ms   (       123)                              peak  0.30 ms\n",
         "│  │  ├─ Frame          0.04 ms   (         3)                              peak  0.04 ms\n",
         "│  │  │  ├─ Send stall  3.20 ms                       encoder backpressure  peak  3.20 ms\n",
+        "│  │  │  ├─ GPU behind  1.00 ms                       frame-latency bound   peak  1.00 ms\n",
         "│  │  │  └─ other       0.00 ms                       non-blocking body     peak  0.00 ms\n",
         "│  │  ├─ Draws          0.12 ms   (1200 ns/draw)                            peak  0.12 ms\n",
         "│  │  │  ├─ snapshot    0.09 ms   ( 900 ns/draw)      read+stamp state      peak  0.09 ms\n",
@@ -833,6 +834,8 @@ fn kv_golden_line() {
         " dev_bind_calls_total=6 dev_state_block_ms=0.000 dev_state_block_peak_ms=0.000",
         " dev_state_block_calls_total=0 dev_misc_ms=0.000 dev_misc_peak_ms=0.000",
         " dev_misc_calls_total=0 present_stall_ms=3.200 present_stall_peak_ms=3.200",
+        " latency_wait_ms=1.000 latency_wait_peak_ms=1.000 latency_waits_total=1",
+        " frames_in_flight_total=3 frames_in_flight_peak_count=3",
         " dev_frame_other_ms=0.000 dev_frame_other_peak_ms=0.000 draw_snapshot_ms=0.090",
         " draw_snapshot_peak_ms=0.090 draw_snapshot_stages_ms=0.020",
         " draw_snapshot_stages_peak_ms=0.020 draw_snapshot_c_ff_ms=0.020",
@@ -1382,6 +1385,11 @@ fn sample_window() -> PerfWindow {
             // so the realloc row's number column is exercised by the
             // golden assertion.
             op_vec_realloc_bytes: 32 * 1024,
+            // A GPU-bound frame: `Present` waited 1 ms for the latency bound
+            // with three presents outstanding.
+            latency_wait_cycles: 1_000_000,
+            latency_waits: 1,
+            frames_in_flight: 3,
         },
         enc: EncoderFrameCounters {
             buffer_destroys: 1,
@@ -2262,4 +2270,32 @@ fn pe_pagebox_traffic_rides_the_payload_into_the_window() {
     assert!(grid.contains("recycled=4007 "), "{grid}");
     assert!(grid.contains("alloc=30 "), "{grid}");
     assert!(grid.contains("free=15 "), "{grid}");
+}
+
+/// The in-flight gauge counts the presents the draw counter has not reached, the newest included.
+#[test]
+fn the_in_flight_gauge_counts_presents_the_draw_counter_has_not_reached() {
+    let mut state = ApiPerfState::new();
+    assert_eq!(state.note_present_in_flight(1, 0), 1);
+    assert_eq!(state.note_present_in_flight(2, 0), 2);
+    // A mid-frame flush took sequence 3; the next present is 4.
+    assert_eq!(state.note_present_in_flight(4, 0), 3);
+    assert_eq!(state.note_present_in_flight(5, 2), 2, "1 and 2 retired");
+    assert_eq!(state.note_present_in_flight(6, 6), 0, "all retired");
+}
+
+/// The gauge looks back 64 presents, so an unbounded pipeline reads as 64.
+#[test]
+fn the_in_flight_gauge_saturates_at_its_window() {
+    let mut state = ApiPerfState::new();
+    let mut last = 0;
+    for seq in 1..=100 {
+        last = state.note_present_in_flight(seq, 0);
+    }
+    assert_eq!(last, 64);
+    assert_eq!(
+        state.note_present_in_flight(101, 90),
+        11,
+        "91 to 101 outstanding"
+    );
 }
