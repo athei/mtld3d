@@ -116,6 +116,110 @@ fn every_device_on_a_window_is_listed_oldest_first() {
 }
 
 #[test]
+fn a_hold_ends_with_the_outermost_hook_call_not_the_nested_one() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    subclasses.register(WINDOW, FIRST, || proc.hook());
+
+    // A restore: the outer `WM_SYSCOMMAND` sends `WM_SIZE`, then the activation.
+    assert_eq!(subclasses.enter(WINDOW), Some((FIRST, GAME_PROC)));
+    assert_eq!(subclasses.enter(WINDOW), Some((FIRST, GAME_PROC)));
+    subclasses.hold_until_dispatch_ends(WINDOW, FIRST);
+    assert_eq!(
+        subclasses.leave(WINDOW),
+        None,
+        "the WM_SIZE returned inside the dispatch"
+    );
+    assert_eq!(subclasses.enter(WINDOW), Some((FIRST, GAME_PROC)));
+    assert_eq!(
+        subclasses.leave(WINDOW),
+        None,
+        "the activation returned inside it too"
+    );
+    assert_eq!(
+        subclasses.leave(WINDOW),
+        Some(FIRST),
+        "the outer call ends the dispatch"
+    );
+
+    // The next dispatch was held by nobody.
+    assert_eq!(subclasses.enter(WINDOW), Some((FIRST, GAME_PROC)));
+    assert_eq!(subclasses.leave(WINDOW), None);
+}
+
+#[test]
+fn a_hold_made_by_the_outermost_call_ends_with_it() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    subclasses.register(WINDOW, FIRST, || proc.hook());
+    subclasses.enter(WINDOW);
+    subclasses.hold_until_dispatch_ends(WINDOW, FIRST);
+    assert_eq!(subclasses.leave(WINDOW), Some(FIRST));
+}
+
+#[test]
+fn a_device_that_left_during_the_dispatch_is_not_named() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    subclasses.register(WINDOW, FIRST, || proc.hook());
+    subclasses.register(WINDOW, SECOND, || proc.hook());
+    subclasses.enter(WINDOW);
+    subclasses.hold_until_dispatch_ends(WINDOW, FIRST);
+    subclasses.unregister(WINDOW, FIRST, |original| proc.restore(original));
+    assert_eq!(subclasses.leave(WINDOW), None, "the holder is gone");
+
+    // The last device leaving drops the window's count with it.
+    subclasses.enter(WINDOW);
+    subclasses.hold_until_dispatch_ends(WINDOW, SECOND);
+    subclasses.unregister(WINDOW, SECOND, |original| proc.restore(original));
+    assert_eq!(subclasses.leave(WINDOW), None);
+    assert_eq!(
+        subclasses.enter(WINDOW),
+        None,
+        "no device, nothing to count"
+    );
+}
+
+#[test]
+fn a_window_registered_again_mid_dispatch_ends_a_hold_early_never_late() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    subclasses.register(WINDOW, FIRST, || proc.hook());
+    // The outer call, then a handler that releases the only device and makes another.
+    subclasses.enter(WINDOW);
+    subclasses.unregister(WINDOW, FIRST, |original| proc.restore(original));
+    subclasses.register(WINDOW, SECOND, || proc.hook());
+    // A nested call on the new registration holds its dispatch.
+    subclasses.enter(WINDOW);
+    subclasses.hold_until_dispatch_ends(WINDOW, SECOND);
+    assert_eq!(
+        subclasses.leave(WINDOW),
+        Some(SECOND),
+        "the new entry never saw the outer call, so the nested one ends the hold"
+    );
+    assert_eq!(
+        subclasses.leave(WINDOW),
+        None,
+        "the outer call's leave finds nothing held"
+    );
+}
+
+#[test]
+fn a_hold_on_a_window_no_device_holds_keeps_nothing() {
+    let mut proc = WindowProc::new();
+    let mut subclasses = WindowSubclasses::default();
+    subclasses.hold_until_dispatch_ends(OTHER_WINDOW, FIRST);
+    subclasses.register(OTHER_WINDOW, FIRST, || proc.hook());
+    subclasses.enter(OTHER_WINDOW);
+    assert_eq!(subclasses.leave(OTHER_WINDOW), None);
+    assert_eq!(
+        subclasses.leave(OTHER_WINDOW),
+        None,
+        "an unbalanced leave stays at zero"
+    );
+}
+
+#[test]
 fn a_device_moving_between_windows_leaves_the_one_it_came_from() {
     let mut first_window = WindowProc::new();
     let mut second_window = WindowProc::new();

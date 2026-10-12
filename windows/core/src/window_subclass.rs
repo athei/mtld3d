@@ -25,6 +25,14 @@ struct Subclass {
     original: usize,
     /// Registered devices, oldest first; the first one receives the messages.
     devices: Vec<usize>,
+    /// Calls of the hook on this window that have not returned yet.
+    ///
+    /// A message the game's procedure handles can send the window further
+    /// messages before it returns, each of which runs the hook again inside
+    /// the first call; zero means no message is being dispatched.
+    depth: u32,
+    /// The device to tell once the outermost hook call on this window has returned.
+    held_until_dispatch_ends: Option<usize>,
 }
 
 impl WindowSubclasses {
@@ -52,6 +60,8 @@ impl WindowSubclasses {
             Subclass {
                 original,
                 devices: vec![device],
+                depth: 0,
+                held_until_dispatch_ends: None,
             },
         );
         true
@@ -89,6 +99,44 @@ impl WindowSubclasses {
         let subclass = self.windows.get(&window)?;
         let device = *subclass.devices.first()?;
         Some((device, subclass.original))
+    }
+
+    /// [`Self::route`] for a hook call that starts on `window`, counted until [`Self::leave`].
+    ///
+    /// `None` for a window no device holds, and then nothing is counted and
+    /// the call has no [`Self::leave`] to make.
+    pub fn enter(&mut self, window: usize) -> Option<(usize, usize)> {
+        let route = self.route(window)?;
+        let subclass = self.windows.get_mut(&window)?;
+        subclass.depth = subclass.depth.saturating_add(1);
+        Some(route)
+    }
+
+    /// Have the running outermost hook call on `window` name `device` when it returns.
+    ///
+    /// A window no device holds keeps nothing. A later hold in the same
+    /// dispatch replaces an earlier one.
+    pub fn hold_until_dispatch_ends(&mut self, window: usize, device: usize) {
+        if let Some(subclass) = self.windows.get_mut(&window) {
+            subclass.held_until_dispatch_ends = Some(device);
+        }
+    }
+
+    /// Count a hook call on `window` that [`Self::enter`] counted as returned.
+    ///
+    /// When it was the outermost one, returns the device the dispatch was
+    /// held for, if that device is still registered on the window. `None`
+    /// for a nested call, a dispatch nothing held, and a window no device
+    /// holds any more: a window whose last device left drops its count with
+    /// its registration.
+    pub fn leave(&mut self, window: usize) -> Option<usize> {
+        let subclass = self.windows.get_mut(&window)?;
+        subclass.depth = subclass.depth.saturating_sub(1);
+        if subclass.depth > 0 {
+            return None;
+        }
+        let device = subclass.held_until_dispatch_ends.take()?;
+        subclass.devices.contains(&device).then_some(device)
     }
 
     /// Every device registered on `window`, oldest first; empty for a window no device holds.
