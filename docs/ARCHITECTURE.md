@@ -981,14 +981,14 @@ The figures are volatile metadata, one row per key, which the HUD indents by two
 
 | Row | What it counts | Source |
 | --- | --- | --- |
-| `Frame draws UP` | Draws from user-pointer data (`DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`) in the last presented frame | The encoder's replay of each draw record, by its vertex kind |
+| `Frame draws UP` | Draws from user-pointer data (`DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`) in the last presented frame | The encoder's replay of each draw record, by its vertex kind; every record counts, including a draw `emit_draw` then leaves out, such as one whose build is pending or failed |
 | `Frame draws VB` | Draws from vertex buffers in the last presented frame | The same count |
 | `Frame passes` | Metal render passes the last presented frame submitted, its mid-frame flushes included | `finalize_submit`, per submission |
 | `Live pipelines` | Render pipeline states the device holds, failed builds included; not the HUD's own cumulative count | The pipeline index's length |
 | `Live samplers` | Sampler states the device holds | The sampler cache's length |
 | `Live textures` | Textures alive on the device | The texture cache's length |
-| `Mem 32-bit free MiB` | Free address space of a 32-bit process | The address-space watch's last walk |
-| `Mem 32-bit largest MiB` | The largest free block, the limit for the next large allocation | The same walk |
+| `Mem 32-bit free MiB` | Free address space of a 32-bit process, refreshed every 600 presents (`SAMPLE_EVERY`), not at the HUD's sample rate | The address-space watch's last walk |
+| `Mem 32-bit largest MiB` | The largest free block, the limit for the next large allocation, refreshed with the free figure | The same walk |
 | `Mem CPU heap MiB` | The native runtime's own heap | snmalloc's current usage in `mtld3d.so` |
 | `Mem in flight MiB` | Vertex and index buffer copies held until the GPU has finished with them | The retained-bytes counter the API thread's retention cap reads |
 | `Mem reuse pool MiB` | Spare memory parked for reuse | The encoder's page-box pool, the parked texture versions and the versions queued for destruction |
@@ -997,7 +997,7 @@ The figures are volatile metadata, one row per key, which the HUD indents by two
 
 The HUD draws a metadata value only when it is a number or a date: it formats a value through `stringValue`, which a string does not have, and leaves the row out. So every value is an integer, and the unit is part of the key. The rows obey four rules, each held by a test in `hud_stats/tests.rs`. Every key, with the widest value it can carry (ten digits for a count or a MiB figure, four for the two address-space rows, which never exceed the 4096 MiB of a 32-bit space), fits in 33 columns with the two-space indent and a free column before the value, the width of the default panel; the HUD centre-truncates a row wider than its panel. The keys are ASCII, start with their group word (`Frame`, `Live`, `Mem`, `Shaders`, in that order), and sort the same way by bytes and ignoring case. The release identity is at most 26 characters, so it fits beside `mtld3d`; a longer development identity gives up hash digits. The address-space rows are left out until the watch has walked, which a 64-bit process never does, and a shader row while it counts nothing, so a game shows only the shader models it uses.
 
-The encoder samples on its own thread, after it has sent a frame's reply, at most twice a second by its calibrated clock, and only once the HUD has loaded: `libMTLHud` is opened by the HUD alone, so its reporter manager's class appearing is the HUD appearing. A sample reads figures that are kept anyway and walks nothing; the API thread pays nothing, and the per-draw cost is two integer adds on the encoder. The watch thread of a 32-bit build stores its walk's free total and largest block in one atomic word the device shares with the encoder (`free_va_ptr` in `CreateEncoderParams`). The domain is one per process, so with several devices the newest one's figures are shown: an encoder takes the rows when it is created, reports only while it holds them, and the holder's teardown clears them, after which the next surviving encoder to sample takes them over.
+The encoder samples on its own thread, after it has sent a frame's reply, at most twice a second by its calibrated clock, and only once the HUD has loaded: neither Metal nor Core Animation links `libMTLHud`, which carries the HUD's reporter manager, so that class appearing is taken as the HUD appearing. A sample reads figures that are kept anyway and walks nothing; the API thread pays nothing, and the per-draw cost is two integer adds on the encoder. The watch thread of a 32-bit build stores its walk's free total and largest block in one atomic word the device shares with the encoder (`free_va_ptr` in `CreateEncoderParams`). The domain is one per process, so with several devices the figures of the newest one that renders are shown: an encoder takes the rows at its first sample, which follows its first encoded frame, so a device that never submits a frame takes nothing; it reports only while it holds them, and the holder's teardown clears them while it still holds them, after which the next surviving encoder to sample takes them over.
 
 ## Perf infrastructure
 
