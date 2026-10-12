@@ -186,7 +186,7 @@ pub struct HudSample {
     pub textures: usize,
     /// The watch's last walk as [`largest_free_word`] stores it; zero before a walk.
     pub largest_free_word: u64,
-    /// Bytes `d3d9.dll` holds in page boxes, everything the layer keeps in the game's space.
+    /// Bytes `d3d9.dll` holds in live page boxes, the parked ones of the reuse pool included.
     pub guest_page_bytes: u64,
     /// Vertex and index buffer copies held until the GPU has finished with them.
     pub in_flight_bytes: u64,
@@ -202,6 +202,8 @@ pub struct HudSample {
 ///
 /// The address-space row is left out until the watch has walked once, which
 /// a 64-bit process never does; a walk that found less than 1 MiB free shows 0.
+/// The guest pages row leaves out the reuse pool, whose parked boxes are live
+/// page boxes too, so the two rows add up to what `d3d9.dll` holds.
 #[must_use]
 pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
     let largest = sample.largest_free_word.checked_sub(1).map(|mib| {
@@ -209,13 +211,19 @@ pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
             .unwrap_or(u32::MAX)
             .min(ADDRESS_SPACE_32_MIB)
     });
+    // Two Relaxed loads of counters other threads move, not one snapshot: a
+    // box parked between them can make the pool read larger than the live
+    // total, which saturates to 0 rather than wrapping.
+    let pages_in_use = sample
+        .guest_page_bytes
+        .saturating_sub(sample.reuse_pool_bytes);
     [
         Some(sample.draws_up),
         Some(sample.draws_vb),
         Some(sample.passes),
         Some(count(sample.textures)),
         largest,
-        Some(mib(sample.guest_page_bytes)),
+        Some(mib(pages_in_use)),
         Some(mib(sample.in_flight_bytes)),
         Some(mib(sample.reuse_pool_bytes)),
         Some(count(sample.fixed_function)),

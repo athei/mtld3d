@@ -12,7 +12,8 @@ fn widest_sample() -> HudSample {
         largest_free_word: u64::MAX,
         guest_page_bytes: u64::MAX,
         in_flight_bytes: u64::MAX,
-        reuse_pool_bytes: u64::MAX,
+        // Half, so the guest pages row, which leaves the pool out, is at its widest too.
+        reuse_pool_bytes: u64::MAX / 2,
         fixed_function: usize::MAX,
         programs: usize::MAX,
     }
@@ -60,6 +61,7 @@ fn values_stay_bounded() {
     let rows = hud_rows(&widest_sample());
     assert_eq!(rows[row("Mem 32-bit largest MiB")], Some(4096));
     assert_eq!(rows[row("Mem guest pages MiB")], Some(u32::MAX));
+    assert_eq!(rows[row("Mem reuse pool MiB")], Some(u32::MAX));
     assert_eq!(rows[row("Live textures")], Some(u32::MAX));
     assert_eq!(rows[row("Shaders programmable")], Some(u32::MAX));
 }
@@ -152,7 +154,8 @@ fn every_row_carries_its_own_field() {
         passes: 3,
         textures: 4,
         largest_free_word: largest_free_word(5),
-        guest_page_bytes: 6 << 20,
+        // The guest pages row leaves the pool out: 14 live less 8 parked.
+        guest_page_bytes: 14 << 20,
         in_flight_bytes: 7 << 20,
         reuse_pool_bytes: 8 << 20,
         fixed_function: 9,
@@ -229,9 +232,25 @@ fn byte_figures_show_in_whole_mib() {
     sample.in_flight_bytes = (1 << 20) - 1;
     sample.reuse_pool_bytes = 64 << 20;
     let rows = hud_rows(&sample);
-    assert_eq!(rows[row("Mem guest pages MiB")], Some(96));
+    assert_eq!(
+        rows[row("Mem guest pages MiB")],
+        Some(32),
+        "96 MiB live less the 64 MiB parked in the pool"
+    );
     assert_eq!(rows[row("Mem in flight MiB")], Some(0));
     assert_eq!(rows[row("Mem reuse pool MiB")], Some(64));
+}
+
+#[test]
+fn a_pool_read_larger_than_the_live_total_shows_no_pages_in_use() {
+    // The two counters are read one after the other, so a box parked in
+    // between can make the pool read above the live total.
+    let mut sample = empty_sample();
+    sample.guest_page_bytes = 10 << 20;
+    sample.reuse_pool_bytes = 12 << 20;
+    let rows = hud_rows(&sample);
+    assert_eq!(rows[row("Mem guest pages MiB")], Some(0));
+    assert_eq!(rows[row("Mem reuse pool MiB")], Some(12));
 }
 
 #[test]
