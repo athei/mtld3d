@@ -203,7 +203,8 @@ pub struct HudSample {
 /// The address-space row is left out until the watch has walked once, which
 /// a 64-bit process never does; a walk that found less than 1 MiB free shows 0.
 /// The guest pages row leaves out the reuse pool, whose parked boxes are live
-/// page boxes too, so the two rows add up to what `d3d9.dll` holds.
+/// page boxes too, so the two rows add up to what `d3d9.dll` holds, to within
+/// 1 MiB, since each rounds down to whole MiB.
 #[must_use]
 pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
     let largest = sample.largest_free_word.checked_sub(1).map(|mib| {
