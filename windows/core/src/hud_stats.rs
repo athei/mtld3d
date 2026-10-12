@@ -3,9 +3,9 @@
 //! On macOS 27 the HUD lists every state reporter under its "State Reporters"
 //! caption: the domain and its label on one row, then one row per metadata
 //! key, indented by two spaces. The layer reports its release identity as the
-//! label and a handful of per-device figures as volatile metadata; this module
-//! holds everything about those rows that needs no Objective-C: the counters
-//! the encoder keeps, the row keys, the values and the width budget.
+//! label and a handful of figures as volatile metadata; this module holds
+//! everything about those rows that needs no Objective-C: the counters the
+//! encoder keeps, the row keys, the values and the width budget.
 //!
 //! The HUD draws a metadata value only when it is a number or a date: a
 //! string value has no `stringValue`, so the HUD skips its row. Every value is
@@ -19,8 +19,8 @@
 //!    budget the default panel gives, and every key with its widest possible
 //!    value leaves at least one column between them.
 //! 2. Bounded values. Counts are `u32`, at most ten digits; byte figures are
-//!    whole MiB, saturating at `u32::MAX`; the two 32-bit address-space rows
-//!    never exceed the 4096 MiB such a space has.
+//!    whole MiB, saturating at `u32::MAX`; the 32-bit address-space row never
+//!    exceeds the 4096 MiB such a space has.
 //! 3. Order. The HUD sorts the keys with `compare:`, which orders ASCII by
 //!    code point. Every key starts with its group word, and the groups read in
 //!    the order `Frame`, `Live`, `Mem`, `Shaders`. Wherever two adjacent keys
@@ -28,8 +28,6 @@
 //!    sorted either way would show the same order.
 //! 4. Header. The domain row carries [`HUD_DOMAIN`] and the release identity,
 //!    which [`hud_label`] shortens to fit beside the domain.
-
-use crate::{LOG_TARGET, dxso::ShaderType};
 
 /// The `StateReporting` domain the layer reports under, which the HUD prints as the header row.
 pub const HUD_DOMAIN: &str = "mtld3d";
@@ -47,47 +45,35 @@ pub const HUD_KEY_INDENT: usize = 2;
 pub const HUD_LABEL_MAX: usize = HUD_COLUMNS - HUD_DOMAIN.len() - 1;
 
 /// How many rows the layer can report under its domain.
-pub const HUD_ROW_COUNT: usize = 19;
+pub const HUD_ROW_COUNT: usize = 10;
 
 /// The metadata keys, in the order the HUD sorts them, indexed like [`hud_rows`]' answer.
 ///
 /// `UP` draws come from user-pointer data (`DrawPrimitiveUP`,
-/// `DrawIndexedPrimitiveUP`), `VB` draws from vertex buffers. `FF` counts the
-/// fixed-function shaders the layer generated, `SM1` to `SM3` the game's
-/// shader programs by shader model.
+/// `DrawIndexedPrimitiveUP`), `VB` draws from vertex buffers. `Shaders FF`
+/// counts the fixed-function shaders the layer generated, `Shaders
+/// programmable` the game's own shader programs.
 pub const HUD_ROW_KEYS: [&str; HUD_ROW_COUNT] = [
     "Frame draws UP",
     "Frame draws VB",
     "Frame passes",
-    "Live pipelines",
-    "Live samplers",
     "Live textures",
-    "Mem 32-bit free MiB",
     "Mem 32-bit largest MiB",
-    "Mem CPU heap MiB",
+    "Mem guest pages MiB",
     "Mem in flight MiB",
     "Mem reuse pool MiB",
-    "Shaders PS FF",
-    "Shaders PS SM1",
-    "Shaders PS SM2",
-    "Shaders PS SM3",
-    "Shaders VS FF",
-    "Shaders VS SM1",
-    "Shaders VS SM2",
-    "Shaders VS SM3",
+    "Shaders FF",
+    "Shaders programmable",
 ];
 
 /// How many samples a second the encoder reports at most.
 pub const HUD_SAMPLE_HZ: u64 = 2;
 
-/// The size of a 32-bit address space in MiB, which bounds both address-space rows.
+/// The size of a 32-bit address space in MiB, which bounds the address-space row.
 const ADDRESS_SPACE_32_MIB: u32 = 4096;
 
-/// Index of the first address-space row in [`HUD_ROW_KEYS`].
-const ROW_MEM_32_FREE: usize = 6;
-
-/// Index of the first shader row in [`HUD_ROW_KEYS`]; four per stage, pixel stage first.
-const ROW_SHADERS: usize = 11;
+/// Index of the address-space row in [`HUD_ROW_KEYS`].
+const ROW_MEM_32_LARGEST: usize = 4;
 
 /// Shortest commit hash [`hud_label`] keeps when it shortens a development identity.
 const MIN_LABEL_HASH: usize = 4;
@@ -168,40 +154,6 @@ impl HudFrame {
     }
 }
 
-/// The game's shader programs a device holds, by stage and shader model.
-///
-/// The encoder keeps every parsed program for the device's life, keyed by its
-/// bytecode, so a program is counted once, when the device first sees it.
-#[derive(Default)]
-pub struct ShaderModels {
-    /// Programs by stage (pixel, vertex) and shader model (1, 2, 3).
-    counts: [[u32; 3]; 2],
-}
-
-impl ShaderModels {
-    /// Count a program the device has not held before.
-    ///
-    /// A major version outside 1 to 3 is not counted; the parser accepts
-    /// none, so one here is logged once.
-    pub fn adopt(&mut self, stage: ShaderType, major: u8) {
-        let Some(model) = usize::from(major).checked_sub(1).filter(|model| *model < 3) else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "hud stats: a shader program with major version {major} is not counted"
-            );
-            return;
-        };
-        let slot = &mut self.counts[stage_index(stage)][model];
-        *slot = slot.saturating_add(1);
-    }
-
-    /// The programs of `stage`, by shader model 1, 2 and 3.
-    #[must_use]
-    pub const fn counts(&self, stage: ShaderType) -> [u32; 3] {
-        self.counts[stage_index(stage)]
-    }
-}
-
 /// Lets a sample through at most once per period of a monotonic clock.
 #[derive(Default)]
 pub struct SampleGate {
@@ -222,6 +174,10 @@ impl SampleGate {
 }
 
 /// Every figure one sample reports, gathered by the encoder.
+///
+/// The frame counts, the textures, the in-flight bytes and both shader
+/// counts belong to the reporting device; the largest free block, the guest
+/// pages and the reuse pool are the process's, read from `d3d9.dll`.
 pub struct HudSample {
     /// The last presented frame's user-pointer draws.
     pub draws_up: u32,
@@ -229,77 +185,47 @@ pub struct HudSample {
     pub draws_vb: u32,
     /// The last presented frame's render passes.
     pub passes: u32,
-    /// Render pipeline states the device holds.
-    pub pipelines: usize,
-    /// Sampler states the device holds.
-    pub samplers: usize,
     /// Textures alive on the device.
     pub textures: usize,
-    /// The address-space watch's last walk, packed by [`pack_free_va`]; zero before one.
-    pub free_va: u64,
-    /// The native runtime's own heap.
-    pub cpu_heap_bytes: u64,
+    /// The largest free block of a 32-bit address space at the watch's last walk; zero before one.
+    pub largest_free_mib: u64,
+    /// Bytes `d3d9.dll` holds in page boxes, everything the layer keeps in the game's space.
+    pub guest_page_bytes: u64,
     /// Vertex and index buffer copies held until the GPU has finished with them.
     pub in_flight_bytes: u64,
-    /// Spare memory parked for reuse.
+    /// Page boxes `d3d9.dll` keeps parked for reuse.
     pub reuse_pool_bytes: u64,
-    /// Fixed-function shaders generated, pixel stage then vertex stage.
-    pub fixed_function: [usize; 2],
-    /// The game's programs by shader model 1 to 3, pixel stage then vertex stage.
-    pub models: [[u32; 3]; 2],
+    /// Fixed-function shaders generated, both stages.
+    pub fixed_function: usize,
+    /// The game's shader programs the device has seen, both stages.
+    pub programs: usize,
 }
 
 /// The value of every row, indexed like [`HUD_ROW_KEYS`]; `None` leaves the row out.
 ///
-/// The address-space rows are left out until the watch has walked once,
-/// which a 64-bit process never does, and a shader row while it counts no
-/// shader, so a game shows only the shader models it uses.
+/// The address-space row is left out until the watch has walked once, which
+/// a 64-bit process never does.
 #[must_use]
 pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
-    let mut rows = [None; HUD_ROW_COUNT];
-    rows[0] = Some(sample.draws_up);
-    rows[1] = Some(sample.draws_vb);
-    rows[2] = Some(sample.passes);
-    rows[3] = Some(count(sample.pipelines));
-    rows[4] = Some(count(sample.samplers));
-    rows[5] = Some(count(sample.textures));
-    if sample.free_va != 0 {
-        let (free, largest) = unpack_free_va(sample.free_va);
-        rows[ROW_MEM_32_FREE] = Some(free.min(ADDRESS_SPACE_32_MIB));
-        rows[ROW_MEM_32_FREE + 1] = Some(largest.min(ADDRESS_SPACE_32_MIB));
-    }
-    rows[8] = Some(mib(sample.cpu_heap_bytes));
-    rows[9] = Some(mib(sample.in_flight_bytes));
-    rows[10] = Some(mib(sample.reuse_pool_bytes));
-    for (stage, (fixed, models)) in sample.fixed_function.iter().zip(&sample.models).enumerate() {
-        let first = ROW_SHADERS + stage * 4;
-        let values = [count(*fixed), models[0], models[1], models[2]];
-        for (row, value) in rows[first..first + 4].iter_mut().zip(values) {
-            *row = (value != 0).then_some(value);
-        }
+    let largest = u32::try_from(sample.largest_free_mib)
+        .unwrap_or(u32::MAX)
+        .min(ADDRESS_SPACE_32_MIB);
+    let mut rows = [
+        Some(sample.draws_up),
+        Some(sample.draws_vb),
+        Some(sample.passes),
+        Some(count(sample.textures)),
+        Some(largest),
+        Some(mib(sample.guest_page_bytes)),
+        Some(mib(sample.in_flight_bytes)),
+        Some(mib(sample.reuse_pool_bytes)),
+        Some(count(sample.fixed_function)),
+        Some(count(sample.programs)),
+    ];
+    if sample.largest_free_mib == 0 {
+        rows[ROW_MEM_32_LARGEST] = None;
     }
     rows
-}
-
-/// Pack one address-space walk into the word the watch thread stores for the encoder.
-///
-/// Free MiB in the high half and the largest free block's MiB in the low
-/// half, each saturating at `u32::MAX`. A walk that found nothing free packs
-/// to zero, which reads as no walk yet.
-#[must_use]
-pub fn pack_free_va(free_mib: u64, largest_mib: u64) -> u64 {
-    let half = |mib: u64| u64::from(u32::try_from(mib).unwrap_or(u32::MAX));
-    (half(free_mib) << 32) | half(largest_mib)
-}
-
-/// The free and largest-free-block MiB of a word [`pack_free_va`] packed.
-#[must_use]
-pub const fn unpack_free_va(packed: u64) -> (u32, u32) {
-    let [h0, h1, h2, h3, l0, l1, l2, l3] = packed.to_be_bytes();
-    (
-        u32::from_be_bytes([h0, h1, h2, h3]),
-        u32::from_be_bytes([l0, l1, l2, l3]),
-    )
 }
 
 /// The release identity as the domain row shows it, at most [`HUD_LABEL_MAX`] bytes.
@@ -336,14 +262,6 @@ pub fn hud_label(build: &str) -> String {
         end -= 1;
     }
     build[..end].to_owned()
-}
-
-/// Index of `stage` in the per-stage arrays: pixel first, as the keys sort.
-const fn stage_index(stage: ShaderType) -> usize {
-    match stage {
-        ShaderType::Pixel => 0,
-        ShaderType::Vertex => 1,
-    }
 }
 
 /// A collection length as a row value, saturating at `u32::MAX`.

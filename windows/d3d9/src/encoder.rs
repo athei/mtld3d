@@ -46,11 +46,11 @@ pub struct EncoderCounters {
     retained_bytes: Arc<AtomicU64>,
     /// The frame-latency floor: no display-paced present at or below it is outstanding.
     paced_present_seq: Arc<AtomicU64>,
-    /// The address-space watch's last walk, as `mtld3d_core::hud_stats::pack_free_va` packs it.
+    /// The largest free block in MiB at the address-space watch's last walk.
     ///
     /// Stored by the device's watch thread, read by the encoder for the Metal
     /// HUD rows; it stays zero in a 64-bit build, which walks nothing.
-    free_va: Arc<AtomicU64>,
+    largest_free_mib: Arc<AtomicU64>,
 }
 
 impl EncoderCounters {
@@ -70,8 +70,8 @@ impl EncoderCounters {
         Arc::clone(&self.retained_bytes)
     }
 
-    pub fn free_va(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.free_va)
+    pub fn largest_free_mib(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.largest_free_mib)
     }
 
     fn new() -> Self {
@@ -81,7 +81,7 @@ impl EncoderCounters {
             failed_submit_seq: Arc::new(AtomicU64::new(0)),
             retained_bytes: Arc::new(AtomicU64::new(0)),
             paced_present_seq: Arc::new(AtomicU64::new(0)),
-            free_va: Arc::new(AtomicU64::new(0)),
+            largest_free_mib: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -92,7 +92,7 @@ impl EncoderCounters {
         let _failed = Arc::into_raw(Arc::clone(&self.failed_submit_seq));
         let _retained = Arc::into_raw(Arc::clone(&self.retained_bytes));
         let _paced = Arc::into_raw(Arc::clone(&self.paced_present_seq));
-        let _free_va = Arc::into_raw(Arc::clone(&self.free_va));
+        let _largest = Arc::into_raw(Arc::clone(&self.largest_free_mib));
     }
 }
 
@@ -155,7 +155,14 @@ impl EncoderThread {
             failed_submit_seq_ptr: Arc::as_ptr(&counters.failed_submit_seq) as u64,
             retained_bytes_ptr: Arc::as_ptr(&counters.retained_bytes) as u64,
             paced_present_seq_ptr: Arc::as_ptr(&counters.paced_present_seq) as u64,
-            free_va_ptr: Arc::as_ptr(&counters.free_va) as u64,
+            largest_free_mib_ptr: Arc::as_ptr(&counters.largest_free_mib) as u64,
+            // Process-lifetime statics of this image: native code may read
+            // them for as long as it runs.
+            guest_page_bytes_ptr: core::ptr::from_ref(mtld3d_core::page_box::live_bytes_counter())
+                as u64,
+            guest_pool_bytes_ptr: core::ptr::from_ref(
+                crate::page_box_pool::PAGEBOX_POOL.pooled_bytes_counter(),
+            ) as u64,
             config_ptr: settings.as_bytes().as_ptr() as u64,
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,

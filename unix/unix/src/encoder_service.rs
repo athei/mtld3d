@@ -187,8 +187,12 @@ pub struct EncoderContext {
     pub failed_submit_seq_ptr: u64,
     pub retained_bytes_ptr: u64,
     pub paced_present_seq_ptr: u64,
-    /// The address-space watch's packed figures, which the encoder reads for the Metal HUD rows.
-    pub free_va_ptr: u64,
+    /// The address-space watch's largest free block in MiB, for the Metal HUD rows.
+    pub largest_free_mib_ptr: u64,
+    /// `d3d9.dll`'s live page-box bytes, a static that lives as long as the image.
+    pub guest_page_bytes_ptr: u64,
+    /// `d3d9.dll`'s recycle pool's parked bytes, a static that lives as long as the image.
+    pub guest_pool_bytes_ptr: u64,
 }
 
 /// Inputs consumed once by the native encoder worker before admitting frames.
@@ -301,7 +305,9 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
             params.failed_submit_seq_ptr,
             params.retained_bytes_ptr,
             params.paced_present_seq_ptr,
-            params.free_va_ptr,
+            params.largest_free_mib_ptr,
+            params.guest_page_bytes_ptr,
+            params.guest_pool_bytes_ptr,
         ]
         .into_iter()
         .any(|pointer| pointer == 0 || pointer % 8 != 0)
@@ -339,7 +345,9 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
         failed_submit_seq_ptr: params.failed_submit_seq_ptr,
         retained_bytes_ptr: params.retained_bytes_ptr,
         paced_present_seq_ptr: params.paced_present_seq_ptr,
-        free_va_ptr: params.free_va_ptr,
+        largest_free_mib_ptr: params.largest_free_mib_ptr,
+        guest_page_bytes_ptr: params.guest_page_bytes_ptr,
+        guest_pool_bytes_ptr: params.guest_pool_bytes_ptr,
     };
     match EncoderService::new(context, config, caps, path, params.source_clock_ptr) {
         Ok(mut service) => {

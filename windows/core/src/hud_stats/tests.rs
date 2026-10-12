@@ -8,15 +8,13 @@ fn widest_sample() -> HudSample {
         draws_up: u32::MAX,
         draws_vb: u32::MAX,
         passes: u32::MAX,
-        pipelines: usize::MAX,
-        samplers: usize::MAX,
         textures: usize::MAX,
-        free_va: u64::MAX,
-        cpu_heap_bytes: u64::MAX,
+        largest_free_mib: u64::MAX,
+        guest_page_bytes: u64::MAX,
         in_flight_bytes: u64::MAX,
         reuse_pool_bytes: u64::MAX,
-        fixed_function: [usize::MAX; 2],
-        models: [[u32::MAX; 3]; 2],
+        fixed_function: usize::MAX,
+        programs: usize::MAX,
     }
 }
 
@@ -26,15 +24,13 @@ fn empty_sample() -> HudSample {
         draws_up: 0,
         draws_vb: 0,
         passes: 0,
-        pipelines: 0,
-        samplers: 0,
         textures: 0,
-        free_va: 0,
-        cpu_heap_bytes: 0,
+        largest_free_mib: 0,
+        guest_page_bytes: 0,
         in_flight_bytes: 0,
         reuse_pool_bytes: 0,
-        fixed_function: [0; 2],
-        models: [[0; 3]; 2],
+        fixed_function: 0,
+        programs: 0,
     }
 }
 
@@ -62,11 +58,10 @@ fn every_key_with_its_widest_value_leaves_a_column_free() {
 #[test]
 fn values_stay_bounded() {
     let rows = hud_rows(&widest_sample());
-    assert_eq!(rows[row("Mem 32-bit free MiB")], Some(4096));
     assert_eq!(rows[row("Mem 32-bit largest MiB")], Some(4096));
-    assert_eq!(rows[row("Mem CPU heap MiB")], Some(u32::MAX));
+    assert_eq!(rows[row("Mem guest pages MiB")], Some(u32::MAX));
     assert_eq!(rows[row("Live textures")], Some(u32::MAX));
-    assert_eq!(rows[row("Shaders VS FF")], Some(u32::MAX));
+    assert_eq!(rows[row("Shaders programmable")], Some(u32::MAX));
 }
 
 #[test]
@@ -155,19 +150,17 @@ fn every_row_carries_its_own_field() {
         draws_up: 1,
         draws_vb: 2,
         passes: 3,
-        pipelines: 4,
-        samplers: 5,
-        textures: 6,
-        free_va: pack_free_va(7, 8),
-        cpu_heap_bytes: 9 << 20,
-        in_flight_bytes: 10 << 20,
-        reuse_pool_bytes: 11 << 20,
-        fixed_function: [12, 16],
-        models: [[13, 14, 15], [17, 18, 19]],
+        textures: 4,
+        largest_free_mib: 5,
+        guest_page_bytes: 6 << 20,
+        in_flight_bytes: 7 << 20,
+        reuse_pool_bytes: 8 << 20,
+        fixed_function: 9,
+        programs: 10,
     };
     let rows = hud_rows(&sample);
     for (index, (key, value)) in HUD_ROW_KEYS.iter().zip(rows).enumerate() {
-        let expected = u32::try_from(index + 1).expect("19 rows");
+        let expected = u32::try_from(index + 1).expect("ten rows");
         assert_eq!(value, Some(expected), "{key}");
     }
 }
@@ -218,81 +211,27 @@ fn counters_wrap_instead_of_panicking() {
 }
 
 #[test]
-fn shader_programs_count_by_stage_and_model() {
-    let mut models = ShaderModels::default();
-    models.adopt(ShaderType::Pixel, 2);
-    models.adopt(ShaderType::Pixel, 2);
-    models.adopt(ShaderType::Pixel, 1);
-    models.adopt(ShaderType::Vertex, 3);
-    models.adopt(ShaderType::Vertex, 0);
-    models.adopt(ShaderType::Vertex, 4);
-    assert_eq!(models.counts(ShaderType::Pixel), [1, 2, 0]);
-    assert_eq!(models.counts(ShaderType::Vertex), [0, 0, 1]);
-}
-
-#[test]
-fn shader_rows_show_only_the_models_in_use() {
-    let mut sample = empty_sample();
-    sample.fixed_function = [12, 8];
-    sample.models = [[4, 210, 0], [0, 118, 0]];
-    let rows = hud_rows(&sample);
-    assert_eq!(rows[row("Shaders PS FF")], Some(12));
-    assert_eq!(rows[row("Shaders PS SM1")], Some(4));
-    assert_eq!(rows[row("Shaders PS SM2")], Some(210));
-    assert_eq!(rows[row("Shaders PS SM3")], None);
-    assert_eq!(rows[row("Shaders VS FF")], Some(8));
-    assert_eq!(rows[row("Shaders VS SM1")], None);
-    assert_eq!(rows[row("Shaders VS SM2")], Some(118));
-    assert_eq!(rows[row("Shaders VS SM3")], None);
-}
-
-#[test]
-fn the_other_rows_show_even_at_zero() {
+fn every_row_but_the_address_space_shows_even_at_zero() {
     let rows = hud_rows(&empty_sample());
-    for key in [
-        "Frame draws UP",
-        "Frame draws VB",
-        "Frame passes",
-        "Live pipelines",
-        "Live samplers",
-        "Live textures",
-        "Mem CPU heap MiB",
-        "Mem in flight MiB",
-        "Mem reuse pool MiB",
-    ] {
-        assert_eq!(rows[row(key)], Some(0), "{key}");
+    for (key, value) in HUD_ROW_KEYS.iter().zip(rows) {
+        if *key == "Mem 32-bit largest MiB" {
+            assert_eq!(value, None, "no walk yet leaves the row out");
+        } else {
+            assert_eq!(value, Some(0), "{key}");
+        }
     }
 }
 
 #[test]
 fn byte_figures_show_in_whole_mib() {
     let mut sample = empty_sample();
-    sample.cpu_heap_bytes = (96 << 20) + (300 << 10);
+    sample.guest_page_bytes = (96 << 20) + (300 << 10);
     sample.in_flight_bytes = (1 << 20) - 1;
     sample.reuse_pool_bytes = 64 << 20;
     let rows = hud_rows(&sample);
-    assert_eq!(rows[row("Mem CPU heap MiB")], Some(96));
+    assert_eq!(rows[row("Mem guest pages MiB")], Some(96));
     assert_eq!(rows[row("Mem in flight MiB")], Some(0));
     assert_eq!(rows[row("Mem reuse pool MiB")], Some(64));
-}
-
-#[test]
-fn the_address_space_word_round_trips_and_zero_leaves_its_rows_out() {
-    let packed = pack_free_va(1453, 512);
-    assert_eq!(unpack_free_va(packed), (1453, 512));
-    assert_eq!(
-        unpack_free_va(pack_free_va(u64::MAX, u64::MAX)),
-        (u32::MAX, u32::MAX)
-    );
-    let mut sample = empty_sample();
-    sample.free_va = packed;
-    let rows = hud_rows(&sample);
-    assert_eq!(rows[row("Mem 32-bit free MiB")], Some(1453));
-    assert_eq!(rows[row("Mem 32-bit largest MiB")], Some(512));
-    sample.free_va = 0;
-    let rows = hud_rows(&sample);
-    assert_eq!(rows[row("Mem 32-bit free MiB")], None);
-    assert_eq!(rows[row("Mem 32-bit largest MiB")], None);
 }
 
 #[test]
@@ -315,8 +254,6 @@ fn the_gate_lets_the_first_sample_through_then_one_per_period() {
 }
 
 #[test]
-fn the_index_constants_name_their_rows() {
-    assert_eq!(HUD_ROW_KEYS[ROW_MEM_32_FREE], "Mem 32-bit free MiB");
-    assert_eq!(HUD_ROW_KEYS[ROW_SHADERS], "Shaders PS FF");
-    assert_eq!(HUD_ROW_KEYS[ROW_SHADERS + 4], "Shaders VS FF");
+fn the_index_constant_names_its_row() {
+    assert_eq!(HUD_ROW_KEYS[ROW_MEM_32_LARGEST], "Mem 32-bit largest MiB");
 }

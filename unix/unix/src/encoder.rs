@@ -21,13 +21,13 @@ use mtld3d_core::{
     draw_data::VsSourceView,
     dxso::{
         DxsoProgram, FF_VS_PALETTE_BASE_ROW, LinkInputs, MAX_VERTEX_BLEND_MATRIX_INDEX,
-        SemanticSet, ShaderType, declared_ps_samplers,
+        SemanticSet, declared_ps_samplers,
     },
     encoder_packet::NativeVbibRetention,
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     guest_pages::GuestOwnedPage,
-    hud_stats::{HudFrameStats, HudSample, ShaderModels, hud_rows},
+    hud_stats::{HudFrameStats, HudSample, hud_rows},
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
@@ -336,6 +336,19 @@ impl SharedCounter {
         // SAFETY: `SharedCounter::new`'s contract.
         unsafe { &*self.0 }.fetch_sub(val, order)
     }
+}
+
+/// A Relaxed read of a shared `AtomicU64` counter, 0 for a null address.
+///
+/// # Safety
+///
+/// `raw` must be 0 or the address of an `AtomicU64` that stays live for the call.
+unsafe fn load_shared(raw: u64) -> u64 {
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: nonzero, so by the caller's contract a live `AtomicU64`.
+    unsafe { SharedCounter::new(raw) }.load(Ordering::Relaxed)
 }
 
 /// One entry of `FrameEncoder::sampler_resolve_memo`.
@@ -986,14 +999,16 @@ pub struct FrameEncoder {
 
     /// The draw and pass counts the Metal HUD rows show, kept in every build.
     hud_stats: HudFrameStats,
-    /// The game's shader programs by stage and shader model, for the Metal HUD rows.
-    shader_models: ShaderModels,
-    /// Pointer to the shared address-space word the PE watch thread stores.
+    /// Pointer to the largest free block, in MiB, the PE watch thread stores.
     ///
     /// Established by the device creation context and read only for a Metal
-    /// HUD sample; the word stays zero in a 64-bit build. 0 means no device
+    /// HUD sample; the value stays zero in a 64-bit build. 0 means no device
     /// supplied one.
-    free_va_ptr: u64,
+    largest_free_mib_ptr: u64,
+    /// Pointer to `d3d9.dll`'s live page-box bytes, a process-lifetime static; 0 for none.
+    guest_page_bytes_ptr: u64,
+    /// Pointer to `d3d9.dll`'s recycle pool's parked bytes, a process-lifetime static; 0 for none.
+    guest_pool_bytes_ptr: u64,
     /// This encoder's live rows in the Metal HUD.
     hud: crate::hud_state::HudReporter,
 
@@ -1733,8 +1748,9 @@ impl FrameEncoder {
             stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
             hud_stats: HudFrameStats::default(),
-            shader_models: ShaderModels::default(),
-            free_va_ptr: context.free_va_ptr,
+            largest_free_mib_ptr: context.largest_free_mib_ptr,
+            guest_page_bytes_ptr: context.guest_page_bytes_ptr,
+            guest_pool_bytes_ptr: context.guest_pool_bytes_ptr,
             hud,
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
@@ -5556,10 +5572,9 @@ impl FrameEncoder {
         if !outputs.is_empty() {
             self.prog_link_outputs.insert(shader_id, outputs);
         }
-        if let Entry::Vacant(slot) = self.program_cache.entry(shader_id) {
-            self.shader_models.adopt(program.shader_type, program.major);
-            slot.insert(Arc::new(program));
-        }
+        self.program_cache
+            .entry(shader_id)
+            .or_insert_with(|| Arc::new(program));
     }
 
     /// Which extra input semantics of the pixel shader `ps_id` the vertex shader `vs` outputs.
@@ -5720,9 +5735,8 @@ impl FrameEncoder {
     /// Send the Metal HUD this device's figures, at most twice a second, once the HUD has loaded.
     ///
     /// Runs on the encoder thread after a frame's reply has gone out. Every
-    /// figure is one that is kept anyway: the frame counters, map lengths,
-    /// two atomic loads of PE counters, snmalloc's own statistic and the
-    /// pools' running totals, so a sample walks nothing.
+    /// figure is one that is kept anyway: the frame counters, map lengths and
+    /// four Relaxed loads of PE counters, so a sample walks nothing.
     fn report_hud(&mut self) {
         if self.hud.is_inert() {
             return;
@@ -5733,43 +5747,28 @@ impl FrameEncoder {
         if !self.hud.sample_due(rdtsc(), hz) {
             return;
         }
-        let free_va = if self.free_va_ptr == 0 {
-            0
-        } else {
-            // SAFETY: `free_va_ptr` is a PE-heap `Arc<AtomicU64>` the device
-            // creation context supplied, kept alive until native destruction.
-            unsafe { SharedCounter::new(self.free_va_ptr) }.load(Ordering::Relaxed)
-        };
-        let in_flight_bytes = if self.retained_bytes_ptr == 0 {
-            0
-        } else {
-            // SAFETY: see `add_retained_bytes`.
-            unsafe { SharedCounter::new(self.retained_bytes_ptr) }.load(Ordering::Relaxed)
-        };
+        // SAFETY: the device creation context supplied this pointer: a PE-heap
+        // `Arc<AtomicU64>` kept alive until native destruction, or 0.
+        let largest_free_mib = unsafe { load_shared(self.largest_free_mib_ptr) };
+        // SAFETY: as above; see `add_retained_bytes`.
+        let in_flight_bytes = unsafe { load_shared(self.retained_bytes_ptr) };
+        // SAFETY: the creation context supplied the address of an `AtomicU64`
+        // static of `d3d9.dll`, which lives as long as the process, or 0.
+        let guest_page_bytes = unsafe { load_shared(self.guest_page_bytes_ptr) };
+        // SAFETY: as above, the gauge inside `d3d9.dll`'s pool static.
+        let reuse_pool_bytes = unsafe { load_shared(self.guest_pool_bytes_ptr) };
         let shown = self.hud_stats.shown();
-        let (fixed_vertex, fixed_pixel) = self.libraries.ff_counts();
         let sample = HudSample {
             draws_up: shown.draws_up(),
             draws_vb: shown.draws_vb(),
             passes: shown.passes(),
-            pipelines: self.pipeline_cache.len(),
-            samplers: self.sampler_cache.len(),
             textures: self.texture_cache.len(),
-            free_va,
-            cpu_heap_bytes: u64::try_from(
-                snmalloc_rs::SnMalloc::memory_stats().current_memory_usage,
-            )
-            .unwrap_or(u64::MAX),
+            largest_free_mib,
+            guest_page_bytes,
             in_flight_bytes,
-            reuse_pool_bytes: u64::try_from(self.pagebox_pool.pooled_bytes())
-                .unwrap_or(u64::MAX)
-                .saturating_add(self.texture_versions.parked_bytes())
-                .saturating_add(self.texture_versions.pending_destroy_bytes()),
-            fixed_function: [fixed_pixel, fixed_vertex],
-            models: [
-                self.shader_models.counts(ShaderType::Pixel),
-                self.shader_models.counts(ShaderType::Vertex),
-            ],
+            reuse_pool_bytes,
+            fixed_function: self.libraries.ff_count(),
+            programs: self.program_cache.len(),
         };
         self.hud.report(&hud_rows(&sample));
     }

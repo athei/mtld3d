@@ -33,6 +33,16 @@ pub fn live_bytes() -> u64 {
     PAGEBOX_LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The counter [`live_bytes`] reads, for a reader in another linkage unit.
+///
+/// Each linkage unit has its own copy of this crate and of the counter, so
+/// the native encoder reads `d3d9.dll`'s through this address, which the
+/// device passes at encoder creation. The static lives as long as the image.
+#[must_use]
+pub const fn live_bytes_counter() -> &'static core::sync::atomic::AtomicU64 {
+    &PAGEBOX_LIVE_BYTES
+}
+
 /// Cumulative count of `PageBox` allocations served by the global allocator.
 #[cfg(perf_tracking)]
 static PAGEBOX_ALLOCS: AtomicU64 = AtomicU64::new(0);
