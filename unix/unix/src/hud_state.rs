@@ -65,9 +65,26 @@ const DOMAINS_KEY: &str = "MTL_HUD_STATE_REPORTER_DOMAINS";
 /// which follows its first encoded frame, so the newest device that renders
 /// holds them; an encoder reports only while it holds them, and the holder's
 /// teardown clears the rows and leaves them to the next surviving encoder that
-/// samples. Touched at an encoder's teardown and at most [`HUD_SAMPLE_HZ`]
-/// times a second per encoder.
+/// samples. A holder that stops sampling, a device that submitted once and
+/// went idle, loses the rows to an encoder that samples once
+/// [`OWNER_SAMPLED`] is [`STALE_PERIODS`] sample periods old. Touched at an
+/// encoder's teardown and at most [`HUD_SAMPLE_HZ`] times a second per encoder.
 static OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC reading of the rows' holder's last due sample.
+///
+/// Process-wide with [`OWNER`], for the same reason: one set of rows per
+/// process, so one record of when its holder last sampled. Written by the
+/// holder at each due sample and by an encoder that takes the rows, read by
+/// the others at theirs. The two words are not updated together, and need not
+/// be: a takeover that races the holder's own sample can leave both encoders
+/// reporting once, after which the loser sees it no longer holds the rows and
+/// the winner's fresh reading keeps it from being taken back, so the rows
+/// settle within one sample period without a lock.
+static OWNER_SAMPLED: AtomicU64 = AtomicU64::new(0);
+
+/// Sample periods without a sample from the holder after which another encoder may take the rows.
+const STALE_PERIODS: u64 = 2;
 
 extern_class!(
     /// The reporter `StateReporting` hands out, one per domain.
@@ -266,27 +283,49 @@ impl HudReporter {
     /// Whether a sample is due at TSC reading `now` on a clock of `hz`.
     ///
     /// Due at most [`HUD_SAMPLE_HZ`] times a second, once the reporter is
-    /// live, and only while this encoder holds the domain's rows. It takes
-    /// them at its first due sample, whoever held them, and afterwards only
-    /// when no encoder does.
+    /// live, and only while this encoder holds the domain's rows
+    /// ([`Self::hold_rows`]).
     pub fn sample_due(&mut self, now: u64, hz: u64) -> bool {
-        if self.is_inert() || !self.gate.due(now, hz / HUD_SAMPLE_HZ) {
+        let period = hz / HUD_SAMPLE_HZ;
+        if self.is_inert() || !self.gate.due(now, period) {
             return false;
         }
+        let holds = self.hold_rows(now, period);
+        if matches!(self.state, ReporterState::Waiting) {
+            self.state = go_live();
+        }
+        holds && matches!(self.state, ReporterState::Live(_))
+    }
+
+    /// Whether this encoder holds the rows at a due sample at `now`, taking them if it may.
+    ///
+    /// It takes them at its first due sample, whoever held them, and
+    /// afterwards when no encoder holds them or when the holder has not had a
+    /// due sample for [`STALE_PERIODS`] periods of `period` cycles. The holder
+    /// records each of its samples in [`OWNER_SAMPLED`].
+    fn hold_rows(&mut self, now: u64, period: u64) -> bool {
         if !self.claimed {
             self.claimed = true;
             OWNER.store(self.owner_id, Ordering::Relaxed);
+            OWNER_SAMPLED.store(now, Ordering::Relaxed);
+            return true;
         }
-        if matches!(self.state, ReporterState::Waiting) {
-            self.state = go_live();
-            if !matches!(self.state, ReporterState::Live(_)) {
-                return false;
-            }
+        let owner = OWNER.load(Ordering::Relaxed);
+        // Saturating: a holder's reading taken on another core just after
+        // `now` counts as fresh, never as a wrapped-around age.
+        let free = owner == 0
+            || (owner != self.owner_id
+                && now.saturating_sub(OWNER_SAMPLED.load(Ordering::Relaxed))
+                    >= period.saturating_mul(STALE_PERIODS));
+        let holds = owner == self.owner_id
+            || (free
+                && OWNER
+                    .compare_exchange(owner, self.owner_id, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok());
+        if holds {
+            OWNER_SAMPLED.store(now, Ordering::Relaxed);
         }
-        match OWNER.compare_exchange(0, self.owner_id, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => true,
-            Err(owner) => owner == self.owner_id,
-        }
+        holds
     }
 
     /// Replace the domain's rows with `rows`, indexed like `HUD_ROW_KEYS`; `None` leaves one out.
