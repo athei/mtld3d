@@ -57,8 +57,9 @@ and no game breaks, speed wins. Those trades are listed in
   and has hardware-cursor latency. Under HDR it is tone-mapped like the
   frame, where the macOS cursor stays at SDR brightness. Showing or hiding it
   does not delay the next present by a refresh as the hardware cursor does.
-  It is on by default whenever HDR output is active, and can be forced on or
-  off. Turned off, the game gets the hardware cursor.
+  Off by default, because its window takes the game window off the direct
+  path to the display. It can be turned on whenever HDR output is active, or
+  always. Turned off, the game gets the hardware cursor.
 - **Game profiles.** The few games that need settings of their own get a
   built-in profile.
 

@@ -1,10 +1,17 @@
 //! Unit tests for present routing, the geometry settle filter and the blit copy guard.
 //!
-//! `present_route` is checked across the geometries a present can produce: equal extents
-//! copy, an enlargement in both axes reaches `MetalFX` only if it exists, and anything
-//! else falls to the stretch shader. The settle tests pin the other half of the decision,
-//! that a scaler is spent on a geometry that held still rather than on a ratio, which is
-//! what keeps a window drag from building one scaler per frame.
+//! `present_route` is checked across the geometries a present can produce: an enlargement
+//! in both axes reaches `MetalFX` only if it exists, and anything else, equal extents
+//! included, falls to the present shader. The settle tests pin the other half of the
+//! decision, that a scaler is spent on a geometry that held still rather than on a ratio,
+//! which is what keeps a window drag from building one scaler per frame.
+//!
+//! The present passes run on the GPU into Private, render-target-only destinations shaped
+//! like a framebuffer-only drawable. The SDR pass without a ramp, and the exact copy the
+//! `MetalFX` route ends with, at matching odd extents must give back the source byte for
+//! byte. A ramp pass that cannot be encoded must leave the plain copy on the destination,
+//! and the HDR pass-through must write the linear values of the source into an
+//! `RGBA16Float` destination.
 //!
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
@@ -117,16 +124,18 @@ fn another_devices_entries_never_answer_a_wait() {
     );
 }
 
-/// Matching extents take the blit whether or not `MetalFX` exists.
+/// Matching extents take the shader's exact copy whether or not `MetalFX` exists.
+///
+/// The drawable is framebuffer-only, so no blit can write it.
 #[test]
-fn equal_extents_route_to_the_blit() {
+fn equal_extents_route_to_the_shader() {
     assert_eq!(
         present_route((1920, 1080), (1920, 1080), true),
-        PresentRoute::Copy
+        PresentRoute::Shader
     );
     assert_eq!(
         present_route((1920, 1080), (1920, 1080), false),
-        PresentRoute::Copy
+        PresentRoute::Shader
     );
 }
 
@@ -139,7 +148,7 @@ fn enlargement_routes_to_metalfx_when_present() {
     );
     assert_eq!(
         present_route((1280, 720), (1920, 1080), false),
-        PresentRoute::Stretch
+        PresentRoute::Shader
     );
 }
 
@@ -148,23 +157,23 @@ fn enlargement_routes_to_metalfx_when_present() {
 fn minification_routes_to_the_shader() {
     assert_eq!(
         present_route((1920, 1080), (1280, 720), true),
-        PresentRoute::Stretch
+        PresentRoute::Shader
     );
 }
 
 /// A drawable larger in one axis and smaller in the other is a stretch.
 ///
-/// `MTLFXSpatialScaler` rejects the pair, and the blit would leave the
-/// axis where the drawable is larger unwritten.
+/// `MTLFXSpatialScaler` rejects the pair; the shader covers every pixel of
+/// the drawable whatever the ratio.
 #[test]
 fn mixed_axis_change_routes_to_the_shader() {
     assert_eq!(
         present_route((1920, 720), (1280, 1080), true),
-        PresentRoute::Stretch
+        PresentRoute::Shader
     );
     assert_eq!(
         present_route((1280, 1080), (1920, 720), true),
-        PresentRoute::Stretch
+        PresentRoute::Shader
     );
 }
 
@@ -1655,4 +1664,357 @@ fn a_committed_frame_wakes_the_frame_latency_wait() {
         atomic_address(&upload),
         atomic_address(&failed),
     );
+}
+
+/// Odd extents a present copies at, off any power-of-two texel grid.
+const EXACT_EXTENTS: [(usize, usize); 2] = [(1366, 768), (1311, 847)];
+
+/// The present shader's SDR pass without a ramp copies matching extents byte for byte.
+///
+/// At matching extents that pass is the whole present, into a drawable no
+/// blit can write. A fragment that missed its texel centre would filter in a
+/// neighbour, and random contents make every such blend visible.
+#[test]
+fn the_sdr_present_pass_copies_matching_extents_exactly() {
+    let queue = test_queue();
+    for (width, height) in EXACT_EXTENTS {
+        let (src, expected) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, width, height);
+        let dst = drawable_shaped(&queue, MTLPixelFormat::BGRA8Unorm, width, height);
+        let cmd = queue.commandBuffer().expect("command buffer");
+        cmd.setLabel(Some(&NSString::from_str("mtld3d-test-present-copy")));
+        assert!(super::encode_present_copy(&cmd, &src, &dst, 0));
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        assert_eq!(
+            cmd.status(),
+            MTLCommandBufferStatus::Completed,
+            "{:?}",
+            cmd.error()
+        );
+        assert_texels_equal(&texture_bytes(&queue, &dst), &expected, 4, width);
+    }
+}
+
+/// The copy that carries a `MetalFX` output onto the drawable reproduces it in both formats.
+///
+/// The SDR drawable is `BGRA8Unorm` and the HDR one `RGBA16Float`, whose
+/// random contents are finite normal halves, positive and negative, beyond
+/// `1.0` included.
+#[test]
+fn the_exact_copy_reproduces_its_source_in_both_drawable_formats() {
+    let queue = test_queue();
+    for format in [MTLPixelFormat::BGRA8Unorm, MTLPixelFormat::RGBA16Float] {
+        for (width, height) in EXACT_EXTENTS {
+            let (src, expected) = random_source(&queue, format, width, height);
+            let dst = drawable_shaped(&queue, format, width, height);
+            let cmd = queue.commandBuffer().expect("command buffer");
+            cmd.setLabel(Some(&NSString::from_str("mtld3d-test-exact-copy")));
+            assert!(super::encode_exact_copy(&cmd, &src, &dst), "{format:?}");
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            assert_eq!(
+                cmd.status(),
+                MTLCommandBufferStatus::Completed,
+                "{:?}",
+                cmd.error()
+            );
+            assert_texels_equal(
+                &texture_bytes(&queue, &dst),
+                &expected,
+                bytes_per_texel(format),
+                width,
+            );
+        }
+    }
+}
+
+/// A ramp pass that cannot be encoded leaves the plain copy on the destination.
+///
+/// The ramp pipeline here is a null handle, so its pass is skipped the way a
+/// pass whose gamma table went away is. The plain pass must then write the
+/// render-target-only destination, which no blit could.
+#[test]
+fn a_ramp_pass_that_fails_falls_back_to_the_plain_copy() {
+    let queue = test_queue();
+    let (width, height) = EXACT_EXTENTS[1];
+    let (src, expected) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, width, height);
+    let dst = drawable_shaped(&queue, MTLPixelFormat::BGRA8Unorm, width, height);
+    let resources =
+        crate::metal::present::ensure_resources(&queue.device()).expect("present pipelines");
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-ramp-fallback")));
+    assert!(super::encode_present_pass(
+        &cmd,
+        &src,
+        &dst,
+        &super::PresentStage {
+            plain: resources.copy,
+            ramp: Some(0),
+            uniforms: None,
+            gamma_layer: 1,
+        },
+    ));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    assert_texels_equal(&texture_bytes(&queue, &dst), &expected, 4, width);
+}
+
+/// The HDR pass-through writes the source's linear values into an `RGBA16Float` destination.
+///
+/// The destination is Private and render-target only, like the float
+/// drawable of an EDR layer. One texel value covers the three branches of the
+/// decode: zero, a mid-tone on the power curve, and full scale.
+#[test]
+fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
+    let queue = test_queue();
+    let (width, height) = EXACT_EXTENTS[1];
+    // Blue, green, red, alpha of a `BGRA8Unorm` texel.
+    let texel = [0_u8, 128, 255, 255];
+    let src = uploaded(
+        &queue,
+        MTLPixelFormat::BGRA8Unorm,
+        (width, height),
+        &texel.repeat(width * height),
+    );
+    let dst = drawable_shaped(&queue, MTLPixelFormat::RGBA16Float, width, height);
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-passthrough")));
+    assert!(super::encode_hdr_present(&cmd, &src, &dst, 1.0, 0));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    let mid_tone = ((128.0_f32 / 255.0 + 0.055) / 1.055).powf(2.4);
+    let expected = [1.0, mid_tone, 0.0, 1.0];
+    let bytes = texture_bytes(&queue, &dst);
+    for (index, texel) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        let channels = texel
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|half| half_to_f32(u16::from_le_bytes(*half)));
+        for (channel, (read, wanted)) in channels.zip(expected).enumerate() {
+            assert!(
+                (read - wanted).abs() <= 1.0e-3,
+                "texel {index} channel {channel} reads {read}, the linear value is {wanted}"
+            );
+        }
+    }
+}
+
+/// A finite IEEE half's value.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let mantissa = bits & 0x3ff;
+    if exponent == 0 {
+        return sign * f32::from(mantissa) / 16_777_216.0;
+    }
+    let normal = f32::from_bits(((exponent + 112) << 23) | (u32::from(mantissa) << 13));
+    sign * normal
+}
+
+/// Bytes per texel of the two drawable formats.
+fn bytes_per_texel(format: MTLPixelFormat) -> usize {
+    if format == MTLPixelFormat::RGBA16Float {
+        8
+    } else {
+        4
+    }
+}
+
+/// A Private, shader-readable texture filled with random texels, and those texels' bytes.
+///
+/// `RGBA16Float` texels are finite normal halves: a NaN payload or a denormal
+/// is not something a drawable ever carries.
+fn random_source(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    format: MTLPixelFormat,
+    width: usize,
+    height: usize,
+) -> (Retained<ProtocolObject<dyn MTLTexture>>, Vec<u8>) {
+    let bpp = bytes_per_texel(format);
+    let mut state =
+        0x9e37_79b9_7f4a_7c15_u64 ^ u64::try_from(width * 4096 + height).expect("a small extent");
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let bytes: Vec<u8> = if bpp == 8 {
+        (0..width * height * 4)
+            .flat_map(|_| {
+                let random = next();
+                let sign = u16::from(random & 1 == 1) << 15;
+                let exponent = u16::try_from(1 + (random >> 1) % 30).expect("below 31") << 10;
+                let mantissa = u16::try_from((random >> 8) & 0x3ff).expect("ten bits");
+                (sign | exponent | mantissa).to_le_bytes()
+            })
+            .collect()
+    } else {
+        (0..width * height)
+            .flat_map(|_| {
+                u32::try_from(next() >> 32)
+                    .expect("the high half")
+                    .to_le_bytes()
+            })
+            .collect()
+    };
+    (uploaded(queue, format, (width, height), &bytes), bytes)
+}
+
+/// A Private, shader-readable texture holding `bytes`, rows packed.
+///
+/// Uploaded through a blit from a shared buffer, which works whether or not
+/// the GPU has unified memory.
+fn uploaded(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    format: MTLPixelFormat,
+    (width, height): (usize, usize),
+    bytes: &[u8],
+) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    let device = queue.device();
+    let row = width * bytes_per_texel(format);
+    assert_eq!(bytes.len(), row * height, "one packed image");
+    let buffer = device
+        .newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared)
+        .expect("upload buffer");
+    buffer.setLabel(Some(&NSString::from_str("mtld3d-test-exact-upload")));
+    // SAFETY: the shared buffer was created with exactly `bytes.len()` bytes
+    // and nothing else references it yet.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buffer.contents().as_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    let texture = texture_2d(
+        &device,
+        format,
+        (width, height),
+        MTLTextureUsage::ShaderRead,
+    );
+    let cmd = queue.commandBuffer().expect("upload command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-exact-upload")));
+    let blit = cmd.blitCommandEncoder().expect("upload blit");
+    blit.setLabel(Some(&NSString::from_str("mtld3d-test-exact-upload-copy")));
+    // SAFETY: the buffer holds `height` rows of `row` bytes, exactly the
+    // texture's extent, and both stay alive until the copy completes.
+    unsafe {
+        blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+            &buffer, 0, row, row * height, MTLSize { width, height, depth: 1 },
+            &texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+    blit.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+    texture
+}
+
+/// A texture shaped like a framebuffer-only drawable: Private and render-target only.
+fn drawable_shaped(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    format: MTLPixelFormat,
+    width: usize,
+    height: usize,
+) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    texture_2d(
+        &queue.device(),
+        format,
+        (width, height),
+        MTLTextureUsage::RenderTarget,
+    )
+}
+
+/// One Private, single-level 2D texture.
+fn texture_2d(
+    device: &ProtocolObject<dyn MTLDevice>,
+    format: MTLPixelFormat,
+    (width, height): (usize, usize),
+    usage: MTLTextureUsage,
+) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    // SAFETY: objc2 typed binding; a single-level 2D descriptor of a colour
+    // format at an extent within Metal's limits.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            format, width, height, false,
+        )
+    };
+    desc.setStorageMode(MTLStorageMode::Private);
+    desc.setUsage(usage);
+    let texture = device
+        .newTextureWithDescriptor(&desc)
+        .expect("test texture");
+    texture.setLabel(Some(&NSString::from_str("mtld3d-test-exact")));
+    texture
+}
+
+/// Every texel of `texture`, rows packed, read back through a staging buffer.
+fn texture_bytes(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+) -> Vec<u8> {
+    let (width, height) = (texture.width(), texture.height());
+    let row = width * bytes_per_texel(texture.pixelFormat());
+    let stride = row.next_multiple_of(256);
+    let buffer = queue
+        .device()
+        .newBufferWithLength_options(stride * height, MTLResourceOptions::StorageModeShared)
+        .expect("readback buffer");
+    buffer.setLabel(Some(&NSString::from_str("mtld3d-test-exact-readback")));
+    let cmd = queue.commandBuffer().expect("readback command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-exact-readback")));
+    let blit = cmd.blitCommandEncoder().expect("readback blit");
+    blit.setLabel(Some(&NSString::from_str("mtld3d-test-exact-readback-copy")));
+    // SAFETY: the buffer holds `height` rows of `stride` bytes, enough for
+    // the whole texture, and both stay alive until the copy completes.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width, height, depth: 1 },
+            &buffer, 0, stride, stride * height,
+        );
+    }
+    blit.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+    // SAFETY: the completed copy initialized every row of the shared buffer,
+    // which is `stride * height` bytes long.
+    let all = unsafe {
+        core::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), stride * height)
+    };
+    all.chunks_exact(stride)
+        .flat_map(|line| &line[..row])
+        .copied()
+        .collect()
+}
+
+/// Assert two packed images are equal, naming the first texel that differs.
+fn assert_texels_equal(actual: &[u8], expected: &[u8], bpp: usize, width: usize) {
+    assert_eq!(actual.len(), expected.len());
+    let pairs = || actual.chunks_exact(bpp).zip(expected.chunks_exact(bpp));
+    if let Some(first) = pairs().position(|(read, wrote)| read != wrote) {
+        let differing = pairs().filter(|(read, wrote)| read != wrote).count();
+        panic!(
+            "texel ({}, {}) reads {:?} where the source holds {:?}; {differing} texels differ",
+            first % width,
+            first / width,
+            &actual[first * bpp..(first + 1) * bpp],
+            &expected[first * bpp..(first + 1) * bpp],
+        );
+    }
 }

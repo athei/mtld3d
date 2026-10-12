@@ -11,9 +11,14 @@
 //!
 //! Both caches in this module belong to one device's record. The map-only
 //! tests pin that bookkeeping without a Metal object behind the entries: a
-//! bound and an eviction list per cache, and a retire that empties one cache
-//! and leaves another alone. The GPU-backed tests pin that two devices at one
-//! geometry are served two objects rather than one stateful one.
+//! bound and an eviction list per cache, a retire that empties one cache and
+//! leaves another alone, and a lookup that leaves the drawable-sized output on
+//! its own entry only. The GPU-backed tests pin that two devices at one
+//! geometry are served two objects rather than one stateful one, that a device
+//! resized through more geometries than the cap holds keeps one output, and
+//! that a destination shaped like a framebuffer-only drawable (Private,
+//! render-target only) reads back exactly the scaler's Private intermediate,
+//! in SDR and HDR.
 
 use mtld3d_shared::mtl::PixelFormat;
 use objc2::runtime::ProtocolObject;
@@ -26,8 +31,8 @@ use rustc_hash::FxHashMap;
 
 use super::{
     MAX_CACHED_SCALERS, MAX_CACHED_SCRATCH, ScalerCache, ScalerEntry, ScalerKey, ScalerSlot,
-    ScratchCache, ScratchEntry, ScratchKey, UpscaleCache, evict_least_recently_used, scratch_in,
-    take_evicted, take_scalers, take_scratch,
+    ScratchCache, ScratchEntry, ScratchKey, UpscaleCache, detach_other_outputs,
+    evict_least_recently_used, scratch_in, take_evicted, take_scalers, take_scratch,
 };
 
 /// A cache's live scaler count.
@@ -127,11 +132,7 @@ fn walking_through_geometries_bounds_the_cache_and_releases_evictions() {
         let (w, h) = (640 + step * 2, 400 + step * 2);
         let (Some(src), Some(dst)) = (
             texture(w / 2, h / 2, MTLTextureUsage::ShaderRead),
-            texture(
-                w,
-                h,
-                MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderWrite,
-            ),
+            texture(w, h, MTLTextureUsage::RenderTarget),
         ) else {
             return;
         };
@@ -237,6 +238,54 @@ fn the_bound_the_eviction_list_and_a_retire_are_per_device() {
     );
 }
 
+/// A lookup leaves the drawable-sized output on its own entry alone.
+///
+/// Every other entry's output moves to the eviction list as an output-only
+/// slot, so a device at its scaler cap holds one output rather than one per
+/// geometry. Map bookkeeping only: the pointers are never dereferenced or
+/// released.
+#[test]
+fn a_lookup_keeps_one_output_and_detaches_the_rest() {
+    let mut cache = cache_with(bound(), 0x1000);
+    for (step, entry) in (0_usize..).zip(cache.scalers.values_mut()) {
+        entry.slot.output =
+            core::ptr::without_provenance_mut::<ProtocolObject<dyn MTLTexture>>(0x9000 + step);
+    }
+    let kept_key = scaler_key(64 + 3);
+    let kept = cache.scalers[&kept_key].slot.output;
+
+    detach_other_outputs(&mut cache, kept_key);
+
+    let live: Vec<_> = cache
+        .scalers
+        .iter()
+        .filter(|(_, entry)| !entry.slot.output.is_null())
+        .collect();
+    assert!(
+        live.len() == 1 && *live[0].0 == kept_key && live[0].1.slot.output == kept,
+        "only the looked-up entry keeps an output, and keeps its own"
+    );
+    let evicted = take_evicted(&mut cache);
+    assert_eq!(evicted.len(), MAX_CACHED_SCALERS - 1);
+    assert!(
+        evicted
+            .iter()
+            .all(|slot| slot.scaler.is_null() && !slot.output.is_null() && slot.output != kept),
+        "each detached output waits alone, with no scaler beside it"
+    );
+    assert_eq!(
+        cache.scalers.len(),
+        MAX_CACHED_SCALERS,
+        "detaching an output keeps its scaler cached"
+    );
+
+    detach_other_outputs(&mut cache, kept_key);
+    assert!(
+        take_evicted(&mut cache).is_empty(),
+        "a second lookup of the same geometry detaches nothing"
+    );
+}
+
 /// Two devices at one geometry are served two scalers, not one shared object.
 ///
 /// `MTLFXSpatialScaler` carries its input and output textures as properties
@@ -265,11 +314,7 @@ fn two_devices_at_one_geometry_get_their_own_scaler() {
     };
     let (Some(src), Some(dst)) = (
         texture(320, 200, MTLTextureUsage::ShaderRead),
-        texture(
-            640,
-            400,
-            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderWrite,
-        ),
+        texture(640, 400, MTLTextureUsage::RenderTarget),
     ) else {
         return;
     };
@@ -592,6 +637,21 @@ fn target(
     texture
 }
 
+/// A destination shaped like a framebuffer-only drawable: Private and render-target only.
+fn drawable(
+    device: &ProtocolObject<dyn MTLDevice>,
+    size: usize,
+    format: MTLPixelFormat,
+) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+    target(
+        device,
+        size,
+        format,
+        MTLStorageMode::Private,
+        MTLTextureUsage::RenderTarget,
+    )
+}
+
 fn fill(
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
@@ -700,10 +760,33 @@ fn output_count(cache: &UpscaleCache) -> usize {
         .count()
 }
 
-/// The indirect route must produce exactly the same pixels as direct Private output.
+/// The scaler's own output, cached on the slot, of the one geometry `cache` holds.
+fn cached_output(
+    cache: &UpscaleCache,
+) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+    let scalers = cache.scalers.lock().expect("cache lock");
+    assert_eq!(scalers.scalers.len(), 1, "one geometry, one scaler");
+    let output = scalers
+        .scalers
+        .values()
+        .next()
+        .map(|entry| entry.slot.output)
+        .expect("one cached scaler");
+    // SAFETY: the cache holds the output's canonical retain under the lock
+    // taken above; this adds a retain of the test's own.
+    let retained = unsafe { objc2::rc::Retained::retain(output) };
+    drop(scalers);
+    retained.expect("the scaler wrote an intermediate")
+}
+
+/// A drawable-shaped destination receives exactly the scaler's output, in SDR and HDR.
+///
+/// The scaler cannot write a framebuffer-only drawable, so it always writes a
+/// Private intermediate and a copy pass carries it across: the destination
+/// must read back byte for byte what the intermediate holds.
 #[test]
-fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
-    use objc2_metal::{MTLCommandBufferStatus, MTLResource};
+fn drawable_outputs_equal_the_intermediate_in_sdr_and_hdr() {
+    use objc2_metal::MTLCommandBufferStatus;
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
     let cache = UpscaleCache::new();
@@ -726,35 +809,19 @@ fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
             MTLStorageMode::Private,
             MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
         );
-        let direct = target(
-            &device,
-            64,
-            format,
-            MTLStorageMode::Private,
-            MTLTextureUsage::Unknown,
-        );
-        let copied = target(
-            &device,
-            64,
-            format,
-            MTLStorageMode::Managed,
-            MTLTextureUsage::Unknown,
-        );
-        assert_eq!(copied.storageMode(), MTLStorageMode::Managed);
+        let dst = drawable(&device, 64, format);
         let cmd = queue.commandBuffer().expect("command buffer");
         cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
             "mtld3d-test-upscale-pair",
         )));
         fill(&cmd, &src, red);
-        assert!(super::encode(&cmd, &device, &cache, &src, &direct, mode));
+        assert!(super::can_scale(&device, &cache, &src, &dst, mode));
         assert_eq!(
             output_count(&cache),
-            0,
-            "direct output allocates no intermediate"
+            1,
+            "a drawable-shaped destination always gets an intermediate"
         );
-        assert!(super::can_scale(&device, &cache, &src, &copied, mode));
-        assert_eq!(output_count(&cache), 1);
-        assert!(super::encode(&cmd, &device, &cache, &src, &copied, mode));
+        assert!(super::encode(&cmd, &device, &cache, &src, &dst, mode));
         cmd.commit();
         cmd.waitUntilCompleted();
         assert_eq!(
@@ -763,8 +830,8 @@ fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
             "{:?}",
             cmd.error()
         );
-        let actual = pixels(&queue, &copied);
-        assert_eq!(actual, pixels(&queue, &direct));
+        let actual = pixels(&queue, &dst);
+        assert_eq!(actual, pixels(&queue, &cached_output(&cache)));
         if format == MTLPixelFormat::RGBA16Float {
             for pixel in actual.as_chunks::<8>().0 {
                 assert!(
@@ -811,13 +878,7 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
         MTLStorageMode::Private,
         MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
     );
-    let dst = target(
-        &device,
-        64,
-        MTLPixelFormat::BGRA8Unorm,
-        MTLStorageMode::Managed,
-        MTLTextureUsage::Unknown,
-    );
+    let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
     let key = super::scaler_key(&src, &dst, mode).expect("key");
     let mut scalers = ScalerCache {
@@ -882,13 +943,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
                 MTLStorageMode::Private,
                 MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
             );
-            let dst = target(
-                &device,
-                32 + step * 2,
-                MTLPixelFormat::BGRA8Unorm,
-                MTLStorageMode::Managed,
-                MTLTextureUsage::Unknown,
-            );
+            let dst = drawable(&device, 32 + step * 2, MTLPixelFormat::BGRA8Unorm);
             let cmd = queue.commandBuffer().expect("command buffer");
             cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
                 "mtld3d-test-upscale-resize",
@@ -904,7 +959,11 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
             ));
             cmd.commit();
             submitted.push((index, cmd, dst));
-            assert!(output_count(cache) <= MAX_CACHED_SCALERS);
+            assert_eq!(
+                output_count(cache),
+                1,
+                "a device keeps one drawable-sized output however many geometries it walked"
+            );
         }
     }
     // No per-frame wait: older encoded resources must survive cache eviction.
@@ -926,11 +985,11 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
         );
     }
     let [first, second] = &caches;
-    assert_eq!(output_count(first), MAX_CACHED_SCALERS);
-    assert_eq!(output_count(second), MAX_CACHED_SCALERS);
+    assert_eq!(output_count(first), 1);
+    assert_eq!(output_count(second), 1);
     super::retire(first);
     assert_eq!(output_count(first), 0);
-    assert_eq!(output_count(second), MAX_CACHED_SCALERS);
+    assert_eq!(output_count(second), 1);
     super::retire(second);
     // A retired cache must build a fresh entry for its next request.
     let src = target(
@@ -940,13 +999,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
         MTLStorageMode::Private,
         MTLTextureUsage::ShaderRead,
     );
-    let dst = target(
-        &device,
-        64,
-        MTLPixelFormat::BGRA8Unorm,
-        MTLStorageMode::Managed,
-        MTLTextureUsage::Unknown,
-    );
+    let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
     assert!(super::can_scale(
         &device,
         first,
@@ -972,13 +1025,7 @@ fn fallback_submission_drains_preflight_evictions() {
             MTLStorageMode::Private,
             MTLTextureUsage::ShaderRead,
         );
-        let dst = target(
-            &device,
-            32 + step * 2,
-            MTLPixelFormat::BGRA8Unorm,
-            MTLStorageMode::Managed,
-            MTLTextureUsage::Unknown,
-        );
+        let dst = drawable(&device, 32 + step * 2, MTLPixelFormat::BGRA8Unorm);
         assert!(super::can_scale(
             &device,
             &cache,
@@ -987,7 +1034,9 @@ fn fallback_submission_drains_preflight_evictions() {
             MTLFXSpatialScalerColorProcessingMode::Perceptual
         ));
     }
-    assert_eq!(pending_release_count(&cache), 1);
+    // Each new geometry detached the previous one's output, and the last one
+    // evicted the least recently used scaler: eight outputs and one scaler.
+    assert_eq!(pending_release_count(&cache), MAX_CACHED_SCALERS + 1);
     let cmd = queue.commandBuffer().expect("fallback command buffer");
     cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-fallback",
@@ -1000,9 +1049,15 @@ fn fallback_submission_drains_preflight_evictions() {
     assert_eq!(output_count(&cache), 0);
 }
 
-/// Explicitly incompatible output usage requires an intermediate even on Private storage.
+/// The intermediate serves the scaler's writes and the copy's reads, and invalid input is refused.
+///
+/// The destination is a render-target-only drawable, which the scaler cannot
+/// write, so the Private intermediate carries the scaler's output usage plus
+/// the shader read of the copy pass.
 #[test]
-fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
+fn the_intermediate_serves_the_scaler_and_the_copy_and_invalid_input_is_refused() {
+    use objc2_metal::MTLResource;
+    use objc2_metal_fx::MTLFXSpatialScalerBase;
     let Some(device) = gpu() else { return };
     let cache = UpscaleCache::new();
     let src = target(
@@ -1012,19 +1067,27 @@ fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
         MTLStorageMode::Private,
         MTLTextureUsage::ShaderRead,
     );
-    let dst = target(
-        &device,
-        64,
-        MTLPixelFormat::BGRA8Unorm,
-        MTLStorageMode::Private,
-        MTLTextureUsage::ShaderRead,
-    );
+    let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
     assert!(super::can_scale(&device, &cache, &src, &dst, mode));
-    assert_eq!(
-        output_count(&cache),
-        1,
-        "a shader-read-only output cannot serve the scaler's writes"
+    let output = cached_output(&cache);
+    let scaler_usage = {
+        let scalers = cache.scalers.lock().expect("cache lock");
+        let entry = scalers.scalers.values().next().expect("one cached scaler");
+        // SAFETY: the cache holds the scaler's canonical retain under the lock.
+        let scaler = unsafe { &*entry.slot.scaler };
+        // SAFETY: typed property read on the live cached scaler.
+        let usage = unsafe { scaler.outputTextureUsage() };
+        drop(scalers);
+        usage
+    };
+    assert_eq!(output.storageMode(), MTLStorageMode::Private);
+    assert!(
+        output
+            .usage()
+            .contains(scaler_usage | MTLTextureUsage::ShaderRead),
+        "{:?} must cover the scaler's {scaler_usage:?} and the copy's shader read",
+        output.usage()
     );
     let invalid = target(
         &device,

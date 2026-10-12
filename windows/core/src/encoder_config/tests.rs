@@ -29,7 +29,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.hdr_enable = !value.hdr_enable;
     value.color_space = ColorSpacePolicy::Accurate;
     value.cursor_scale = CursorScale::Fixed(7);
-    value.cursor_software = SoftwareCursorPolicy::Off;
+    value.cursor_software = SoftwareCursorPolicy::On;
     value.shader_cache_enable = !value.shader_cache_enable;
     value.shader_async_compile = !value.shader_async_compile;
     value.log_dir = "log_dir/utf8-ä".into();

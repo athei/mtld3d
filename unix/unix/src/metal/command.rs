@@ -815,8 +815,6 @@ pub struct PresentEncode<'a> {
     pub record: &'a Arc<DeviceRecord>,
     pub attachment: Option<&'a Arc<attachment::Attachment>>,
     pub source: &'a ProtocolObject<dyn MTLTexture>,
-    /// The wire handle of `source`, for the blit fallback's log line.
-    pub source_raw: u64,
     pub seq: u64,
     /// The `nextDrawable` wait of this present, for the cadence probe.
     pub drawable_wait_ns: u64,
@@ -824,8 +822,10 @@ pub struct PresentEncode<'a> {
 
 /// Encode the present of `args.source` into `drawable` and queue its presentation.
 ///
-/// One of three routes (`present_route`) with their fallbacks, then the
-/// throttled `presentDrawable`. Runs on the presenter thread under its
+/// One of two routes (`present_route`) with their fallbacks, then the
+/// throttled `presentDrawable`. Every route writes the framebuffer-only
+/// drawable through a render pass, and a frame no pass could encode
+/// presents a cleared drawable. Runs on the presenter thread under its
 /// state's lock; reads the attachment record's atomics and touches no
 /// `AppKit` object. Returns whether the present waits for the display, i.e.
 /// carries a minimum duration (vsync, a divided interval or the frame cap).
@@ -839,11 +839,9 @@ pub fn encode_present(
 
     // HDR present: when the layer is configured for EDR
     // (RGBA16Float + an extended-linear colorspace + wantsEDR),
-    // the drawable expects *linear* float values — a raw blit
-    // copy of the game's gamma-encoded BGRA8 backbuffer into
-    // an RGBA16Float drawable reinterprets the bytes and
-    // produces magenta noise. So once we're on the HDR layer
-    // we're committed to running the present shader.
+    // the drawable expects *linear* float values, so the HDR
+    // pass decodes the game's gamma-encoded BGRA8 backbuffer
+    // rather than copying it.
     //
     // Feed the *live* dynamic headroom directly into the
     // shader, with no bootstrap and no latch. When `current >
@@ -881,7 +879,7 @@ pub fn encode_present(
         geometry.dst,
         super::upscale::is_available(&device),
     ) {
-        PresentRoute::Upscale if !settled => PresentRoute::Stretch,
+        PresentRoute::Upscale if !settled => PresentRoute::Shader,
         route => route,
     };
     // Reads what the main thread last published and queues the next
@@ -923,7 +921,7 @@ pub fn encode_present(
             // The tone-map pass samples through `filter::linear`, so
             // one encode covers both an exact present and a
             // minification.
-            PresentRoute::Copy | PresentRoute::Stretch => encode_hdr_present(
+            PresentRoute::Shader => encode_hdr_present(
                 cmd_buf,
                 args.source,
                 &drawable_texture,
@@ -933,19 +931,16 @@ pub fn encode_present(
         }
     } else {
         match route {
-            // Extents match: the blit below is exact and cheaper than
-            // a render pass. A gamma ramp is the one thing a blit
-            // cannot carry, so it takes the shader instead.
-            PresentRoute::Copy if gamma_layer == 0 => false,
             // A scaler Metal declines after `is_available` said yes
             // still has to write every drawable pixel, so it falls
-            // through to the stretch rather than to the blit.
+            // through to the stretch.
             //
-            // `MetalFX` writes the drawable itself, so a ramp cannot ride
-            // that pass: the ramp goes into a scratch at render resolution
-            // first and the scaler enlarges the ramped frame. That keeps
-            // `render.scale` working while a ramp is set, at one extra pass
-            // over the render grid.
+            // `MetalFX` enlarges the source it is given into its
+            // intermediate, and the exact copy only carries that onto the
+            // drawable, so a ramp rides neither: the ramp goes into a
+            // scratch at render resolution first and the scaler enlarges
+            // the ramped frame. That keeps `render.scale` working while a
+            // ramp is set, at one extra pass over the render grid.
             PresentRoute::Upscale => {
                 encode_sdr_upscaled(
                     cmd_buf,
@@ -955,42 +950,24 @@ pub fn encode_present(
                     gamma_layer,
                 ) || encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
             }
-            PresentRoute::Copy | PresentRoute::Stretch => {
+            // Exact at matching extents, a filtered stretch otherwise.
+            PresentRoute::Shader => {
                 encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
             }
         }
     };
     if !presented {
-        if hdr {
-            // No blit fallback on the HDR layer: a `copyFromTexture`
-            // from the BGRA8 backbuffer into an RGBA16Float drawable
-            // is invalid API use, so Metal kills the command buffer
-            // and the drawable is presented with nothing written,
-            // which reads as magenta noise. A defined black frame is
-            // the only correct fallback here.
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "present: HDR present pass failed to encode {}x{} → {}x{}; \
-                 presenting a cleared drawable instead",
-                geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
-            );
-            clear_drawable(cmd_buf, &drawable_texture);
-        } else {
-            if gamma_layer != 0 {
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "present: the gamma-ramp pass failed to encode; the frame is copied without \
-                     the ramp"
-                );
-            }
-            encode_present_blit(
-                cmd_buf,
-                args.source,
-                &drawable_texture,
-                route,
-                args.source_raw,
-            );
-        }
+        // The drawable is framebuffer-only, so no blit can write it, and a
+        // drawable presented with nothing written reads as noise (magenta on
+        // the float layer). A defined black frame is the only fallback left.
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: no present pass could be encoded for {}x{} → {}x{} {:?}; presenting a \
+             cleared drawable instead",
+            geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
+            drawable_texture.pixelFormat(),
+        );
+        clear_drawable(cmd_buf, &drawable_texture);
     }
 
     mtld3d_shared::crumb!("submit:present", args.drawable_wait_ns);
@@ -1234,21 +1211,20 @@ fn encode_upload_cmd_buf(
 
 /// How present resolves the back buffer onto the drawable.
 ///
-/// The three arms are the three things Metal can do here, in preference
-/// order for the geometry that selects them.
+/// The drawable is framebuffer-only, so both arms write it through a render
+/// pass; no blit reaches it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PresentRoute {
-    /// Extents match: a 1:1 blit, exact and costing no render pass.
-    Copy,
     /// The drawable is larger in both axes and this GPU has `MetalFX`.
     ///
     /// An edge-aware upscale, materially sharper than a bilinear magnify.
     Upscale,
-    /// Any other geometry.
+    /// Any other geometry, matching extents included.
     ///
-    /// The present shader's filtered stretch, the only route that covers
-    /// every drawable pixel at any ratio.
-    Stretch,
+    /// The present shader: a bit-exact copy at matching extents and a
+    /// filtered stretch otherwise, the only route that covers every drawable
+    /// pixel at any ratio.
+    Shader,
 }
 
 /// One present's source and destination extents.
@@ -1333,11 +1309,10 @@ fn geometry_settled(seen: &mut Option<(PresentGeometry, u32)>, geometry: Present
 
 /// Pick the present route for one frame's geometry.
 ///
-/// `MTLBlitCommandEncoder` only copies 1:1 and `MTLFXSpatialScaler` only
-/// enlarges, so anything else is the shader's. A drawable larger in one
-/// axis and smaller in the other is a stretch, not an upscale: the scaler
-/// rejects that pair, and routing it to the blit would leave the axis where
-/// the drawable is larger unwritten.
+/// `MTLFXSpatialScaler` only enlarges, so anything else is the shader's,
+/// matching extents included, where the shader is an exact copy. A drawable
+/// larger in one axis and smaller in the other is a stretch, not an upscale:
+/// the scaler rejects that pair.
 ///
 /// Whether an enlargement is *worth* a scaler is a separate question, and
 /// deliberately not asked here: see [`SETTLED_PRESENTS`].
@@ -1346,12 +1321,11 @@ const fn present_route(
     dst: (usize, usize),
     metalfx_available: bool,
 ) -> PresentRoute {
-    if src.0 == dst.0 && src.1 == dst.1 {
-        PresentRoute::Copy
-    } else if metalfx_available && src.0 <= dst.0 && src.1 <= dst.1 {
+    let enlarges = src.0 <= dst.0 && src.1 <= dst.1 && (src.0 < dst.0 || src.1 < dst.1);
+    if metalfx_available && enlarges {
         PresentRoute::Upscale
     } else {
-        PresentRoute::Stretch
+        PresentRoute::Shader
     }
 }
 
@@ -1387,66 +1361,6 @@ unsafe fn sampler_or_default<'a>(
          binding the default sampler in its place"
     );
     null_texture::default_sampler(&cmd_buf.device())
-}
-
-/// The 1:1 present blit, and the last resort when a shader route failed to encode.
-///
-/// SDR only: the drawable and the backbuffer are both `BGRA8Unorm`, so the
-/// copy is well-formed. On the HDR layer the caller clears the drawable
-/// instead, because a cross-format `copyFromTexture` into `RGBA16Float` is
-/// invalid API use that kills the command buffer.
-///
-/// The copy extent is clamped to the smaller texture in each axis. On the
-/// `Copy` route that changes nothing (the extents are equal); on any other
-/// route it is what keeps a source larger than the drawable from being an
-/// out-of-bounds copy. A clamped copy cannot fill a larger drawable, so the
-/// margin is cleared first, because undefined drawable memory reads as
-/// noise, and on an `RGBA16Float` layer that noise is magenta.
-fn encode_present_blit(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    src: &ProtocolObject<dyn MTLTexture>,
-    drawable: &ProtocolObject<dyn MTLTexture>,
-    route: PresentRoute,
-    src_handle: u64,
-) {
-    if route != PresentRoute::Copy {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "present: {}x{} → {}x{} needed a resample and none could be encoded; \
-             the frame is copied 1:1 into the corner of a cleared drawable",
-            src.width(), src.height(), drawable.width(), drawable.height(),
-        );
-        clear_drawable(cmd_buf, drawable);
-    }
-    let Some(blit) = cmd_buf.blitCommandEncoder() else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "present: the blit encoder could not be created; the drawable is presented as it is"
-        );
-        return;
-    };
-    let label = objc2_foundation::NSString::from_str("mtld3d-present-blit");
-    blit.setLabel(Some(&label));
-    let width = src.width().min(drawable.width());
-    let height = src.height().min(drawable.height());
-
-    mtld3d_shared::crumb!("submit:pblit", src_handle, (width << 32) | height);
-    // SAFETY: objc2 typed binding; both textures are non-nil retained
-    // protocol objects valid for the call, and the extent is clamped to
-    // both above.
-    unsafe {
-        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-            src,
-            0, 0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize { width, height, depth: 1 },
-            drawable,
-            0, 0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-        );
-    }
-
-    blit.endEncoding();
 }
 
 /// Clear the drawable to opaque black with an empty render pass.
@@ -1546,8 +1460,9 @@ fn encode_hdr_present_upscaled(
 
 /// SDR upscale with the guest's gamma ramp applied before the scaler.
 ///
-/// `MetalFX` writes the drawable from the source it is given, so the ramp has
-/// to be in that source: the present shader writes a ramped copy of the render
+/// `MetalFX` enlarges the source it is given, and the exact copy that carries
+/// its output onto the drawable transforms nothing, so the ramp has to be in
+/// that source: the present shader writes a ramped copy of the render
 /// grid into a `BGRA8` scratch and the scaler enlarges that. Without a ramp
 /// there is nothing to insert and the scaler reads the game's own texture, the
 /// route this had before.
@@ -1636,9 +1551,8 @@ fn encode_hdr_present_upscaled_with(
 /// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
 /// are `RGBA16Float`, which is what the present pipelines are built against.
 ///
-/// Returns `false` if the pipeline or render encoder is unavailable. If no
-/// HDR route succeeds, presentation clears the drawable; a raw blit from
-/// the differently formatted backbuffer would be invalid.
+/// Returns `false` if the pipeline or render encoder is unavailable; the
+/// caller then clears the drawable.
 fn encode_hdr_present(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
@@ -1665,38 +1579,40 @@ fn encode_hdr_present(
     } else {
         super::present::GammaStage::Bt2446
     };
-    let gamma_pipeline = if gamma_layer == 0 {
+    let ramp = if gamma_layer == 0 {
         None
     } else {
         super::present::ensure_gamma_pipeline(&device, stage)
     };
-    let (pipeline_handle, uniforms) = if peak <= 1.0 {
-        (gamma_pipeline.unwrap_or(resources.passthrough), None)
+    let (plain, uniforms) = if peak <= 1.0 {
+        (resources.passthrough, None)
     } else {
         // Fragment uniform block consumed by the BT.2446 pipeline, 16 bytes;
         // MSL alignment for `constant T&` requires 16-byte alignment, and a
         // stack array of four f32 is naturally aligned and fits. Computed once
         // per frame on the CPU rather than in every fragment.
-        (
-            gamma_pipeline.unwrap_or(resources.bt2446),
-            Some(super::present::hdr_uniforms(peak)),
-        )
+        (resources.bt2446, Some(super::present::hdr_uniforms(peak)))
     };
-    let gamma_layer = if gamma_pipeline.is_some() {
-        gamma_layer
-    } else {
-        0
-    };
-    encode_present_pass(cmd_buf, src, dst, pipeline_handle, uniforms, gamma_layer)
+    encode_present_pass(
+        cmd_buf,
+        src,
+        dst,
+        &PresentStage {
+            plain,
+            ramp,
+            uniforms,
+            gamma_layer,
+        },
+    )
 }
 
-/// SDR present pass: the game's back buffer onto a same-format drawable, resampled.
+/// SDR present pass: the game's back buffer onto a same-format drawable.
 ///
-/// The route for every SDR geometry a blit and `MetalFX` cannot serve: a
-/// minification, a mixed-axis change, or a GPU with no `MetalFX` at all.
-/// The fragment stage is a plain sample, so an exact-extent call through
-/// here is bit-identical to the blit; it is the resample that needs the
-/// render pass.
+/// The route for every SDR geometry `MetalFX` does not serve: matching
+/// extents, a minification, a mixed-axis change, or a GPU with no `MetalFX`
+/// at all. The fragment stage is a plain sample, and at matching extents every
+/// fragment lands on its own texel centre, so the pass is a bit-exact copy
+/// there and a filtered stretch everywhere else.
 ///
 /// Returns `false` (with an error at the call site of `ensure_resources`)
 /// if pipeline creation failed.
@@ -1710,7 +1626,7 @@ fn encode_present_copy(
     let Some(resources) = super::present::ensure_resources(&device) else {
         return false;
     };
-    let gamma_pipeline = if gamma_layer == 0 {
+    let ramp = if gamma_layer == 0 {
         None
     } else {
         super::present::ensure_gamma_pipeline(&device, super::present::GammaStage::Copy)
@@ -1719,40 +1635,94 @@ fn encode_present_copy(
         cmd_buf,
         src,
         dst,
-        gamma_pipeline.unwrap_or(resources.copy),
-        None,
-        if gamma_pipeline.is_some() {
-            gamma_layer
-        } else {
-            0
+        &PresentStage {
+            plain: resources.copy,
+            ramp,
+            uniforms: None,
+            gamma_layer,
         },
     )
 }
 
+/// One present pass's fragment stage, with and without the guest's gamma ramp.
+struct PresentStage {
+    /// The pipeline without a ramp.
+    plain: u64,
+    /// Its gamma-ramp twin, `None` when no ramp is set or its compile failed.
+    ramp: Option<u64>,
+    /// The `BT.2446` block at fragment slot 0; `None` for the stages with none.
+    uniforms: Option<[f32; 4]>,
+    /// Layer whose gamma table `ramp` reads.
+    gamma_layer: usize,
+}
+
 /// Encode one present pass: a fullscreen triangle sampling `src` across `dst`.
 ///
-/// Shared by every shader-driven route. `uniforms` is the BT.2446 fragment
-/// block at buffer slot 0; the copy and pass-through pipelines declare no
-/// uniforms and pass `None`.
+/// Shared by every shader-driven route. A ramp pass that cannot be encoded
+/// (its table went away, or no encoder) is encoded again without the ramp,
+/// so the frame still reaches the drawable, which no blit can write.
 fn encode_present_pass(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
-    pipeline_handle: u64,
-    uniforms: Option<[f32; 4]>,
-    gamma_layer: usize,
+    stage: &PresentStage,
 ) -> bool {
     // The fullscreen triangle covers every pixel, so nothing is loaded.
+    let pass = |pipeline_handle, gamma_layer| {
+        encode_fullscreen_pass(
+            cmd_buf,
+            src,
+            dst,
+            &FullscreenPass {
+                pipeline_handle,
+                uniforms: stage.uniforms,
+                load_action: MTLLoadAction::DontCare,
+                label: "mtld3d-present-pass",
+                gamma_layer,
+            },
+        )
+    };
+    stage.ramp.is_some_and(|ramp| pass(ramp, stage.gamma_layer)) || pass(stage.plain, 0)
+}
+
+/// Copy `src` onto `dst` of the same extent and format, texel for texel, through a render pass.
+///
+/// For a destination no blit can write, such as a framebuffer-only drawable.
+/// The nearest-texel readback pipeline built for `dst`'s format samples each
+/// texel centre, so the copy is exact for every format it is built for, the
+/// float ones included. Returns `false`, logged once, when the format has no
+/// such pipeline or the pass cannot be encoded.
+pub fn encode_exact_copy(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+) -> bool {
+    let mtl_format = dst.pixelFormat();
+    let Some(format) = super::texture::wire_pixel_format(mtl_format) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "exact copy: {mtl_format:?} is not a format mtld3d creates; the copy is not encoded"
+        );
+        return false;
+    };
+    let Some(pipeline) = super::present::ensure_readback_pipeline(&cmd_buf.device(), format, true)
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "exact copy: no {format:?} copy pipeline; the copy is not encoded"
+        );
+        return false;
+    };
     encode_fullscreen_pass(
         cmd_buf,
         src,
         dst,
         &FullscreenPass {
-            pipeline_handle,
-            uniforms,
+            pipeline_handle: pipeline,
+            uniforms: None,
             load_action: MTLLoadAction::DontCare,
-            label: "mtld3d-present-pass",
-            gamma_layer,
+            label: "mtld3d-exact-copy",
+            gamma_layer: 0,
         },
     )
 }

@@ -125,9 +125,10 @@ pub struct Mtld3dConfig {
     pub cursor_scale: CursorScale,
     /// Draw the cursor in the unix-side overlay window instead of the hardware HCURSOR.
     ///
-    /// Default: [`SoftwareCursorPolicy::Auto`], on when the HDR present path
-    /// is active and off otherwise; `On` / `Off` force it. Resolved on the unix
-    /// side at device creation. File key: `cursor.software`
+    /// Default: [`SoftwareCursorPolicy::Off`], the hardware cursor, because the
+    /// overlay window sends the game window through the compositor. `Auto` turns
+    /// it on when the HDR present path is active, `On` forces it. Resolved on
+    /// the unix side at device creation. File key: `cursor.software`
     /// (`auto` | `true` | `false`).
     pub cursor_software: SoftwareCursorPolicy,
     /// Use the persistent on-disk shader cache.
@@ -389,7 +390,7 @@ impl Default for Mtld3dConfig {
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
-            cursor_software: SoftwareCursorPolicy::Auto,
+            cursor_software: SoftwareCursorPolicy::Off,
             shader_cache_enable: true,
             shader_async_compile: true,
             log_dir: String::new(),
