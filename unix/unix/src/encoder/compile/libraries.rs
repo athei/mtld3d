@@ -211,6 +211,14 @@ impl StageLibraries {
         self.prog_ps.clear();
     }
 
+    /// How many fixed-function libraries are built or failed, vertex stage then pixel stage.
+    ///
+    /// One per distinct fixed-function shader key; the pixel stage's variants
+    /// of one key count once. A key whose build failed counts too.
+    pub fn ff_counts(&self) -> (usize, usize) {
+        (self.ff_vs.len(), self.ff_ps.len())
+    }
+
     /// Forget the memo before a packet whose records may reuse the previous packet's addresses.
     pub const fn begin_packet(&mut self) {
         self.memo.forget();

@@ -21,12 +21,13 @@ use mtld3d_core::{
     draw_data::VsSourceView,
     dxso::{
         DxsoProgram, FF_VS_PALETTE_BASE_ROW, LinkInputs, MAX_VERTEX_BLEND_MATRIX_INDEX,
-        SemanticSet, declared_ps_samplers,
+        SemanticSet, ShaderType, declared_ps_samplers,
     },
     encoder_packet::NativeVbibRetention,
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     guest_pages::GuestOwnedPage,
+    hud_stats::{HudFrameStats, HudSample, ShaderModels, hud_rows},
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
@@ -983,6 +984,19 @@ pub struct FrameEncoder {
     /// `mtld3d_core::perf` for the full field list.
     perf: EncoderPerfState,
 
+    /// The draw and pass counts the Metal HUD rows show, kept in every build.
+    hud_stats: HudFrameStats,
+    /// The game's shader programs by stage and shader model, for the Metal HUD rows.
+    shader_models: ShaderModels,
+    /// Pointer to the shared address-space word the PE watch thread stores.
+    ///
+    /// Established by the device creation context and read only for a Metal
+    /// HUD sample; the word stays zero in a 64-bit build. 0 means no device
+    /// supplied one.
+    free_va_ptr: u64,
+    /// This encoder's live rows in the Metal HUD.
+    hud: crate::hud_state::HudReporter,
+
     /// Set of `(rt_handle, vs_id, ps_id)` tuples already logged by `maybe_log_pass_shader`.
     ///
     /// Lets one `debug` run emit one line per unique triple. Keyed on the
@@ -1667,6 +1681,9 @@ impl FrameEncoder {
             }
         }
         flags.set(FrameEncoderFlags::CAPTURE_LAYER, capture_layer_loaded());
+        // The clock allocation lives as long as this encoder, so its address
+        // names the encoder among the live ones.
+        let hud = crate::hud_state::HudReporter::new(Arc::as_ptr(&clock) as u64);
         Ok(Self {
             cache_path,
             compile_threads,
@@ -1715,6 +1732,10 @@ impl FrameEncoder {
             depth_snapshots: FxHashMap::default(),
             stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
+            hud_stats: HudFrameStats::default(),
+            shader_models: ShaderModels::default(),
+            free_va_ptr: context.free_va_ptr,
+            hud,
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
             device,
@@ -5535,9 +5556,10 @@ impl FrameEncoder {
         if !outputs.is_empty() {
             self.prog_link_outputs.insert(shader_id, outputs);
         }
-        self.program_cache
-            .entry(shader_id)
-            .or_insert_with(|| Arc::new(program));
+        if let Entry::Vacant(slot) = self.program_cache.entry(shader_id) {
+            self.shader_models.adopt(program.shader_type, program.major);
+            slot.insert(Arc::new(program));
+        }
     }
 
     /// Which extra input semantics of the pixel shader `ps_id` the vertex shader `vs` outputs.
@@ -5693,6 +5715,63 @@ impl FrameEncoder {
             shader_compile_stats::format_summary(&snap, "compiled", total),
             shader_compile_stats::format_async_suffix(&asynchronous),
         );
+    }
+
+    /// Send the Metal HUD this device's figures, at most twice a second, once the HUD has loaded.
+    ///
+    /// Runs on the encoder thread after a frame's reply has gone out. Every
+    /// figure is one that is kept anyway: the frame counters, map lengths,
+    /// two atomic loads of PE counters, snmalloc's own statistic and the
+    /// pools' running totals, so a sample walks nothing.
+    fn report_hud(&mut self) {
+        if self.hud.is_inert() {
+            return;
+        }
+        let Ok(Some(hz)) = self.clock.get() else {
+            return;
+        };
+        if !self.hud.sample_due(rdtsc(), hz) {
+            return;
+        }
+        let free_va = if self.free_va_ptr == 0 {
+            0
+        } else {
+            // SAFETY: `free_va_ptr` is a PE-heap `Arc<AtomicU64>` the device
+            // creation context supplied, kept alive until native destruction.
+            unsafe { SharedCounter::new(self.free_va_ptr) }.load(Ordering::Relaxed)
+        };
+        let in_flight_bytes = if self.retained_bytes_ptr == 0 {
+            0
+        } else {
+            // SAFETY: see `add_retained_bytes`.
+            unsafe { SharedCounter::new(self.retained_bytes_ptr) }.load(Ordering::Relaxed)
+        };
+        let shown = self.hud_stats.shown();
+        let (fixed_vertex, fixed_pixel) = self.libraries.ff_counts();
+        let sample = HudSample {
+            draws_up: shown.draws_up(),
+            draws_vb: shown.draws_vb(),
+            passes: shown.passes(),
+            pipelines: self.pipeline_cache.len(),
+            samplers: self.sampler_cache.len(),
+            textures: self.texture_cache.len(),
+            free_va,
+            cpu_heap_bytes: u64::try_from(
+                snmalloc_rs::SnMalloc::memory_stats().current_memory_usage,
+            )
+            .unwrap_or(u64::MAX),
+            in_flight_bytes,
+            reuse_pool_bytes: u64::try_from(self.pagebox_pool.pooled_bytes())
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.texture_versions.parked_bytes())
+                .saturating_add(self.texture_versions.pending_destroy_bytes()),
+            fixed_function: [fixed_pixel, fixed_vertex],
+            models: [
+                self.shader_models.counts(ShaderType::Pixel),
+                self.shader_models.counts(ShaderType::Vertex),
+            ],
+        };
+        self.hud.report(&hud_rows(&sample));
     }
 
     /// One-shot `debug!` per unique `(rt_handle, vs_key, ps_key)` seen by `emit_draw`.
@@ -9473,6 +9552,9 @@ fn encoder_thread_main(
                     if let Some(done) = done {
                         let _ = done.send(status);
                     }
+                    // After the reply: an async frame is already on the submit
+                    // thread and a synchronous caller has its answer.
+                    enc.report_hud();
                 }
                 Ok(EncoderMessage::DrainRetiredNow(done)) => {
                     if enc.failed_replay.is_some() {
@@ -9727,6 +9809,8 @@ fn run_frame(
                             let draw = mtld3d_core::encoder_draw::draw_record::DrawView::new(
                                 command.payload(),
                             )?;
+                            enc.hud_stats
+                                .count_draw(matches!(draw.vertices(), VertexView::Up { .. }));
                             // SAFETY: this packet retains authentic capture and backing addresses
                             // through the final submit CPU reader, including failure quarantine.
                             unsafe { draw::emit_draw(enc, state.draw_reader().snapshot(), &draw) };
@@ -9965,6 +10049,7 @@ fn finalize_submit(
     // encoder state. `apply_pass_rules` above has already rewritten them
     // in place, so the descriptors built from the taken vec are final.
     let passes = enc.pass_state.take_finished_passes();
+    enc.hud_stats.end_submit(passes.len(), !no_present);
 
     let visibility_buffer_handle = enc.visibility.current_buffer_handle();
     let mut descriptors: Vec<PassDescriptor> = passes
