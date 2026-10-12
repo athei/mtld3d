@@ -57,6 +57,7 @@ pub mod guest_mem;
 pub mod guest_pages;
 pub mod guest_queries;
 pub mod held_pages;
+pub mod hud_stats;
 pub mod ids;
 pub mod level_authority;
 pub mod multisample;

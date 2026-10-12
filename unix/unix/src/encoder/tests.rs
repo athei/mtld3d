@@ -754,3 +754,83 @@ fn a_failed_submission_ends_the_frame_latency_wait() {
         "the mailbox holds the failure"
     );
 }
+
+/// A grown-out fan index pattern counts in the retained bytes while it waits, and leaves them.
+///
+/// The retained-bytes counter is the API thread's retention-cap input and the
+/// HUD's in-flight figure; a box the drain subtracts without having added it
+/// wraps the counter to near `u64::MAX`. Shutdown, like a reset, drains the
+/// queue without waiting for the gate, and has to subtract what it takes too.
+#[test]
+fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use mtld3d_core::{
+        config::Mtld3dConfig, convert::fan_pattern_bytes, gpu_caps::GpuCaps, page_box::PageBox,
+    };
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    // Nothing is submitted, so every queued entry's sequence (0) has retired.
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+
+    assert_ne!(enc.fan_index_buffer(300), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the live pattern is not retention"
+    );
+    assert_ne!(enc.fan_index_buffer(1000), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        PageBox::padded_len(fan_pattern_bytes(300)) as u64,
+        "the grown-out pattern waits in retention"
+    );
+    enc.drain_retired_resource_retention();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the drain takes back exactly what was added"
+    );
+
+    assert_ne!(enc.fan_index_buffer(5000), 0);
+    assert_ne!(retained.load(Ordering::Relaxed), 0);
+    enc.shutdown_cleanup();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "shutdown's drain takes back what it empties"
+    );
+    drop(enc);
+}

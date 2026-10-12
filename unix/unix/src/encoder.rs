@@ -27,6 +27,7 @@ use mtld3d_core::{
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     guest_pages::GuestOwnedPage,
+    hud_stats::{HudFrameStats, HudSample, hud_rows},
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
@@ -335,6 +336,19 @@ impl SharedCounter {
         // SAFETY: `SharedCounter::new`'s contract.
         unsafe { &*self.0 }.fetch_sub(val, order)
     }
+}
+
+/// A Relaxed read of a shared `AtomicU64` counter, 0 for a null address.
+///
+/// # Safety
+///
+/// `raw` must be 0 or the address of an `AtomicU64` that stays live for the call.
+unsafe fn load_shared(raw: u64) -> u64 {
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: nonzero, so by the caller's contract a live `AtomicU64`.
+    unsafe { SharedCounter::new(raw) }.load(Ordering::Relaxed)
 }
 
 /// One entry of `FrameEncoder::sampler_resolve_memo`.
@@ -982,6 +996,21 @@ pub struct FrameEncoder {
     /// counters, and the 2-second `PerfWindow` aggregator. See
     /// `mtld3d_core::perf` for the full field list.
     perf: EncoderPerfState,
+
+    /// The draw and pass counts the Metal HUD rows show, kept in every build.
+    hud_stats: HudFrameStats,
+    /// Pointer to the largest free block the PE watch thread stores, in MiB plus one.
+    ///
+    /// Established by the device creation context and read only for a Metal
+    /// HUD sample; the value stays zero, no walk, in a 64-bit build. 0 means
+    /// no device supplied one.
+    largest_free_word_ptr: u64,
+    /// Pointer to `d3d9.dll`'s live page-box bytes, a process-lifetime static; 0 for none.
+    guest_page_bytes_ptr: u64,
+    /// Pointer to `d3d9.dll`'s recycle pool's parked bytes, a process-lifetime static; 0 for none.
+    guest_pool_bytes_ptr: u64,
+    /// This encoder's live rows in the Metal HUD.
+    hud: crate::hud_state::HudReporter,
 
     /// Set of `(rt_handle, vs_id, ps_id)` tuples already logged by `maybe_log_pass_shader`.
     ///
@@ -1667,6 +1696,9 @@ impl FrameEncoder {
             }
         }
         flags.set(FrameEncoderFlags::CAPTURE_LAYER, capture_layer_loaded());
+        // The clock allocation lives as long as this encoder, so its address
+        // names the encoder among the live ones.
+        let hud = crate::hud_state::HudReporter::new(Arc::as_ptr(&clock) as u64);
         Ok(Self {
             cache_path,
             compile_threads,
@@ -1715,6 +1747,11 @@ impl FrameEncoder {
             depth_snapshots: FxHashMap::default(),
             stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
+            hud_stats: HudFrameStats::default(),
+            largest_free_word_ptr: context.largest_free_word_ptr,
+            guest_page_bytes_ptr: context.guest_page_bytes_ptr,
+            guest_pool_bytes_ptr: context.guest_pool_bytes_ptr,
+            hud,
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
             device,
@@ -2971,6 +3008,12 @@ impl FrameEncoder {
             },
         );
         if !grown_out.handle.is_null() {
+            // Every box entering retention is counted here, as the drain
+            // subtracts it when it leaves.
+            if let Some(backing) = &grown_out.backing {
+                self.perf.bump_vbib_retained_add(backing.len());
+                self.add_retained_bytes(backing.len());
+            }
             self.pending_resource_retention
                 .push_back(PendingResourceRetention {
                     kind: DestroyKind::Buffer,
@@ -5693,6 +5736,47 @@ impl FrameEncoder {
             shader_compile_stats::format_summary(&snap, "compiled", total),
             shader_compile_stats::format_async_suffix(&asynchronous),
         );
+    }
+
+    /// Send the Metal HUD this device's figures, at most twice a second, once the HUD has loaded.
+    ///
+    /// Runs on the encoder thread after a frame's reply has gone out. Every
+    /// figure is one that is kept anyway: the frame counters, map lengths and
+    /// four Relaxed loads of PE counters, so a sample walks nothing.
+    fn report_hud(&mut self) {
+        if self.hud.is_inert() {
+            return;
+        }
+        let Ok(Some(hz)) = self.clock.get() else {
+            return;
+        };
+        if !self.hud.sample_due(rdtsc(), hz) {
+            return;
+        }
+        // SAFETY: the device creation context supplied this pointer: a PE-heap
+        // `Arc<AtomicU64>` kept alive until native destruction, or 0.
+        let largest_free_word = unsafe { load_shared(self.largest_free_word_ptr) };
+        // SAFETY: as above; see `add_retained_bytes`.
+        let in_flight_bytes = unsafe { load_shared(self.retained_bytes_ptr) };
+        // SAFETY: the creation context supplied the address of an `AtomicU64`
+        // static of `d3d9.dll`, which lives as long as the process, or 0.
+        let guest_page_bytes = unsafe { load_shared(self.guest_page_bytes_ptr) };
+        // SAFETY: as above, the gauge inside `d3d9.dll`'s pool static.
+        let reuse_pool_bytes = unsafe { load_shared(self.guest_pool_bytes_ptr) };
+        let shown = self.hud_stats.shown();
+        let sample = HudSample {
+            draws_up: shown.draws_up(),
+            draws_vb: shown.draws_vb(),
+            passes: shown.passes(),
+            textures: self.texture_cache.len(),
+            largest_free_word,
+            guest_page_bytes,
+            in_flight_bytes,
+            reuse_pool_bytes,
+            fixed_function: self.libraries.ff_count(),
+            programs: self.program_cache.len(),
+        };
+        self.hud.report(&hud_rows(&sample));
     }
 
     /// One-shot `debug!` per unique `(rt_handle, vs_key, ps_key)` seen by `emit_draw`.
@@ -8898,6 +8982,9 @@ impl FrameEncoder {
                 }
             }
             if let Some(pb) = entry.page_box {
+                // Counted when it entered retention, as in the seq-gated drain.
+                self.perf.bump_vbib_retained_sub(pb.len());
+                self.sub_retained_bytes(pb.len());
                 held.pageboxes.push(pb);
             }
             if let Some(arc) = entry.staging_arc {
@@ -9473,6 +9560,9 @@ fn encoder_thread_main(
                     if let Some(done) = done {
                         let _ = done.send(status);
                     }
+                    // After the reply: an async frame is already on the submit
+                    // thread and a synchronous caller has its answer.
+                    enc.report_hud();
                 }
                 Ok(EncoderMessage::DrainRetiredNow(done)) => {
                     if enc.failed_replay.is_some() {
@@ -9727,6 +9817,8 @@ fn run_frame(
                             let draw = mtld3d_core::encoder_draw::draw_record::DrawView::new(
                                 command.payload(),
                             )?;
+                            enc.hud_stats
+                                .count_draw(matches!(draw.vertices(), VertexView::Up { .. }));
                             // SAFETY: this packet retains authentic capture and backing addresses
                             // through the final submit CPU reader, including failure quarantine.
                             unsafe { draw::emit_draw(enc, state.draw_reader().snapshot(), &draw) };
@@ -9965,6 +10057,7 @@ fn finalize_submit(
     // encoder state. `apply_pass_rules` above has already rewritten them
     // in place, so the descriptors built from the taken vec are final.
     let passes = enc.pass_state.take_finished_passes();
+    enc.hud_stats.end_submit(passes.len(), !no_present);
 
     let visibility_buffer_handle = enc.visibility.current_buffer_handle();
     let mut descriptors: Vec<PassDescriptor> = passes

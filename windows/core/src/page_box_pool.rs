@@ -27,7 +27,7 @@
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::page_box::{PAGE_SIZE, PageBox};
@@ -105,7 +105,7 @@ impl PoolInner {
     /// Pop a parked box of `logical_len`'s class from `kind`'s lane, keeping `gauge` in step.
     ///
     /// The caller has checked that the pool is enabled.
-    fn pop(&mut self, kind: LaneKind, logical_len: usize, gauge: &AtomicUsize) -> Option<PageBox> {
+    fn pop(&mut self, kind: LaneKind, logical_len: usize, gauge: &AtomicU64) -> Option<PageBox> {
         // The page count less one, which is what the padded length names
         // without forming it: a length too long to round up is oversize too.
         let class = logical_len.max(1).div_ceil(PAGE_SIZE) - 1;
@@ -128,7 +128,7 @@ impl PoolInner {
         );
         let mut pb = pb?;
         lane.bytes -= pb.len();
-        gauge.store(self.total_bytes(), Ordering::Relaxed);
+        gauge.store(self.total_bytes() as u64, Ordering::Relaxed);
         pb.set_logical_len(logical_len);
         Some(pb)
     }
@@ -219,7 +219,10 @@ pub struct PoolTraffic {
 pub struct PageBoxPool {
     inner: Mutex<PoolInner>,
     /// Mirror of both lanes' parked bytes for lock-free gauge reads.
-    pooled_bytes: AtomicUsize,
+    ///
+    /// A `u64` whatever the pointer width, since the native encoder reads
+    /// `d3d9.dll`'s through its address ([`Self::pooled_bytes_counter`]).
+    pooled_bytes: AtomicU64,
     /// Byte cap; `0` disables the pool.
     ///
     /// Read without the lock on the fast path and written by
@@ -237,7 +240,7 @@ impl PageBoxPool {
             inner: Mutex::new(PoolInner {
                 lanes: [Lane::new(), Lane::new()],
             }),
-            pooled_bytes: AtomicUsize::new(0),
+            pooled_bytes: AtomicU64::new(0),
             cap_bytes: AtomicUsize::new(cap_bytes),
         }
     }
@@ -411,7 +414,7 @@ impl PageBoxPool {
             .map(core::mem::take)
             .collect();
         self.pooled_bytes
-            .store(inner.total_bytes(), Ordering::Relaxed);
+            .store(inner.total_bytes() as u64, Ordering::Relaxed);
         drop(inner);
         drop(classes);
         bytes
@@ -463,14 +466,25 @@ impl PageBoxPool {
         PoolTraffic {
             recycled,
             recycled_bytes,
-            parked_bytes: self.pooled_bytes() as u64,
+            parked_bytes: self.pooled_bytes.load(Ordering::Relaxed),
         }
     }
 
     /// Padded bytes currently parked across both lanes (lock-free Relaxed read).
     #[must_use]
     pub fn pooled_bytes(&self) -> usize {
-        self.pooled_bytes.load(Ordering::Relaxed)
+        // The gauge mirrors a `usize` sum of this process's boxes, so it fits.
+        usize::try_from(self.pooled_bytes.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
+    }
+
+    /// The gauge [`Self::pooled_bytes`] reads, for a reader in another linkage unit.
+    ///
+    /// The native encoder reads `d3d9.dll`'s process-wide pool through this
+    /// address, which the device passes at encoder creation; a pool in a
+    /// `static` lives as long as the image.
+    #[must_use]
+    pub const fn pooled_bytes_counter(&self) -> &AtomicU64 {
+        &self.pooled_bytes
     }
 
     /// Whether a box of `logical_len` can be parked here: the pool is enabled and its class fits.
@@ -532,7 +546,8 @@ impl PageBoxPool {
         #[cfg(perf_tracking)]
         lane.diagnostics.recycle(diagnostics::Recycle::Parked, len);
         lane.bytes += len;
-        self.pooled_bytes.store(total + len, Ordering::Relaxed);
+        self.pooled_bytes
+            .store((total + len) as u64, Ordering::Relaxed);
         lane.classes[class].push(pb);
         drop(inner);
         None

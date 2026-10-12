@@ -32,6 +32,16 @@ pub struct CreateEncoderParams {
     pub retained_bytes_ptr: u64,
     /// The frame-latency floor: no display-paced present at or below it is outstanding.
     pub paced_present_seq_ptr: u64,
+    /// The largest free block at the address-space watch's last walk, in MiB plus one; zero before.
+    ///
+    /// An `AtomicU64` the device owns, stored by the PE watch thread of a
+    /// 32-bit build and read by the encoder for the Metal HUD rows
+    /// (`mtld3d_core::hud_stats::largest_free_word`).
+    pub largest_free_word_ptr: u64,
+    /// `d3d9.dll`'s live page-box bytes, an `AtomicU64` static that lives as long as the image.
+    pub guest_page_bytes_ptr: u64,
+    /// `d3d9.dll`'s recycle pool's parked bytes, an `AtomicU64` in a process-lifetime static.
+    pub guest_pool_bytes_ptr: u64,
 }
 
 #[repr(C, align(8))]
@@ -48,7 +58,7 @@ impl Thunk for DestroyEncoderParams {
 }
 
 const _: () = {
-    assert!(size_of::<CreateEncoderParams>() == 96);
+    assert!(size_of::<CreateEncoderParams>() == 120);
     assert!(align_of::<CreateEncoderParams>() == 8);
     assert!(core::mem::offset_of!(CreateEncoderParams, runtime) == 32);
     assert!(core::mem::offset_of!(CreateEncoderParams, source_clock_ptr) == 40);
@@ -58,6 +68,9 @@ const _: () = {
     assert!(core::mem::offset_of!(CreateEncoderParams, failed_submit_seq_ptr) == 72);
     assert!(core::mem::offset_of!(CreateEncoderParams, retained_bytes_ptr) == 80);
     assert!(core::mem::offset_of!(CreateEncoderParams, paced_present_seq_ptr) == 88);
+    assert!(core::mem::offset_of!(CreateEncoderParams, largest_free_word_ptr) == 96);
+    assert!(core::mem::offset_of!(CreateEncoderParams, guest_page_bytes_ptr) == 104);
+    assert!(core::mem::offset_of!(CreateEncoderParams, guest_pool_bytes_ptr) == 112);
     assert!(size_of::<DestroyEncoderParams>() == 8);
 };
 
