@@ -18,6 +18,7 @@ use objc2::{
     runtime::{AnyClass, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{NSView, NSWindow};
+use objc2_core_foundation::CGRect;
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -2428,9 +2429,10 @@ fn refresh_all_on_main() {
 /// where everything the display decides is reconciled against that screen
 /// for this record: the layer's own configuration
 /// ([`follow_screen_layer_mode`]), the present throttle
-/// ([`follow_screen_present_throttle`]) and the backing scale the PE side
-/// consumes ([`follow_layer_backing_scale`]). A record that was retired
-/// between the queueing and the run finds no view and does nothing.
+/// ([`follow_screen_present_throttle`]), the backing scale the PE side
+/// consumes ([`follow_layer_backing_scale`]) and the window layers a covering
+/// metal view hides ([`clear_covered_window_layers`]). A record that was
+/// retired between the queueing and the run finds no view and does nothing.
 fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     use objc2_app_kit::NSScreen;
 
@@ -2468,6 +2470,7 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
         follow_screen_layer_mode(att, screen, mtm);
         follow_screen_present_throttle(att, screen);
         follow_layer_backing_scale(att, mtm);
+        clear_covered_window_layers(&view_obj, mtm);
     }
     log_headroom_change_if_any(att, headroom, &view_obj, mtm);
     cursor_overlay::reconcile_on_main();
@@ -2981,6 +2984,102 @@ fn follow_layer_backing_scale(att: &Arc<Attachment>, mtm: MainThreadMarker) {
         target: LOG_TARGET,
         "present: the Wine layer's contents scale is {scale}x (was {applied}x), cursor scale republished to the guest",
     );
+}
+
+/// Clear what the window's layers paint under a metal view that covers it. **Main thread only.**
+///
+/// Two layers of a winemac window paint beneath the metal view. The frame
+/// view's layer carries the window's background colour, which `AppKit` puts
+/// there because Wine's content view is not opaque, and the content view's
+/// layer holds Wine's window surface image as its `contents`, set again on
+/// every surface flush. Either one can keep the game's layer in the
+/// compositor instead of going direct to the display, as seen on an M1 Max
+/// (an M5 Max goes direct with both in place). When the metal view is shown
+/// and its visible rectangle covers the frame view to within a sixty-fourth
+/// of a point, far below a device pixel, both are entirely hidden under its
+/// opaque layer, so clearing them changes no pixel on screen. A window the
+/// view does not cover shows them and keeps them, and so does a window whose
+/// metal view is hidden, as Wine hides the client view when another client
+/// surface takes over or, on some Wines, on every surface flush: the surface
+/// image is then all the window shows. Nothing is restored: Wine sets the
+/// surface image again on its next flush, which a resize makes, and the
+/// background colour on the window's next show, and the next refresh clears
+/// whichever property `AppKit` or Wine has set again while the cover holds.
+fn clear_covered_window_layers(view: &NSView, _mtm: MainThreadMarker) {
+    // A view between windows has none; the next pass finds the new one.
+    let Some(window) = view.window() else {
+        return;
+    };
+    // A hidden view leaves the surface image as all the window shows, so it
+    // stays; the next pass after Wine shows the view again clears it.
+    if view.isHiddenOrHasHiddenAncestor() {
+        return;
+    }
+    let content = window.contentView();
+    // SAFETY: objc2 typed binding; `superview` is unsafe only because the
+    // view hierarchy may change under a caller off the main thread, and the
+    // marker puts this read on the main thread, where that hierarchy changes.
+    let frame_view = content
+        .as_deref()
+        .and_then(|content| unsafe { content.superview() });
+    let (Some(content), Some(frame_view)) = (content, frame_view) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the metal view's window has no content view or frame view; what the \
+             window paints under the game's layer is left as it is",
+        );
+        return;
+    };
+    let covered = rect_covers(
+        view.convertRect_toView(view.visibleRect(), None),
+        frame_view.convertRect_toView(frame_view.bounds(), None),
+    );
+    if !covered {
+        return;
+    }
+    let (Some(content_layer), Some(frame_layer)) = (content.layer(), frame_view.layer()) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the metal view's window has a content or frame view without a layer; what \
+             the window paints under the game's layer is left as it is",
+        );
+        return;
+    };
+    if frame_layer.backgroundColor().is_some() {
+        frame_layer.setBackgroundColor(None);
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: the metal view covers its window; cleared the frame view's background \
+             colour beneath it so the game's layer can go direct to the display",
+        );
+    }
+    // SAFETY: objc2 typed binding; `contents` is unsafe only because the
+    // object it returns is untyped, and it is only tested for presence here.
+    if unsafe { content_layer.contents() }.is_some() {
+        // SAFETY: `nil` is a valid `contents` for any layer and means no image.
+        unsafe { content_layer.setContents(None) };
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: the metal view covers its window; cleared the content view's surface \
+             image beneath it so the game's layer can go direct to the display",
+        );
+    }
+}
+
+/// Whether `inner` covers `outer`, both in one coordinate space, to 1/64 point on every edge.
+///
+/// Wine's view frames come from integer Win32 rectangles, at most halved,
+/// so the conversion between view spaces is exact in `f64`; the tolerance
+/// only absorbs float noise and stays far below a device pixel, so no
+/// visible strip of the window counts as covered.
+fn rect_covers(inner: CGRect, outer: CGRect) -> bool {
+    const SLACK: f64 = 1.0 / 64.0;
+    let (inner_min, inner_max) = (inner.min(), inner.max());
+    let (outer_min, outer_max) = (outer.min(), outer.max());
+    inner_min.x <= outer_min.x + SLACK
+        && inner_min.y <= outer_min.y + SLACK
+        && inner_max.x >= outer_max.x - SLACK
+        && inner_max.y >= outer_max.y - SLACK
 }
 
 /// Set the SDR layer colorspace under the `Passthrough` policy.
