@@ -306,8 +306,9 @@ pub const fn unpack_free_va(packed: u64) -> (u32, u32) {
 ///
 /// An identity that fits is returned as it is. A longer development identity
 /// (`<tag>-<n>-g<hash>`, with or without `-dirty`) keeps its tag, its commit
-/// distance and `-dirty`, and gives up hash digits, down to four. Anything
-/// longer still keeps its first [`HUD_LABEL_MAX`] bytes.
+/// distance and `-dirty`, and gives up hash digits, down to four; with room
+/// for fewer it drops the hash and its `-g` altogether. Anything longer still
+/// keeps its first [`HUD_LABEL_MAX`] bytes.
 #[must_use]
 pub fn hud_label(build: &str) -> String {
     if build.len() <= HUD_LABEL_MAX {
@@ -319,8 +320,15 @@ pub fn hud_label(build: &str) -> String {
     if let Some(at) = body.rfind("-g") {
         let (head, hash) = body.split_at(at + 2);
         let room = HUD_LABEL_MAX.saturating_sub(head.len() + dirty.len());
-        if room >= MIN_LABEL_HASH && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return format!("{head}{}{dirty}", &hash[..room.min(hash.len())]);
+        if hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if room >= MIN_LABEL_HASH {
+                return format!("{head}{}{dirty}", &hash[..room.min(hash.len())]);
+            }
+            // Too little room for a useful hash: drop it with its `-g`.
+            let short = format!("{}{dirty}", &body[..at]);
+            if short.len() <= HUD_LABEL_MAX {
+                return short;
+            }
         }
     }
     let mut end = HUD_LABEL_MAX;

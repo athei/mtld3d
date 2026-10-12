@@ -133,11 +133,43 @@ fn a_long_development_identity_gives_up_hash_digits_first() {
         hud_label("v0.12.0-12345-gbc8bc1e6d3f4a5b6c7-dirty"),
         "v0.12.0-12345-gbc8bc-dirty"
     );
-    // No room for four hash digits: the first bytes stay.
+    // No room for four hash digits: the hash goes with its `-g`.
     assert_eq!(
         hud_label("v10.123.456-rc.12-12345-gbc8bc1e6"),
-        "v10.123.456-rc.12-12345-gb"
+        "v10.123.456-rc.12-12345"
     );
+    assert_eq!(
+        hud_label("v10.123.456-rc-12345-gbc8bc1e6-dirty"),
+        "v10.123.456-rc-12345-dirty"
+    );
+    // Not a development identity: the first bytes stay.
+    assert_eq!(
+        hud_label("v10.123.456-release-candidate-12"),
+        "v10.123.456-release-candid"
+    );
+}
+
+#[test]
+fn every_row_carries_its_own_field() {
+    let sample = HudSample {
+        draws_up: 1,
+        draws_vb: 2,
+        passes: 3,
+        pipelines: 4,
+        samplers: 5,
+        textures: 6,
+        free_va: pack_free_va(7, 8),
+        cpu_heap_bytes: 9 << 20,
+        in_flight_bytes: 10 << 20,
+        reuse_pool_bytes: 11 << 20,
+        fixed_function: [12, 16],
+        models: [[13, 14, 15], [17, 18, 19]],
+    };
+    let rows = hud_rows(&sample);
+    for (index, (key, value)) in HUD_ROW_KEYS.iter().zip(rows).enumerate() {
+        let expected = u32::try_from(index + 1).expect("19 rows");
+        assert_eq!(value, Some(expected), "{key}");
+    }
 }
 
 #[test]
