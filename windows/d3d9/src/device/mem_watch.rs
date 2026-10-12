@@ -56,6 +56,7 @@ use mtld3d_core::{
         FREE_THRESHOLDS_MIB, FreeSpace, LARGEST_THRESHOLDS_MIB, PageBoxHolders, ThresholdReport,
         UNSAMPLED, cycles_to_micros, threshold_step,
     },
+    hud_stats::largest_free_word,
     thread_wait::wait_until_finished,
     watch_handoff::{self, ApiLink, Offer, Watch},
 };
@@ -130,13 +131,14 @@ pub struct MemWatchState {
 impl MemWatchState {
     /// Start the watch, with its thread in a 32-bit build.
     ///
-    /// The thread stores each walk's largest free block, in MiB, into
-    /// `largest_free_mib`, which the encoder reads for the Metal HUD rows.
-    pub fn new(largest_free_mib: Arc<AtomicU64>) -> Self {
+    /// The thread stores each walk's largest free block into
+    /// `largest_free_word`, as `mtld3d_core::hud_stats::largest_free_word`
+    /// encodes it, which the encoder reads for the Metal HUD rows.
+    pub fn new(largest_free_word: Arc<AtomicU64>) -> Self {
         Self {
             presents: AtomicU32::new(0),
             worker: if WALKS {
-                MemWatchWorker::spawn(largest_free_mib)
+                MemWatchWorker::spawn(largest_free_word)
             } else {
                 None
             },
@@ -229,8 +231,11 @@ struct Sample {
 
 /// The watch thread's half of the hand-off: the Win32 walk, the latches and the lines.
 struct AddressSpaceWatch {
-    /// Where each walk's largest free block, in MiB, goes for the encoder's Metal HUD rows.
-    largest_free_mib: Arc<AtomicU64>,
+    /// Where each walk's largest free block goes for the encoder's Metal HUD rows.
+    ///
+    /// Stored as [`largest_free_word`] encodes it, so a walk that found less
+    /// than 1 MiB free still reads as walked.
+    largest_free_word: Arc<AtomicU64>,
 }
 
 impl Watch for AddressSpaceWatch {
@@ -240,8 +245,10 @@ impl Watch for AddressSpaceWatch {
     /// Walk for sample `index` and advance both threshold latches on what the walk found.
     fn take(&mut self, index: u32) -> Sample {
         let walk = Walk::now();
-        self.largest_free_mib
-            .store(walk.space.largest_mib(), Ordering::Relaxed);
+        self.largest_free_word.store(
+            largest_free_word(walk.space.largest_mib()),
+            Ordering::Relaxed,
+        );
         let free = advance(
             &NEXT_FREE_THRESHOLD,
             &FREE_THRESHOLDS_MIB,
@@ -367,12 +374,12 @@ struct MemWatchWorker {
 
 impl MemWatchWorker {
     /// Start the device's watch thread; `None`, logged once, when it cannot start.
-    fn spawn(largest_free_mib: Arc<AtomicU64>) -> Option<Self> {
+    fn spawn(largest_free_word: Arc<AtomicU64>) -> Option<Self> {
         let (link, worker_link) = watch_handoff::link(FIGURES_WAIT);
         match thread::Builder::new()
             .name("mtld3d-mem-watch".into())
             .stack_size(WATCH_STACK_BYTES)
-            .spawn(move || worker_link.run(&mut AddressSpaceWatch { largest_free_mib }))
+            .spawn(move || worker_link.run(&mut AddressSpaceWatch { largest_free_word }))
         {
             Ok(handle) => Some(Self {
                 link: Some(link),

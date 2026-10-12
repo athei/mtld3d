@@ -3511,7 +3511,7 @@ impl Direct3DDevice9 {
         let upload_coherent_seq = counters.upload_coherent_seq();
         let failed_submit_seq = counters.failed_submit_seq();
         let vbib_retained_bytes = counters.retained_bytes();
-        let largest_free_mib = counters.largest_free_mib();
+        let largest_free_word = counters.largest_free_word();
         if info.config.present_max_frame_latency != 0 {
             log::info!(
                 target: LOG_TARGET,
@@ -3563,7 +3563,7 @@ impl Direct3DDevice9 {
             upload_coherent_seq,
             failed_submit_seq,
             vbib_retained_bytes,
-            mem_watch: mem_watch::MemWatchState::new(largest_free_mib),
+            mem_watch: mem_watch::MemWatchState::new(largest_free_word),
             vram_bytes_used: Arc::new(AtomicU64::new(0)),
             outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.

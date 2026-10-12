@@ -791,7 +791,7 @@ fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
         failed_submit_seq_ptr: 0,
         retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
         paced_present_seq_ptr: 0,
-        largest_free_mib_ptr: 0,
+        largest_free_word_ptr: 0,
         guest_page_bytes_ptr: 0,
         guest_pool_bytes_ptr: 0,
     };

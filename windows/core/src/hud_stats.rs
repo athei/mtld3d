@@ -72,9 +72,6 @@ pub const HUD_SAMPLE_HZ: u64 = 2;
 /// The size of a 32-bit address space in MiB, which bounds the address-space row.
 const ADDRESS_SPACE_32_MIB: u32 = 4096;
 
-/// Index of the address-space row in [`HUD_ROW_KEYS`].
-const ROW_MEM_32_LARGEST: usize = 4;
-
 /// Shortest commit hash [`hud_label`] keeps when it shortens a development identity.
 const MIN_LABEL_HASH: usize = 4;
 
@@ -187,8 +184,8 @@ pub struct HudSample {
     pub passes: u32,
     /// Textures alive on the device.
     pub textures: usize,
-    /// The largest free block of a 32-bit address space at the watch's last walk; zero before one.
-    pub largest_free_mib: u64,
+    /// The watch's last walk as [`largest_free_word`] stores it; zero before a walk.
+    pub largest_free_word: u64,
     /// Bytes `d3d9.dll` holds in page boxes, everything the layer keeps in the game's space.
     pub guest_page_bytes: u64,
     /// Vertex and index buffer copies held until the GPU has finished with them.
@@ -204,28 +201,36 @@ pub struct HudSample {
 /// The value of every row, indexed like [`HUD_ROW_KEYS`]; `None` leaves the row out.
 ///
 /// The address-space row is left out until the watch has walked once, which
-/// a 64-bit process never does.
+/// a 64-bit process never does; a walk that found less than 1 MiB free shows 0.
 #[must_use]
 pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
-    let largest = u32::try_from(sample.largest_free_mib)
-        .unwrap_or(u32::MAX)
-        .min(ADDRESS_SPACE_32_MIB);
-    let mut rows = [
+    let largest = sample.largest_free_word.checked_sub(1).map(|mib| {
+        u32::try_from(mib)
+            .unwrap_or(u32::MAX)
+            .min(ADDRESS_SPACE_32_MIB)
+    });
+    [
         Some(sample.draws_up),
         Some(sample.draws_vb),
         Some(sample.passes),
         Some(count(sample.textures)),
-        Some(largest),
+        largest,
         Some(mib(sample.guest_page_bytes)),
         Some(mib(sample.in_flight_bytes)),
         Some(mib(sample.reuse_pool_bytes)),
         Some(count(sample.fixed_function)),
         Some(count(sample.programs)),
-    ];
-    if sample.largest_free_mib == 0 {
-        rows[ROW_MEM_32_LARGEST] = None;
-    }
-    rows
+    ]
+}
+
+/// The word the address-space watch stores for a walk whose largest free block is `mib` MiB.
+///
+/// One more than the figure, saturating, so that 0 means only that no walk
+/// has happened yet: a walk that found less than 1 MiB free, the state the
+/// row exists to show, stores 1 and still shows, as 0.
+#[must_use]
+pub const fn largest_free_word(mib: u64) -> u64 {
+    mib.saturating_add(1)
 }
 
 /// The release identity as the domain row shows it, at most [`HUD_LABEL_MAX`] bytes.

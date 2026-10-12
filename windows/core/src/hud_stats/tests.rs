@@ -9,7 +9,7 @@ fn widest_sample() -> HudSample {
         draws_vb: u32::MAX,
         passes: u32::MAX,
         textures: usize::MAX,
-        largest_free_mib: u64::MAX,
+        largest_free_word: u64::MAX,
         guest_page_bytes: u64::MAX,
         in_flight_bytes: u64::MAX,
         reuse_pool_bytes: u64::MAX,
@@ -25,7 +25,7 @@ fn empty_sample() -> HudSample {
         draws_vb: 0,
         passes: 0,
         textures: 0,
-        largest_free_mib: 0,
+        largest_free_word: 0,
         guest_page_bytes: 0,
         in_flight_bytes: 0,
         reuse_pool_bytes: 0,
@@ -151,7 +151,7 @@ fn every_row_carries_its_own_field() {
         draws_vb: 2,
         passes: 3,
         textures: 4,
-        largest_free_mib: 5,
+        largest_free_word: largest_free_word(5),
         guest_page_bytes: 6 << 20,
         in_flight_bytes: 7 << 20,
         reuse_pool_bytes: 8 << 20,
@@ -254,6 +254,18 @@ fn the_gate_lets_the_first_sample_through_then_one_per_period() {
 }
 
 #[test]
-fn the_index_constant_names_its_row() {
-    assert_eq!(HUD_ROW_KEYS[ROW_MEM_32_LARGEST], "Mem 32-bit largest MiB");
+fn a_walk_that_found_under_a_mib_shows_zero_and_no_walk_shows_nothing() {
+    let mut sample = empty_sample();
+    let largest = row("Mem 32-bit largest MiB");
+    assert_eq!(hud_rows(&sample)[largest], None, "no walk yet");
+    sample.largest_free_word = largest_free_word(0);
+    assert_eq!(hud_rows(&sample)[largest], Some(0), "a walked 0 MiB");
+    sample.largest_free_word = largest_free_word(512);
+    assert_eq!(hud_rows(&sample)[largest], Some(512));
+    sample.largest_free_word = largest_free_word(u64::MAX);
+    assert_eq!(
+        hud_rows(&sample)[largest],
+        Some(4096),
+        "saturates, then clamps"
+    );
 }

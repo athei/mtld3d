@@ -999,12 +999,12 @@ pub struct FrameEncoder {
 
     /// The draw and pass counts the Metal HUD rows show, kept in every build.
     hud_stats: HudFrameStats,
-    /// Pointer to the largest free block, in MiB, the PE watch thread stores.
+    /// Pointer to the largest free block the PE watch thread stores, in MiB plus one.
     ///
     /// Established by the device creation context and read only for a Metal
-    /// HUD sample; the value stays zero in a 64-bit build. 0 means no device
-    /// supplied one.
-    largest_free_mib_ptr: u64,
+    /// HUD sample; the value stays zero, no walk, in a 64-bit build. 0 means
+    /// no device supplied one.
+    largest_free_word_ptr: u64,
     /// Pointer to `d3d9.dll`'s live page-box bytes, a process-lifetime static; 0 for none.
     guest_page_bytes_ptr: u64,
     /// Pointer to `d3d9.dll`'s recycle pool's parked bytes, a process-lifetime static; 0 for none.
@@ -1748,7 +1748,7 @@ impl FrameEncoder {
             stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
             hud_stats: HudFrameStats::default(),
-            largest_free_mib_ptr: context.largest_free_mib_ptr,
+            largest_free_word_ptr: context.largest_free_word_ptr,
             guest_page_bytes_ptr: context.guest_page_bytes_ptr,
             guest_pool_bytes_ptr: context.guest_pool_bytes_ptr,
             hud,
@@ -5755,7 +5755,7 @@ impl FrameEncoder {
         }
         // SAFETY: the device creation context supplied this pointer: a PE-heap
         // `Arc<AtomicU64>` kept alive until native destruction, or 0.
-        let largest_free_mib = unsafe { load_shared(self.largest_free_mib_ptr) };
+        let largest_free_word = unsafe { load_shared(self.largest_free_word_ptr) };
         // SAFETY: as above; see `add_retained_bytes`.
         let in_flight_bytes = unsafe { load_shared(self.retained_bytes_ptr) };
         // SAFETY: the creation context supplied the address of an `AtomicU64`
@@ -5769,7 +5769,7 @@ impl FrameEncoder {
             draws_vb: shown.draws_vb(),
             passes: shown.passes(),
             textures: self.texture_cache.len(),
-            largest_free_mib,
+            largest_free_word,
             guest_page_bytes,
             in_flight_bytes,
             reuse_pool_bytes,
