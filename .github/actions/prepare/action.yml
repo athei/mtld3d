@@ -58,7 +58,7 @@ runs:
     # prefix fallback can hand back one without the other; a miss costs the setup
     # job one cold install and the other legs nothing.
     - name: Restore the toolchains and cargo tools
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: |
           ~/.rustup
@@ -70,7 +70,7 @@ runs:
     # The crate registry is keyed on the lockfiles and a prefix fallback is right
     # here: a partial registry costs a fetch of what is missing, nothing more.
     - name: Restore the crate registry
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: |
           ~/.cargo/registry
@@ -95,7 +95,7 @@ runs:
       run: make xwin-dir
 
     - name: Restore the MSVC SDK splat
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       if: inputs.pe == 'true'
       with:
         path: /opt/xwin
@@ -119,7 +119,7 @@ runs:
 
     - name: Restore the Wine SDK
       id: wine-cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       if: inputs.pe == 'true'
       with:
         path: ~/wine-sdk
@@ -149,7 +149,7 @@ runs:
       run: make fetch
 
     - name: Save the toolchains and cargo tools
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       if: inputs.prime == 'true'
       with:
         path: |
@@ -160,7 +160,7 @@ runs:
         key: ${{ steps.keys.outputs.tools }}
 
     - name: Save the crate registry
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       if: inputs.prime == 'true'
       with:
         path: |
@@ -169,14 +169,14 @@ runs:
         key: registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Save the MSVC SDK splat
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       if: inputs.prime == 'true' && inputs.pe == 'true'
       with:
         path: /opt/xwin
         key: xwin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
 
     - name: Save the Wine SDK
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       if: inputs.prime == 'true' && inputs.pe == 'true'
       with:
         path: ~/wine-sdk

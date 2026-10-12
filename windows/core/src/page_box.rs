@@ -582,7 +582,7 @@ impl PageBoxRead {
         // exhaustion rather than publishing a wrapped zero to a guest writer.
         backing
             .reader_count()
-            .fetch_update(
+            .try_update(
                 core::sync::atomic::Ordering::Relaxed,
                 core::sync::atomic::Ordering::Relaxed,
                 |count| count.checked_add(1),

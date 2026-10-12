@@ -483,7 +483,7 @@ impl Attachment {
         } else {
             let (Ok(run) | Err(run)) =
                 self.undisplayed_paced
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
                         Some(run.saturating_add(1))
                     });
             run

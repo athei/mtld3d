@@ -160,7 +160,7 @@ fn handed_over_leases_retire_only_after_replay_completion_and_their_final_notifi
     drop(native);
     assert!(pool.has_ready());
     retirement.maintain(&pool, &mut calls);
-    assert!(registered(&retirement).is_empty());
+    assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert!(retirement.leases.aliases.iter().all(Option::is_none));
     assert!(
         retirement.leases.retired.is_empty(),
@@ -271,7 +271,7 @@ fn a_synchronous_submission_frees_the_pages_native_released_before_it_returns() 
         address
     );
     assert!(retirement.pending.is_empty());
-    assert!(registered(&retirement).is_empty());
+    assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert!(!pool.has_ready());
 }
 
@@ -413,7 +413,7 @@ fn staging_released_before_its_upload_retires_is_parked_by_the_retiring_pass() {
     assert!(pages.acquire_staging(64 * 256).is_none());
     drop(native);
     retirement.maintain(&pool, &mut calls);
-    assert!(registered(&retirement).is_empty());
+    assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert_eq!(pages.staging_bytes(), PAGE_SIZE);
     assert_eq!(
         pages
@@ -450,7 +450,7 @@ fn device_teardown_retires_staging_leases_and_the_drain_empties_the_lane() {
     // SAFETY: the native owners above are gone and nothing else can reach the packets.
     unsafe { retirement.cancel_after_quiescence(&pool) };
     assert!(retirement.pending.is_empty());
-    assert!(registered(&retirement).is_empty());
+    assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert!(!pool.has_ready());
     assert_eq!(pages.staging_bytes(), 3 * PAGE_SIZE);
     assert_eq!(pages.drain_staging(), 3 * PAGE_SIZE);
@@ -494,7 +494,7 @@ fn a_native_wrapper_keepalive_defers_parking_until_it_drops() {
     // Retention destroys the wrapper after GPU retirement, then drops the keepalive.
     drop(keepalive);
     retirement.maintain(&pool, &mut calls);
-    assert!(registered(&retirement).is_empty());
+    assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert_eq!(pages.staging_bytes(), PAGE_SIZE);
     assert_eq!(
         pages

@@ -176,8 +176,10 @@ The build needs a toolchain the x86 builds do not:
 
 - The Rust targets `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`,
   which `EC=1 make setup-rust` adds.
-- [llvm-mingw](https://github.com/mstorsjo/llvm-mingw), for its ARM64 and
-  ARM64EC CRT. `LLVM_MINGW` names the install.
+- [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20260826 or newer,
+  for its ARM64X CRT: its `aarch64-w64-mingw32` sysroot carries the ARM64 and
+  ARM64EC halves together. An older release keeps ARM64EC in a sysroot of its
+  own, which the link does not read. `LLVM_MINGW` names the install.
 - LLD 23 or newer as `lld-link`, such as Homebrew's (`brew install lld`).
   `ARM64X_LLD` names it. An older LLD links an image whose x64 view runs the
   ARM64 view's TLS callbacks.

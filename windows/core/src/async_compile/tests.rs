@@ -576,7 +576,7 @@ fn libraries_landing_in_either_order_reach_the_pipeline() {
         assert_eq!(deferred.pending_tickets(), [pipeline]);
         assert_eq!(deferred.answer(&id), None, "no answer while it builds");
         deferred.on_pipeline(pipeline, Some(42));
-        assert!(deferred.pending_tickets().is_empty());
+        assert_eq!(deferred.pending_tickets(), [] as [JobTicket; 0]);
         assert_eq!(deferred.answer(&id), Some(42));
     }
 }
@@ -601,7 +601,7 @@ fn a_failed_library_or_pipeline_fails_the_record() {
     );
     deferred.on_library(ps, None);
     deferred.on_pipeline(pipeline, None);
-    assert!(deferred.pending_tickets().is_empty());
+    assert_eq!(deferred.pending_tickets(), [] as [JobTicket; 0]);
     assert_eq!(deferred.answer(&by_library), None);
     assert_eq!(deferred.answer(&by_pipeline), None);
 }

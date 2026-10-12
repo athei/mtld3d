@@ -19,8 +19,8 @@ fn defaults_fill_in_behind_the_mandatory_pair() {
     assert_eq!(config.jobs, 1);
     assert_eq!(config.timeout, Duration::from_mins(1));
     assert!(config.fail_fast);
-    assert!(config.filter.is_empty());
-    assert!(config.skip.is_empty());
+    assert_eq!(config.filter, [] as [String; 0]);
+    assert_eq!(config.skip, [] as [String; 0]);
     assert!(config.log_dir.is_none());
     assert!(!config.ignored);
     assert_eq!(config.exes.len(), 2);

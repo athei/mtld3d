@@ -600,7 +600,7 @@ fn empty_file_with_just_header_is_compacted() {
     let mut buf = Vec::new();
     write_header(&mut buf);
     let (read, needs_compaction) = read_shaders(&buf);
-    assert!(read.is_empty());
+    assert_eq!(read, [] as [CacheEntry; 0]);
     assert!(needs_compaction);
 }
 
@@ -800,7 +800,7 @@ fn concurrent_loaders_and_writers_observe_valid_records() {
                 else {
                     panic!("raced cache stopped being current");
                 };
-                assert!(!records.shaders.is_empty());
+                assert_ne!(records.shaders, [] as [CacheEntry; 0]);
             }
         });
     });
@@ -1091,7 +1091,7 @@ fn inventory_counts_stored_records_across_emitter_fingerprints() {
         assert!(!stats.needs_compaction);
         if emitter != SHADER_EMITTER_VERSION {
             let runtime = read_records(&bytes);
-            assert!(runtime.shaders.is_empty());
+            assert_eq!(runtime.shaders, [] as [CacheEntry; 0]);
             assert!(runtime.pipelines.is_empty());
             assert!(runtime.needs_compaction);
         }

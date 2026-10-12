@@ -56,7 +56,7 @@ fn the_host_rounds_come_first_then_each_round_runs_each_binary_in_both_legs() {
 
 #[test]
 fn nothing_to_run_is_an_empty_schedule() {
-    assert!(schedule(0, 0, false, 5).is_empty());
+    assert_eq!(schedule(0, 0, false, 5), [] as [Step; 0]);
 }
 
 fn bench(exe: &str, name: &str) -> Bench {

@@ -126,7 +126,7 @@ fn a_shared_default_pool_resource_is_not_available() {
             "{kind:?}"
         );
         assert_eq!(refusal(&verdict).hresult(), D3DERR_NOTAVAILABLE);
-        assert!(!refusal(&verdict).reason().is_empty());
+        assert_ne!(refusal(&verdict).reason(), "");
     }
 }
 

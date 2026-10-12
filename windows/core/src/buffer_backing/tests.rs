@@ -167,7 +167,7 @@ fn a_re_created_backing_is_partial_and_may_not_widen() {
         assert!(b.is_released());
         assert!(!b.may_widen_upload());
         assert_eq!(b.ptr(), 0);
-        assert!(b.as_slice().is_empty());
+        assert_eq!(b.as_slice(), []);
         assert!(b.read_ptr_at(0).is_none());
 
         b.restore(PageBox::new_zeroed(SMALL as usize));

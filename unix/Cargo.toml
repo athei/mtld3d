@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 version = "0.12.0"
 license = "Zlib"
 description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
@@ -88,9 +88,12 @@ objc2-metal = { version = "0.3", features = [
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CATransaction", "objc2-metal"] }
 rustc-hash = "2"
-# The global allocator of the native dylib, the same pinned revision and `build_cc`
-# configuration the PE side ships (windows/Cargo.toml).
-snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f94f3ec1c10c0a29f910e17c1f30978", features = ["build_cc"] }
+# The global allocator of the native dylib, with the `build_cc` configuration
+# the PE side ships (windows/Cargo.toml). Both lockfiles resolve the same
+# version, and `make upgrade` and `make upgrade-incompat` keep this one on it
+# by moving them together. The windows workspace's `snmalloc_drift` tests catch
+# a bump that changes the allocator's shape; this workspace has none.
+snmalloc-rs = { version = "0.7.6", features = ["build_cc"] }
 strum = { version = "0.28", default-features = false }
 
 [profile.dev]

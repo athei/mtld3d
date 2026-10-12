@@ -86,8 +86,8 @@ fn ab_defaults_fill_in_behind_the_mandatory_flags() {
     assert_eq!(config.runs, 5);
     assert_eq!(config.timeout, Duration::from_mins(5));
     assert_eq!(config.wait_idle, Duration::ZERO);
-    assert!(config.benches.is_empty());
-    assert!(config.config.is_empty());
+    assert_eq!(config.benches, [] as [String; 0]);
+    assert_eq!(config.config, "");
     assert!(config.base.config.is_none());
     assert!(config.cand.config.is_none());
     assert!(config.report.is_none());

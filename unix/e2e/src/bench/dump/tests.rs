@@ -311,7 +311,7 @@ fn a_draw_count_within_ten_percent_passes() {
         tex_per_draw: 1.0,
         state: None,
     };
-    assert!(flags(Some(&game), Some(&near)).is_empty());
+    assert_eq!(flags(Some(&game), Some(&near)), [] as [&str; 0]);
     let far = BenchPass { draws: 111, ..near };
     assert_eq!(flags(Some(&game), Some(&far)), ["draws"]);
 }
@@ -703,18 +703,18 @@ fn state_shares_pass_at_ten_points_and_counts_at_fifteen_percent_or_five() {
         values
     };
     // Shares, of 100 draws on both sides: 10 points pass, 11 do not.
-    assert!(judged(with(0, 20), with(0, 30)).is_empty());
-    assert!(judged(with(0, 20), with(0, 10)).is_empty());
+    assert_eq!(judged(with(0, 20), with(0, 30)), [] as [&str; 0]);
+    assert_eq!(judged(with(0, 20), with(0, 10)), [] as [&str; 0]);
     assert_eq!(judged(with(0, 20), with(0, 31)), ["blend"]);
     assert_eq!(judged(with(4, 20), with(4, 9)), ["cmask0"]);
     // Counts: 15 % of the game's.
-    assert!(judged(with(5, 100), with(5, 115)).is_empty());
-    assert!(judged(with(5, 100), with(5, 85)).is_empty());
+    assert_eq!(judged(with(5, 100), with(5, 115)), [] as [&str; 0]);
+    assert_eq!(judged(with(5, 100), with(5, 85)), [] as [&str; 0]);
     assert_eq!(judged(with(5, 100), with(5, 116)), ["vs_sw"]);
     assert_eq!(judged(with(13, 100), with(13, 84)), ["tex_n"]);
     // Counts: never closer than 5, which outweighs 15 % below 34.
-    assert!(judged(with(7, 10), with(7, 15)).is_empty());
-    assert!(judged(with(7, 0), with(7, 5)).is_empty());
+    assert_eq!(judged(with(7, 10), with(7, 15)), [] as [&str; 0]);
+    assert_eq!(judged(with(7, 0), with(7, 5)), [] as [&str; 0]);
     assert_eq!(judged(with(7, 10), with(7, 16)), ["tex_sw"]);
     assert_eq!(judged(with(7, 0), with(7, 6)), ["tex_sw"]);
 }

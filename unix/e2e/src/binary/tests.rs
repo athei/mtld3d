@@ -397,7 +397,7 @@ fn launcher_uses_the_same_absolute_executable_for_sizing_and_launch() {
     .err()
     .expect("oversized name rejected before launch");
     assert!(error.contains("executable-path allowance"));
-    assert!(log.results.is_empty());
+    assert_eq!(log.results, [] as [TestResult; 0]);
 }
 
 #[test]
@@ -565,7 +565,7 @@ fn clean_and_declared_exits_keep_no_abnormal_bundle() {
         assert_eq!(run.outcome, BinaryOutcome::Complete);
         assert_eq!(log.results.len(), 1);
         assert_eq!(log.results[0].verdict, crate::attribute::Verdict::Passed);
-        assert!(log.notes.is_empty());
+        assert_eq!(log.notes, [] as [String; 0]);
         assert!(
             !log_dir.exists(),
             "clean completion needs no diagnostic directory"

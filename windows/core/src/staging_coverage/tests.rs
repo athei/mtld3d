@@ -120,7 +120,7 @@ fn unequal_bands_cover() {
 fn a_rect_outside_the_level_is_ignored() {
     let mut cov = StagingCoverage::new();
     cov.add(r(64, 64, 16, 16), 64, 64);
-    assert!(cov.rects.is_empty());
+    assert_eq!(cov.rects, [] as [DirtyRect; 0]);
     assert!(!cov.is_full());
 }
 

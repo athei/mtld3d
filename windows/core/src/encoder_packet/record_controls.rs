@@ -555,8 +555,8 @@ capture_control!(ColorFillOp, ColorFill, v, recorder, scratch, tag, {
             scale: v.fill.scale.percent(),
             slice: v.fill.subresource.0,
             level: rasterized_level(&v.kind, v.fill.subresource.1),
-            rect: [v.fill.rect.0, v.fill.rect.1, v.fill.rect.2, v.fill.rect.3],
-            rgba: [v.fill.rgba.0, v.fill.rgba.1, v.fill.rgba.2, v.fill.rgba.3],
+            rect: v.fill.rect.into(),
+            rgba: v.fill.rgba.into(),
             sample_count: u32::from(v.fill.sample_count),
             regenerate_mipmaps: u32::from(v.fill.regenerate_mipmaps)
         }

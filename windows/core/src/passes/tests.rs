@@ -7099,7 +7099,7 @@ fn rule_h_keeps_fill_changes_outside_removed_color_clear() {
     s.strip_color_from_no_color_draw_passes(&alt);
     let pass = &s.passes()[0];
     assert!(pass.color_texture().is_null());
-    assert!(pass.color_clear_quad_ranges().is_empty());
+    assert_eq!(pass.color_clear_quad_ranges(), []);
     let mut fill = TriangleFillMode::Fill as u32;
     let mut draw_modes = Vec::new();
     for cmd in pass.commands() {
@@ -10426,7 +10426,7 @@ fn pass_reads_follow_the_passes_that_bind_them() {
     assert!(s.pass_reads().is_empty(), "taken with their passes");
     s.record_pass_reads(false);
     s.emit_command(Command::set_fragment_texture(tex(0x7003).raw(), 0));
-    assert!(s.pass_reads().is_empty());
+    assert_eq!(s.pass_reads(), []);
 }
 
 /// The placeholder bind of deferred record `index`, as `DeferredPipelineId::placeholder` makes it.

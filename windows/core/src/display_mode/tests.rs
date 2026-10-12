@@ -465,7 +465,7 @@ fn a_bound_of_zero_still_serves_the_desktop() {
 
 #[test]
 fn an_empty_settable_list_serves_nothing() {
-    assert!(served_mode_sizes(&[], MBP, 5).is_empty());
+    assert_eq!(served_mode_sizes(&[], MBP, 5), [] as [(u32, u32); 0]);
 }
 
 #[test]
@@ -488,8 +488,8 @@ fn served_indices_are_the_positions_of_served_sizes_in_list_order() {
 
 #[test]
 fn no_served_size_in_the_list_yields_no_indices() {
-    assert!(served_mode_indices([(640, 480)], &[MBP]).is_empty());
-    assert!(served_mode_indices([], &[MBP]).is_empty());
+    assert_eq!(served_mode_indices([(640, 480)], &[MBP]), [] as [u32; 0]);
+    assert_eq!(served_mode_indices([], &[MBP]), [] as [u32; 0]);
 }
 
 /// The heights a 2234-pixel-high display at 96 dpi cannot be scaled to.
@@ -604,8 +604,11 @@ fn every_known_unscalable_size_is_dropped_and_the_desktop_never_is() {
 #[test]
 fn an_empty_settable_list_drops_nothing() {
     let mut settable = Vec::new();
-    assert!(drop_unscalable_sizes(&mut settable, MBP, 96).is_empty());
-    assert!(settable.is_empty());
+    assert_eq!(
+        drop_unscalable_sizes(&mut settable, MBP, 96),
+        [] as [(u32, u32); 0]
+    );
+    assert_eq!(settable, [] as [(u32, u32); 0]);
 }
 
 const HD_60: ModeRequest = ModeRequest {
