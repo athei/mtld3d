@@ -791,6 +791,7 @@ impl Harness {
             "the device reference is released once"
         );
         self.set(HarnessState::DEVICE_RELEASED, true);
+        win32::end_cursor_script(self.hwnd);
         // SAFETY: vtable thunk; this releases the reference `CreateDevice`
         // handed the harness, which `Drop` now skips.
         unsafe { (self.dev_vtbl().release)(self.device) }
@@ -3237,6 +3238,24 @@ impl Harness {
         unsafe { (self.dev_vtbl().show_cursor)(self.device, i32::from(show)) }
     }
 
+    /// Have the window's own procedure call this device's `ShowCursor(FALSE)` on every `msg`.
+    ///
+    /// The hide a game's window procedure makes from inside its handler of a
+    /// message. `0` hides on nothing and only has the procedure answer a
+    /// synthesized `WM_ACTIVATE` itself (`win32::script_cursor_hide` says
+    /// why). The script ends before the harness releases the device.
+    pub fn hide_cursor_from_window_procedure_on(&self, msg: u32) {
+        // SAFETY: the device stays live until `Drop` or `release_device`,
+        // and both end the window's script before releasing it.
+        unsafe { win32::script_cursor_hide(self.hwnd, self.device, msg) };
+    }
+
+    /// How many hides the window's procedure made for this device, and what the last one returned.
+    #[must_use]
+    pub fn window_procedure_hides(&self) -> (usize, i32) {
+        win32::scripted_hides(self.hwnd)
+    }
+
     /// Send `msg` synchronously through the device window's wndproc.
     ///
     /// mtld3d subclasses that wndproc at `CreateDevice`, so tests can
@@ -3667,6 +3686,7 @@ impl Default for Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         if !self.device.is_null() && !self.has(HarnessState::DEVICE_RELEASED) {
+            win32::end_cursor_script(self.hwnd);
             // SAFETY: vtable thunk; `self.device` is live and released exactly once.
             unsafe { (self.dev_vtbl().release)(self.device) };
         }

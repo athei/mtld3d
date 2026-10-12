@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_types::ICONINFO;
+use mtld3d_types::{ICONINFO, IDirect3DDevice9Vtbl};
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -74,6 +74,9 @@ unsafe extern "system" {
     ) -> i32;
     fn GetDC(hwnd: usize) -> usize;
     fn ReleaseDC(hwnd: usize, hdc: usize) -> i32;
+    fn SetPropA(hwnd: usize, name: *const c_char, data: usize) -> i32;
+    fn GetPropA(hwnd: usize, name: *const c_char) -> usize;
+    fn RemovePropA(hwnd: usize, name: *const c_char) -> usize;
 }
 
 // `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
@@ -475,6 +478,13 @@ extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize)
     if msg == WM_HARNESS_PROBE {
         return HARNESS_PROBE_REPLY;
     }
+    if msg == WM_HARNESS_RESTORE {
+        replay_restore(hwnd, lparam);
+        return 0;
+    }
+    if run_cursor_script(hwnd, msg) {
+        return 0;
+    }
     if msg == WM_DISPLAYCHANGE {
         move_to_armed_top(hwnd);
     }
@@ -709,6 +719,139 @@ pub const WM_HARNESS_PROBE: u32 = 0x8000 + 0x0E2E;
 
 /// What the harness window's procedure answers [`WM_HARNESS_PROBE`] with.
 pub const HARNESS_PROBE_REPLY: isize = 0x6D74_6C64;
+
+/// A private message the harness window's procedure answers the way Wine restores a window.
+///
+/// Wine delivers a restore as one `WM_SYSCOMMAND` (`SC_RESTORE`): inside it
+/// the window is resized, which sends `WM_WINDOWPOSCHANGED` and from that
+/// the `WM_SIZE` of the restored size, and then activated (`WM_ACTIVATEAPP`,
+/// then `WM_ACTIVATE`), all before it returns. The procedure does the same
+/// from inside its handling of this one: it resizes a borderless window to
+/// the client size `lParam` carries (height in the high word, width in the
+/// low) and sends the two activation messages. `WM_APP` range: a real
+/// `WM_SYSCOMMAND` would have the default procedure restore and show the
+/// hidden test window.
+pub const WM_HARNESS_RESTORE: u32 = 0x8000 + 0x0E2F;
+
+/// `WM_SIZE`: the window's client area changed size; `wParam` is the `SIZE_*` kind.
+pub const WM_SIZE: u32 = 0x0005;
+/// `WM_ACTIVATE`: the window was activated or deactivated; `wParam` is a `WA_*` state.
+pub const WM_ACTIVATE: u32 = 0x0006;
+/// `WA_INACTIVE`: the `WM_ACTIVATE` state of a window being deactivated.
+pub const WA_INACTIVE: usize = 0;
+/// `WA_ACTIVE`: the `WM_ACTIVATE` state of a window activated other than by a click.
+pub const WA_ACTIVE: usize = 1;
+
+/// The window property holding the device a cursor script hides through ([`script_cursor_hide`]).
+const SCRIPT_DEVICE: &core::ffi::CStr = c"mtld3d_test_script_device";
+/// The window property holding the message a cursor script hides on.
+const SCRIPT_HIDE_ON: &core::ffi::CStr = c"mtld3d_test_script_hide_on";
+/// The window property counting the hides a cursor script made.
+const SCRIPT_HIDES: &core::ffi::CStr = c"mtld3d_test_script_hides";
+/// The window property holding what the last scripted `ShowCursor(FALSE)` returned.
+const SCRIPT_LAST_HIDE: &core::ffi::CStr = c"mtld3d_test_script_last_hide";
+
+/// Have the window's own procedure hide `device`'s cursor whenever it receives `hide_on`.
+///
+/// The procedure calls `IDirect3DDevice9::ShowCursor(FALSE)` from inside its
+/// handling of the message, the way a game's window procedure does, and
+/// counts the calls ([`scripted_hides`]); `0` hides on nothing. While a script
+/// is set, the procedure also answers `WM_ACTIVATE` itself rather than
+/// passing it to the default procedure, whose focus change would activate the
+/// hidden test window for the whole process when a test synthesizes the
+/// message. [`end_cursor_script`] ends it. The script lives in window
+/// properties, the one per-window store a window procedure reaches by its
+/// `HWND`.
+///
+/// # Safety
+///
+/// `device` must stay a live `IDirect3DDevice9` until [`end_cursor_script`]
+/// runs for the window.
+pub unsafe fn script_cursor_hide(hwnd: usize, device: *mut c_void, hide_on: u32) {
+    let hide_on = usize::try_from(hide_on).expect("a message id fits usize");
+    for (name, value) in [
+        (SCRIPT_DEVICE, device as usize),
+        (SCRIPT_HIDE_ON, hide_on),
+        (SCRIPT_HIDES, 0),
+        (SCRIPT_LAST_HIDE, 0),
+    ] {
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+        // `name` a NUL-terminated string valid for the call.
+        let set = unsafe { SetPropA(hwnd, name.as_ptr(), value) };
+        assert!(set != 0, "SetPropA failed");
+    }
+}
+
+/// How many hides the window's cursor script made, and what the last one returned.
+#[must_use]
+pub fn scripted_hides(hwnd: usize) -> (usize, i32) {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // name is a NUL-terminated string valid for the call.
+    let hides = unsafe { GetPropA(hwnd, SCRIPT_HIDES.as_ptr()) };
+    // SAFETY: as above.
+    let last = unsafe { GetPropA(hwnd, SCRIPT_LAST_HIDE.as_ptr()) };
+    let last = u32::try_from(last)
+        .expect("the stored result is a 32-bit value")
+        .cast_signed();
+    (hides, last)
+}
+
+/// End the window's cursor script; a window without one is left alone.
+pub fn end_cursor_script(hwnd: usize) {
+    for name in [
+        SCRIPT_DEVICE,
+        SCRIPT_HIDE_ON,
+        SCRIPT_HIDES,
+        SCRIPT_LAST_HIDE,
+    ] {
+        // SAFETY: Win32 thunk; any window handle is accepted, and a missing
+        // property is answered with 0.
+        unsafe { RemovePropA(hwnd, name.as_ptr()) };
+    }
+}
+
+/// Run the window's cursor script for `msg`; `true` when the procedure answered the message.
+fn run_cursor_script(hwnd: usize, msg: u32) -> bool {
+    // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for.
+    let device = unsafe { GetPropA(hwnd, SCRIPT_DEVICE.as_ptr()) };
+    if device == 0 {
+        return false;
+    }
+    // SAFETY: as above.
+    let hide_on = unsafe { GetPropA(hwnd, SCRIPT_HIDE_ON.as_ptr()) };
+    // `WM_NULL` is no message to hide on: Wine sends it to probe a window.
+    if hide_on != 0 && usize::try_from(msg).is_ok_and(|msg| msg == hide_on) {
+        let device = device as *mut c_void;
+        // SAFETY: `script_cursor_hide`'s contract keeps `device` a live
+        // `IDirect3DDevice9` while the script is set.
+        let vtbl = unsafe { crate::vtbl::deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+        // SAFETY: vtable thunk on that live device.
+        let result = unsafe { (vtbl.show_cursor)(device, 0) };
+        // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for.
+        let hides = unsafe { GetPropA(hwnd, SCRIPT_HIDES.as_ptr()) };
+        let result = usize::try_from(result.cast_unsigned()).expect("a u32 fits usize");
+        // SAFETY: as above, with NUL-terminated names valid for the call.
+        unsafe { SetPropA(hwnd, SCRIPT_HIDES.as_ptr(), hides + 1) };
+        // SAFETY: as above.
+        unsafe { SetPropA(hwnd, SCRIPT_LAST_HIDE.as_ptr(), result) };
+    }
+    msg == WM_ACTIVATE
+}
+
+/// Send the window what Wine sends from inside a restore ([`WM_HARNESS_RESTORE`]).
+///
+/// The size change is a real `SetWindowPos`, so the `WM_SIZE` is the one
+/// the default procedure sends from inside the `WM_WINDOWPOSCHANGED` it
+/// answers, as it does in Wine's restore.
+fn replay_restore(hwnd: usize, size_lparam: isize) {
+    let size = size_lparam.cast_unsigned();
+    let width = i32::try_from(size & 0xFFFF).expect("a 16-bit width fits i32");
+    let height = i32::try_from((size >> 16) & 0xFFFF).expect("a 16-bit height fits i32");
+    let rect = window_rect(hwnd);
+    set_window_pos(hwnd, rect.left, rect.top, width, height);
+    let _ = send_message(hwnd, WM_ACTIVATEAPP, 1, 0);
+    let _ = send_message(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+}
 
 /// `GWLP_WNDPROC`: a window's procedure.
 const GWLP_WNDPROC: i32 = -4;

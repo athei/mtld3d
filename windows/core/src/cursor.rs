@@ -1,8 +1,19 @@
-//! Cursor bitmap validation and acknowledged upload decisions.
+//! Cursor bitmap validation, acknowledged upload decisions and the resize hide rule.
 //!
 //! Shared by both cursor modes before the COM wrapper reads a locked surface.
 
 use mtld3d_types::D3DFMT_A8R8G8B8;
+
+/// `SIZE_RESTORED`: the `WM_SIZE` `wParam` of a window resized, neither minimised nor maximised.
+pub const SIZE_RESTORED: usize = 0;
+/// `SIZE_MINIMIZED`: the `WM_SIZE` `wParam` of a window that was minimised.
+pub const SIZE_MINIMIZED: usize = 1;
+/// `SIZE_MAXIMIZED`: the `WM_SIZE` `wParam` of a window that was maximised.
+pub const SIZE_MAXIMIZED: usize = 2;
+/// `SIZE_MAXSHOW`: the `WM_SIZE` `wParam` telling a window another one was restored from maximised.
+pub const SIZE_MAXSHOW: usize = 3;
+/// `SIZE_MAXHIDE`: the `WM_SIZE` `wParam` telling a window another one was maximised.
+pub const SIZE_MAXHIDE: usize = 4;
 
 /// The bitmap dimensions and hotspot before cursor scaling.
 pub struct BitmapLayout {
@@ -71,6 +82,24 @@ impl BitmapLayout {
 /// full upload remains unknown, so visibility changes and retargets retry it.
 pub fn reconcile_upload(known: bool, mut send: impl FnMut(bool) -> bool) -> bool {
     (known && send(false)) || send(true)
+}
+
+/// Whether a `WM_SIZE` of `size_type` drops the hides the game issues while handling it.
+///
+/// Some games hide the cursor while they answer a resize and show it again
+/// only seconds later, which leaves the pointer gone for that long. The
+/// device keeps a shown cursor shown across the game's handling of the
+/// message dispatch the resize arrived in. Wine sends a restore as one
+/// `WM_SYSCOMMAND` inside which the `WM_SIZE` and the activation messages
+/// that follow it are sent, so that dispatch is the whole restore. A hide
+/// the game issues once that dispatch has returned is honoured, since it is
+/// the game hiding the cursor for its own reasons (a mouselook, say). A
+/// minimise sizes nothing the game reloads for, and `SIZE_MAXSHOW` and
+/// `SIZE_MAXHIDE` tell a window about another window, so they keep nothing.
+/// A cursor the game had already hidden has nothing to keep.
+#[must_use]
+pub const fn resize_suppresses_hide(size_type: usize, cursor_shown: bool) -> bool {
+    cursor_shown && matches!(size_type, SIZE_RESTORED | SIZE_MAXIMIZED)
 }
 
 #[cfg(test)]

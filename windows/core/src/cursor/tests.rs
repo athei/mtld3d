@@ -1,8 +1,43 @@
-//! Bitmap bounds and acknowledged-upload recovery.
+//! Bitmap bounds, acknowledged-upload recovery and the resize hide rule.
 
 use mtld3d_types::{D3DFMT_A8, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8};
 
-use super::{BitmapLayout, reconcile_upload};
+use super::{
+    BitmapLayout, SIZE_MAXHIDE, SIZE_MAXIMIZED, SIZE_MAXSHOW, SIZE_MINIMIZED, SIZE_RESTORED,
+    reconcile_upload, resize_suppresses_hide,
+};
+
+#[test]
+fn a_resize_suppresses_the_hides_of_its_dispatch_while_the_cursor_is_shown() {
+    assert!(resize_suppresses_hide(SIZE_RESTORED, true));
+    assert!(resize_suppresses_hide(SIZE_MAXIMIZED, true));
+}
+
+#[test]
+fn a_minimise_or_another_windows_size_change_suppresses_nothing() {
+    for size_type in [SIZE_MINIMIZED, SIZE_MAXSHOW, SIZE_MAXHIDE, 5, usize::MAX] {
+        assert!(
+            !resize_suppresses_hide(size_type, true),
+            "size type {size_type}"
+        );
+    }
+}
+
+#[test]
+fn a_hidden_cursor_has_nothing_to_keep_across_a_resize() {
+    for size_type in [
+        SIZE_RESTORED,
+        SIZE_MINIMIZED,
+        SIZE_MAXIMIZED,
+        SIZE_MAXSHOW,
+        SIZE_MAXHIDE,
+    ] {
+        assert!(
+            !resize_suppresses_hide(size_type, false),
+            "size type {size_type}"
+        );
+    }
+}
 
 fn bitmap() -> BitmapLayout {
     BitmapLayout {

@@ -331,7 +331,10 @@ const WM_APP_REACTIVATE_FULLSCREEN: u32 = 0x8000 + 0x03DA;
 /// per-device user data, and a window procedure has no key but the `HWND`.
 /// Two devices may share one window, so only the first one replaces the
 /// procedure and the last one to leave puts it back
-/// ([`mtld3d_core::window_subclass`]).
+/// ([`mtld3d_core::window_subclass`]). Each window's entry also counts the
+/// calls of `cursor_wnd_proc` running on it, which only the window procedure
+/// knows of and which belong to the window rather than to a device, and names
+/// the device to tell when the outermost one returns (`HookCall`).
 static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
     LazyLock::new(|| Mutex::new(WindowSubclasses::default()));
 
@@ -457,13 +460,14 @@ bitflags::bitflags! {
         ///
         /// The next WM_SETCURSOR / paint cycle needs to re-realise.
         const DIRTY = 1 << 1;
-        /// Latched on WM_SIZE-driven auto-resize.
+        /// Set by a resize `WM_SIZE` until the message dispatch it arrived in returns.
         ///
-        /// Suppresses a single game-issued ShowCursor(FALSE) until the next
-        /// ShowCursor(TRUE). Some games hide the cursor from their own
-        /// WM_SIZE handler and re-show it seconds later; this latch pre-empts
-        /// that transient hide while preserving legitimate hides.
-        const FORCE_VISIBLE_AFTER_RESIZE = 1 << 2;
+        /// A game-issued `ShowCursor(FALSE)` is dropped while it is set, and
+        /// a `ShowCursor(TRUE)` clears it. Armed only while the cursor is
+        /// shown, so it never shows a cursor the game hid; the rule is
+        /// `mtld3d_core::cursor::resize_suppresses_hide`, and the dispatch is
+        /// counted by `mtld3d_core::window_subclass::WindowSubclasses`.
+        const HIDE_SUPPRESSED_IN_RESIZE = 1 << 2;
         /// The unix-side overlay window draws the cursor.
         ///
         /// Fixed for the device's lifetime. `handle` is then the blank
@@ -780,9 +784,9 @@ impl CursorState {
         }
     }
 
-    /// The flags word `SetCursorOverlay` carries: the *effective* visibility.
+    /// The flags word `SetCursorOverlay` carries: the visibility once a cursor surface is set.
     const fn overlay_flags(&self) -> CursorOverlayFlags {
-        let mut flags = if self.effective_visible() && !self.handle.is_null() {
+        let mut flags = if self.visible() && !self.handle.is_null() {
             CursorOverlayFlags::VISIBLE
         } else {
             CursorOverlayFlags::empty()
@@ -883,7 +887,7 @@ impl CursorState {
         };
         self.hash = hash;
         self.handle = handle;
-        if self.effective_visible() {
+        if self.visible() {
             let us = timed_set_cursor(handle);
             self.charge_call_us(us);
         }
@@ -1000,27 +1004,53 @@ impl CursorState {
         }
     }
 
-    const fn force_visible_after_resize(&self) -> bool {
-        self.flags.contains(CursorFlags::FORCE_VISIBLE_AFTER_RESIZE)
+    const fn hide_suppressed_in_resize(&self) -> bool {
+        self.flags.contains(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE)
     }
 
-    /// Visibility that drives the *physical* Win32 cursor.
-    ///
-    /// The game-requested flag, or the post-resize pin while the latch is
-    /// armed. Only `VISIBLE` feeds `ShowCursor`'s previous-state return — the
-    /// latch must not leak into the API bookkeeping.
-    const fn effective_visible(&self) -> bool {
-        self.visible() || self.force_visible_after_resize()
-    }
-
-    const fn set_force_visible_after_resize(&mut self, on: bool) {
+    const fn set_hide_suppressed_in_resize(&mut self, on: bool) {
         if on {
-            self.flags = self.flags.union(CursorFlags::FORCE_VISIBLE_AFTER_RESIZE);
+            self.flags = self.flags.union(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE);
         } else {
             self.flags = self
                 .flags
-                .difference(CursorFlags::FORCE_VISIBLE_AFTER_RESIZE);
+                .difference(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE);
         }
+    }
+
+    /// Answer a `WM_SIZE` of `size_type` before the game's window procedure sees it.
+    ///
+    /// Arms the hide suppression when `mtld3d_core::cursor::resize_suppresses_hide`
+    /// says so and returns whether it did; the caller holds the window's
+    /// message dispatch, whose end disarms it ([`Self::end_resize_dispatch`]).
+    ///
+    /// Also marks the cursor dirty, so the next `WM_SETCURSOR` runs the
+    /// null-then-set kick, and re-asserts the HCURSOR, since a drag resize
+    /// leaves macOS's resize cursor on screen until something replaces it. A
+    /// hidden hardware cursor is not re-asserted: while it is hidden the game
+    /// owns the Win32 cursor. The software blank is, as `ShowCursor` keeps it
+    /// selected in both states.
+    fn enter_resize(&mut self, size_type: usize) -> bool {
+        let suppress = mtld3d_core::cursor::resize_suppresses_hide(size_type, self.visible());
+        if suppress {
+            self.set_hide_suppressed_in_resize(true);
+        }
+        self.set_dirty(true);
+        if !self.handle.is_null() && (self.visible() || self.software()) {
+            set_cursor(self.handle);
+        }
+        self.push_overlay_state();
+        suppress
+    }
+
+    /// Disarm the hide suppression: the message dispatch a resize arrived in has returned.
+    ///
+    /// Returns whether it was still armed; a `ShowCursor(TRUE)` inside the
+    /// dispatch may have disarmed it already.
+    const fn end_resize_dispatch(&mut self) -> bool {
+        let armed = self.hide_suppressed_in_resize();
+        self.set_hide_suppressed_in_resize(false);
+        armed
     }
 
     /// Subclass the game's hwnd so `WM_SETCURSOR` / `WM_ACTIVATE` route through `cursor_wnd_proc`.
@@ -1119,7 +1149,7 @@ impl CursorState {
         }
         let thread_cursor = get_cursor();
         let restored = if handles.contains(&thread_cursor) {
-            let preserve_hide = self.software() && !self.effective_visible();
+            let preserve_hide = self.software() && !self.visible();
             let mut replacement = if self.hwnd.is_null() {
                 null_mut()
             } else {
@@ -1162,7 +1192,9 @@ impl CursorState {
     /// one, and a new window another device already subclasses is joined
     /// rather than hooked a second time. The realized `HCURSOR`, both sprite
     /// caches and the visibility latches carry over: `Reset` re-specifies the
-    /// swap chain, not the cursor the application set.
+    /// swap chain, not the cursor the application set. The resize hide
+    /// suppression does not: it belongs to a message dispatch on the window
+    /// the device leaves, whose end would no longer find the device there.
     ///
     /// `view_handle` names the view the new window's attach produced, null
     /// when it produced none. The overlay state is re-sent against it because
@@ -1176,6 +1208,7 @@ impl CursorState {
         dev_ptr: *mut DeviceInner,
     ) {
         self.uninstall_subclass(dev_ptr);
+        self.set_hide_suppressed_in_resize(false);
         self.hwnd = hwnd;
         self.view_handle = view_handle;
         self.install_subclass(dev_ptr);
@@ -1353,11 +1386,11 @@ pub extern "system" fn device_set_cursor_properties(
 
     cur.hash = hash;
     cur.handle = handle;
-    let visible = cur.effective_visible();
+    let visible = cur.visible();
     // Software mode: the overlay gets the new sprite (or just its hash) and the
     // current visibility. The blank Win32 cursor is unchanged by a cursor
     // change and already in place from the last show, so it is realized here
-    // only for the first cursor a device sets while already pinned visible.
+    // only when no cursor was set before.
     cur.push_overlay_state();
     // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
     // While hidden the game owns the win32 cursor — pushing null here clobbers
@@ -1427,10 +1460,10 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     let cur = obj.inner().cursor_mut();
     let prev = cur.visible();
     let next = show != 0;
-    if !next && cur.force_visible_after_resize() {
+    if !next && cur.hide_suppressed_in_resize() {
         debug!(
             target: LOG_TARGET,
-            "ShowCursor(show=0) suppressed by force_visible_after_resize (post-resize hide pre-empted) tid={}",
+            "ShowCursor(show=0) suppressed: issued inside the dispatch a resize arrived in tid={}",
             current_thread_id(),
         );
         cur.push_overlay_state();
@@ -1447,7 +1480,7 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
         return i32::from(prev);
     }
     if next {
-        cur.set_force_visible_after_resize(false);
+        cur.set_hide_suppressed_in_resize(false);
         // A pointer that came back from another process while the cursor was
         // hidden: the game's cursor was not on screen to kick then, so the
         // show pushes null first and Wine re-applies on the handle change.
@@ -1533,7 +1566,10 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
 /// procedure) before it frees anything, so only a message already past the
 /// lookup can meet a device being released. A deferred fullscreen repair that
 /// one device posted and another device on the window receives finds that
-/// device's own state, and its guards make it a no-op there. A
+/// device's own state, and its guards make it a no-op there. The resize hide
+/// suppression is the one write made with the mutex held: the call counted
+/// on the window ends in `HookCall`'s drop, which disarms the device named
+/// for it while the mutex keeps that device registered. A
 /// user resize or activation change on this thread while another thread
 /// draws, resets or releases the device under the flag is the residual, and
 /// native D3D9's window hook leaves the same one.
@@ -1541,13 +1577,17 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
     // Resolve the device for *this* window, and the procedure the hook
     // replaced. A window may still be subclassed briefly after its last
     // device left (or never have been registered); fall back to the default
-    // proc rather than deref a missing/stale device.
+    // proc rather than deref a missing/stale device. The call is counted on
+    // the window until `_call` drops, on every return below.
     let route = DEVICE_INSTANCES
         .lock()
         .expect("device-instances mutex poisoned")
-        .route(hwnd as usize);
+        .enter(hwnd as usize);
     let Some((device, original_wndproc)) = route else {
         return def_window_proc(hwnd, msg, wp, lp);
+    };
+    let _call = HookCall {
+        window: hwnd as usize,
     };
     let dev_ptr = device as *mut DeviceInner;
     let original_wndproc = original_wndproc as *mut c_void;
@@ -1602,8 +1642,8 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // by `uninstall_subclass`, which runs before the device is freed.
         let cur = unsafe { (*dev_ptr).cursor_mut() };
         let hit_test = lp.cast_unsigned() & 0xFFFF;
-        if hit_test == HTCLIENT && !cur.handle.is_null() && cur.effective_visible() {
-            // We own the win32 cursor ONLY while the D3D cursor is effectively
+        if hit_test == HTCLIENT && !cur.handle.is_null() && cur.visible() {
+            // We own the win32 cursor ONLY while the D3D cursor is
             // visible. Consuming then takes over DefWindowProc's duty: the
             // displayed cursor is whatever the last SetCursor call pushed, and
             // entering the window does NOT re-apply it — so every consumed
@@ -1651,7 +1691,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             trace!(
                 target: LOG_TARGET,
                 "wndproc WM_SETCURSOR: hit_test={hit_test:#x} visible={} handle={:p} tid={} → forwarded",
-                cur.effective_visible(), cur.handle, current_thread_id(),
+                cur.visible(), cur.handle, current_thread_id(),
             );
         }
     } else if msg == WM_ACTIVATE {
@@ -1726,35 +1766,21 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
                 dev.apply_auto_resize(new_width, new_height);
             }
         }
-        // WoW's own `WM_SIZE` handler (about to run via the
-        // `CallWindowProcW` tail below) will call `ShowCursor(FALSE)`
-        // and re-show ~6 s later. Pin visibility to TRUE across that
-        // window so the cursor doesn't disappear mid-loading. The
-        // latch clears on the next game-issued `ShowCursor(TRUE)` and
-        // pins only the *physical* cursor (`effective_visible`) — it
-        // must not touch `VISIBLE`, which `ShowCursor` reports as the
-        // previous state (a macdrv WM_SIZE can race the first
-        // ShowCursor(TRUE), and touching `VISIBLE` here would corrupt
-        // that return value).
-        //
-        // Always re-assert the HCURSOR + mark dirty so a follow-up
-        // `WM_SETCURSOR` re-runs `SetCursor` too. After a user-driven
-        // drag resize, macOS's native resize cursor is left over until
-        // we explicitly replace it; without this the in-game cursor
-        // bitmap stays gone after the drag.
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
         // lifetime of the subclass.
         let cur = unsafe { (*dev_ptr).cursor_mut() };
-        cur.set_force_visible_after_resize(true);
-        cur.set_dirty(true);
-        if !cur.handle.is_null() {
-            set_cursor(cur.handle);
+        let suppress = cur.enter_resize(wp);
+        if suppress {
+            DEVICE_INSTANCES
+                .lock()
+                .expect("device-instances mutex poisoned")
+                .hold_until_dispatch_ends(hwnd as usize, device);
         }
-        cur.push_overlay_state();
         debug!(
             target: LOG_TARGET,
-            "wndproc WM_SIZE: {new_width}x{new_height} → pinned visible, dirty armed, handle={:p} tid={}",
-            cur.handle, current_thread_id(),
+            "wndproc WM_SIZE: type={wp} {new_width}x{new_height} → game hides suppressed until \
+             this dispatch returns={suppress} visible={} handle={:p} tid={}",
+            cur.visible(), cur.handle, current_thread_id(),
         );
     } else if msg == WM_APP_REASSERT_FULLSCREEN {
         // Deferred half of the WM_SIZE branch above. Our own message, so it
@@ -1783,6 +1809,50 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
 
     let _app_call = crate::fullscreen::app_procedure_call(hwnd);
     call_window_proc(original_wndproc, hwnd, msg, wp, lp)
+}
+
+/// One call of `cursor_wnd_proc` the window's registration counted, ended when it drops.
+///
+/// Dropped after the game's procedure returned, on every return path. The
+/// outermost call on a window ends the message dispatch every nested message
+/// ran inside; a resize that suppressed the game's hides in it ends the
+/// suppression there. Wine sends a restore from minimised as one
+/// `WM_SYSCOMMAND`, and the `WM_SIZE` and the activation that follows it run
+/// inside it, so a game that hides from any handler that runs after the
+/// `WM_SIZE` in that dispatch is covered. The drop writes the device's
+/// cursor flags under the `DEVICE_INSTANCES` lock, and sends no message and
+/// takes no other lock there, so the lock stays a leaf.
+struct HookCall {
+    window: usize,
+}
+
+impl Drop for HookCall {
+    fn drop(&mut self) {
+        let disarmed = {
+            let mut instances = DEVICE_INSTANCES
+                .lock()
+                .expect("device-instances mutex poisoned");
+            instances.leave(self.window).is_some_and(|device| {
+                // SAFETY: `leave` names only a device still registered on the
+                // window, and the `DEVICE_INSTANCES` lock is held across the
+                // use: a device's release unregisters it under that lock
+                // before it frees anything. The reference is the whole device,
+                // as in every branch of `cursor_wnd_proc`: a `WM_SIZE` that a
+                // thunk's own window call dispatched on this thread runs while
+                // that thunk holds the device too, and only the cursor flags
+                // are written here.
+                let device = unsafe { &mut *(device as *mut DeviceInner) };
+                device.cursor_mut().end_resize_dispatch()
+            })
+        };
+        if disarmed {
+            debug!(
+                target: LOG_TARGET,
+                "wndproc: the dispatch that resized the window returned; game hides honoured again tid={}",
+                current_thread_id(),
+            );
+        }
+    }
 }
 
 // ── Helpers ──
