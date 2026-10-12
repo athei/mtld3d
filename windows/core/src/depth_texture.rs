@@ -78,10 +78,15 @@ impl PackedDepth {
         } else {
             depth.clamp(0.0, 1.0)
         };
+        // The product of a float32 depth and a 24-bit maximum is exact in
+        // binary64. It stays a plain multiply rather than a fused one: the PE
+        // baselines have no FMA instruction, so `mul_add` would be a C runtime
+        // call for every pixel of a depth readback.
+        let scaled = f64::from(depth) * max;
         // Adding 2^52 rounds a nonnegative binary64 value below 2^24 to
         // an integer in its mantissa, without an unchecked float-to-int cast.
-        let rounded = (f64::from(depth) * max + 4_503_599_627_370_496.0).to_bits()
-            - 4_503_599_627_370_496.0_f64.to_bits();
+        let rounded =
+            (scaled + 4_503_599_627_370_496.0).to_bits() - 4_503_599_627_370_496.0_f64.to_bits();
         let bytes = rounded.to_le_bytes();
         match self {
             Self::D16 => pixel[..2].copy_from_slice(&bytes[..2]),

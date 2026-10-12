@@ -601,7 +601,7 @@ extern "system" fn d3d9_release(this: *mut c_void) -> u32 {
     // wrapping the count; it answers 0 and frees nothing.
     let Ok(previous) = wrap
         .refcount
-        .fetch_update(Ordering::Release, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Release, Ordering::Relaxed, |count| {
             count.checked_sub(1)
         })
     else {

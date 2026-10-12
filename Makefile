@@ -18,8 +18,9 @@ endif
 #                    libraries" step stages as `dist/wine-arm64x`. The Wine SDK
 #                    is an x86 Wine and carries neither. The ARM64X build and
 #                    its clippy leg read it.
-#   LLVM_MINGW       an llvm-mingw install, whose ARM64 and ARM64EC sysroots
-#                    are the CRT the link takes. The ARM64X build reads it.
+#   LLVM_MINGW       an llvm-mingw install of release 20260826 or newer, whose
+#                    `aarch64-w64-mingw32` sysroot carries the ARM64X CRT the
+#                    link takes. The ARM64X build reads it.
 #   ARM64X_LLD       an `lld-link` of LLD 23 or newer, such as Homebrew's
 #                    `lld`. The ARM64X build reads it.
 #   WINE_ARM64       an arm64 Wine tree, the directory holding `bin/wine` and
@@ -521,12 +522,16 @@ windows-x86_64:
 # it carries the ARM64EC stack probe. It goes last: LLD takes a symbol from the
 # first library that defines it, and Wine's ntdll also exports C runtime
 # functions (`memcpy`, `_errno`) that have to come from the ucrt the rest of
-# the CRT uses. Each library is named by path for both halves, since both
-# sysroots spell it the same. `/defarm64native` exports the same names from the
-# ARM64 half as `/def` does from the EC half. `/opt:ref,icf` is what rustc
-# passes for the x86 DLLs, and `/debug` would otherwise turn both off: it drops
-# the code nothing reaches, along with any C assertion import that code
-# carries.
+# the CRT uses. From release 20260826 on, llvm-mingw keeps both halves in its
+# `aarch64-w64-mingw32` sysroot: `dllcrt2.o` and every archive member there is
+# a hybrid object carrying an ARM64 and an ARM64EC object, so each is named
+# once, by path, and serves both halves. An older release keeps ARM64EC in an
+# `arm64ec-w64-mingw32` sysroot of its own, which this link does not read, so
+# the check below asks for the hybrid `dllcrt2.o` and names the release that
+# brings it. `/defarm64native` exports the same names from the ARM64 half as
+# `/def` does from the EC half. `/opt:ref,icf` is what rustc passes for the x86
+# DLLs, and `/debug` would otherwise turn both off: it drops the code nothing
+# reaches, along with any C assertion import that code carries.
 #
 # The linker has to be LLD 23 or newer. An ARM64X image has one TLS directory
 # field, and each half brings its own `_tls_used`, `_tls_index` and TLS
@@ -536,10 +541,13 @@ windows-x86_64:
 # TLS index the loader never set. Homebrew's `lld` is one: its version follows
 # Homebrew's `llvm`, and llvm-mingw's own LLD may be older.
 #
-# LLVM_MINGW is the CRT, and its `llvm-nm` reads the static libraries for the
-# checks below; ARM64X_LLD is the linker; WINE_SDK_ARM64X holds the Wine
-# archives (all three at the top of this file).
+# LLVM_MINGW is the CRT, its `llvm-readobj` tells a hybrid object from a plain
+# one and its `llvm-nm` reads the static libraries for the checks below;
+# ARM64X_LLD is the linker; WINE_SDK_ARM64X holds the Wine archives (all three
+# at the top of this file).
 ARM64X_LLD_MIN     := 23
+ARM64X_MINGW_MIN   := 20260826
+ARM64X_CRT         := $(LLVM_MINGW)/aarch64-w64-mingw32/lib
 ARM64X_SYSLIBS     := mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi32 ws2_32 \
 	userenv bcrypt dbghelp
 
@@ -560,11 +568,12 @@ for archive in libwinecrt0.a libntdll.a; do \
 done
 endef
 define ARM64X_REQUIRE_LINK
-[ -n '$(LLVM_MINGW)' ] || { echo "EC=1: LLVM_MINGW is not set; it names the llvm-mingw install whose ARM64 and ARM64EC CRT the link takes" >&2; exit 2; }; \
-for sysroot in aarch64 arm64ec; do \
-	[ -f '$(LLVM_MINGW)/'$$sysroot-w64-mingw32/lib/dllcrt2.o ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no $$sysroot-w64-mingw32 CRT; it names an llvm-mingw install" >&2; exit 2; }; \
+[ -n '$(LLVM_MINGW)' ] || { echo "EC=1: LLVM_MINGW is not set; it names the llvm-mingw install ($(ARM64X_MINGW_MIN) or newer) whose ARM64X CRT the link takes" >&2; exit 2; }; \
+for tool in llvm-nm llvm-readobj; do \
+	[ -x '$(LLVM_MINGW)/bin/'$$tool ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no bin/$$tool; it names an llvm-mingw install" >&2; exit 2; }; \
 done; \
-[ -x '$(LLVM_MINGW)/bin/llvm-nm' ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no bin/llvm-nm; it names an llvm-mingw install" >&2; exit 2; }; \
+[ -f '$(ARM64X_CRT)/dllcrt2.o' ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no aarch64-w64-mingw32/lib/dllcrt2.o; it names an llvm-mingw install, $(ARM64X_MINGW_MIN) or newer" >&2; exit 2; }; \
+'$(LLVM_MINGW)/bin/llvm-readobj' --file-headers '$(ARM64X_CRT)/dllcrt2.o' 2>/dev/null | grep -q IMAGE_FILE_MACHINE_ARM64EC || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has an aarch64-w64-mingw32/lib/dllcrt2.o with no ARM64EC half; the ARM64X link needs llvm-mingw $(ARM64X_MINGW_MIN) or newer, whose aarch64 sysroot carries hybrid objects" >&2; exit 2; }; \
 [ -n '$(ARM64X_LLD)' ] || { echo "EC=1: ARM64X_LLD is not set; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
 version=$$('$(ARM64X_LLD)' --version 2>/dev/null | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p'); \
 [ -n "$$version" ] || { echo "EC=1: ARM64X_LLD=$(ARM64X_LLD) is no LLD; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
@@ -573,7 +582,7 @@ endef
 
 # `-fno-threadsafe-statics` (see `windows/.cargo/config.toml`) is sound only
 # while every guarded local static in the C++ is one that a lock of its own
-# already serializes, which for this snmalloc revision is one, the handler
+# already serializes, which for this snmalloc version is one, the handler
 # latch in `PALWindows::initialise_for_singleton` under its `Singleton`. So the
 # guard variables the two halves carry are held to exactly that one, and a
 # thread-safe guard (`?$TSS`, `_Init_thread_*`) would mean the flag stopped
@@ -598,9 +607,8 @@ define arm64x_link
 $(ARM64X_LLD) -lldmingw /dll /machine:arm64x /nodefaultlib /opt:ref,icf \
 	/entry:DllMainCRTStartup /def:windows/$(2) /defarm64native:windows/$(2) \
 	/debug /pdb:$(OUT_arm64x)/$(1).pdb /out:$(OUT_arm64x)/$(1).dll \
-	$(LLVM_MINGW)/aarch64-w64-mingw32/lib/dllcrt2.o $(LLVM_MINGW)/arm64ec-w64-mingw32/lib/dllcrt2.o \
-	$(OUT_arm64)/$(1).lib $(OUT_arm64ec)/$(1).lib \
-	$(foreach sysroot,aarch64 arm64ec,$(foreach lib,$(ARM64X_SYSLIBS),$(LLVM_MINGW)/$(sysroot)-w64-mingw32/lib/lib$(lib).a)) \
+	$(ARM64X_CRT)/dllcrt2.o $(OUT_arm64)/$(1).lib $(OUT_arm64ec)/$(1).lib \
+	$(foreach lib,$(ARM64X_SYSLIBS),$(ARM64X_CRT)/lib$(lib).a) \
 	$(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/libntdll.a
 endef
 
@@ -1244,7 +1252,8 @@ test-unit:
 #
 # The default of 4 assumes a Wine built from `cx-26-patched` at or after
 # the winemac change that releases the D3DMetal client surfaces outside the
-# window data lock; no wine-build release up to `cx-26.3.0-3` carries it.
+# window data lock. wine-build releases from `cx-26.3.0-6` on carry it, and
+# none up to `cx-26.3.0-3` does.
 # Without it the two locks are taken in both orders (`macdrv_DestroyWindow`
 # holds the window data and takes win32u's surface lock,
 # `update_client_surfaces` and `detach_client_surfaces` the other way

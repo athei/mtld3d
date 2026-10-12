@@ -994,7 +994,7 @@ fn restart_batches_stop_on_gpu_hang_without_launching_the_suffix() {
     assert_eq!(run.outcome, BinaryOutcome::GpuHang);
     assert_eq!(run.processes, 1);
     assert_eq!(launcher.launched.len(), 1);
-    assert!(log.results.is_empty());
+    assert_eq!(log.results, [] as [TestResult; 0]);
 }
 
 #[test]

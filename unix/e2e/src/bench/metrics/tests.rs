@@ -61,7 +61,7 @@ fn unknown_meta_keys_are_kept_and_not_an_error() {
 #[test]
 fn a_required_meta_value_may_not_be_empty() {
     assert!(error_of("meta b layer").contains("meta layer has no value"));
-    assert!(parse("meta b config\n", "b").unwrap().meta["config"].is_empty());
+    assert_eq!(parse("meta b config\n", "b").unwrap().meta["config"], "");
 }
 
 #[test]

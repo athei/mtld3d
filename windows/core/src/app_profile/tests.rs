@@ -38,9 +38,9 @@ fn the_version_fields_decode_past_the_entry_headers() {
 #[test]
 fn an_image_without_a_version_resource_has_empty_fields() {
     let id = AppIdentity::new("GTAIV.exe".to_owned(), None);
-    assert!(id.company.is_empty());
-    assert!(id.product.is_empty());
-    assert!(id.original_filename.is_empty());
+    assert_eq!(id.company, "");
+    assert_eq!(id.product, "");
+    assert_eq!(id.original_filename, "");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::ids::TextureId;
 #[test]
 fn a_fresh_list_drains_nothing() {
     let departed = DepartedTextures::default();
-    assert!(departed.take().is_empty());
+    assert_eq!(departed.take(), [] as [TextureId; 0]);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn cancelling_the_last_filed_texture_leaves_nothing_to_drain() {
     let id = TextureId::new_unique();
     departed.note(id);
     departed.cancel(id);
-    assert!(departed.take().is_empty());
+    assert_eq!(departed.take(), [] as [TextureId; 0]);
     departed.cancel(id);
     assert!(
         departed.take().is_empty(),

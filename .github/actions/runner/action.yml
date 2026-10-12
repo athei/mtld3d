@@ -29,7 +29,7 @@ runs:
     # the save happens on a miss right here rather than at the end of the job.
     - name: Wine SDK
       id: wine-cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/wine-sdk
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
@@ -50,7 +50,7 @@ runs:
       run: make setup-rosetta
 
     - name: Download the staged build
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: stage
         path: ${{ runner.temp }}

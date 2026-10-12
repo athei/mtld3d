@@ -77,16 +77,17 @@ concurrency:
 # MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
 # the xwin call that consumes them.
 env:
-  # cx-26.3.0-2 is the first bundle without MoltenVK. The one before it
-  # shipped the library, and win32u's display-device enumeration created a
-  # Vulkan instance through it at every prefix boot; on the Intel image's
-  # paravirtual device that made Metal abort inside explorer.exe, so no prefix
-  # ever booted there.
-  WINE_RELEASE: cx-26.3.0-5
-  RUST_STABLE: 1.98.1
-  RUST_NIGHTLY: nightly-2026-08-18
+  # The wine-build release has two bounds. It is cx-26.3.0-2 or later, the
+  # first bundle without MoltenVK: with the library, win32u's display-device
+  # enumeration created a Vulkan instance at every prefix boot, and on the
+  # Intel image's paravirtual device Metal aborted inside explorer.exe, so no
+  # prefix booted there. It is older than cx-26.3.0-8, which needs macOS 26
+  # and so would not run on the macos-15 and Intel images.
+  WINE_RELEASE: cx-26.3.0-7
+  RUST_STABLE: 1.99.0
+  RUST_NIGHTLY: nightly-2026-10-11
   CARGO_TOOLS: xwin@0.10.0
-  NEXTEST_VERSION: 0.9.143
+  NEXTEST_VERSION: 0.9.148
 
 # The shape: two machines compile, everything else replays. `build` makes the
 # stage every test leg installs and runs from, so the suites fan out over
@@ -115,7 +116,7 @@ jobs:
     outputs:
       runners: ${{ (github.event_name == 'schedule' || inputs.intel_only) && '["macos-15-intel"]' || github.event_name == 'pull_request' && '["macos-26","macos-15"]' || '["macos-26","macos-15","macos-15-intel"]' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # BUILD_ID, which names the build inside every binary, comes from
           # `git describe --tags`.
@@ -127,7 +128,7 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           prime: 'true'
       - run: make stage
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: stage
           path: windows/target/mtld3d-stage.tar
@@ -148,7 +149,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-tags: true
       - uses: ./.github/actions/prepare
@@ -243,7 +244,7 @@ jobs:
         scale: [""]
         include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"}]' || '[]') }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
@@ -288,7 +289,7 @@ jobs:
       # the one whose logs are worth reading, and a leg cut off by its budget
       # ends cancelled, not failed. A leg that dies before any process logs a
       # line has nothing to upload, and that must not turn one red into two.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
@@ -335,7 +336,7 @@ jobs:
             printf 'state=completed\n'
           } >> "$output/collection-status.txt"
           exit "$collector_status"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-system-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
@@ -386,7 +387,7 @@ jobs:
         variant: [""]
         include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","variant":"scale"}]' || '[]') }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
@@ -492,14 +493,14 @@ jobs:
 
       # `always()`, because a diverging run is exactly the one whose output is
       # worth reading, and the job reports failure whenever it diverges.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ inputs.record_intel_baseline && matrix.runner == 'macos-15-intel' }}
         with:
           name: baseline-mac2-${{ matrix.arch }}
@@ -532,13 +533,10 @@ jobs:
       contents: write
       actions: read
     steps:
-      # No fetch-tags here: a tag run's checkout creates the tag's ref from
-      # the commit it fetches, which is the one tag `git describe` needs for
-      # the stamp, and asking for every tag on top makes git 2.48 and later
-      # refuse to fetch one ref from two sources ("Cannot fetch both <sha>
-      # and refs/tags/<tag> to refs/tags/<tag>"), which failed every tag run
-      # since the macos-26 image.
-      - uses: actions/checkout@v5
+      # No fetch-tags here: a tag run's checkout fetches the tag it runs for,
+      # which is the one tag `git describe` needs for the stamp, so every
+      # other tag would only add to the fetch.
+      - uses: actions/checkout@v7
       # The toolchain first, since every make target needs the WINE_SDK the
       # prepare action sets; then the version check, so a tag that disagrees
       # with the manifests is answered before the wait for main's run and the

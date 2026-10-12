@@ -939,8 +939,8 @@ fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
     let gap = 1.0_f32 / 4096.0;
     let slope = gap / 64.0;
     let z0 = 0.5_f32;
-    let left = z0 + gap - slope * 320.5;
-    let right = left + slope * 640.0;
+    let left = slope.mul_add(-320.5, z0 + gap);
+    let right = slope.mul_add(640.0, left);
     let v = |x: f32, y: f32, z: f32| PosColorVertex {
         x,
         y,

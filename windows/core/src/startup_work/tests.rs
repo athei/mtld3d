@@ -89,10 +89,10 @@ fn empty_or_cancelled_batch_starts_no_worker_or_job() {
             items,
             &AtomicBool::new(cancelled),
             MAX_WORKERS,
-            &|_: &i32| panic!("no work admitted"),
+            &|_: &i32| -> i32 { panic!("no work admitted") },
             &mut spawner,
         );
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [(usize, i32); 0]);
     }
     assert_eq!(spawner.attempts, 0);
 }

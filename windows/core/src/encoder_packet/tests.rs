@@ -321,7 +321,7 @@ fn invalid_constant_capture_latches_error_without_publishing_a_command() {
         Err(WireError::InvalidValue)
     );
     assert_eq!(recorder.count, 0);
-    assert!(scratch.command_descriptor_bytes().is_empty());
+    assert_eq!(scratch.command_descriptor_bytes(), []);
 }
 
 #[test]
@@ -1508,7 +1508,7 @@ fn cursor_borrows_typed_payloads_at_both_eight_byte_positions() {
         if let Some(id) = id {
             assert_eq!(borrow::<IdRecord>(record.payload).unwrap().id, id);
         } else {
-            assert!(record.payload.is_empty());
+            assert_eq!(record.payload, []);
         }
     }
     assert!(cursor.is_complete());

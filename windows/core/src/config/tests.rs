@@ -34,10 +34,10 @@ fn defaults_match_documented_values() {
     assert_eq!(d.cursor_software, SoftwareCursorPolicy::Off);
     assert!(d.shader_cache_enable);
     assert!(d.shader_async_compile);
-    assert!(d.log_dir.is_empty());
-    assert!(d.bytecode_dump_dir.is_empty());
-    assert!(d.skip_shaders.is_empty());
-    assert!(d.present_gate_file.is_empty());
+    assert_eq!(d.log_dir, "");
+    assert_eq!(d.bytecode_dump_dir, "");
+    assert_eq!(d.skip_shaders, [] as [u64; 0]);
+    assert_eq!(d.present_gate_file, "");
     assert!(!d.present_occluded);
     assert!(!d.query_flush_immediate);
     assert!(!d.query_event_immediate);
@@ -508,7 +508,7 @@ fn present_occluded_defaults_off_and_parses_on() {
 #[test]
 fn empty_string_disables_bytecode_dump() {
     let cfg = parse(None, "debug.bytecodeDumpDir =\n", None);
-    assert!(cfg.bytecode_dump_dir.is_empty());
+    assert_eq!(cfg.bytecode_dump_dir, "");
 }
 
 #[test]

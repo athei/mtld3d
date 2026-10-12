@@ -294,7 +294,7 @@ impl VisibilityQueryCore {
         let generation = self
             .mailbox()
             .requested_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .expect("visibility query requested generation exhausted")

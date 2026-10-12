@@ -8149,7 +8149,7 @@ extern "system" fn device_update_surface(
             .map(|r| (r.x1, r.y1, r.x2, r.y2));
         // SAFETY: as above; POINT is two i32 (x, y).
         let point =
-            (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
+            (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), Into::into);
         // SAFETY: `src_ptr`/`src_len` describe the live system-memory backing of
         // the source surface (kept alive while the surface is alive).
         let src_bytes = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
@@ -8228,7 +8228,7 @@ extern "system" fn device_update_surface(
             .map(|r| (r.x1, r.y1, r.x2, r.y2));
         // SAFETY: as above; POINT is two i32 (x, y).
         let point =
-            (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
+            (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), Into::into);
         return update_surface_into_color_target(obj.inner(), &src_surf, &dst_surf, rect, point);
     }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
@@ -8244,8 +8244,7 @@ extern "system" fn device_update_surface(
     let rect = (unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(src_rect) })
         .map(|r| (r.x1, r.y1, r.x2, r.y2));
     // SAFETY: as above; POINT is two i32 (x, y).
-    let point =
-        (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
+    let point = (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), Into::into);
     copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
         let src_extent = (src.mip_width(src_level), src.mip_height(src_level));
         if !dst.update_region_valid(dst_level, src_extent, rect, point) {

@@ -103,8 +103,8 @@ fn a_single_leg_update_keeps_the_other_legs() {
     assert!(next.entries.contains_key(&mine));
     // The untouched leg is carried, not re-measured: it reports nothing.
     assert_eq!(summary.carried, 0);
-    assert!(summary.new_sites.is_empty());
-    assert!(summary.dropped_sites.is_empty());
+    assert_eq!(summary.new_sites, [] as [Site; 0]);
+    assert_eq!(summary.dropped_sites, [] as [Site; 0]);
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
 
     let (new, summary) = merge(&Baseline::default(), I686, &fresh, "new".to_owned());
     assert!(new.entries[&key].sites.is_empty(), "no pin to retain");
-    assert!(summary.skipped_sites.is_empty());
+    assert_eq!(summary.skipped_sites, [] as [Site; 0]);
 
     let output = format!(
         "{output}device.c:6780: Test failed: Got unexpected query result.\n\

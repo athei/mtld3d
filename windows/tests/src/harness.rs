@@ -2957,7 +2957,7 @@ impl Harness {
         dst: &Surface<'_>,
         dst_point: (i32, i32),
     ) -> i32 {
-        let point = [dst_point.0, dst_point.1];
+        let point: [i32; 2] = dst_point.into();
         // SAFETY: vtable thunk; both surfaces are live, `src_rect` is a live
         // D3DRECT and `point` a live POINT (two i32).
         unsafe {

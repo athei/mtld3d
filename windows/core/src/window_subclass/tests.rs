@@ -105,7 +105,7 @@ fn every_device_on_a_window_is_listed_oldest_first() {
     subclasses.register(WINDOW, FIRST, || proc.hook());
     subclasses.register(WINDOW, SECOND, || proc.hook());
     assert_eq!(subclasses.devices_on(WINDOW), &[FIRST, SECOND]);
-    assert!(subclasses.devices_on(OTHER_WINDOW).is_empty());
+    assert_eq!(subclasses.devices_on(OTHER_WINDOW), []);
     subclasses.unregister(WINDOW, FIRST, |original| proc.restore(original));
     assert_eq!(subclasses.devices_on(WINDOW), &[SECOND]);
     subclasses.unregister(WINDOW, SECOND, |original| proc.restore(original));

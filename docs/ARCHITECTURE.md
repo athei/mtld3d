@@ -52,14 +52,18 @@ owner and lifetime; sharing an address does not transfer allocator ownership.
 Deferred work crosses as data with a fixed layout, never as a Rust closure,
 trait object, function pointer or owning collection from the other runtime.
 
-Both runtimes allocate through snmalloc at the same pinned revision, each with
-its own copy as the Rust global allocator: `d3d9.dll` on the PE side, `mtld3d.so`
-on the Unix side. Neither frees a block the other allocated, as the ownership
-rule above requires. snmalloc replaces only Rust's allocation calls, not
-`malloc` and `free`, so memory the system frameworks allocate is still freed
-through them. The Unix side does not use the macOS default allocator: it costs
-the encoder about 5.5 microseconds per packet more than snmalloc in a matched
-streaming comparison.
+Both runtimes allocate through snmalloc, each with its own copy as the Rust
+global allocator: `d3d9.dll` on the PE side, `mtld3d.so` on the Unix side. The
+two lockfiles resolve the same snmalloc-rs and snmalloc-sys version, and
+`make upgrade` and `make upgrade-incompat` keep the unix lock on it by moving
+both together. The windows workspace's `snmalloc_drift` tests, on the host
+and in the PE end-to-end suite, catch a bump that changes the allocator's
+shape; the unix workspace has none of its own. Neither frees a block the other
+allocated, as the ownership rule above requires. snmalloc replaces only Rust's
+allocation calls, not `malloc` and `free`, so memory the system frameworks
+allocate is still freed through them. The Unix side does not use the macOS
+default allocator: it costs the encoder about 5.5 microseconds per packet more
+than snmalloc in a matched streaming comparison.
 
 Placement changes preserve bounded queue capacity, ordering, cancellation,
 resource retirement and per-device isolation. The threading sections below

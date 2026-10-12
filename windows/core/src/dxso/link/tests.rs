@@ -252,7 +252,7 @@ fn pixel_inputs_read_their_semantic_member() {
         "float4(0.0)",
         "the point size is no varying"
     );
-    assert!(unlinked.extras().is_empty());
+    assert_eq!(unlinked.extras(), []);
 
     let tangent_only = PsInputs::build(&ps, 0b10);
     assert_eq!(tangent_only.reads()[&1], "float4(0.0)");

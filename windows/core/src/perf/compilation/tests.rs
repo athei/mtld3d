@@ -71,7 +71,7 @@ fn empty_windows_reset_remainders() {
     perf.finish_frame(90_000_000, 80_000_000, 100_000_000);
     let mut output = String::new();
     perf.append_window(&mut output, 1, 1);
-    assert!(output.is_empty());
+    assert_eq!(output, "");
     perf.record_enabled(Kind::Depth, 1_000_000, true, 2, identity);
     perf.finish_frame(2_000_000, 3_000_000, 4_000_000);
     assert_eq!(perf.window[Kind::ResolveOther as usize].ns, 2_000_000);

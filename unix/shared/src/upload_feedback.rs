@@ -80,7 +80,7 @@ impl UploadFeedback {
             crate::InPtr::<AtomicU64>::new(self.sequence.load(Ordering::Relaxed) as *const _)
         };
         let value = sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 old.checked_add(1)
             })
             .expect("upload feedback sequence exhausted")
