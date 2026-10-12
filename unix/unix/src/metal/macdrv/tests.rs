@@ -35,6 +35,12 @@
 //! taker saw, and that among them the newest whose window is gone is the one
 //! picked for a window with none of its own.
 //!
+//! `rect_covers` decides whether the metal view covers its window's frame
+//! view, which is what lets the window's own layers under it be cleared. The
+//! tests pin an exact cover, a cover off by float noise on every edge, and a
+//! view that leaves a title bar's strip, a side of the window, or a single
+//! Retina pixel uncovered.
+//!
 //! The other half of that path, what a device's teardown retires and what
 //! it leaves alone for the devices still attached, is the attachment
 //! registry's, and lives in `attachment/tests.rs`.
@@ -74,14 +80,56 @@ use core::{
 };
 
 use block2::{Block, RcBlock};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use super::{
     KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
     PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
     first_null_required_entry, layer_mode_change, layer_mode_for, min_present_duration,
-    min_present_duration_change, pack_pacing, pick_orphan, run_through_wine,
+    min_present_duration_change, pack_pacing, pick_orphan, rect_covers, run_through_wine,
     screen_params_filter_step, unpack_pacing,
 };
+
+/// A rectangle at `x`, `y` of `width` by `height` points.
+const fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
+#[test]
+fn a_view_covers_a_frame_it_matches_to_within_a_sixty_fourth_of_a_point() {
+    let frame = rect(0.0, 0.0, 1512.0, 982.0);
+    assert!(rect_covers(frame, frame));
+    assert!(rect_covers(rect(0.01, 0.01, 1511.98, 981.98), frame));
+    assert!(rect_covers(rect(-10.0, -10.0, 1600.0, 1000.0), frame));
+}
+
+#[test]
+fn a_view_that_leaves_part_of_the_frame_uncovered_does_not_cover_it() {
+    let frame = rect(0.0, 0.0, 1512.0, 982.0);
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1512.0, 954.0), frame),
+        "a title bar's strip"
+    );
+    assert!(
+        !rect_covers(rect(1.0, 0.0, 1511.0, 982.0), frame),
+        "the left edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 1.0, 1512.0, 981.0), frame),
+        "the bottom edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1511.0, 982.0), frame),
+        "the right edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1512.0, 981.5), frame),
+        "one Retina pixel at the top edge"
+    );
+}
 
 #[test]
 fn vsync_only_paces_at_panel_rate() {
