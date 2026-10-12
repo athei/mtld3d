@@ -3008,6 +3008,12 @@ impl FrameEncoder {
             },
         );
         if !grown_out.handle.is_null() {
+            // Every box entering retention is counted here, as the drain
+            // subtracts it when it leaves.
+            if let Some(backing) = &grown_out.backing {
+                self.perf.bump_vbib_retained_add(backing.len());
+                self.add_retained_bytes(backing.len());
+            }
             self.pending_resource_retention
                 .push_back(PendingResourceRetention {
                     kind: DestroyKind::Buffer,
@@ -8976,6 +8982,9 @@ impl FrameEncoder {
                 }
             }
             if let Some(pb) = entry.page_box {
+                // Counted when it entered retention, as in the seq-gated drain.
+                self.perf.bump_vbib_retained_sub(pb.len());
+                self.sub_retained_bytes(pb.len());
                 held.pageboxes.push(pb);
             }
             if let Some(arc) = entry.staging_arc {
