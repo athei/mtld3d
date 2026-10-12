@@ -32,6 +32,11 @@ pub struct CreateEncoderParams {
     pub retained_bytes_ptr: u64,
     /// The frame-latency floor: no display-paced present at or below it is outstanding.
     pub paced_present_seq_ptr: u64,
+    /// The address-space watch's last walk: free MiB high, largest free MiB low; zero before one.
+    ///
+    /// Stored by the PE watch thread of a 32-bit build, read by the encoder
+    /// for the Metal HUD rows (`mtld3d_core::hud_stats::pack_free_va`).
+    pub free_va_ptr: u64,
 }
 
 #[repr(C, align(8))]
@@ -48,7 +53,7 @@ impl Thunk for DestroyEncoderParams {
 }
 
 const _: () = {
-    assert!(size_of::<CreateEncoderParams>() == 96);
+    assert!(size_of::<CreateEncoderParams>() == 104);
     assert!(align_of::<CreateEncoderParams>() == 8);
     assert!(core::mem::offset_of!(CreateEncoderParams, runtime) == 32);
     assert!(core::mem::offset_of!(CreateEncoderParams, source_clock_ptr) == 40);
@@ -58,6 +63,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CreateEncoderParams, failed_submit_seq_ptr) == 72);
     assert!(core::mem::offset_of!(CreateEncoderParams, retained_bytes_ptr) == 80);
     assert!(core::mem::offset_of!(CreateEncoderParams, paced_present_seq_ptr) == 88);
+    assert!(core::mem::offset_of!(CreateEncoderParams, free_va_ptr) == 96);
     assert!(size_of::<DestroyEncoderParams>() == 8);
 };
 

@@ -46,6 +46,11 @@ pub struct EncoderCounters {
     retained_bytes: Arc<AtomicU64>,
     /// The frame-latency floor: no display-paced present at or below it is outstanding.
     paced_present_seq: Arc<AtomicU64>,
+    /// The address-space watch's last walk, as `mtld3d_core::hud_stats::pack_free_va` packs it.
+    ///
+    /// Stored by the device's watch thread, read by the encoder for the Metal
+    /// HUD rows; it stays zero in a 64-bit build, which walks nothing.
+    free_va: Arc<AtomicU64>,
 }
 
 impl EncoderCounters {
@@ -65,6 +70,10 @@ impl EncoderCounters {
         Arc::clone(&self.retained_bytes)
     }
 
+    pub fn free_va(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.free_va)
+    }
+
     fn new() -> Self {
         Self {
             coherent_seq: Arc::new(AtomicU64::new(0)),
@@ -72,6 +81,7 @@ impl EncoderCounters {
             failed_submit_seq: Arc::new(AtomicU64::new(0)),
             retained_bytes: Arc::new(AtomicU64::new(0)),
             paced_present_seq: Arc::new(AtomicU64::new(0)),
+            free_va: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -82,6 +92,7 @@ impl EncoderCounters {
         let _failed = Arc::into_raw(Arc::clone(&self.failed_submit_seq));
         let _retained = Arc::into_raw(Arc::clone(&self.retained_bytes));
         let _paced = Arc::into_raw(Arc::clone(&self.paced_present_seq));
+        let _free_va = Arc::into_raw(Arc::clone(&self.free_va));
     }
 }
 
@@ -144,6 +155,7 @@ impl EncoderThread {
             failed_submit_seq_ptr: Arc::as_ptr(&counters.failed_submit_seq) as u64,
             retained_bytes_ptr: Arc::as_ptr(&counters.retained_bytes) as u64,
             paced_present_seq_ptr: Arc::as_ptr(&counters.paced_present_seq) as u64,
+            free_va_ptr: Arc::as_ptr(&counters.free_va) as u64,
             config_ptr: settings.as_bytes().as_ptr() as u64,
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,

@@ -31,7 +31,9 @@
 //! asks for them only when a line is due, and the next present answers, so a
 //! line is logged a present or two after its walk. When no present answers
 //! within `FIGURES_WAIT`, the threshold lines are logged without those figures
-//! and the breakdown is dropped.
+//! and the breakdown is dropped. After each walk the thread also stores the
+//! free total and the largest free block in one atomic word the native encoder
+//! reads for the Metal HUD rows (`mtld3d_core::hud_stats`).
 //!
 //! The periodic breakdown logs at debug on its own target, so
 //! `RUST_LOG=mtld3d::d3d9::mem_watch=debug` turns it on without the rest of
@@ -41,8 +43,9 @@
 //! thresholds, and keeps the breakdown, logged from the present, which still
 //! says what the layer holds in memory.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::{
+    sync::Arc,
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -53,6 +56,7 @@ use mtld3d_core::{
         FREE_THRESHOLDS_MIB, FreeSpace, LARGEST_THRESHOLDS_MIB, PageBoxHolders, ThresholdReport,
         UNSAMPLED, cycles_to_micros, threshold_step,
     },
+    hud_stats::pack_free_va,
     thread_wait::wait_until_finished,
     watch_handoff::{self, ApiLink, Offer, Watch},
 };
@@ -126,10 +130,17 @@ pub struct MemWatchState {
 
 impl MemWatchState {
     /// Start the watch, with its thread in a 32-bit build.
-    pub fn new() -> Self {
+    ///
+    /// The thread stores each walk's free and largest-free figures into
+    /// `free_va`, which the encoder reads for the Metal HUD rows.
+    pub fn new(free_va: Arc<AtomicU64>) -> Self {
         Self {
             presents: AtomicU32::new(0),
-            worker: if WALKS { MemWatchWorker::spawn() } else { None },
+            worker: if WALKS {
+                MemWatchWorker::spawn(free_va)
+            } else {
+                None
+            },
         }
     }
 
@@ -218,7 +229,10 @@ struct Sample {
 }
 
 /// The watch thread's half of the hand-off: the Win32 walk, the latches and the lines.
-struct AddressSpaceWatch;
+struct AddressSpaceWatch {
+    /// Where each walk's free figures go for the encoder's Metal HUD rows.
+    free_va: Arc<AtomicU64>,
+}
 
 impl Watch for AddressSpaceWatch {
     type Sample = Sample;
@@ -227,6 +241,10 @@ impl Watch for AddressSpaceWatch {
     /// Walk for sample `index` and advance both threshold latches on what the walk found.
     fn take(&mut self, index: u32) -> Sample {
         let walk = Walk::now();
+        self.free_va.store(
+            pack_free_va(walk.space.total_mib(), walk.space.largest_mib()),
+            Ordering::Relaxed,
+        );
         let free = advance(
             &NEXT_FREE_THRESHOLD,
             &FREE_THRESHOLDS_MIB,
@@ -352,12 +370,12 @@ struct MemWatchWorker {
 
 impl MemWatchWorker {
     /// Start the device's watch thread; `None`, logged once, when it cannot start.
-    fn spawn() -> Option<Self> {
+    fn spawn(free_va: Arc<AtomicU64>) -> Option<Self> {
         let (link, worker_link) = watch_handoff::link(FIGURES_WAIT);
         match thread::Builder::new()
             .name("mtld3d-mem-watch".into())
             .stack_size(WATCH_STACK_BYTES)
-            .spawn(move || worker_link.run(&mut AddressSpaceWatch))
+            .spawn(move || worker_link.run(&mut AddressSpaceWatch { free_va }))
         {
             Ok(handle) => Some(Self {
                 link: Some(link),

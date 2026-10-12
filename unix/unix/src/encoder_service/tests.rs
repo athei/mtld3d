@@ -224,6 +224,7 @@ fn failed_startup_retires_started_workers(reject_submit: bool) {
                         failed_submit_seq_ptr: 0,
                         retained_bytes_ptr: 0,
                         paced_present_seq_ptr: 0,
+                        free_va_ptr: 0,
                     },
                     clocks: super::EncoderClocks {
                         native: native_clock,
@@ -309,6 +310,7 @@ fn null_device_rejects_encoder_startup_before_submit_spawn() {
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
             paced_present_seq_ptr: 0,
+            free_va_ptr: 0,
         },
         clocks: super::EncoderClocks {
             native: Arc::new(mtld3d_shared::clock_calibration::ClockCalibration::new()),
