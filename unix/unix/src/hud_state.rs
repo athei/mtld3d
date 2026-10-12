@@ -61,11 +61,12 @@ const DOMAINS_KEY: &str = "MTL_HUD_STATE_REPORTER_DOMAINS";
 ///
 /// The resource is process-wide: `StateReporting` hands out one reporter per
 /// domain for the process, so the HUD shows one set of `mtld3d` rows however
-/// many devices are live. The newest encoder takes the rows when it is
-/// created, an encoder reports only while it holds them, and the holder's
+/// many devices are live. An encoder takes the rows at its first sample,
+/// which follows its first encoded frame, so the newest device that renders
+/// holds them; an encoder reports only while it holds them, and the holder's
 /// teardown clears the rows and leaves them to the next surviving encoder that
-/// samples. Touched at an encoder's creation and teardown and at most
-/// [`HUD_SAMPLE_HZ`] times a second per encoder.
+/// samples. Touched at an encoder's teardown and at most [`HUD_SAMPLE_HZ`]
+/// times a second per encoder.
 static OWNER: AtomicU64 = AtomicU64::new(0);
 
 extern_class!(
@@ -203,13 +204,16 @@ pub fn show_row(layer: &CAMetalLayer) {
 ///
 /// Lives on the `FrameEncoder` and runs on its thread only. A sample is due at
 /// most [`HUD_SAMPLE_HZ`] times a second, and only once the HUD is loaded:
-/// `libMTLHud`, which carries the HUD's reporter manager, is opened by the HUD
-/// itself and by nothing else, so its class appearing is the HUD appearing.
+/// `libMTLHud` carries the HUD's reporter manager, and neither Metal nor
+/// Core Animation links it, so its class appearing is taken as the HUD
+/// appearing.
 pub struct HudReporter {
     /// The id this encoder holds the domain's rows under in [`OWNER`]; never 0.
     owner_id: u64,
     gate: SampleGate,
     state: ReporterState,
+    /// Whether this encoder has had a sample due, and with it taken the rows once.
+    claimed: bool,
 }
 
 /// How far an encoder's reporter has come.
@@ -231,12 +235,13 @@ struct LiveReporter {
 }
 
 impl HudReporter {
-    /// The reporter of the encoder `owner_id` names, which takes the domain's rows from now on.
+    /// The reporter of the encoder `owner_id` names, which takes the rows at its first sample.
     ///
     /// `owner_id` must be nonzero and unique among live encoders; the address
-    /// of an allocation the encoder owns for its life serves.
+    /// of an allocation the encoder owns for its life serves. A device that
+    /// never encodes a frame never samples, so it never takes the rows from
+    /// one that renders.
     pub fn new(owner_id: u64) -> Self {
-        OWNER.store(owner_id, Ordering::Relaxed);
         Self {
             owner_id,
             gate: SampleGate::default(),
@@ -245,6 +250,7 @@ impl HudReporter {
             } else {
                 ReporterState::Unsupported
             },
+            claimed: false,
         }
     }
 
@@ -260,11 +266,16 @@ impl HudReporter {
     /// Whether a sample is due at TSC reading `now` on a clock of `hz`.
     ///
     /// Due at most [`HUD_SAMPLE_HZ`] times a second, once the reporter is
-    /// live, and only while this encoder holds the domain's rows, which it
-    /// takes when no encoder does.
+    /// live, and only while this encoder holds the domain's rows. It takes
+    /// them at its first due sample, whoever held them, and afterwards only
+    /// when no encoder does.
     pub fn sample_due(&mut self, now: u64, hz: u64) -> bool {
         if self.is_inert() || !self.gate.due(now, hz / HUD_SAMPLE_HZ) {
             return false;
+        }
+        if !self.claimed {
+            self.claimed = true;
+            OWNER.store(self.owner_id, Ordering::Relaxed);
         }
         if matches!(self.state, ReporterState::Waiting) {
             self.state = go_live();
@@ -298,16 +309,18 @@ impl HudReporter {
 
 impl Drop for HudReporter {
     /// Clear the rows when this encoder holds them, and leave them to the next encoder.
+    ///
+    /// The clear goes out while this encoder still holds the rows, so a
+    /// surviving encoder that takes them afterwards reports over the clear
+    /// rather than having its rows wiped by it.
     fn drop(&mut self) {
-        if OWNER
-            .compare_exchange(self.owner_id, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
+        if OWNER.load(Ordering::Relaxed) != self.owner_id {
             return;
         }
         if let ReporterState::Live(live) = &self.state {
             live.reporter.report_volatile_update(None);
         }
+        let _ = OWNER.compare_exchange(self.owner_id, 0, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
