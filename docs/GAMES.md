@@ -22,17 +22,32 @@ the reason for each one.
 | Need for Speed: Underground 2 | Plays, with the Widescreen Fix, ExtraOptions and XtendedInput |
 | Need for Speed: Most Wanted (2005) | Plays, with the Widescreen Fix and ExtraOptions |
 | Need for Speed: Carbon | Plays, with the Widescreen Fix |
+| NosTale | Plays, 32-bit, windowed and DPI-unaware |
 | Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |
 
-Half-Life 2 and Team Fortress 2 call `Direct3DCreate9Ex` and, now that it
-succeeds, take the D3D9Ex path; the rows above were verified on plain D3D9,
-and a run on the extended path is still pending. `-nod3d9ex` on the command
-line keeps them on plain D3D9. Every other game in the table that was
-checked creates a plain device.
+Half-Life 2 and Team Fortress 2 call `Direct3DCreate9Ex`. Since v0.13.0
+([#1088](https://github.com/athei/mtld3d/pull/1088)) they run on the D3D9Ex
+device, and both rows were verified on it. `-nod3d9ex` on the command line
+keeps them on plain D3D9. Every other game in the table that was checked
+creates a plain device.
+
+NosTale needs v0.13.0 or later. Before it, its characters drew with other
+sprites' images.
+
+NosTale draws its text with GDI into slots sized for 96 DPI, so it has to
+run DPI-unaware. On a prefix above 96 DPI, a DPI-aware NosTale draws its
+text larger. The slots clip it, and the text overflows its boxes. Do not
+give its executable the `HIGHDPIAWARE` flag that
+[`INSTALL.md`](../INSTALL.md#fullscreen) recommends for fullscreen, and do
+not set that flag as the prefix default with `/ve`.
+
+Play NosTale in a window. Its fullscreen mode keeps a windowed device and
+changes the display mode. Under `EmulateModeset` on a prefix above 96 DPI,
+its window then comes out larger than the screen.
 
 ## Reporting a game
 
