@@ -11,7 +11,7 @@
 //! string value has no `stringValue`, so the HUD skips its row. Every value is
 //! therefore an integer, and a unit goes into the key (`MiB`).
 //!
-//! Four rules keep the panel readable whatever the figures are, and the tests
+//! Five rules keep the panel readable whatever the figures are, and the tests
 //! hold each one:
 //!
 //! 1. Width. The HUD centre-truncates a row whose indent, key and value
@@ -28,6 +28,9 @@
 //!    sorted either way would show the same order.
 //! 4. Header. The domain row carries [`HUD_DOMAIN`] and the release identity,
 //!    which [`hud_label`] shortens to fit beside the domain.
+//! 5. Stability. A row appears only once it carries information, its first
+//!    nonzero sampled value on the device, and never disappears afterwards,
+//!    so the panel does not jump as a figure falls back to 0 ([`HudRowLatch`]).
 
 /// The `StateReporting` domain the layer reports under, which the HUD prints as the header row.
 pub const HUD_DOMAIN: &str = "mtld3d";
@@ -50,9 +53,18 @@ pub const HUD_ROW_COUNT: usize = 10;
 /// The metadata keys, in the order the HUD sorts them, indexed like [`hud_rows`]' answer.
 ///
 /// `UP` draws come from user-pointer data (`DrawPrimitiveUP`,
-/// `DrawIndexedPrimitiveUP`), `VB` draws from vertex buffers. `Shaders FF`
-/// counts the fixed-function shaders the layer generated, `Shaders
-/// programmable` the game's own shader programs.
+/// `DrawIndexedPrimitiveUP`), `VB` draws from vertex buffers. Both shader rows
+/// count distinct shaders seen since the device was created, not live objects,
+/// and neither drops an entry when the game releases a shader. `Shaders FF`
+/// counts the fixed-function shader keys the encoder built from the game's
+/// draw state: those of a stage with no shader bound, and the vertex shader of
+/// a pre-transformed (`XYZRHW`, `POSITIONT`) draw. They are not D3D objects.
+/// Fixed-function vertex keys whose build failed leave the count when the
+/// encoder's reset cleanup runs (a `Reset` that changes the implicit surfaces
+/// or the device window, or an automatic back-buffer resize), until a draw
+/// that uses one records it again. `Shaders programmable` counts the game's
+/// own shader programs by bytecode, so the same bytecode created twice counts
+/// once, and only shrinks when the device is destroyed.
 pub const HUD_ROW_KEYS: [&str; HUD_ROW_COUNT] = [
     "Frame draws UP",
     "Frame draws VB",
@@ -71,6 +83,11 @@ pub const HUD_SAMPLE_HZ: u64 = 2;
 
 /// The size of a 32-bit address space in MiB, which bounds the address-space row.
 const ADDRESS_SPACE_32_MIB: u32 = 4096;
+
+/// The index of the address-space row, `Mem 32-bit largest MiB`, in [`HUD_ROW_KEYS`].
+const ADDRESS_SPACE_ROW: usize = 4;
+
+const _: () = assert!(HUD_ROW_COUNT <= u16::BITS as usize, "one latch bit per row");
 
 /// Shortest commit hash [`hud_label`] keeps when it shortens a development identity.
 const MIN_LABEL_HASH: usize = 4;
@@ -170,6 +187,43 @@ impl SampleGate {
     }
 }
 
+/// Which rows a device has shown, so each appears once it carries information and then stays.
+///
+/// A row is hidden until its first nonzero sampled value and shown from then
+/// on, at 0 too. The latch sees only the samples its reporter takes: at most
+/// [`HUD_SAMPLE_HZ`] a second, the frame counts from the last presented frame,
+/// and only while this device's encoder holds the rows. A device that never
+/// draws from user-pointer data shows no `Frame draws UP` row, and one that
+/// does keeps the row through frames that have none. The address-space row
+/// latches on any value, since a walk that found less than 1 MiB free shows 0
+/// and that is the state the row exists to show. One latch lives as long as
+/// its device's reporter.
+#[derive(Default)]
+pub struct HudRowLatch {
+    /// Bit `i` set once row `i` of [`HUD_ROW_KEYS`] has carried information.
+    seen: u16,
+}
+
+impl HudRowLatch {
+    /// The rows the panel shows of `rows`: each one latched so far, with its current value.
+    #[must_use]
+    pub fn visible(
+        &mut self,
+        mut rows: [Option<u32>; HUD_ROW_COUNT],
+    ) -> [Option<u32>; HUD_ROW_COUNT] {
+        for (row, value) in rows.iter_mut().enumerate() {
+            let bit = 1_u16 << row;
+            if value.is_some_and(|value| value != 0 || row == ADDRESS_SPACE_ROW) {
+                self.seen |= bit;
+            }
+            if self.seen & bit == 0 {
+                *value = None;
+            }
+        }
+        rows
+    }
+}
+
 /// Every figure one sample reports, gathered by the encoder.
 ///
 /// The frame counts, the textures, the in-flight bytes and both shader
@@ -192,9 +246,9 @@ pub struct HudSample {
     pub in_flight_bytes: u64,
     /// Page boxes `d3d9.dll` keeps parked for reuse.
     pub reuse_pool_bytes: u64,
-    /// Fixed-function shaders generated, both stages.
+    /// Distinct fixed-function shader keys the game's draws used since device creation.
     pub fixed_function: usize,
-    /// The game's shader programs the device has seen, both stages.
+    /// Distinct shader bytecode the game created since device creation, both stages.
     pub programs: usize,
 }
 
@@ -202,9 +256,10 @@ pub struct HudSample {
 ///
 /// The address-space row is left out until the watch has walked once, which
 /// a 64-bit process never does; a walk that found less than 1 MiB free shows 0.
-/// The guest pages row leaves out the reuse pool, whose parked boxes are live
-/// page boxes too, so the two rows add up to what `d3d9.dll` holds, to within
-/// 1 MiB, since each rounds down to whole MiB.
+/// Every other row carries its value, 0 included; [`HudRowLatch`] decides
+/// which rows the panel shows. The guest pages row leaves out the reuse pool,
+/// whose parked boxes are live page boxes too, so the two rows add up to what
+/// `d3d9.dll` holds, to within 1 MiB, since each rounds down to whole MiB.
 #[must_use]
 pub fn hud_rows(sample: &HudSample) -> [Option<u32>; HUD_ROW_COUNT] {
     let largest = sample.largest_free_word.checked_sub(1).map(|mib| {

@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use mtld3d_core::hud_stats::SampleGate;
+use mtld3d_core::hud_stats::{HudRowLatch, SampleGate};
 
 use super::{DOMAIN, HudReporter, OWNER, ReporterState, domains_with_ours, report_attached};
 
@@ -50,6 +50,7 @@ fn waiting_reporter(owner_id: u64) -> HudReporter {
     HudReporter {
         owner_id,
         gate: SampleGate::default(),
+        latch: HudRowLatch::default(),
         state: ReporterState::Waiting,
         claimed: false,
     }

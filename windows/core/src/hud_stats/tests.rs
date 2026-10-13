@@ -1,4 +1,4 @@
-//! The HUD rows' counters, values, width budget, key order and header label.
+//! The HUD rows' counters, values, width budget, key order, header label and latch.
 
 use super::*;
 
@@ -214,7 +214,7 @@ fn counters_wrap_instead_of_panicking() {
 }
 
 #[test]
-fn every_row_but_the_address_space_shows_even_at_zero() {
+fn every_row_but_the_address_space_carries_its_value_even_at_zero() {
     let rows = hud_rows(&empty_sample());
     for (key, value) in HUD_ROW_KEYS.iter().zip(rows) {
         if *key == "Mem 32-bit largest MiB" {
@@ -223,6 +223,84 @@ fn every_row_but_the_address_space_shows_even_at_zero() {
             assert_eq!(value, Some(0), "{key}");
         }
     }
+}
+
+#[test]
+fn the_address_space_row_index_names_its_key() {
+    assert_eq!(row("Mem 32-bit largest MiB"), ADDRESS_SPACE_ROW);
+}
+
+#[test]
+fn a_fresh_latch_hides_every_row_at_zero() {
+    let mut latch = HudRowLatch::default();
+    assert_eq!(
+        latch.visible(hud_rows(&empty_sample())),
+        [None; HUD_ROW_COUNT]
+    );
+}
+
+#[test]
+fn a_row_appears_at_its_first_nonzero_value_and_stays_at_zero() {
+    let mut latch = HudRowLatch::default();
+    let up = row("Frame draws UP");
+    let mut sample = empty_sample();
+    sample.draws_up = 3;
+    assert_eq!(latch.visible(hud_rows(&sample))[up], Some(3));
+    sample.draws_up = 0;
+    assert_eq!(
+        latch.visible(hud_rows(&sample))[up],
+        Some(0),
+        "a latched row stays at 0"
+    );
+}
+
+#[test]
+fn the_address_space_row_appears_on_a_walk_that_found_under_a_mib() {
+    let mut latch = HudRowLatch::default();
+    let largest = row("Mem 32-bit largest MiB");
+    let mut sample = empty_sample();
+    assert_eq!(
+        latch.visible(hud_rows(&sample))[largest],
+        None,
+        "no walk yet"
+    );
+    sample.largest_free_word = largest_free_word(0);
+    assert_eq!(
+        latch.visible(hud_rows(&sample))[largest],
+        Some(0),
+        "a walked 0 MiB carries information"
+    );
+}
+
+#[test]
+fn rows_latch_independently() {
+    let mut latch = HudRowLatch::default();
+    let mut sample = empty_sample();
+    sample.passes = 2;
+    sample.programs = 5;
+    let shown = latch.visible(hud_rows(&sample));
+    for (key, value) in HUD_ROW_KEYS.iter().zip(shown) {
+        let expected = match *key {
+            "Frame passes" => Some(2),
+            "Shaders programmable" => Some(5),
+            _ => None,
+        };
+        assert_eq!(value, expected, "{key}");
+    }
+    let shown = latch.visible(hud_rows(&empty_sample()));
+    for (key, value) in HUD_ROW_KEYS.iter().zip(shown) {
+        let expected = match *key {
+            "Frame passes" | "Shaders programmable" => Some(0),
+            _ => None,
+        };
+        assert_eq!(value, expected, "{key} after its figures fell to 0");
+    }
+    sample = empty_sample();
+    sample.textures = 7;
+    let shown = latch.visible(hud_rows(&sample));
+    assert_eq!(shown[row("Live textures")], Some(7));
+    assert_eq!(shown[row("Frame passes")], Some(0));
+    assert_eq!(shown[row("Frame draws VB")], None);
 }
 
 #[test]

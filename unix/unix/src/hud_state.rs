@@ -21,7 +21,7 @@ use std::sync::{
 use libloading::os::unix::{Library, RTLD_NOW};
 use log::info;
 use mtld3d_core::hud_stats::{
-    HUD_DOMAIN, HUD_ROW_COUNT, HUD_ROW_KEYS, HUD_SAMPLE_HZ, SampleGate, hud_label,
+    HUD_DOMAIN, HUD_ROW_COUNT, HUD_ROW_KEYS, HUD_SAMPLE_HZ, HudRowLatch, SampleGate, hud_label,
 };
 use mtld3d_shared::identity;
 use objc2::{
@@ -228,6 +228,8 @@ pub struct HudReporter {
     /// The id this encoder holds the domain's rows under in [`OWNER`]; never 0.
     owner_id: u64,
     gate: SampleGate,
+    /// The rows this device has shown, kept across a `Reset` and while another device holds them.
+    latch: HudRowLatch,
     state: ReporterState,
     /// Whether this encoder has had a sample due, and with it taken the rows once.
     claimed: bool,
@@ -262,6 +264,7 @@ impl HudReporter {
         Self {
             owner_id,
             gate: SampleGate::default(),
+            latch: HudRowLatch::default(),
             state: if is_supported() {
                 ReporterState::Waiting
             } else {
@@ -329,16 +332,20 @@ impl HudReporter {
     }
 
     /// Replace the domain's rows with `rows`, indexed like `HUD_ROW_KEYS`; `None` leaves one out.
-    pub fn report(&self, rows: &[Option<u32>; HUD_ROW_COUNT]) {
+    ///
+    /// The rows pass through this device's [`HudRowLatch`] first, so a row
+    /// shows only once it has carried information on this device.
+    pub fn report(&mut self, rows: &[Option<u32>; HUD_ROW_COUNT]) {
         let ReporterState::Live(live) = &self.state else {
             return;
         };
+        let rows = self.latch.visible(*rows);
         let mut keys: Vec<&NSString> = Vec::with_capacity(HUD_ROW_COUNT);
         let mut values = Vec::with_capacity(HUD_ROW_COUNT);
         for (key, value) in live.keys.iter().zip(rows) {
             if let Some(value) = value {
                 keys.push(key);
-                values.push(NSNumber::new_u32(*value));
+                values.push(NSNumber::new_u32(value));
             }
         }
         let metadata = NSDictionary::from_retained_objects(&keys, &values);
