@@ -80,7 +80,8 @@ fn fixed_ps(specular_add: bool) -> FixedPsSource {
         },
         sampled_stage_mask: 1,
         constant_rows: 0,
-        reserved: [0; 3],
+        bump_env: false,
+        reserved: [0; 2],
     }
 }
 

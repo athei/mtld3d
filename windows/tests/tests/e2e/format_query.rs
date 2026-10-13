@@ -203,17 +203,18 @@ fn srgb_read_and_write_queries_are_independent() {
     );
 }
 
-/// No format and no resource type answers the legacy bump-map query.
+/// The legacy bump-map query answers yes for the signed bump formats as 2D textures alone.
 ///
-/// `D3DCAPS9::TextureOpCaps` advertises neither `BUMPENVMAP` nor
-/// `BUMPENVMAPLUMINANCE`, so an application that probes for legacy bump
-/// mapping is told no rather than told yes and then left without an
-/// operation to use the format with. The signed formats hardware of the era
-/// advertised are no exception.
+/// `D3DCAPS9::TextureOpCaps` advertises `BUMPENVMAP` and
+/// `BUMPENVMAPLUMINANCE`. V8U8, V16U16 and Q8W8V8U8 carry the `(du, dv)`
+/// pair a bump stage reads, so a 2D texture of one answers yes to the query
+/// alone and, beside AUTOGENMIPMAP or SRGBREAD, what that usage alone gets.
+/// Every other format, and every other resource type, answers no.
 #[test]
-fn legacy_bump_map_queries_are_unavailable() {
+fn legacy_bump_map_queries_answer_for_the_bump_formats_alone() {
     let h = Harness::factory_only();
     for (format, name) in FORMATS {
+        let bump_format = matches!(format, D3DFMT_V8U8 | D3DFMT_V16U16 | D3DFMT_Q8W8V8U8);
         for rtype in [
             D3DRTYPE_SURFACE,
             D3DRTYPE_TEXTURE,
@@ -222,6 +223,11 @@ fn legacy_bump_map_queries_are_unavailable() {
             D3DRTYPE_VOLUMETEXTURE,
         ] {
             for extra in [0, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_QUERY_SRGBREAD] {
+                let expected = if bump_format && rtype == D3DRTYPE_TEXTURE {
+                    h.check_device_format(D3DFMT_X8R8G8B8, extra, rtype, format)
+                } else {
+                    D3DERR_NOTAVAILABLE
+                };
                 assert_eq!(
                     h.check_device_format(
                         D3DFMT_X8R8G8B8,
@@ -229,10 +235,22 @@ fn legacy_bump_map_queries_are_unavailable() {
                         rtype,
                         format
                     ),
-                    D3DERR_NOTAVAILABLE,
+                    expected,
                     "{name} rtype {rtype} legacy bump map with {extra:#x}"
                 );
             }
+        }
+        if bump_format {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    D3DRTYPE_TEXTURE,
+                    format
+                ),
+                D3D_OK,
+                "{name} legacy bump map"
+            );
         }
     }
 }

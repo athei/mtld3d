@@ -13395,13 +13395,19 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
             let constant_rows = key.constant_rows();
+            // Any stage naming a bump-environment operation, ahead of the
+            // cascade's end or not: a superset of the shaders that read the
+            // slot-12 uniform, and binding it unread costs one deduplicated
+            // bind.
+            let bump_env = dev.ff_state().bump_stage_mask() != 0;
             Some(PsSource::FixedFunction(
                 mtld3d_core::draw_data::FixedPsSource {
                     key,
                     sampled_stage_mask,
                     constant_rows,
+                    bump_env,
 
-                    reserved: [0; 3],
+                    reserved: [0; 2],
                 },
             ))
         } else {
@@ -13653,8 +13659,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         None
     };
     // Bump-environment matrix bytes (PS slot 12). Built only when a bump TSS
-    // state changed (rare); the slot is bound at draw time only for a PS that
-    // actually uses texbem/texbeml/bem.
+    // state changed (rare); the slot is bound at draw time only for a
+    // programmable PS that uses texbem/texbeml/bem or a fixed-function PS
+    // whose stages name a bump-environment operation
+    // (`FixedPsSource::uses_bump_env`).
     let bump_env_buf = if dirty.contains(SnapshotDirty::BUMP_ENV) {
         Some(dev.ff_state().build_bump_env_bytes())
     } else {

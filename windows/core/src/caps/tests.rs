@@ -253,6 +253,8 @@ fn texture_op_caps_match_emitter() {
         | TexOpCaps::BLENDTEXTUREALPHAPM
         | TexOpCaps::BLENDFACTORALPHA
         | TexOpCaps::BLENDCURRENTALPHA
+        | TexOpCaps::BUMPENVMAP
+        | TexOpCaps::BUMPENVMAPLUMINANCE
         | TexOpCaps::DOTPRODUCT3;
     assert_eq!(filled().texture_op_caps, expected.bits());
 }
@@ -317,14 +319,19 @@ fn unimplemented_texture_ops_are_the_ones_the_emitter_renders_as_selectarg1() {
 fn unimplemented_texture_op_names_the_operation() {
     for (op, name) in [
         (D3DTOP_PREMODULATE, "PREMODULATE"),
-        (D3DTOP_BUMPENVMAP, "BUMPENVMAP"),
-        (D3DTOP_BUMPENVMAPLUMINANCE, "BUMPENVMAPLUMINANCE"),
         (D3DTOP_MULTIPLYADD, "MULTIPLYADD"),
         (D3DTOP_LERP, "LERP"),
     ] {
         assert_eq!(unimplemented_texture_op(op), Some(name), "D3DTOP {op}");
     }
-    for op in [0, D3DTOP_LERP + 1, 33, u32::MAX] {
+    for op in [
+        0,
+        D3DTOP_BUMPENVMAP,
+        D3DTOP_BUMPENVMAPLUMINANCE,
+        D3DTOP_LERP + 1,
+        33,
+        u32::MAX,
+    ] {
         assert_eq!(unimplemented_texture_op(op), None, "D3DTOP {op}");
     }
 }

@@ -1459,16 +1459,17 @@ fn srgb_write_queries_follow_render_target_capability() {
     ));
 }
 
-/// No format answers the legacy bump-map query.
+/// The legacy bump-map query answers yes for the signed `(du, dv)` formats alone.
 ///
-/// `D3DCAPS9::TextureOpCaps` advertises neither `BUMPENVMAP` nor
-/// `BUMPENVMAPLUMINANCE`, so the operations the query asks about do not
-/// exist, and that holds for the signed formats hardware of the era
-/// advertised as well as for every other one.
+/// `D3DCAPS9::TextureOpCaps` advertises `BUMPENVMAP` and
+/// `BUMPENVMAPLUMINANCE`, and V8U8, V16U16 and Q8W8V8U8 are the formats a
+/// bump stage reads its displacement from. Every other colour format answers
+/// no, alone and beside the sampling usages.
 #[test]
-fn legacy_bump_map_queries_answer_no_for_every_format() {
+fn legacy_bump_map_queries_answer_yes_for_the_bump_formats_only() {
     use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_V8U8, D3DFMT_V16U16};
 
+    const BUMP_FORMATS: [u32; 3] = [D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_Q8W8V8U8];
     const COMBINED: [u32; 6] = [
         0,
         D3DUSAGE_DYNAMIC,
@@ -1481,6 +1482,9 @@ fn legacy_bump_map_queries_answer_no_for_every_format() {
     for float32_filtering in [false, true] {
         for native_packed16 in [false, true] {
             for format in COLOUR_FORMATS {
+                if BUMP_FORMATS.contains(&format) {
+                    continue;
+                }
                 for extra in COMBINED {
                     assert!(
                         !super::supports_usage_query(
@@ -1493,17 +1497,34 @@ fn legacy_bump_map_queries_answer_no_for_every_format() {
                     );
                 }
             }
+            // The bump query adds nothing to the answer the rest of the usage
+            // gets, so a bump format answers it the way it answers that rest.
+            for format in BUMP_FORMATS {
+                for extra in COMBINED {
+                    assert_eq!(
+                        super::supports_usage_query(
+                            format,
+                            D3DUSAGE_QUERY_LEGACYBUMPMAP | extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        super::supports_usage_query(
+                            format,
+                            extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        "format {format} extra {extra:#x}"
+                    );
+                }
+                assert!(super::supports_usage_query(
+                    format,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    float32_filtering,
+                    native_packed16
+                ));
+            }
         }
-    }
-    // The signed formats the legacy fixed-function path used are no
-    // exception while the operations are absent.
-    for format in [D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_Q8W8V8U8] {
-        assert!(!super::supports_usage_query(
-            format,
-            D3DUSAGE_QUERY_LEGACYBUMPMAP,
-            true,
-            true
-        ));
     }
 }
 

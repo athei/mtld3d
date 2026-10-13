@@ -114,7 +114,20 @@ pub struct FixedPsSource {
     pub key: FfPsKey,
     pub sampled_stage_mask: u16,
     pub constant_rows: u8,
-    pub reserved: [u8; 3],
+    /// Whether a stage's `D3DTSS_COLOROP` is a bump-environment operation.
+    ///
+    /// Set from the raw stage states, so it may hold for a shader that reads
+    /// no bump-environment uniform; the draw then binds the uniform unread.
+    pub bump_env: bool,
+    pub reserved: [u8; 2],
+}
+
+impl FixedPsSource {
+    /// Whether the draw binds the bump-environment uniform for this shader.
+    #[must_use]
+    pub const fn uses_bump_env(&self) -> bool {
+        self.bump_env
+    }
 }
 
 /// API builder ownership; only the selected canonical record is captured.

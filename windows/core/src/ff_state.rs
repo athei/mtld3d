@@ -39,7 +39,8 @@ use crate::{
     convert::FfVsLayout,
     dxso::{
         FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
-        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey, tci_entry,
+        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey, is_bump_env_op,
+        tci_entry,
     },
     scratch::ScratchArena,
 };
@@ -215,6 +216,13 @@ pub struct FfState {
     /// I.e. the per-stage texture transform contributes to the FF VS const
     /// upload. Maintained by `set_texture_stage_state`.
     tt_active_mask: u8,
+    /// Bit `s` set iff stage `s`'s `D3DTSS_COLOROP` is a bump-environment operation.
+    ///
+    /// The raw stored value decides, whatever the stage's texture or the
+    /// cascade's length, so the mask covers every stage the fixed-function
+    /// pixel shader can read the bump-environment uniform for. Maintained by
+    /// `set_texture_stage_state`.
+    bump_stage_mask: u8,
     /// Per-(stage, ty) once-warn latch for unsupported D3DTSS_* writes.
     ///
     /// Bit `ty` of `tss_warn_fired[stage]` is set after the first warn
@@ -274,6 +282,7 @@ impl FfState {
                 texture_stage_state_defaults(7),
             ],
             tt_active_mask: 0,
+            bump_stage_mask: 0,
             tss_warn_fired: [0; 8],
             texture_op_warn_fired: 0,
             // Cold-start: encoder mirror is zero-init, so every section
@@ -672,20 +681,35 @@ impl FfState {
         self.tt_active_mask
     }
 
-    /// Re-derive `tt_active_mask` from the texture-stage-state array.
+    /// Bit `s` set iff stage `s`'s `D3DTSS_COLOROP` is a bump-environment operation.
     ///
-    /// The setter maintains it incrementally; a bulk array restore
+    /// The draw binds the bump-environment uniform for a fixed-function pixel
+    /// shader while any bit is set; a shader that reads none of it costs that
+    /// bind alone.
+    #[inline]
+    #[must_use]
+    pub const fn bump_stage_mask(&self) -> u8 {
+        self.bump_stage_mask
+    }
+
+    /// Re-derive `tt_active_mask` and `bump_stage_mask` from the texture-stage-state array.
+    ///
+    /// The setter maintains both incrementally; a bulk array restore
     /// (state-block `Apply`) bypasses the setter and must call this afterwards
-    /// or the mask goes stale against the restored array. The light masks
+    /// or the masks go stale against the restored array. The light masks
     /// cannot be re-derived the same way (an untouched slot's
     /// `D3DLIGHT9::default()` is indistinguishable from an explicit
     /// directional `SetLight`), so [`FfStateSnapshot`] restores lights
     /// through their setters instead.
-    fn recompute_tt_active_mask(&mut self) {
+    fn recompute_stage_masks(&mut self) {
         self.tt_active_mask = 0;
+        self.bump_stage_mask = 0;
         for (s, stage) in self.texture_stage_states.iter().enumerate() {
             if stage[D3DTSS_TEXTURETRANSFORMFLAGS as usize] != 0 {
                 self.tt_active_mask |= 1u8 << s;
+            }
+            if is_bump_env_op(stage[D3DTSS_COLOROP as usize]) {
+                self.bump_stage_mask |= 1u8 << s;
             }
         }
     }
@@ -852,7 +876,8 @@ impl FfState {
     /// Pack the per-stage bump-environment matrix + luminance scale/offset for upload.
     ///
     /// The destination is the PS slot-12 uniform consumed by
-    /// `texbem`/`texbeml`/`bem`. Layout per stage `s`:
+    /// `texbem`/`texbeml`/`bem` and by the fixed-function
+    /// `D3DTOP_BUMPENVMAP`/`D3DTOP_BUMPENVMAPLUMINANCE` stages. Layout per stage `s`:
     /// `bump_env[s*2] = (m00, m01, m10, m11)` and
     /// `bump_env[s*2+1] = (lscale, loffset, 0, 0)` — matching the indexing the
     /// DXSO emitter uses (`bump_matrix_exprs` / `bump_lum_exprs`). Eight stages,
@@ -916,6 +941,14 @@ impl FfState {
         }
         let changed = self.texture_stage_states[stage][ty] != value;
         self.texture_stage_states[stage][ty] = value;
+        if ty == D3DTSS_COLOROP as usize {
+            let bit = 1u8 << stage;
+            if is_bump_env_op(value) {
+                self.bump_stage_mask |= bit;
+            } else {
+                self.bump_stage_mask &= !bit;
+            }
+        }
         if ty == D3DTSS_TEXTURETRANSFORMFLAGS as usize && stage < 8 {
             let bit = 1u8 << stage;
             let was_active = (self.tt_active_mask & bit) != 0;
@@ -2212,7 +2245,10 @@ pub enum TssWriteFeeds {
     FfPipeline,
     /// The per-stage `D3DTSS_CONSTANT` rows of the FF PS constants.
     StageConstant,
-    /// The SM1 `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`).
+    /// The bump-environment PS uniform (`build_bump_env_bytes`).
+    ///
+    /// The SM1 `texbem`/`texbeml`/`bem` instructions and the fixed-function
+    /// bump-environment stages read it; no shader key does.
     BumpEnv,
 }
 
@@ -2595,7 +2631,7 @@ impl FfStateSnapshot {
         ff.material = self.material;
         self.restore_lights(ff);
         ff.texture_stage_states = self.texture_stage_states;
-        ff.recompute_tt_active_mask();
+        ff.recompute_stage_masks();
         // The arrays were written past the setters, so the constant sections
         // they feed are marked here; every section reads something restored.
         ff.ff_vs_dirty |= FfVsDirty::all();
@@ -2617,9 +2653,10 @@ impl FfStateSnapshot {
     ///   [`StateBlockType::includes_tss`].
     ///
     /// As with [`Self::restore_into`], the lights go back through their
-    /// setters, which keep the light masks, while `tt_active_mask` re-derives
-    /// from the restored stage states via `FfState::recompute_tt_active_mask`,
-    /// since a bulk array restore bypasses the setter that maintains it.
+    /// setters, which keep the light masks, while `tt_active_mask` and
+    /// `bump_stage_mask` re-derive from the restored stage states via
+    /// `FfState::recompute_stage_masks`, since a bulk array restore bypasses
+    /// the setter that maintains them.
     pub fn restore_filtered(&self, ff: &mut FfState, block_type: StateBlockType) {
         // Transforms + material: D3DSBT_ALL only.
         if matches!(block_type, StateBlockType::All) {
@@ -2653,7 +2690,7 @@ impl FfStateSnapshot {
                 }
             }
         }
-        ff.recompute_tt_active_mask();
+        ff.recompute_stage_masks();
         // The fields were written past the setters, so the constant sections
         // they feed are marked here: the stage states can move the TT extent
         // for every block type, the lights feed LIGHTS for a vertex block, and
@@ -2779,9 +2816,10 @@ enum TssClass {
 const fn tss_classify(ty: u32) -> TssClass {
     match ty {
         // Consumed by mtld3d. The first ten feed the FF VS + PS keys; the
-        // bump-environment matrix and luminance slots feed the SM1
-        // `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`), not
-        // the FF keys.
+        // bump-environment matrix and luminance slots feed the PS uniform
+        // (`build_bump_env_bytes`) that the SM1 `texbem`/`texbeml`/`bem`
+        // instructions and the FF bump-environment stages read, not the FF
+        // keys.
         D3DTSS_COLOROP
         | D3DTSS_COLORARG1
         | D3DTSS_COLORARG2

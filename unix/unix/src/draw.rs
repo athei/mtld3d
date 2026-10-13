@@ -650,9 +650,14 @@ fn emit_draw_view(
     };
     let alpha_ref_slice = snap.alpha_ref_bytes.unwrap_or(ScratchSlice::EMPTY);
     let fog_color_slice = snap.fog_color_bytes.unwrap_or(ScratchSlice::EMPTY);
-    // SM1 texbem bump-env uniform (slot 12). Only the bound PS knowing it uses
-    // a bem-family op pulls the slice — every other draw skips it entirely.
-    let ps_uses_bump_env = matches!(ps, PsSourceView::Programmable(value) if value.uses_bump_env());
+    // Bump-environment uniform (slot 12). Only a programmable PS using a
+    // bem-family op, or a fixed-function PS whose stages name a
+    // bump-environment operation, pulls the slice; every other draw skips it
+    // entirely.
+    let ps_uses_bump_env = match ps {
+        PsSourceView::Programmable(value) => value.uses_bump_env(),
+        PsSourceView::FixedFunction(value) => value.uses_bump_env(),
+    };
     let bump_env_slice = if ps_uses_bump_env {
         snap.bump_env_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {

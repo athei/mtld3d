@@ -39,15 +39,17 @@ use mtld3d_types::{
     D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK,
     D3DTA_SPECULAR, D3DTA_TEMP, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED,
     D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA,
-    D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE,
-    D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X,
-    D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_MODULATECOLOR_ADDALPHA, D3DTOP_MODULATEINVALPHA_ADDCOLOR,
+    D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM,
+    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3,
+    D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_MODULATEALPHA_ADDCOLOR,
+    D3DTOP_MODULATECOLOR_ADDALPHA, D3DTOP_MODULATEINVALPHA_ADDCOLOR,
     D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
 use super::{
     emit::{
-        VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+        VariantFlags, VariantKey, bump_lum_exprs, bump_matrix_exprs, fog_blend_active,
+        write_fog_blend, write_point_sprite_prologue,
     },
     link::{
         MAX_LINKED_INPUTS, Semantic, passthrough_extras, write_extra_members,
@@ -423,6 +425,16 @@ pub const fn tt_projected(flags: u8) -> bool {
     (flags & 0x10) != 0
 }
 
+/// Whether `op` is `D3DTOP_BUMPENVMAP` or `D3DTOP_BUMPENVMAPLUMINANCE`.
+///
+/// A colour operation of either kind makes its stage a bump-environment stage:
+/// the stage writes no register and its texture displaces, and for the
+/// luminance kind also scales, the next stage's sample.
+#[must_use]
+pub const fn is_bump_env_op(op: u32) -> bool {
+    matches!(op, D3DTOP_BUMPENVMAP | D3DTOP_BUMPENVMAPLUMINANCE)
+}
+
 bitflags::bitflags! {
     /// Texture presence and result destination share one byte in the stage key.
     // Copy keeps the existing seven-byte FfStage value semantics.
@@ -515,6 +527,20 @@ impl FfStage {
 
     fn color_writes_alpha(self) -> bool {
         u32::from(self.color_op) == D3DTOP_DOTPRODUCT3 && !self.color_uses_unbound_fallback()
+    }
+
+    /// Whether this stage runs as a bump-environment stage.
+    ///
+    /// A stage without a texture whose bump operation names `D3DTA_TEXTURE`
+    /// takes the unbound-texture rule instead, and selects CURRENT like any
+    /// other operation reading a missing texture.
+    fn is_bump_env(self) -> bool {
+        is_bump_env_op(u32::from(self.color_op)) && !self.color_uses_unbound_fallback()
+    }
+
+    /// Whether this bump-environment stage also scales the next stage's sample.
+    fn is_bump_env_luminance(self) -> bool {
+        u32::from(self.color_op) == D3DTOP_BUMPENVMAPLUMINANCE && self.is_bump_env()
     }
 
     fn references_texture_factor(self) -> bool {
@@ -1751,6 +1777,44 @@ fn resolve_mat(source: u8, mat_slot: u32, flags: MatColorFlags) -> String {
 // color in a dedicated float4 on slot 13 — same contract as the
 // user-shader path in `emit.rs::emit_ps_function`.
 fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
+    // The cascade ends at the first DISABLE colour operation. Each stage's
+    // expressions are built once; a bump-environment stage has none, since it
+    // writes no register.
+    let active_count = ps
+        .stages
+        .iter()
+        .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
+        .count();
+    let active = &ps.stages[..active_count];
+    let exprs: Vec<Option<(String, StageAlpha)>> = active
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| (!stage.is_bump_env()).then(|| stage_expressions(*stage, i)))
+        .collect();
+    // The temporary register is a local of this fragment invocation, not a
+    // texture or a draw. Its readers are the cascade's own expressions, which
+    // end at the first DISABLE, so a stage behind that one is not a reader and
+    // neither is an argument the operation discards. A stage whose result is
+    // the temporary contributes nothing else, so with no reader at all the
+    // register and every write to it are dead, and the declaration would be a
+    // local nothing reads, which Metal's compiler warns about. A stage that
+    // reads the temporary makes the register live and is therefore never one
+    // of the writes this drops. A stage that keeps its result register's alpha
+    // does not read that register: the value it keeps is already the
+    // register's own.
+    let reads_temp = exprs
+        .iter()
+        .flatten()
+        .any(|(color_expr, alpha)| names_local(color_expr, "temp") || alpha.names_local("temp"));
+    let sampled = cascade_sampled_stages(active, &exprs, reads_temp);
+    // A bump-environment stage reads its matrix and luminance terms only for a
+    // next stage that samples: the matrix when its own texture displaces that
+    // sample, the luminance terms when it scales it.
+    let reads_bump_env = active.windows(2).zip(1..).any(|(pair, next)| {
+        pair[0].is_bump_env()
+            && sampled & (1u16 << next) != 0
+            && (pair[0].has_texture() || pair[0].is_bump_env_luminance())
+    });
     // Discover which stages sample a texture so we know which textures+samplers
     // to declare in the entry-point signature.
     // `D3DRS_MULTISAMPLEMASK` has no pipeline-state equivalent on Metal, so a
@@ -1782,21 +1846,16 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if fog_blend_active(variant) {
         out.push_str(",\n    constant float4 *fog_data [[buffer(13)]]");
     }
+    // The bump-environment matrix and luminance terms share the slot-12
+    // uniform the SM1 bump instructions read.
+    if reads_bump_env {
+        out.push_str(",\n    constant float4 *bump_env [[buffer(12)]]");
+    }
     // Per-slot `D3DSAMP_MIPMAPLODBIAS` and explicit-level clamp. Metal
     // samplers carry no LOD bias and ignore their clamps at an explicit
     // level, so the cascade's sample sites apply both; declared only for the
     // variant that needs it, so a plain scene keeps the shader it had.
     let lod_bias = variant.flags.contains(VariantFlags::LOD_BIAS);
-    // Depth samples pin a level rather than compute one: the stage's finest
-    // level, the row's `.w` under the table (below 0 for a slot with no
-    // clamp).
-    let depth_level = |i: usize| {
-        if lod_bias {
-            format!("level(max(lod_bias[{i}].w, 0.0))")
-        } else {
-            "level(0)".to_string()
-        }
-    };
     if lod_bias {
         let _ = write!(
             out,
@@ -1838,32 +1897,20 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
     // since no previous stage contributed).
     out.push_str("    float4 current = in.color0;\n");
-    // The temporary register is a local of this fragment invocation, not a
-    // texture or a draw. Its readers are the cascade's own expressions, which
-    // end at the first DISABLE, so a stage behind that one is not a reader and
-    // neither is an argument the operation discards. A stage whose result is
-    // the temporary contributes nothing else, so with no reader at all the
-    // register and every write to it are dead, and the declaration would be a
-    // local nothing reads, which Metal's compiler warns about. A stage that
-    // reads the temporary makes the register live and is therefore never one
-    // of the writes this drops.
-    let active = || {
-        ps.stages
-            .iter()
-            .enumerate()
-            .take_while(|(_, s)| u32::from(s.color_op) != D3DTOP_DISABLE)
-    };
-    // A stage that keeps its result register's alpha does not read that
-    // register: the value it keeps is already the register's own.
-    let reads_temp = active().any(|(i, stage)| {
-        let (color_expr, alpha) = stage_expressions(*stage, i);
-        names_local(&color_expr, "temp") || alpha.names_local("temp")
-    });
     if reads_temp {
         out.push_str("    float4 temp = float4(0.0);\n");
     }
 
-    for (i, stage) in active() {
+    for (i, (stage, expressions)) in active.iter().zip(&exprs).enumerate() {
+        let sampled_here = sampled & (1u16 << i) != 0;
+        let Some((color_expr, alpha)) = expressions else {
+            // A bump-environment stage writes neither CURRENT nor TEMP, colour
+            // or alpha. Its sample exists only for the next stage's lookup.
+            if sampled_here {
+                emit_stage_sample(out, ps, variant, i);
+            }
+            continue;
+        };
         if stage.result() == FfStageResult::Temp && !reads_temp {
             continue;
         }
@@ -1871,106 +1918,12 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             FfStageResult::Current => "current",
             FfStageResult::Temp => "temp",
         };
-        let (color_expr, alpha) = stage_expressions(*stage, i);
         // The sample feeds this stage's own expressions and nothing else, so
         // it is emitted for the stage that names it and skipped for the stage
         // that discards it. The texture and sampler arguments stay as they
         // are: an unread sample costs a declaration, not a binding.
-        let texture_local = format!("t{i}");
-        let samples_texture =
-            names_local(&color_expr, &texture_local) || alpha.names_local(&texture_local);
-        if samples_texture {
-            // VS emits the TCI-resolved coord for stage i into
-            // `Varyings.texcoord[i]`, so PS stage i samples slot i directly.
-            // Depth slots are comparison samplers (`compareFunction =
-            // LessEqual`); a `depth2d` texture must be read with
-            // `sample_compare` (reference = the texcoord's z), matching the
-            // programmable emitter's `sample_or_compare` depth branch.
-            if (variant.fetch4_mask & (1u16 << i)) != 0 {
-                let uv = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
-                    format!(
-                        "(in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xy / in.texcoord{i}.w : float2(0.0))"
-                    )
-                } else {
-                    format!("in.texcoord{i}.xy")
-                };
-                let sample = super::emit::fetch4_sample(
-                    u16::try_from(i).expect("eight texture stages fit u16"),
-                    &uv,
-                    variant.depth_sampler_mask & (1u16 << i) != 0,
-                    variant.fetch4_alpha_mask & (1u16 << i) != 0,
-                );
-                let _ = writeln!(out, "    float4 t{i} = {sample};");
-            } else if (variant.depth_fetch_mask & (1u16 << i)) != 0 {
-                // INTZ/DF24/DF16 read stored depth without a shadow comparison,
-                // honouring D3DTTFF_PROJECTED like the colour path. INTZ
-                // broadcasts depth; DF formats fill GBA as 0,0,1.
-                let uv = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
-                    format!(
-                        "(in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xy / in.texcoord{i}.w : float2(0.0))"
-                    )
-                } else {
-                    format!("in.texcoord{i}.xy")
-                };
-                let fill = if variant.raw_depth_red_mask & (1u16 << i) != 0 {
-                    ", 0.0, 0.0, 1.0"
-                } else {
-                    ""
-                };
-                let level = depth_level(i);
-                let _ = writeln!(
-                    out,
-                    "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, {level}){fill});"
-                );
-            } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
-                // D3DTTFF_PROJECTED divides the reference depth by `.w` along
-                // with the coordinate, the projective shadow-map lookup; `.w
-                // == 0` reads the origin against a zero reference, as the
-                // colour path reads the origin.
-                let coord = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
-                    let _ = writeln!(
-                        out,
-                        "    float3 proj{i} = in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xyz / in.texcoord{i}.w : float3(0.0);"
-                    );
-                    format!("proj{i}")
-                } else {
-                    format!("in.texcoord{i}")
-                };
-                let level = depth_level(i);
-                let _ = writeln!(
-                    out,
-                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), {level}));",
-                );
-            } else {
-                // D3DTTFF_PROJECTED: divide the coordinate by `.w` before
-                // sampling (the FF / ps_1_x projective sample). `.w == 0`
-                // samples at the origin, matching native (D3D9 returns the
-                // (0,0) texel there). A volume-bound slot samples with the
-                // full `.xyz` coordinate (texture3d takes a float3).
-                let three_dimensional = (variant.volume_sampler_mask & (1u16 << i)) != 0
-                    || (variant.cube_sampler_mask & (1u16 << i)) != 0;
-                let (sw, zero) = if three_dimensional {
-                    ("xyz", "float3(0.0)")
-                } else {
-                    ("xy", "float2(0.0)")
-                };
-                let uv = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
-                    format!(
-                        "(in.texcoord{i}.w != 0.0 ? in.texcoord{i}.{sw} / in.texcoord{i}.w : {zero})"
-                    )
-                } else {
-                    format!("in.texcoord{i}.{sw}")
-                };
-                // The bias applies to this implicit-LOD sample only: the
-                // depth branches above pin a level, which supplies it
-                // outright.
-                let bias = if lod_bias {
-                    format!(", bias(lod_bias[{i}].x)")
-                } else {
-                    String::new()
-                };
-                let _ = writeln!(out, "    float4 t{i} = s{i}.sample(samp{i}, {uv}{bias});");
-            }
+        if sampled_here {
+            emit_stage_sample(out, ps, variant, i);
         }
         // Both expressions read the old register values before either channel
         // changes, including when this stage reads its own destination.
@@ -2046,6 +1999,193 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     out.push_str("}\n");
 }
 
+/// The stages of the active cascade whose texture the fragment function samples, as a bit mask.
+///
+/// A stage with expressions samples when one of them names its texture local,
+/// unless it writes a temporary nothing reads, which is never emitted. A
+/// bump-environment stage (`None` in `exprs`) samples when it has a texture
+/// and the next stage samples, since its texel feeds that stage's lookup and
+/// nothing else. The walk runs from the last active stage back so the next
+/// stage's bit is known first, which also covers consecutive bump stages: each
+/// one displaces the next one's own bump sample.
+fn cascade_sampled_stages(
+    active: &[FfStage],
+    exprs: &[Option<(String, StageAlpha)>],
+    reads_temp: bool,
+) -> u16 {
+    let mut mask = 0u16;
+    for (i, (stage, expressions)) in active.iter().zip(exprs).enumerate().rev() {
+        let samples = match expressions {
+            None => stage.has_texture() && mask & (1u16 << (i + 1)) != 0,
+            Some(_) if stage.result() == FfStageResult::Temp && !reads_temp => false,
+            Some((color_expr, alpha)) => {
+                let texture_local = format!("t{i}");
+                names_local(color_expr, &texture_local) || alpha.names_local(&texture_local)
+            }
+        };
+        if samples {
+            mask |= 1u16 << i;
+        }
+    }
+    mask
+}
+
+/// Emit stage `i`'s `t{i}` sample.
+///
+/// The VS emits the TCI-resolved coordinate for stage `i` into
+/// `Varyings.texcoord[i]`, so the stage samples slot `i` at it directly,
+/// unless the stage before is a bump-environment stage. A bump stage with a
+/// texture displaces this coordinate: after the projective divide, `xy` moves
+/// by its 2x2 matrix applied to its texel's `(du, dv)`, and `z` and `w` stay,
+/// for every destination kind. A luminance bump stage then scales all four
+/// channels of the sample by `saturate(l * lscale + loffset)`, `l` being its
+/// texel's third channel, or zero for a bump stage without a texture. The
+/// matrix and the luminance terms are the bump stage's own.
+fn emit_stage_sample(out: &mut String, ps: &FfPsKey, variant: VariantKey, i: usize) {
+    let lod_bias = variant.flags.contains(VariantFlags::LOD_BIAS);
+    // Depth samples pin a level rather than compute one: the stage's finest
+    // level, the row's `.w` under the table (below 0 for a slot with no
+    // clamp).
+    let depth_level = || {
+        if lod_bias {
+            format!("level(max(lod_bias[{i}].w, 0.0))")
+        } else {
+            "level(0)".to_string()
+        }
+    };
+    let bump = i
+        .checked_sub(1)
+        .map(|n| (n, ps.stages[n]))
+        .filter(|(_, stage)| stage.is_bump_env());
+    // A displaced coordinate is already divided, so the sample below takes it
+    // as it is.
+    let (tc, projected) = match bump {
+        Some((n, stage)) if stage.has_texture() => {
+            write_displaced_coordinate(out, ps, i, n);
+            (format!("bc{i}"), false)
+        }
+        _ => (
+            format!("in.texcoord{i}"),
+            (ps.tt_projected_mask & (1u8 << i)) != 0,
+        ),
+    };
+    // Depth slots are comparison samplers (`compareFunction = LessEqual`); a
+    // `depth2d` texture must be read with `sample_compare` (reference = the
+    // texcoord's z), matching the programmable emitter's `sample_or_compare`
+    // depth branch.
+    if (variant.fetch4_mask & (1u16 << i)) != 0 {
+        let uv = if projected {
+            format!("({tc}.w != 0.0 ? {tc}.xy / {tc}.w : float2(0.0))")
+        } else {
+            format!("{tc}.xy")
+        };
+        let sample = super::emit::fetch4_sample(
+            u16::try_from(i).expect("eight texture stages fit u16"),
+            &uv,
+            variant.depth_sampler_mask & (1u16 << i) != 0,
+            variant.fetch4_alpha_mask & (1u16 << i) != 0,
+        );
+        let _ = writeln!(out, "    float4 t{i} = {sample};");
+    } else if (variant.depth_fetch_mask & (1u16 << i)) != 0 {
+        // INTZ/DF24/DF16 read stored depth without a shadow comparison,
+        // honouring D3DTTFF_PROJECTED like the colour path. INTZ broadcasts
+        // depth; DF formats fill GBA as 0,0,1.
+        let uv = if projected {
+            format!("({tc}.w != 0.0 ? {tc}.xy / {tc}.w : float2(0.0))")
+        } else {
+            format!("{tc}.xy")
+        };
+        let fill = if variant.raw_depth_red_mask & (1u16 << i) != 0 {
+            ", 0.0, 0.0, 1.0"
+        } else {
+            ""
+        };
+        let level = depth_level();
+        let _ = writeln!(
+            out,
+            "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, {level}){fill});"
+        );
+    } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
+        // D3DTTFF_PROJECTED divides the reference depth by `.w` along with the
+        // coordinate, the projective shadow-map lookup; `.w == 0` reads the
+        // origin against a zero reference, as the colour path reads the
+        // origin.
+        let coord = if projected {
+            let _ = writeln!(
+                out,
+                "    float3 proj{i} = {tc}.w != 0.0 ? {tc}.xyz / {tc}.w : float3(0.0);"
+            );
+            format!("proj{i}")
+        } else {
+            tc
+        };
+        let level = depth_level();
+        let _ = writeln!(
+            out,
+            "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), {level}));",
+        );
+    } else {
+        // D3DTTFF_PROJECTED: divide the coordinate by `.w` before sampling
+        // (the FF / ps_1_x projective sample). `.w == 0` samples at the
+        // origin, matching native (D3D9 returns the (0,0) texel there). A
+        // volume-bound slot samples with the full `.xyz` coordinate (texture3d
+        // takes a float3).
+        let three_dimensional = (variant.volume_sampler_mask & (1u16 << i)) != 0
+            || (variant.cube_sampler_mask & (1u16 << i)) != 0;
+        let (sw, zero) = if three_dimensional {
+            ("xyz", "float3(0.0)")
+        } else {
+            ("xy", "float2(0.0)")
+        };
+        let uv = if projected {
+            format!("({tc}.w != 0.0 ? {tc}.{sw} / {tc}.w : {zero})")
+        } else {
+            format!("{tc}.{sw}")
+        };
+        // The bias applies to this implicit-LOD sample only: the depth
+        // branches above pin a level, which supplies it outright.
+        let bias = if lod_bias {
+            format!(", bias(lod_bias[{i}].x)")
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "    float4 t{i} = s{i}.sample(samp{i}, {uv}{bias});");
+    }
+    if let Some((n, stage)) = bump.filter(|(_, stage)| stage.is_bump_env_luminance()) {
+        let (lscale, loffset) =
+            bump_lum_exprs(u16::try_from(n).expect("eight texture stages fit u16"));
+        let luminance = if stage.has_texture() {
+            format!("saturate(t{n}.z * {lscale} + {loffset})")
+        } else {
+            format!("saturate({loffset})")
+        };
+        let _ = writeln!(out, "    t{i} *= {luminance};");
+    }
+}
+
+/// Declare `bc{i}`, stage `i`'s coordinate displaced by bump-environment stage `n`'s texel.
+///
+/// A projected coordinate is divided by its `.w` first, reading the origin for
+/// a `.w` of 0, so the displacement is not divided with it; the divided
+/// coordinate's `.w` is 1.
+fn write_displaced_coordinate(out: &mut String, ps: &FfPsKey, i: usize, n: usize) {
+    let base = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
+        let _ = writeln!(
+            out,
+            "    float4 pc{i} = in.texcoord{i}.w != 0.0 ? float4(in.texcoord{i}.xyz / in.texcoord{i}.w, 1.0) : float4(0.0, 0.0, 0.0, 1.0);"
+        );
+        format!("pc{i}")
+    } else {
+        format!("in.texcoord{i}")
+    };
+    let (m00, m01, m10, m11) =
+        bump_matrix_exprs(u16::try_from(n).expect("eight texture stages fit u16"));
+    let _ = writeln!(
+        out,
+        "    float4 bc{i} = float4({base}.xy + float2({m00} * t{n}.x + {m10} * t{n}.y, {m01} * t{n}.x + {m11} * t{n}.y), {base}.zw);"
+    );
+}
+
 /// Where one texture stage's result alpha comes from.
 enum StageAlpha {
     /// The colour operation writes all four channels (`D3DTOP_DOTPRODUCT3`).
@@ -2053,7 +2193,9 @@ enum StageAlpha {
     /// `D3DTOP_DISABLE` under an enabled colour operation: the register keeps its alpha.
     ///
     /// The register is the stage's own destination, CURRENT or TEMP, so a
-    /// stage writing TEMP keeps TEMP's alpha, zero until a stage writes it.
+    /// stage writing TEMP keeps TEMP's alpha, zero until a stage writes it. A
+    /// bump-environment operation in the alpha role keeps the alpha the same
+    /// way, since it computes no value.
     Kept,
     /// The alpha operation's expression, whose `.a` the stage writes.
     Op(String),
@@ -2076,6 +2218,9 @@ impl StageAlpha {
 /// of CURRENT is just `current`, so short-circuit to it. Colour and alpha are
 /// tested independently; textured stages take the byte-identical path. A
 /// disabled alpha operation reads no argument, so it never takes that fallback.
+/// A bump-environment alpha operation that reads no missing texture keeps the
+/// alpha. A bump-environment colour operation has no expressions; the caller
+/// emits that stage itself.
 fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
     let color_expr = if stage.color_uses_unbound_fallback() {
         "current".to_string()
@@ -2090,6 +2235,8 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
         StageAlpha::Kept
     } else if stage.alpha_uses_unbound_fallback() {
         StageAlpha::Op("current".to_string())
+    } else if is_bump_env_op(u32::from(stage.alpha_op)) {
+        StageAlpha::Kept
     } else {
         let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
         let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
