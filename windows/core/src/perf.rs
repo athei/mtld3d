@@ -1023,13 +1023,15 @@ struct FrameCounters {
     texture_preserve_cpu: u32,
     /// Partial texture Locks this frame handed back in place over an upload no GPU use has seen.
     ///
-    /// A plain (no `DISCARD`, no `NOOVERWRITE`) partial Lock of a level whose
-    /// pages an upload of the frame being recorded still reads, with no GPU
-    /// operation on the texture recorded since that upload: nothing recorded
-    /// can see the version the write replaces, so the upload carries the
-    /// newer bytes. `NOOVERWRITE` / `READONLY` Locks and Locks of pages no
-    /// upload reads are excluded. A Lock that finds an upload a GPU operation
-    /// has seen, or one of an earlier frame, renames and counts as a preserve.
+    /// A plain (no honoured `DISCARD`) partial Lock of a level whose pages an
+    /// upload of the frame being recorded still reads, with no GPU operation
+    /// on the texture recorded since that upload: nothing recorded can see the
+    /// version the write replaces, so the upload carries the newer bytes. Only
+    /// `READONLY` Locks and Locks of pages no upload reads are excluded;
+    /// `NOOVERWRITE` is not a texture lock flag and is dropped before the
+    /// decision, so a Lock carrying it counts like a plain one. A Lock that
+    /// finds an upload a GPU operation has seen, or one of an earlier frame,
+    /// renames and counts as a preserve.
     texture_write_in_place_unseen: u32,
     /// Count of `AddDirtyRect` calls this frame (`texture_add_dirty_rect` thunk).
     ///

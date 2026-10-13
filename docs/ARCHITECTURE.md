@@ -361,6 +361,12 @@ not. A `LockRect` follows the same rule for a partial rect
 (`decide_lock_action`); a whole-level lock always preserves under a reader,
 since the game may read every byte through the pointer, and a compressed rect
 off the block grid does too, since the encoder widens its read to the level.
+`D3DLOCK_NOOVERWRITE` is not a texture lock flag in D3D9 (it is defined for
+vertex and index buffers). `honoured_lock_flags` drops it from the
+`LockRect` of a 2D texture level or a cube face, whether it comes through the
+texture or through the level's surface, so such a lock is served as a plain
+one and follows the rule above. A volume `LockBox` and the lock of a surface
+no texture backs never read the flag.
 Writes into a render-target or depth texture and read-backs from the GPU
 always move, and a level the game holds mapped is always written in place.
 
