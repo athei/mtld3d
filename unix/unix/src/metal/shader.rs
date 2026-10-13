@@ -1,7 +1,6 @@
 use log::error;
 use mtld3d_shared::{
     MetalHandle,
-    mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLLibraryKind},
 };
 use objc2::rc::Retained;
@@ -31,7 +30,6 @@ mod tests;
 pub fn compile_shader_library(
     device_handle: MetalHandle<MTLDeviceKind>,
     msl: &str,
-    stage_tag: StageTag,
     entry: &str,
     timings: &mut mtld3d_shared::perf::ShaderTimings,
 ) -> Option<(MetalHandle<MTLLibraryKind>, MetalHandle<MTLFunctionKind>)> {
@@ -42,28 +40,18 @@ pub fn compile_shader_library(
     let source = objc2_foundation::NSString::from_str(msl);
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
-    // Documented prerequisite for `[[position, invariant]]` to take effect:
-    // without it, AMD-Mac Metal compilers reorder FMA chains independently
-    // per shader and ground-projected decals z-fight terrain even when the
-    // emitter produces byte-identical FMA chains across VS pairs. Apple
-    // Silicon honours invariance without the flag; AMD-Mac Metal compilers
-    // require it, so `[[position, invariant]]` is set explicitly here.
+    // Documented prerequisite for `[[position, invariant]]` to take effect.
+    // It keeps the position identical across pipelines that compute it the
+    // same way, such as a depth prepass and the pass that tests against it.
     options.setPreserveInvariance(true);
-    // Fast Math allows the compiler to reassociate FP ops, which on
-    // AMD-Mac defeats `preserveInvariance` even when each shader's
-    // emitted MSL is byte-identical: AMD's compiler reassociates within
-    // the explicit `fma()` chain and the cross-shader byte-equivalence
-    // collapses. Apple Silicon's compiler doesn't reassociate under
-    // `preserveInvariance` even with Fast Math on, so Safe is the
-    // safe default on the VS path that depends on cross-pipeline
-    // position invariance. PS keeps Fast — needs the transcendental
-    // throughput and has no invariance contract. Pinned explicitly
-    // rather than relying on the language-version default (Fast for
-    // MSL ≤ 3.1, Relaxed for ≥ 3.2 — future-proof).
-    match stage_tag {
-        StageTag::Vertex => options.setMathMode(MTLMathMode::Safe),
-        StageTag::Fragment => options.setMathMode(MTLMathMode::Fast),
-    }
+    // Fast for both stages. With `preserveInvariance`, Fast only adds the
+    // per-op nnan, ninf, nsz, arcp and afn flags in the frontend and leaves
+    // reassociation and contraction to the backend under the invariance
+    // contract (the `invariance-late-*` function attributes), so
+    // `[[position, invariant]]` holds and the vertex stage needs no Safe
+    // mode. Pinned explicitly rather than relying on the language-version
+    // default (Fast for MSL 3.1 and older, Relaxed from 3.2).
+    options.setMathMode(MTLMathMode::Fast);
     drop(preparation);
     let compile = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.library_ns);
     let compiled = device.newLibraryWithSource_options_error(&source, Some(&options));

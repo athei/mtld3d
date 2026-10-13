@@ -44,7 +44,6 @@ unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromR
 unix/shared/src/mtl.rs ReadbackPlanes Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs SnapshotFlags Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs SoftwareCursorPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
-unix/shared/src/mtl.rs StageTag Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StencilOp Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StorageMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StoreAction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr

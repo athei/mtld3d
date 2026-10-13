@@ -1,4 +1,4 @@
-use mtld3d_shared::{MetalHandle, mtl::StageTag, perf::ShaderTimings};
+use mtld3d_shared::{MetalHandle, perf::ShaderTimings};
 use objc2::rc::Retained;
 use objc2_metal::MTLCreateSystemDefaultDevice;
 
@@ -20,9 +20,7 @@ fn shader_timings_reset_unreached_phases_and_preserve_results() {
     mtld3d_shared::init_logger();
     mtld3d_shared::perf::init_tracking_enabled();
     let mut timings = poisoned_timings();
-    assert!(
-        compile_shader_library(MetalHandle::NULL, "", StageTag::Vertex, "", &mut timings).is_none()
-    );
+    assert!(compile_shader_library(MetalHandle::NULL, "", "", &mut timings).is_none());
     assert_eq!(timings.library_ns, 0);
     assert_eq!(timings.function_ns, 0);
     assert_ne!(timings.preparation_ns, u64::MAX);
@@ -37,7 +35,7 @@ fn shader_timings_reset_unreached_phases_and_preserve_results() {
         ("invalid MSL", "probe", false, false),
     ] {
         timings = poisoned_timings();
-        let result = compile_shader_library(handle, source, StageTag::Vertex, entry, &mut timings);
+        let result = compile_shader_library(handle, source, entry, &mut timings);
         assert_eq!(result.is_some(), success);
         assert_ne!(timings.preparation_ns, u64::MAX);
         assert_ne!(timings.library_ns, u64::MAX);

@@ -1256,14 +1256,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // two-step decomposition is load-bearing for FF↔programmable z
     // parity at the math level: pre-multiplying WVP CPU-side and
     // emitting one matmul produces a different FP-rounding shape than
-    // any programmable shader. Plain MSL `dot()` — Apple Silicon has
+    // any programmable shader. Plain MSL `dot()`, since Apple Silicon has
     // hardware dot-product. Cross-shader bit-invariance is not the
     // goal: z parity between different shaders is not guaranteed, and the
     // only depth bias is the one the application's render states set;
-    // `[[position, invariant]]` +
-    // `setPreserveInvariance(true)` + `setMathMode(Safe)` on the VS
-    // compile keep clip-position bit-stable WITHIN a shader for
-    // reflection-style same-shader-twice scenarios.
+    // `[[position, invariant]]` + `setPreserveInvariance(true)` on the
+    // VS compile keep the clip-space position identical when the same
+    // vertex shader runs in different pipelines (a depth prepass and an
+    // EQUAL-tested pass, or one VS paired with different pixel shaders),
+    // which multipass rendering relies on.
     out.push_str("    float4 pos = float4(in.v0.xyz, 1.0);\n");
     if blended {
         // The accumulation that feeds `n_blend` costs a multiply-add per

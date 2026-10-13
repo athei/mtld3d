@@ -43,7 +43,6 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
-    mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
     tsc::rdtsc,
@@ -484,12 +483,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             let tag = reference_tag(reference);
             trace!(target: MSL_TRACE_TARGET, "── {stage} MSL {tag} ──\n{msl}\n── /{stage} MSL {tag} ──");
         }
-        let stage_tag = if input.is_vertex() {
-            StageTag::Vertex
-        } else {
-            StageTag::Fragment
-        };
-        let handles = compile_stage_library(device, stage_tag, &msl, &entry_name, &mut native)?;
+        let handles = compile_stage_library(device, &msl, &entry_name, &mut native)?;
         elapsed = started.elapsed();
         if persist {
             let _persist = NanosSetTimer::start(&raw mut persist_ns);

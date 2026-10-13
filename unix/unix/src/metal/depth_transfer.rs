@@ -80,6 +80,8 @@ kernel void transfer({depth_argument} {stencil_argument}
     );
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
+    // Safe because the kernel only moves stored depth floats and stencil bytes:
+    // every value has to arrive bit for bit, so no float optimization may apply.
     options.setMathMode(MTLMathMode::Safe);
     let library = device
         .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
