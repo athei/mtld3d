@@ -3,8 +3,8 @@
 //! Plus cube and volume texture contracts.
 
 use mtld3d_tests::{
-    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeTexture, VolumeVertex,
-    assert_pixel_approx, assert_pixel_eq,
+    Harness, HarnessConfig, LockedRect, Rgba8, Texture, TexturedVertex, VolumeTexture,
+    VolumeVertex, assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
@@ -13,14 +13,15 @@ use mtld3d_types::{
     D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
     D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
-    D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
-    D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_BUMPENVMAT00,
-    D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
+    D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -2864,6 +2865,8 @@ struct SpriteCase {
     view: (usize, usize),
     /// Whether every lock after the first rename hands back the same pages.
     stable_pointer: bool,
+    /// The `D3DLOCK_*` flags every sprite's lock carries.
+    lock_flags: u32,
 }
 
 /// A rectangle of texels, right and bottom exclusive.
@@ -2890,12 +2893,12 @@ enum SpriteTarget<'a, 'h> {
 }
 
 impl SpriteTarget<'_, '_> {
-    fn lock(&self, rect: Option<&[i32; 4]>) -> LockedRect<'_> {
+    fn lock(&self, rect: Option<&[i32; 4]>, flags: u32) -> LockedRect<'_> {
         match (self, rect) {
-            (Self::Flat(tex), Some(rect)) => tex.lock_rect_partial(0, rect, 0),
-            (Self::Flat(tex), None) => tex.lock_rect(0, 0),
-            (Self::CubeFace(cube), Some(rect)) => cube.lock_rect_partial(0, 0, rect, 0),
-            (Self::CubeFace(cube), None) => cube.lock_rect(0, 0, 0),
+            (Self::Flat(tex), Some(rect)) => tex.lock_rect_partial(0, rect, flags),
+            (Self::Flat(tex), None) => tex.lock_rect(0, flags),
+            (Self::CubeFace(cube), Some(rect)) => cube.lock_rect_partial(0, 0, rect, flags),
+            (Self::CubeFace(cube), None) => cube.lock_rect(0, 0, flags),
         }
     }
 
@@ -3126,7 +3129,7 @@ const fn sprite_pixel(case: &SpriteCase, column: usize, texel: (usize, usize)) -
 fn check_sprite_versions(h: &Harness, case: &SpriteCase, target: &SpriteTarget<'_, '_>) {
     let edge = usize::try_from(case.edge).expect("edge fits usize");
     write_sprite(
-        &mut target.lock(None),
+        &mut target.lock(None, 0),
         case.format,
         &TexelRegion {
             left: 0,
@@ -3149,7 +3152,7 @@ fn check_sprite_versions(h: &Harness, case: &SpriteCase, target: &SpriteTarget<'
                 let (x, y) = case.origin;
                 let rect = [x, y, x + w, y + height]
                     .map(|v| u32::try_from(v).expect("rect fits u32").cast_signed());
-                let mut locked = target.lock(Some(&rect));
+                let mut locked = target.lock(Some(&rect), case.lock_flags);
                 pointers.push(locked.bits_ptr().addr());
                 write_sprite(
                     &mut locked,
@@ -3213,6 +3216,7 @@ fn a_scratch_sprite_rewritten_between_draws_keeps_each_draws_texels() {
         sizes: &SPRITE_SIZES,
         view: (128, 120),
         stable_pointer: true,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
 }
@@ -3240,6 +3244,7 @@ fn a_dynamic_sprite_rewritten_at_an_offset_keeps_each_draws_texels() {
         sizes: &SIZES,
         view: (100, 120),
         stable_pointer: true,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
 }
@@ -3257,6 +3262,7 @@ fn a_24_bit_sprite_on_the_upload_pass_keeps_each_draws_texels() {
         sizes: &SIZES,
         view: (64, 64),
         stable_pointer: true,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
 }
@@ -3274,6 +3280,7 @@ fn a_dxt1_sprite_on_the_block_grid_keeps_each_draws_texels() {
         sizes: &SIZES,
         view: (32, 32),
         stable_pointer: true,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
 }
@@ -3294,6 +3301,7 @@ fn a_dxt1_sprite_off_the_block_grid_keeps_each_draws_texels() {
         sizes: &SIZES,
         view: (32, 32),
         stable_pointer: false,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
 }
@@ -3311,8 +3319,214 @@ fn a_cube_face_sprite_rewritten_between_draws_keeps_each_draws_texels() {
         sizes: &SIZES,
         view: (64, 64),
         stable_pointer: true,
+        lock_flags: 0,
     };
     check_sprite_versions(&h, &case, &SpriteTarget::CubeFace(&cube));
+}
+
+/// A sprite locked with `D3DLOCK_NOOVERWRITE` keeps each draw's texels.
+///
+/// D3D9 defines `D3DLOCK_NOOVERWRITE` for vertex and index buffers; it is not
+/// a texture lock flag, so a texture lock carrying it is a plain lock. The
+/// managed atlas of the scratch case, with the flag on every sprite's lock,
+/// still shows each draw its own sprite rather than the frame's last.
+#[test]
+fn a_sprite_locked_with_nooverwrite_keeps_each_draws_texels() {
+    let h = Harness::new();
+    let tex = h.create_texture(512, 512, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_A4R4G4B4,
+        edge: 512,
+        origin: (0, 0),
+        sizes: &SPRITE_SIZES,
+        view: (128, 120),
+        stable_pointer: true,
+        lock_flags: D3DLOCK_NOOVERWRITE,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A dynamic default-pool sprite locked with `D3DLOCK_NOOVERWRITE` keeps each draw's texels.
+#[test]
+fn a_dynamic_sprite_locked_with_nooverwrite_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(60, 50), (40, 30), (20, 24)];
+    let h = Harness::new();
+    let tex = h.create_texture(
+        128,
+        128,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let case = SpriteCase {
+        format: D3DFMT_A8R8G8B8,
+        edge: 128,
+        origin: (16, 8),
+        sizes: &SIZES,
+        view: (100, 120),
+        stable_pointer: true,
+        lock_flags: D3DLOCK_NOOVERWRITE,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::Flat(&tex));
+}
+
+/// A cube face sprite locked with `D3DLOCK_NOOVERWRITE` keeps each draw's texels.
+#[test]
+fn a_cube_face_sprite_locked_with_nooverwrite_keeps_each_draws_texels() {
+    const SIZES: [(usize, usize); 3] = [(40, 40), (30, 30), (16, 16)];
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let case = SpriteCase {
+        format: D3DFMT_A8R8G8B8,
+        edge: 64,
+        origin: (0, 0),
+        sizes: &SIZES,
+        view: (64, 64),
+        stable_pointer: true,
+        lock_flags: D3DLOCK_NOOVERWRITE,
+    };
+    check_sprite_versions(&h, &case, &SpriteTarget::CubeFace(&cube));
+}
+
+/// The tile widths of one row of an image cut from one scratch texture: six of 256, one of 144.
+const TILE_WIDTHS: [usize; 7] = [256, 256, 256, 256, 256, 256, 144];
+
+/// The height of every tile.
+const TILE_HEIGHT: usize = 210;
+
+/// The rows of tiles that cover the image.
+const TILE_ROWS: usize = 5;
+
+/// Frames of tile rewrites: enough partial uploads to reach the upload-snapshot arena's cap.
+const TILE_FRAMES: usize = 4;
+
+/// The colour of `tile` in `frame`, distinct for every tile of a frame.
+fn tile_color(tile: usize, frame: usize) -> u32 {
+    let tile = u32::try_from(tile).expect("35 tiles");
+    let frame = u32::try_from(frame).expect("four frames");
+    0xFF00_0000 | ((tile * 7) << 16) | ((frame * 50 + 20) << 8) | (255 - tile * 7)
+}
+
+/// The quad that draws texels `(0, 0)` to `(width, height)` of a 256x256 texture 1:1.
+///
+/// The quad lands at back-buffer pixel `(left, top)` of a target `target`
+/// pixels in size.
+fn tile_quad(
+    (left, top): (usize, usize),
+    (width, height): (usize, usize),
+    target: (usize, usize),
+) -> [TexturedVertex; 6] {
+    let f = |v: usize| f32::from(u16::try_from(v).expect("tile coordinate fits u16"));
+    let x0 = (f(left) / f(target.0)).mul_add(2.0, -1.0);
+    let x1 = (f(left + width) / f(target.0)).mul_add(2.0, -1.0);
+    let y0 = (f(top) / f(target.1)).mul_add(-2.0, 1.0);
+    let y1 = (f(top + height) / f(target.1)).mul_add(-2.0, 1.0);
+    let (s, t) = (f(width) / 256.0, f(height) / 256.0);
+    let vertex = |x: f32, y: f32, u: f32, v: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u,
+        v,
+    };
+    [
+        vertex(x0, y0, 0.0, 0.0),
+        vertex(x1, y0, s, 0.0),
+        vertex(x0, y1, 0.0, t),
+        vertex(x1, y0, s, 0.0),
+        vertex(x1, y1, s, t),
+        vertex(x0, y1, 0.0, t),
+    ]
+}
+
+/// Draw a 1680x1050 image tile by tile from one scratch texture, and check every tile.
+///
+/// The shape of a loading screen cut into tiles: one managed 256x256
+/// A8R8G8B8 texture, locked at its origin with `lock_flags` for each of the
+/// 35 tiles (seven columns of 256 or 144 texels, five rows of 210) and drawn
+/// to the tile's place before the next lock. Each partial upload is a box of
+/// about 210 KiB, one per snapshot-arena chunk, so four frames make enough
+/// partial uploads to reach the arena's cap. A lock that wrote over pages a
+/// queued upload reads would show every tile the frame's last.
+fn check_tiled_image(lock_flags: u32) {
+    const TARGET: (usize, usize) = (1680, 1050);
+    let h = Harness::create(&HarnessConfig {
+        width: 1680,
+        height: 1050,
+        ..HarnessConfig::default()
+    });
+    let tex = h.create_texture(256, 256, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    bind_for_quadrant_draws(&h, &tex);
+    let (tile_h, rows) = (TILE_HEIGHT, TILE_ROWS);
+    let tile_h_i32 = i32::try_from(tile_h).expect("tile height fits i32");
+    let columns = TILE_WIDTHS.len();
+    for frame in 0..TILE_FRAMES {
+        h.render_once(BLACK, |d| {
+            for row in 0..rows {
+                let mut left = 0;
+                for (column, &width) in TILE_WIDTHS.iter().enumerate() {
+                    let tile = row * columns + column;
+                    let rect = [
+                        0,
+                        0,
+                        i32::try_from(width).expect("width fits i32"),
+                        tile_h_i32,
+                    ];
+                    let locked = tex.lock_rect_partial(0, &rect, lock_flags);
+                    fill_locked_rect(&locked, width, tile_h, tile_color(tile, frame));
+                    drop(locked);
+                    let quad = tile_quad((left, row * tile_h), (width, tile_h), TARGET);
+                    assert_eq!(
+                        d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                        0,
+                        "frame {frame} tile {tile} draw"
+                    );
+                    left += width;
+                }
+            }
+        });
+        let (pixels, stride) = read_sprite_frame(&h);
+        for row in 0..rows {
+            let mut left = 0;
+            for (column, &width) in TILE_WIDTHS.iter().enumerate() {
+                let tile = row * columns + column;
+                let (x, y) = (left + width / 2, row * tile_h + tile_h / 2);
+                let actual = pixels[y * stride + x];
+                let sampled = (0..rows * columns)
+                    .find(|&t| tile_color(t, frame) == actual)
+                    .map_or_else(|| format!("{actual:#010x}"), |t| format!("tile {t}"));
+                assert_pixel_eq(
+                    actual,
+                    tile_color(tile, frame),
+                    &format!("frame {frame}: the draw of tile {tile} samples {sampled}"),
+                );
+                left += width;
+            }
+        }
+    }
+    assert_eq!(h.clear_texture(0), 0, "unbind the tile texture");
+}
+
+/// An image drawn tile by tile from one scratch texture keeps each tile's texels.
+///
+/// Plain partial locks: the first one after a draw sampled the texture moves
+/// the level to fresh pages, and the uploads after it copy their boxes into
+/// the snapshot arena, so the locks after that find no upload reading the
+/// pages.
+#[test]
+fn a_tiled_image_drawn_from_one_scratch_keeps_each_tiles_texels() {
+    check_tiled_image(0);
+}
+
+/// The tiled image with `D3DLOCK_NOOVERWRITE` on every lock keeps each tile's texels.
+///
+/// D3D9 does not define the flag for textures, so each lock is served as a
+/// plain partial lock.
+#[test]
+fn a_tiled_image_locked_with_nooverwrite_keeps_each_tiles_texels() {
+    check_tiled_image(D3DLOCK_NOOVERWRITE);
 }
 
 /// A cube face uploads whole onto the device it migrates to.

@@ -8,8 +8,9 @@
 //! the Lock would sample texels written after it.
 //!
 //! Decision tree:
-//! - `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY`, or no upload reads the
-//!   pages: `WriteInPlace`.
+//! - `D3DLOCK_READONLY`, or no upload reads the pages: `WriteInPlace`.
+//!   `D3DLOCK_NOOVERWRITE` is not a texture lock flag and is dropped
+//!   before the decision, see [`honoured_lock_flags`].
 //! - `D3DLOCK_DISCARD` on a whole-mip Lock of a `D3DPOOL_DEFAULT`
 //!   texture: Rename, no preserve (game promised the old bytes are
 //!   gone). Every other DISCARD is dropped first, see
@@ -89,10 +90,9 @@ pub enum PreserveKind {
 pub enum LockAction {
     /// Hand back a pointer into the existing `Arc<PageBox>`.
     ///
-    /// No upload reads the pages, the caller promised not to touch what an
-    /// upload reads (NOOVERWRITE / READONLY), or every upload still reading
-    /// them belongs to the frame being recorded with no GPU operation on the
-    /// texture recorded since.
+    /// No upload reads the pages, the caller promised not to write
+    /// (READONLY), or every upload still reading them belongs to the frame
+    /// being recorded with no GPU operation on the texture recorded since.
     WriteInPlace,
     /// Swap the slot's `Arc<PageBox>` for a fresh allocation and apply `preserve`.
     ///
@@ -136,7 +136,14 @@ pub const fn is_whole_mip(rect: Option<DirtyRect>, shape: MipShape) -> bool {
     }
 }
 
-/// The `D3DLOCK_*` bits a Lock is served with: `flags` less a `D3DLOCK_DISCARD` it cannot honour.
+/// The `D3DLOCK_*` bits a texture Lock is served with: `flags` less the ones it cannot honour.
+///
+/// `D3DLOCK_NOOVERWRITE` is always dropped. D3D9 defines it for vertex and
+/// index buffers only; the flags a texture or surface lock accepts are
+/// `D3DLOCK_DISCARD`, `D3DLOCK_NO_DIRTY_UPDATE`, `D3DLOCK_NOSYSLOCK` and
+/// `D3DLOCK_READONLY` (plus `D3DLOCK_DONOTWAIT` on a surface). A texture lock
+/// carrying it is served as a plain lock, so its writes never reach an upload
+/// a draw recorded before the lock still reads.
 ///
 /// DISCARD is honoured on a whole-mip Lock of a `D3DPOOL_DEFAULT` texture only,
 /// the one shape where "the contents are dead" can be taken literally. The
@@ -154,6 +161,7 @@ pub const fn honoured_lock_flags(
     rect: Option<DirtyRect>,
     shape: MipShape,
 ) -> u32 {
+    let flags = flags & !D3DLOCK_NOOVERWRITE;
     if pool == D3DPOOL_DEFAULT && is_whole_mip(rect, shape) {
         flags
     } else {
@@ -187,9 +195,10 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 ///   submits as well as retained upload readers: a retired upload can still
 ///   be replayed, so retirement alone does not end its read lifetime.
 ///   `MAPPED` and `WHOLE_LEVEL` are ignored; the Lock decides those itself.
-/// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A DISCARD the
-///   Lock cannot honour is dropped here as well as in the caller (see
-///   [`honoured_lock_flags`]), so a verdict never rests on one.
+/// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A NOOVERWRITE,
+///   and a DISCARD the Lock cannot honour, are dropped here as well as in
+///   the caller (see [`honoured_lock_flags`]), so a verdict never rests on
+///   one.
 /// - `pool` is the texture's `D3DPOOL` captured at `CreateTexture`.
 /// - `rect` is the locked sub-rect. `None` ⇒ full-mip Lock.
 /// - `shape` carries the mip + block dimensions (see [`MipShape`]).
@@ -208,7 +217,7 @@ pub const fn decide_lock_action(
     shape: MipShape,
 ) -> LockAction {
     let flags = honoured_lock_flags(flags, pool, rect, shape);
-    if flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE) != 0 {
+    if flags & D3DLOCK_READONLY != 0 {
         return LockAction::WriteInPlace;
     }
     if !write.contains(StagingWrite::HAS_READERS) {
@@ -311,11 +320,11 @@ pub const fn decide_staging_write(write: &StagingWrite) -> LockAction {
 /// is defined for a whole-level lock and promises the caller reads nothing it
 /// did not just write. The caller passes the flags through
 /// [`honoured_lock_flags`] first, so a DISCARD on a partial lock never reaches
-/// this decision. `D3DLOCK_READONLY` is the opposite promise, and
-/// `D3DLOCK_NOOVERWRITE` constrains only where the caller writes, not what it
-/// may read. D3D9 has no write-only lock flag: the "no readback expected" hint
-/// for a texture is `D3DUSAGE_DYNAMIC` at create time, and a dynamic texture
-/// keeps its staging for its whole life, so no usage bit reaches this decision.
+/// this decision, nor does a `D3DLOCK_NOOVERWRITE`, which is not a texture
+/// lock flag. `D3DLOCK_READONLY` is the opposite promise. D3D9 has no
+/// write-only lock flag: the "no readback expected" hint for a texture is
+/// `D3DUSAGE_DYNAMIC` at create time, and a dynamic texture keeps its staging
+/// for its whole life, so no usage bit reaches this decision.
 #[must_use]
 pub const fn released_level_lock_needs_readback(flags: u32) -> bool {
     flags & D3DLOCK_DISCARD == 0

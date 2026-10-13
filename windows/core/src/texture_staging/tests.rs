@@ -6,8 +6,10 @@
 //! renames preserving whichever pool the texture is in. A partial Lock under a reader follows
 //! the staging-write rule: in place only under an unseen upload of the frame being recorded,
 //! which one case pins against every combination of the facts, and an unaligned compressed
-//! rect always preserves, since the encoder widens its read to the whole mip. The
-//! `honoured_lock_flags` cases pin the two conditions on their own. The `texture_lock_offset`
+//! rect always preserves, since the encoder widens its read to the whole mip.
+//! `D3DLOCK_NOOVERWRITE` is no texture lock flag, and one case pins that adding it never
+//! changes a verdict. The `honoured_lock_flags` cases pin the DISCARD conditions on their own
+//! and the NOOVERWRITE drop on every lock. The `texture_lock_offset`
 //! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
 //! The `staging_droppable_class` cases walk the pool, usage and shape combinations, since every
 //! class outside the one that releases is a level whose only copy of some byte is the staging.
@@ -214,18 +216,29 @@ fn acknowledged_upload_reuses_staging_with_a_cached_wrapper() {
 fn replayable_readers_keep_flag_and_partial_lock_contracts() {
     let backing = recovery_staging(0x11);
     let _read = PageBoxRead::new(Arc::clone(&backing));
-    for flags in [D3DLOCK_READONLY, D3DLOCK_NOOVERWRITE] {
-        assert_eq!(
-            decide_lock_action(
-                &readers(backing.has_readers()),
-                flags,
-                D3DPOOL_DEFAULT,
-                None,
-                RECOVERY_SHAPE
-            ),
-            LockAction::WriteInPlace
-        );
-    }
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_READONLY,
+            D3DPOOL_DEFAULT,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::WriteInPlace
+    );
+    // NOOVERWRITE is no texture lock flag: the lock preserves like a plain one.
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
     assert_eq!(
         decide_lock_action(
             &readers(backing.has_readers()),
@@ -340,7 +353,7 @@ fn readonly_in_place_contended() {
 }
 
 #[test]
-fn nooverwrite_in_place_contended() {
+fn a_contended_nooverwrite_partial_lock_renames_like_a_plain_one() {
     assert_eq!(
         decide(
             D3DLOCK_NOOVERWRITE,
@@ -350,12 +363,14 @@ fn nooverwrite_in_place_contended() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
     );
 }
 
 #[test]
-fn nooverwrite_wins_over_discard() {
+fn discard_with_nooverwrite_is_served_as_the_discard() {
     assert_eq!(
         decide(
             D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
@@ -365,8 +380,69 @@ fn nooverwrite_wins_over_discard() {
             COHERENT,
             (1, 1)
         ),
-        LockAction::WriteInPlace
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
     );
+}
+
+#[test]
+fn nooverwrite_never_changes_the_verdict() {
+    // Every pool, rect shape and combination of the write facts, under every
+    // combination of the other known flags: adding NOOVERWRITE decides
+    // exactly what the same lock without it decides.
+    let compressed = shape((4, 4));
+    let shapes = [
+        (None, shape((1, 1)), "whole"),
+        (Some(full()), shape((1, 1)), "whole rect"),
+        (Some(rect(8, 8, 16, 16)), shape((1, 1)), "partial"),
+        (
+            Some(rect(8, 8, 16, 16)),
+            compressed,
+            "compressed on the grid",
+        ),
+        (
+            Some(rect(2, 2, 13, 13)),
+            compressed,
+            "compressed off the grid",
+        ),
+    ];
+    let others = [
+        D3DLOCK_READONLY,
+        D3DLOCK_DISCARD,
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE,
+        mtld3d_types::D3DLOCK_NOSYSLOCK,
+    ];
+    let pools = [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ];
+    for combo in 0u32..1 << others.len() {
+        let flags = others
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| combo & (1 << bit) != 0)
+            .fold(0, |flags, (_, flag)| flags | flag);
+        for pool in pools {
+            for (r, mip, what) in shapes {
+                assert_eq!(
+                    honoured_lock_flags(flags | D3DLOCK_NOOVERWRITE, pool, r, mip),
+                    honoured_lock_flags(flags, pool, r, mip),
+                    "served flags {flags:#x}, pool {pool}, {what}"
+                );
+                for bits in 0..=StagingWrite::all().bits() {
+                    let write = StagingWrite::from_bits_truncate(bits);
+                    assert_eq!(
+                        decide_lock_action(&write, flags | D3DLOCK_NOOVERWRITE, pool, r, mip),
+                        decide_lock_action(&write, flags, pool, r, mip),
+                        "flags {flags:#x}, pool {pool}, {what}, facts {bits:#08b}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ── seq arms ──
@@ -1022,7 +1098,7 @@ fn whole_mip_default_pool_keeps_discard() {
 }
 
 #[test]
-fn partial_lock_drops_discard_and_keeps_the_rest() {
+fn partial_lock_drops_discard_and_nooverwrite_and_keeps_the_rest() {
     let flags = D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | mtld3d_types::D3DLOCK_NOSYSLOCK;
     assert_eq!(
         honoured_lock_flags(
@@ -1031,7 +1107,40 @@ fn partial_lock_drops_discard_and_keeps_the_rest() {
             Some(rect(8, 8, 16, 16)),
             shape((1, 1))
         ),
-        D3DLOCK_NOOVERWRITE | mtld3d_types::D3DLOCK_NOSYSLOCK
+        mtld3d_types::D3DLOCK_NOSYSLOCK
+    );
+}
+
+#[test]
+fn every_texture_lock_drops_nooverwrite() {
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        for r in [None, Some(full()), Some(rect(8, 8, 16, 16))] {
+            assert_eq!(
+                honoured_lock_flags(
+                    D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY,
+                    pool,
+                    r,
+                    shape((1, 1))
+                ),
+                D3DLOCK_READONLY,
+                "pool {pool}, rect {r:?}"
+            );
+        }
+    }
+    // A whole-level default-pool DISCARD survives its NOOVERWRITE companion.
+    assert_eq!(
+        honoured_lock_flags(
+            D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            None,
+            shape((1, 1))
+        ),
+        D3DLOCK_DISCARD
     );
 }
 

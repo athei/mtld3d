@@ -2598,15 +2598,14 @@ impl TextureInner {
         let device_inner = self.device_inner;
         let base = match action {
             LockAction::WriteInPlace => {
-                // In place over a reader only under NOOVERWRITE, or when every
-                // upload reading the pages is this frame's and no GPU
-                // operation on the cube was recorded since; the latter is
-                // counted (see `lock_region_ptr`).
+                // In place over a reader only when every upload reading the
+                // pages is this frame's and no GPU operation on the cube was
+                // recorded since, which is counted (see `lock_region_ptr`).
                 if !contended {
                     // The write lands on pages no upload reads, so the next
                     // GPU use is the first that can see it, as for any writer.
                     self.note_unread_staging(face, level);
-                } else if flags & D3DLOCK_NOOVERWRITE == 0 && device_inner != 0 {
+                } else if device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
                         .bump_texture_write_in_place_unseen();
@@ -3038,14 +3037,14 @@ impl TextureInner {
                 // clones to keep the staging alive while they wrap it; they
                 // never borrow the bytes themselves.
                 //
-                // With a reader this is NOOVERWRITE, or an upload of this
-                // frame no GPU operation has seen: counted, since each one
-                // is a write that lands in pages an upload will carry.
+                // With a reader this is an upload of this frame no GPU
+                // operation has seen: counted, since each one is a write
+                // that lands in pages an upload will carry.
                 if !contended {
                     // The write lands on pages no upload reads, so the next
                     // GPU use is the first that can see it, as for any writer.
                     self.note_unread_staging(0, level);
-                } else if flags & D3DLOCK_NOOVERWRITE == 0 && self.device_inner != 0 {
+                } else if self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
                         .bump_texture_write_in_place_unseen();
@@ -3159,13 +3158,23 @@ impl TextureInner {
 
     /// The `D3DLOCK_*` bits a Lock of `level` is served with.
     ///
-    /// See `honoured_lock_flags`. A dropped `D3DLOCK_DISCARD` is logged once
-    /// per texture: the game asked for a discard it does not get, which is
-    /// what D3D9 gives it too, but the line is where to look when its writes
-    /// come out wrong.
+    /// See `honoured_lock_flags`. A dropped `D3DLOCK_DISCARD` or
+    /// `D3DLOCK_NOOVERWRITE` is logged once per texture: the game asked for a
+    /// flag it does not get, which is what D3D9 gives it too, but the line is
+    /// where to look when its writes come out wrong.
     fn served_lock_flags(&self, level: usize, rect: Option<DirtyRect>, flags: u32) -> u32 {
         let served = honoured_lock_flags(flags, self.d3d_pool, rect, self.mip_shape(level));
-        if served != flags {
+        let dropped = flags & !served;
+        if dropped & D3DLOCK_NOOVERWRITE != 0 {
+            mtld3d_shared::log_once_info_by!(
+                target: TEX_TRACE_TARGET,
+                key: self.texture_id.raw(),
+                "tex {:#x}: D3DLOCK_NOOVERWRITE is not a texture lock flag and is ignored, the \
+                 lock is served as a plain one",
+                self.texture_id.raw()
+            );
+        }
+        if dropped & D3DLOCK_DISCARD != 0 {
             let shape = if self.d3d_pool == D3DPOOL_DEFAULT {
                 "partial"
             } else {
@@ -4678,9 +4687,9 @@ extern "system" fn texture_lock_rect(
         }
     }
     let dirty_rect = parse_rect(rect, mip_w, mip_h);
-    // A `D3DLOCK_DISCARD` the lock cannot honour (partial rect, CPU pool) is
-    // dropped here, so every consumer below sees the flags the lock is served
-    // with.
+    // A `D3DLOCK_DISCARD` the lock cannot honour (partial rect, CPU pool) and
+    // a `D3DLOCK_NOOVERWRITE` (not a texture lock flag) are dropped here, so
+    // every consumer below sees the flags the lock is served with.
     let flags = ti.served_lock_flags(level_u, dirty_rect, flags);
     // A level the GPU wrote with no CPU mirror has to be read back before the
     // Lock hands out a pointer into staging, and before `lock_region_ptr` may
