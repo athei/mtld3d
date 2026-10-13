@@ -1052,8 +1052,8 @@ pub struct FrameEncoder {
     /// dropped on the probe instead of repeating the build; a key a worker
     /// is building is in `pending_pipelines` until its outcome lands here. The
     /// no-color sibling has a key of its own and is remembered the same way.
-    /// `reset_cleanup` forgets the failures; a Reset at unchanged back-buffer
-    /// dimensions never reaches it.
+    /// `reset_cleanup` forgets the failures; it runs when the device replaces
+    /// its implicit surfaces or moves its window, not on every Reset.
     pipeline_cache: BuildIndex<PipelineKey, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-format-combo "clear-quad" pipeline handles.
     ///
@@ -8921,10 +8921,10 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         drop(held);
         self.blit_retention.release_all(&mut self.perf);
-        // A failed library or pipeline build gets one more attempt per Reset
-        // that reaches this cleanup (one at unchanged dimensions does not):
-        // a rejected source or descriptor fails again at the cost of one
-        // build, a build the compiler service dropped goes through.
+        // A failed library or pipeline build gets one more attempt each time
+        // this cleanup runs (not every Reset reaches it): a rejected source or
+        // descriptor fails again at the cost of one build, a build the compiler
+        // service dropped goes through.
         self.libraries.forget_failures();
         self.pipeline_cache.forget_failures();
         // The implicit surfaces the caller is about to destroy never pass
