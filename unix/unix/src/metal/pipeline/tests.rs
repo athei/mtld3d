@@ -19,7 +19,7 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     MetalHandle, VertexBufferLayoutDesc,
-    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, StageTag, VertexStepFunction},
+    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
     mtl_handle::MTLDeviceKind,
     perf::{PipelineTimings, ShaderTimings},
 };
@@ -98,22 +98,10 @@ fn pipeline_builds(
     resolved: &ResolvedAttrs,
 ) -> bool {
     let mut shader_timings = ShaderTimings::new();
-    let (vs_lib, vs_fn) = compile_shader_library(
-        device,
-        vs_msl,
-        StageTag::Vertex,
-        vs_entry,
-        &mut shader_timings,
-    )
-    .unwrap_or_else(|| panic!("VS compiles\n{vs_msl}"));
-    let (ps_lib, ps_fn) = compile_shader_library(
-        device,
-        ps_msl,
-        StageTag::Fragment,
-        ps_entry,
-        &mut shader_timings,
-    )
-    .unwrap_or_else(|| panic!("PS compiles\n{ps_msl}"));
+    let (vs_lib, vs_fn) = compile_shader_library(device, vs_msl, vs_entry, &mut shader_timings)
+        .unwrap_or_else(|| panic!("VS compiles\n{vs_msl}"));
+    let (ps_lib, ps_fn) = compile_shader_library(device, ps_msl, ps_entry, &mut shader_timings)
+        .unwrap_or_else(|| panic!("PS compiles\n{ps_msl}"));
     let layouts = [VertexBufferLayoutDesc {
         buffer_index: 0,
         stride: resolved.extents[0],

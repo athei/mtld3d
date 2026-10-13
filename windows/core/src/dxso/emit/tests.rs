@@ -2056,7 +2056,7 @@ fn fog_msl_compiles_under_metal() {
 fn metal_compile_or_fail(msl: &str) {
     use objc2_foundation::NSString;
     use objc2_metal::{
-        MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion,
+        MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode,
     };
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping Metal-compile check");
@@ -2064,6 +2064,8 @@ fn metal_compile_or_fail(msl: &str) {
     };
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
+    options.setPreserveInvariance(true);
+    options.setMathMode(MTLMathMode::Fast);
     let source = NSString::from_str(msl);
     if let Err(err) = device.newLibraryWithSource_options_error(&source, Some(&options)) {
         panic!("MSL failed Metal compilation: {err}\n--- MSL ---\n{msl}");

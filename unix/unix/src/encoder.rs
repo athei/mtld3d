@@ -67,7 +67,7 @@ use mtld3d_shared::{
     encoder_protocol::EncoderSubmitMode,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
-        PixelFormat, PresentWaitPolicy, PrimitiveType, StageTag, StorageMode, StoreAction, Swizzle,
+        PixelFormat, PresentWaitPolicy, PrimitiveType, StorageMode, StoreAction, Swizzle,
         TextureCreateFlags, TextureUsage, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
@@ -9413,7 +9413,6 @@ enum EncoderMessage {
 /// Returns `None` on empty input, missing entry or Metal compile failure.
 pub fn compile_stage_library(
     device_handle: MetalHandle<MTLDeviceKind>,
-    stage_tag: StageTag,
     msl: &str,
     entry: &str,
     timings: &mut ShaderTimings,
@@ -9427,11 +9426,11 @@ pub fn compile_stage_library(
             log::warn!(target: LOG_TARGET, "CompileShaderLibrary: empty entry name");
             None
         } else {
-            crate::metal::compile_shader_library(device_handle, msl, stage_tag, entry, timings)
+            crate::metal::compile_shader_library(device_handle, msl, entry, timings)
         }
     });
     let Some((library, func)) = result else {
-        error!(target: LOG_TARGET, "encoder: CompileShaderLibrary failed (stage={stage_tag:?}, entry={entry})");
+        error!(target: LOG_TARGET, "encoder: CompileShaderLibrary failed (entry={entry})");
         return None;
     };
     Some(StageLibHandles { library, func })

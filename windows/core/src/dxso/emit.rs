@@ -614,11 +614,12 @@ fn emit_vertex_in(out: &mut String, vs: &DxsoProgram, provided_mask: u16) {
 
 fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8, extras: &[Semantic]) {
     w(out, "struct Varyings {\n");
-    // `invariant` — the analog of an `Invariant` decoration on a SPIR-V
-    // `gl_Position` output — keeps the clip-space position bit-stable WITHIN a
-    // single shader across draws (with `setPreserveInvariance(true)` at VS
-    // compile time). It does not make the FF and programmable pipelines agree
-    // bit-for-bit; see the `Dp3`/`Dp4` emission for why cross-shader
+    // `invariant` (the analog of an `Invariant` decoration on a SPIR-V
+    // `gl_Position` output) keeps the clip-space position identical when the
+    // same vertex shader runs in different pipelines (with
+    // `setPreserveInvariance(true)` at VS compile time), which multipass
+    // rendering relies on. It does not make the FF and programmable pipelines
+    // agree bit-for-bit; see the `Dp3`/`Dp4` emission for why cross-shader
     // bit-invariance is not the goal.
     w(out, "    float4 position [[position, invariant]];\n");
     // Secondary POSITION semantic (`dcl_positionN`, N>=1) as an interpolated
@@ -1934,16 +1935,17 @@ fn translate_instruction(
         Opcode::Sub => format!("({} - {})", srcs[0], srcs[1]),
         Opcode::Mul => format!("({} * {})", srcs[0], srcs[1]),
         Opcode::Mad => format!("fma({}, {}, {})", srcs[0], srcs[1], srcs[2]),
-        // Plain MSL `dot()` — Apple Silicon has hardware dot-product;
+        // Plain MSL `dot()`: Apple Silicon has hardware dot-product, so
         // let the compiler use it. Cross-shader bit-invariance is not
         // achievable in general (per-shader matrices and vertex inputs
         // genuinely differ between FF and programmable paths), so z
         // parity between different shaders is not guaranteed and the only
         // depth bias is the application's own. `[[position, invariant]]` +
-        // `setPreserveInvariance(true)` + `setMathMode(Safe)` on VS
-        // remain in place as cheap defense — they keep clip-position
-        // bit-stable WITHIN a single shader across frames, which
-        // helps reflection passes and the like.
+        // `setPreserveInvariance(true)` at VS compile time keep the
+        // clip-space position identical when the same vertex shader runs in
+        // different pipelines (a depth prepass and an EQUAL-tested pass, or
+        // one VS paired with different pixel shaders), which multipass
+        // rendering relies on.
         Opcode::Dp3 => format!("float4(dot(({}).xyz, ({}).xyz))", srcs[0], srcs[1]),
         Opcode::Dp4 => format!("float4(dot({}, {}))", srcs[0], srcs[1]),
         Opcode::Rcp => format!("float4(1.0 / ({}).x)", srcs[0]),

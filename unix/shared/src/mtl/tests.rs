@@ -220,7 +220,6 @@ fn enum_layout_is_u32() {
     assert_eq!(core::mem::size_of::<MinMagFilter>(), 4);
     assert_eq!(core::mem::size_of::<MipFilter>(), 4);
     assert_eq!(core::mem::size_of::<AddressMode>(), 4);
-    assert_eq!(core::mem::size_of::<StageTag>(), 4);
     assert_eq!(core::mem::size_of::<Swizzle>(), 4);
     assert_eq!(core::mem::size_of::<VertexFormat>(), 4);
     assert_eq!(core::mem::size_of::<VertexStepFunction>(), 4);

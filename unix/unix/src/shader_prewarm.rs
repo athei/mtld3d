@@ -24,13 +24,11 @@ use mtld3d_core::{
     pipeline_state::{self, PipelineBuildInputs},
     shader_cache::{self, CacheLoad, ShaderRecordRef},
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
-    shader_key::CachedKind,
     shader_prewarm::PrewarmHandle,
     startup_work,
 };
 use mtld3d_shared::{
     MetalHandle,
-    mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
     perf::NanosSetTimer,
 };
@@ -304,13 +302,7 @@ fn compile_library(
     let entry_name = entry.kind.entry_name(entry.key);
     let started = Instant::now();
     let mut timings = mtld3d_shared::perf::ShaderTimings::new();
-    let handles = compile_stage_library(
-        device,
-        stage_for_kind(entry.kind),
-        &entry.msl,
-        &entry_name,
-        &mut timings,
-    );
+    let handles = compile_stage_library(device, &entry.msl, &entry_name, &mut timings);
     LibraryCompilation {
         handles,
         timings,
@@ -431,17 +423,6 @@ fn record_pipeline(
             0,
             identity,
         );
-    }
-}
-
-const fn stage_for_kind(kind: CachedKind) -> StageTag {
-    match kind {
-        CachedKind::FfVs | CachedKind::Sm1Vs | CachedKind::Sm2Vs | CachedKind::Sm3Vs => {
-            StageTag::Vertex
-        }
-        CachedKind::FfPs | CachedKind::Sm1Ps | CachedKind::Sm2Ps | CachedKind::Sm3Ps => {
-            StageTag::Fragment
-        }
     }
 }
 

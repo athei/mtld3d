@@ -489,20 +489,6 @@ pub enum BorderColor {
     OpaqueWhite = 2,
 }
 
-/// Shader stage selector for the native shader compiler.
-///
-/// Selects the MSL compile options for the stage: the Unix side compiles the
-/// vertex path with `MTLMathMode::Safe` (FP reassociation would defeat
-/// `[[position, invariant]]` across pipelines) and the fragment path with
-/// `MTLMathMode::Fast`. The entry-point name is carried separately in
-/// the native compiler entry name.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
-pub enum StageTag {
-    Vertex = 0,
-    Fragment = 1,
-}
-
 /// Resource kind for `DestroyResourcesBulkParams`.
 ///
 /// The Unix side dispatches on this to release the matching MTL protocol type
