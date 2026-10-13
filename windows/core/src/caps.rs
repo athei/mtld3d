@@ -339,6 +339,8 @@ const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::BLENDTEXTUREALPHAPM)
     .union(TexOpCaps::BLENDFACTORALPHA)
     .union(TexOpCaps::BLENDCURRENTALPHA)
+    .union(TexOpCaps::BUMPENVMAP)
+    .union(TexOpCaps::BUMPENVMAPLUMINANCE)
     .union(TexOpCaps::DOTPRODUCT3);
 
 /// Line-drawing caps: textured, depth-tested, blended, alpha-tested, fogged lines.

@@ -14,8 +14,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   texture-stage cascade (CURRENT/TEMP registers, per-stage constants,
   DOTPRODUCT3 color and alpha, MODULATEALPHA_ADDCOLOR,
   MODULATECOLOR_ADDALPHA, MODULATEINVALPHA_ADDCOLOR,
-  MODULATEINVCOLOR_ADDALPHA and premultiplied texture-alpha blending),
-  vertex blending and range-based
+  MODULATEINVCOLOR_ADDALPHA, premultiplied texture-alpha blending, and
+  BUMPENVMAP and BUMPENVMAPLUMINANCE bump-environment mapping, for which
+  `D3DUSAGE_QUERY_LEGACYBUMPMAP` accepts V8U8, V16U16 and Q8W8V8U8 2D
+  textures), vertex blending and range-based
   vertex fog. Table fog supports Z and W sources with LINEAR,
   EXP and EXP2; SM3 shaders own their fog.
 - Every draw call and primitive type, point sprites, user clip planes, all
@@ -191,11 +193,6 @@ unless its entry says otherwise.
   `D3DTSS_COLORARG0` and `D3DTSS_ALPHAARG0`, which only the last two read,
   are stored and reported back, and warned once when written away from
   their default.
-- Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
-  `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
-  `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
-  format to match. The SM1 `texbem` instruction and the `D3DTSS_BUMPENVMAT*`
-  matrix it reads are a separate surface and do work.
 - DEFAULT offscreen cross-format `StretchRect` outside the narrow normalized
   codecs and A16B16G16R16/A32B32G32R32F into A8R8G8B8 returns
   `D3DERR_INVALIDCALL`. Wide-to-wide conversion and offscreen scaling remain

@@ -265,6 +265,31 @@ pub(super) fn fetch4_sample(slot: u16, uv: &str, depth: bool, alpha: bool) -> St
     )
 }
 
+/// MSL expressions for texture stage `stage`'s 2×2 bump-environment matrix.
+///
+/// `D3DTSS_BUMPENVMAT00/01/10/11`, packed by the d3d9 side as a `float4`
+/// `(m00, m01, m10, m11)` at `bump_env[stage*2]`. Returns
+/// `(m00, m01, m10, m11)`. The SM1 bump instructions and the fixed-function
+/// bump-environment stages read the same uniform.
+pub(super) fn bump_matrix_exprs(stage: u16) -> (String, String, String, String) {
+    let i = stage * 2;
+    (
+        format!("bump_env[{i}].x"),
+        format!("bump_env[{i}].y"),
+        format!("bump_env[{i}].z"),
+        format!("bump_env[{i}].w"),
+    )
+}
+
+/// MSL expressions for stage `stage`'s bump luminance scale/offset.
+///
+/// `D3DTSS_BUMPENVLSCALE`/`LOFFSET`, packed as `(lscale, loffset, 0, 0)` at
+/// `bump_env[stage*2+1]`. Returns `(lscale, loffset)`.
+pub(super) fn bump_lum_exprs(stage: u16) -> (String, String) {
+    let i = stage * 2 + 1;
+    (format!("bump_env[{i}].x"), format!("bump_env[{i}].y"))
+}
+
 /// Texture kind bound to each vertex-fetch sampler slot.
 ///
 /// The four `D3DVERTEXTEXTURESAMPLER0..3` slots (API stages 257..260) bind
@@ -3190,30 +3215,6 @@ const fn sm1_op_samples(op: Opcode) -> bool {
             | Opcode::TexReg2Rgb
             | Opcode::TexDp3Tex
     )
-}
-
-/// MSL expressions for texture stage `stage`'s 2×2 bump-environment matrix.
-///
-/// `D3DTSS_BUMPENVMAT00/01/10/11`, packed by the d3d9 side as a `float4`
-/// `(m00, m01, m10, m11)` at `bump_env[stage*2]`. Returns
-/// `(m00, m01, m10, m11)`.
-fn bump_matrix_exprs(stage: u16) -> (String, String, String, String) {
-    let i = stage * 2;
-    (
-        format!("bump_env[{i}].x"),
-        format!("bump_env[{i}].y"),
-        format!("bump_env[{i}].z"),
-        format!("bump_env[{i}].w"),
-    )
-}
-
-/// MSL expressions for stage `stage`'s bump luminance scale/offset.
-///
-/// `D3DTSS_BUMPENVLSCALE`/`LOFFSET`, packed as `(lscale, loffset, 0, 0)` at
-/// `bump_env[stage*2+1]`. Returns `(lscale, loffset)`.
-fn bump_lum_exprs(stage: u16) -> (String, String) {
-    let i = stage * 2 + 1;
-    (format!("bump_env[{i}].x"), format!("bump_env[{i}].y"))
 }
 
 /// Emit a sampling expression honouring D3D9's hardware shadow filter:

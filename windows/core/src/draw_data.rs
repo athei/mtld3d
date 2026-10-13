@@ -689,8 +689,11 @@ pub struct CurrentSnapshot {
     pub fog_color_bytes: Option<ScratchSlice>,
     /// Per-stage bump-environment matrix + luminance (PS slot 12).
     ///
-    /// Consumed by SM1 `texbem`/`texbeml`/`bem`. Bound only for a PS that
-    /// uses one of those ops (`ProgrammablePsSource::uses_bump_env`).
+    /// Consumed by SM1 `texbem`/`texbeml`/`bem` and by the fixed-function
+    /// bump-environment stages. Bound only for a programmable PS that uses
+    /// one of those ops (`ProgrammablePsSource::uses_bump_env`) or a
+    /// fixed-function PS whose stages name a bump-environment operation
+    /// (`FixedPsSource::uses_bump_env`).
     pub bump_env_bytes: Option<ScratchSlice>,
     /// VS integer-constant file (vertex slot 14).
     ///

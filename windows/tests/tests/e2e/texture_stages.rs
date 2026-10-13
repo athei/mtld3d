@@ -2704,3 +2704,493 @@ fn disabled_alpha_under_an_enabled_color_stage_keeps_the_incoming_alpha() {
         "untextured stage kept alpha, red {red}"
     );
 }
+
+/// A vertex with a 2D bump coordinate in set 0 and an `N`-wide one in set 1.
+#[repr(C)]
+struct BumpVertex<const N: usize> {
+    x: f32,
+    y: f32,
+    z: f32,
+    diffuse: u32,
+    bump: [f32; 2],
+    dest: [f32; N],
+}
+
+/// Red, green, blue and white texels in a 2x2 grid, row by row.
+const BUMP_DEST_TEXELS: [u32; 4] = [0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+
+/// A `V8U8` texel's word: `du` in the low byte, `dv` in the high byte.
+const fn v8u8(du: i8, dv: i8) -> u16 {
+    u16::from_le_bytes([du.cast_unsigned(), dv.cast_unsigned()])
+}
+
+/// The FVF of [`BumpVertex<N>`]: two coordinate sets, the second `N` wide.
+fn bump_fvf(n: usize) -> u32 {
+    use mtld3d_types::{D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4};
+    let format = match n {
+        2 => 0,
+        3 => D3DFVF_TEXTUREFORMAT3,
+        4 => D3DFVF_TEXTUREFORMAT4,
+        _ => unreachable!("destination coordinates are 2, 3 or 4 wide"),
+    };
+    D3DFVF_XYZ | D3DFVF_DIFFUSE | (2 << D3DFVF_TEXCOUNT_SHIFT) | (format << 18)
+}
+
+/// Draw a full-target quad whose every vertex carries `dest` and read the centre pixel.
+fn draw_bump_quad<const N: usize>(h: &Harness, diffuse: u32, dest: [f32; N]) -> Rgba8 {
+    let v = |x: f32, y: f32| BumpVertex {
+        x,
+        y,
+        z: 0.5,
+        diffuse,
+        bump: [0.5, 0.5],
+        dest,
+    };
+    let verts = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    assert_eq!(h.set_fvf(bump_fvf(N)), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+    });
+    Rgba8::from_pixel(h.read_pixel(320, 240))
+}
+
+/// Point-sample stage `stage` with clamped addressing, so one texel answers each coordinate.
+fn point_clamp(h: &Harness, stage: u32) {
+    use mtld3d_types::{
+        D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+        D3DTADDRESS_CLAMP, D3DTEXF_POINT,
+    };
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(stage, state, value), 0);
+    }
+}
+
+/// Write stage `stage`'s bump-environment matrix `(m00, m01, m10, m11)`.
+fn set_bump_matrix(h: &Harness, stage: u32, matrix: [f32; 4]) {
+    use mtld3d_types::{
+        D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11,
+    };
+    for (state, value) in [
+        D3DTSS_BUMPENVMAT00,
+        D3DTSS_BUMPENVMAT01,
+        D3DTSS_BUMPENVMAT10,
+        D3DTSS_BUMPENVMAT11,
+    ]
+    .into_iter()
+    .zip(matrix)
+    {
+        assert_eq!(h.set_texture_stage_state(stage, state, value.to_bits()), 0);
+    }
+}
+
+/// Write stage `stage`'s bump-environment luminance scale and offset.
+fn set_bump_luminance(h: &Harness, stage: u32, scale: f32, offset: f32) {
+    use mtld3d_types::{D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE};
+    assert_eq!(
+        h.set_texture_stage_state(stage, D3DTSS_BUMPENVLSCALE, scale.to_bits()),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(stage, D3DTSS_BUMPENVLOFFSET, offset.to_bits()),
+        0
+    );
+}
+
+/// A one-texel `V8U8` bump map holding `(du, dv)`.
+fn v8u8_bump_map(h: &Harness, du: i8, dv: i8) -> Texture<'_> {
+    use mtld3d_types::{D3DFMT_V8U8, D3DPOOL_MANAGED};
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_V8U8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write::<u16>(&[v8u8(du, dv)]);
+    tex
+}
+
+/// The 2x2 red, green, blue and white destination texture.
+fn bump_destination(h: &Harness) -> Texture<'_> {
+    use mtld3d_types::D3DPOOL_MANAGED;
+    let tex = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32_rect(2, 2, &BUMP_DEST_TEXELS);
+    tex
+}
+
+/// Stage 0 runs `op` over the bound bump map and stage 1 selects its texture, colour and alpha.
+///
+/// Both stages point-sample with clamped addressing and lighting is off. The
+/// stage states left at their defaults keep stage 0's arguments at
+/// `D3DTA_TEXTURE` and `D3DTA_CURRENT`.
+fn bump_cascade(h: &Harness, op: u32) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    for (stage, state, value) in [
+        (0, D3DTSS_COLOROP, op),
+        (1, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (1, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+    }
+    point_clamp(h, 0);
+    point_clamp(h, 1);
+}
+
+/// The 2x2 destination texel a displaced lookup reads, as an opaque colour.
+const fn bump_texel(index: usize) -> Rgba8 {
+    Rgba8::from_pixel(BUMP_DEST_TEXELS[index])
+}
+
+/// Whether `px` is within `tol` of `expected` on red, green and blue.
+const fn rgb_near(px: Rgba8, expected: Rgba8, tol: u8) -> bool {
+    px.r.abs_diff(expected.r) <= tol
+        && px.g.abs_diff(expected.g) <= tol
+        && px.b.abs_diff(expected.b) <= tol
+}
+
+/// The bump stage's own matrix displaces the next stage's coordinate.
+///
+/// `u` moves by `m00 du + m10 dv` and `v` by `m01 du + m11 dv`. The bump
+/// texel is `(du, dv) = (64/127, 0)` and the destination coordinate
+/// `(0.25, 0.25)`, the red texel of the 2x2 map. With `m01 = 1`
+/// alone the lookup moves down to blue, with `m00 = 1` alone right to
+/// green, and with `m10 = 1` alone it stays, since `dv` is zero. Stage 1
+/// carries a matrix of its own that would move the lookup elsewhere, so the
+/// colours show the bump stage's matrix is the one applied.
+#[test]
+fn bump_env_displaces_the_next_stage_by_the_bump_stage_matrix() {
+    use mtld3d_types::D3DTOP_BUMPENVMAP;
+
+    let h = Harness::new();
+    let bump = v8u8_bump_map(&h, 64, 0);
+    let dest = bump_destination(&h);
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_texture(1, &dest), 0);
+    bump_cascade(&h, D3DTOP_BUMPENVMAP);
+    set_bump_matrix(&h, 1, [1.0, 1.0, 1.0, 1.0]);
+    for (matrix, texel, what) in [
+        ([0.0, 0.0, 0.0, 0.0], 0, "zero matrix"),
+        ([0.0, 1.0, 0.0, 0.0], 2, "m01 moves v by du"),
+        ([1.0, 0.0, 0.0, 0.0], 1, "m00 moves u by du"),
+        ([0.0, 0.0, 1.0, 0.0], 0, "m10 moves u by a zero dv"),
+    ] {
+        set_bump_matrix(&h, 0, matrix);
+        let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+        assert!(rgb_near(px, bump_texel(texel), 2), "{what}: {px:?}");
+    }
+}
+
+/// The luminance variant scales all four channels of the next sample.
+///
+/// The scale is the clamped luminance term of the bump stage.
+/// The `Q8W8V8U8` bump texel stores no displacement and `W = 64/127`, the
+/// third channel the luminance term reads. Over a white destination the
+/// colour reads `saturate(W * lscale + loffset)`, and a following stage that
+/// replicates the alpha reads the same scale from the alpha channel. Stage
+/// 1's own scale and offset would give one.
+#[test]
+fn bump_env_luminance_scales_the_next_sample_by_the_bump_stage_terms() {
+    use mtld3d_types::{
+        D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED, D3DTA_ALPHAREPLICATE, D3DTA_CURRENT,
+        D3DTOP_BUMPENVMAPLUMINANCE,
+    };
+
+    let h = Harness::new();
+    let bump = h.create_texture(1, 1, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    bump.lock_rect(0, 0).write_u32(&[0x0040_0000]);
+    let white = solid_texture(&h, 0xFFFF_FFFF);
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_texture(1, &white), 0);
+    bump_cascade(&h, D3DTOP_BUMPENVMAPLUMINANCE);
+    set_bump_matrix(&h, 0, [0.0; 4]);
+    set_bump_luminance(&h, 1, 0.0, 1.0);
+    let w: f32 = 64.0 / 127.0;
+    for (scale, offset) in [(2.0f32, -0.25f32), (10.0, 0.0), (1.0, -1.0)] {
+        set_bump_luminance(&h, 0, scale, offset);
+        let expected = w.mul_add(scale, offset).clamp(0.0, 1.0) * 255.0;
+        for replicate_alpha in [false, true] {
+            let stage2_op = if replicate_alpha {
+                D3DTOP_SELECTARG1
+            } else {
+                mtld3d_types::D3DTOP_DISABLE
+            };
+            assert_eq!(h.set_texture_stage_state(2, D3DTSS_COLOROP, stage2_op), 0);
+            assert_eq!(
+                h.set_texture_stage_state(
+                    2,
+                    D3DTSS_COLORARG1,
+                    D3DTA_CURRENT | D3DTA_ALPHAREPLICATE
+                ),
+                0
+            );
+            let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.5, 0.5]);
+            for channel in [px.r, px.g, px.b] {
+                assert!(
+                    (f32::from(channel) - expected).abs() <= 2.5,
+                    "scale {scale} offset {offset} alpha={replicate_alpha}: {px:?}, \
+                     expected {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// A projected destination is divided by its `w` before the displacement is added.
+///
+/// The destination coordinate `(0.4, 1.0, 0, 4)` divides to `(0.1, 0.25)`,
+/// red, and the displacement `du = 64/127` moves it to green. Dividing the
+/// displacement too would land on red, and not dividing at all on white.
+#[test]
+fn bump_env_displaces_a_projected_destination_after_the_divide() {
+    use mtld3d_types::{
+        D3DTOP_BUMPENVMAP, D3DTS_TEXTURE1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4,
+        D3DTTFF_PROJECTED,
+    };
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+
+    let h = Harness::new();
+    let bump = v8u8_bump_map(&h, 64, 0);
+    let dest = bump_destination(&h);
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_texture(1, &dest), 0);
+    bump_cascade(&h, D3DTOP_BUMPENVMAP);
+    set_bump_matrix(&h, 0, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(h.set_transform(D3DTS_TEXTURE1, &IDENTITY), 0);
+    assert_eq!(
+        h.set_texture_stage_state(
+            1,
+            D3DTSS_TEXTURETRANSFORMFLAGS,
+            D3DTTFF_COUNT4 | D3DTTFF_PROJECTED
+        ),
+        0
+    );
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.4, 1.0, 0.0, 4.0]);
+    assert!(rgb_near(px, bump_texel(1), 2), "projected: {px:?}");
+}
+
+/// A cube destination moves its `x` and `y` and keeps its third coordinate.
+///
+/// The direction `(0.2, 0.1, 1.0)` names +Z. With `m00 = 2` the displacement
+/// `2 * 64/127` takes `x` past `z`, to +X; moving `z` by the same amount
+/// would keep the lookup on +Z.
+#[test]
+fn bump_env_moves_only_the_first_two_coordinates_of_a_cube_destination() {
+    use mtld3d_types::{D3DPOOL_MANAGED, D3DTOP_BUMPENVMAP};
+    // +X, -X, +Y, -Y, +Z, -Z.
+    const FACES: [u32; 6] = [
+        0xffff_0000,
+        0xff00_ffff,
+        0xff00_ff00,
+        0xffff_00ff,
+        0xff00_00ff,
+        0xffff_ff00,
+    ];
+
+    let h = Harness::new();
+    let bump = v8u8_bump_map(&h, 64, 0);
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    for (face, colour) in (0u32..).zip(FACES) {
+        cube.lock_rect(face, 0, 0).write_u32(&[colour; 16]);
+    }
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_cube_texture(1, &cube), 0);
+    bump_cascade(&h, D3DTOP_BUMPENVMAP);
+    set_bump_matrix(&h, 0, [0.0; 4]);
+    let undisplaced = draw_bump_quad(&h, 0xFFFF_FFFF, [0.2, 0.1, 1.0]);
+    assert!(
+        rgb_near(undisplaced, Rgba8::from_pixel(FACES[4]), 2),
+        "zero matrix: {undisplaced:?}"
+    );
+    set_bump_matrix(&h, 0, [2.0, 0.0, 0.0, 0.0]);
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.2, 0.1, 1.0]);
+    assert!(
+        rgb_near(px, Rgba8::from_pixel(FACES[0]), 2),
+        "displaced: {px:?}"
+    );
+}
+
+/// An unbound bump stage takes the unbound-texture rule, or reads a zero texel.
+///
+/// Stage 1 modulates its white texel's alpha by CURRENT's and stage 2
+/// replicates the result into the colour. With its default `D3DTA_TEXTURE`
+/// argument the bump stage selects CURRENT and runs its own alpha
+/// operation, the texture factor's 0x40 alpha. With arguments that name no
+/// texture it stays a bump stage, writes no alpha and leaves the diffuse
+/// 0xff. The luminance variant then scales stage 1 by `saturate(loffset)`
+/// alone, since the missing texel's luminance is zero.
+#[test]
+fn an_unbound_bump_stage_selects_current_or_reads_a_zero_texel() {
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE,
+    };
+
+    let h = Harness::new();
+    let white = solid_texture(&h, 0xFFFF_FFFF);
+    assert_eq!(h.set_texture(1, &white), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x40FF_FFFF), 0);
+    for (op, arg1, expected) in [
+        (D3DTOP_BUMPENVMAP, D3DTA_TEXTURE, 0x40u8),
+        (D3DTOP_BUMPENVMAP, D3DTA_DIFFUSE, 0xFF),
+        (D3DTOP_BUMPENVMAPLUMINANCE, D3DTA_DIFFUSE, 0x80),
+    ] {
+        bump_cascade(&h, op);
+        set_bump_matrix(&h, 0, [1.0; 4]);
+        set_bump_luminance(&h, 0, 7.0, 0.5);
+        for (stage, state, value) in [
+            (0, D3DTSS_COLORARG1, arg1),
+            (0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR),
+            (1, D3DTSS_ALPHAOP, D3DTOP_MODULATE),
+            (2, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+            (2, D3DTSS_COLORARG1, D3DTA_CURRENT | D3DTA_ALPHAREPLICATE),
+        ] {
+            assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+        }
+        let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.5, 0.5]);
+        for channel in [px.r, px.g, px.b] {
+            assert!(
+                channel.abs_diff(expected) <= 2,
+                "op {op} arg1 {arg1}: {px:?}, expected {expected:#x}"
+            );
+        }
+    }
+}
+
+/// A bump stage writes neither CURRENT nor TEMP.
+///
+/// That holds whatever its result argument and alpha operation. Stage 0
+/// writes the texture factor to TEMP. The bump stage names TEMP as its
+/// result and selects TEMP for its alpha, stage 2 writes its red texel to
+/// CURRENT, and stage 3 selects TEMP, which still holds the factor.
+#[test]
+fn a_bump_stage_leaves_the_temporary_register_alone() {
+    use mtld3d_types::{D3DTA_TEMP, D3DTOP_BUMPENVMAP, D3DTSS_RESULTARG, D3DTSS_TEXCOORDINDEX};
+
+    let h = Harness::new();
+    let bump = v8u8_bump_map(&h, 0, 0);
+    let red = solid_texture(&h, 0xFFFF_0000);
+    assert_eq!(h.set_texture(1, &bump), 0);
+    assert_eq!(h.set_texture(2, &red), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x0123_4567), 0);
+    for (stage, state, value) in [
+        (0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (0, D3DTSS_COLORARG1, D3DTA_TFACTOR),
+        (0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR),
+        (0, D3DTSS_RESULTARG, D3DTA_TEMP),
+        (1, D3DTSS_COLOROP, D3DTOP_BUMPENVMAP),
+        (1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (1, D3DTSS_ALPHAARG1, D3DTA_TEMP),
+        (1, D3DTSS_RESULTARG, D3DTA_TEMP),
+        (1, D3DTSS_TEXCOORDINDEX, 0),
+        (2, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (2, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (2, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (2, D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (2, D3DTSS_TEXCOORDINDEX, 1),
+        (3, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (3, D3DTSS_COLORARG1, D3DTA_TEMP),
+        (3, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (3, D3DTSS_ALPHAARG1, D3DTA_TEMP),
+    ] {
+        assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+    }
+    point_clamp(&h, 1);
+    set_bump_matrix(&h, 1, [1.0; 4]);
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.5, 0.5]);
+    assert!(
+        rgb_near(px, Rgba8::from_pixel(0xFF23_4567), 1),
+        "TEMP after the bump stage: {px:?}"
+    );
+}
+
+/// A bump stage applied from a state block, and one that follows a pixel shader, displaces.
+///
+/// The pixel-state block captured with the bump stage set restores its
+/// operation and matrix over a stage that selects CURRENT with a zero
+/// matrix, and so does a recorded block. A `ps_1_1` `texbem` reads stage 1's
+/// matrix, which is zero, and samples red; the fixed-function draw after it
+/// reads stage 0's and samples green, and the shader bound again reads red.
+#[test]
+fn bump_env_survives_state_blocks_and_shader_switches() {
+    use mtld3d_types::{D3DSBT_PIXELSTATE, D3DTOP_BUMPENVMAP, D3DTOP_SELECTARG2};
+    // ps_1_1 { tex t0; texbem t1, t0; mov r0, t1 }
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0043,
+        0xb00f_0001,
+        0xb0e4_0000,
+        0x0000_0001,
+        0x800f_0000,
+        0xb0e4_0001,
+        0x0000_ffff,
+    ];
+
+    let h = Harness::new();
+    let bump = v8u8_bump_map(&h, 64, 0);
+    let dest = bump_destination(&h);
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_texture(1, &dest), 0);
+    bump_cascade(&h, D3DTOP_BUMPENVMAP);
+    set_bump_matrix(&h, 0, [1.0, 0.0, 0.0, 0.0]);
+    set_bump_matrix(&h, 1, [0.0; 4]);
+    let green = bump_texel(1);
+    let red = bump_texel(0);
+    let unbump = || {
+        assert_eq!(
+            h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2),
+            0
+        );
+        set_bump_matrix(&h, 0, [0.0; 4]);
+    };
+
+    let captured = h.create_state_block(D3DSBT_PIXELSTATE);
+    unbump();
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+    assert!(rgb_near(px, red, 2), "before the captured block: {px:?}");
+    assert_eq!(captured.apply(), 0);
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+    assert!(rgb_near(px, green, 2), "captured block applied: {px:?}");
+
+    unbump();
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_BUMPENVMAP),
+        0
+    );
+    set_bump_matrix(&h, 0, [1.0, 0.0, 0.0, 0.0]);
+    let recorded = h.end_state_block();
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+    assert!(rgb_near(px, red, 2), "before the recorded block: {px:?}");
+    assert_eq!(recorded.apply(), 0);
+    let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+    assert!(rgb_near(px, green, 2), "recorded block applied: {px:?}");
+
+    let shader = h.create_pixel_shader(PS);
+    for (programmable, expected, what) in [
+        (true, red, "texbem reads stage 1's zero matrix"),
+        (false, green, "fixed function after the shader"),
+        (true, red, "texbem bound again"),
+    ] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&shader), 0);
+        } else {
+            assert_eq!(h.clear_pixel_shader(), 0);
+        }
+        let px = draw_bump_quad(&h, 0xFFFF_FFFF, [0.25, 0.25]);
+        assert!(rgb_near(px, expected, 2), "{what}: {px:?}");
+    }
+}

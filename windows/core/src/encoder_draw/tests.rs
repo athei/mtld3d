@@ -246,7 +246,8 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         depth_stencil_state::DepthStencilSnapshot,
         draw_data::{
             AttrSnapshot, DepthScissorFlags, DepthStencilFlags, PsSource, PsSourcePtr,
-            RenderStatePtr, RenderStateSnapshot, StageBinding, bump_packed_stage_bindings,
+            PsSourceView, RenderStatePtr, RenderStateSnapshot, StageBinding,
+            bump_packed_stage_bindings,
         },
         dxso::{FfPsKey, FfStage, FfVsFlags, FfVsKey, VariantKey},
         ids::TextureId,
@@ -313,8 +314,9 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
             },
             sampled_stage_mask: 1,
             constant_rows: 2,
+            bump_env: true,
 
-            reserved: [0; 3],
+            reserved: [0; 2],
         }),
     );
     let packed: [StageBinding; 16] = std::array::from_fn(|_| StageBinding {
@@ -414,6 +416,14 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         vs_address(restored.vs.unwrap().as_ref()),
         vs_address(snapshot.vs.unwrap().as_ref())
     );
+    // The fixed-function source's scalars, the bump-environment flag in the
+    // byte after `constant_rows` among them, survive the round trip.
+    let PsSourceView::FixedFunction(restored_ps) = restored.ps.as_ref().unwrap().as_ref() else {
+        panic!("the fixed-function pixel source decodes as fixed-function");
+    };
+    assert_eq!(restored_ps.sampled_stage_mask, 1);
+    assert_eq!(restored_ps.constant_rows, 2);
+    assert!(restored_ps.uses_bump_env());
     assert!(record.is_empty());
     let leaf_address = std::ptr::from_ref(restored.render_state.unwrap().as_ref()) as usize;
     assert!(
@@ -658,7 +668,8 @@ fn canonical_pixel_source_rejects_invalid_bool_before_borrowing() {
         },
         sampled_stage_mask: 0,
         constant_rows: 0,
-        reserved: [0; 3],
+        bump_env: false,
+        reserved: [0; 2],
     });
     let mut arena = ScratchArena::new();
     let payload = encode_snapshot(
@@ -669,7 +680,14 @@ fn canonical_pixel_source_rejects_invalid_bool_before_borrowing() {
         },
     );
     assert_eq!(payload.len(), 80);
-    for (offset, invalid) in [(8, 2), (16 + 56, 2), (16 + 6, 128), (16 + 61, 1)] {
+    for (offset, invalid) in [
+        (8, 2),
+        (16 + 56, 2),
+        (16 + 6, 128),
+        (16 + 61, 2),
+        (16 + 62, 1),
+        (16 + 63, 1),
+    ] {
         let mut copied = AlignedPayload([0; 80]);
         copied.0.copy_from_slice(payload);
         copied.0[offset] = invalid;

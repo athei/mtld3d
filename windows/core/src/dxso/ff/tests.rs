@@ -1290,6 +1290,110 @@ fn no_pixel_shader_local_is_declared_unread() {
         }
     }
 
+    // Bump-environment pairs: a bump stage with and without a texture and
+    // with each argument pair, ahead of every operation on a next stage that
+    // has or lacks a texture and writes CURRENT or TEMP, then a third stage
+    // that ends the cascade, reads the temporary or is a bump stage itself.
+    // The next stage's sample kind and projection vary, since each declares
+    // its own coordinate locals.
+    let bump_ops = [
+        narrow(mtld3d_types::D3DTOP_BUMPENVMAP),
+        narrow(mtld3d_types::D3DTOP_BUMPENVMAPLUMINANCE),
+    ];
+    let bump_args = [
+        (narrow(D3DTA_TEXTURE), narrow(D3DTA_CURRENT)),
+        (narrow(D3DTA_DIFFUSE), narrow(D3DTA_CURRENT)),
+        (narrow(D3DTA_TEMP), narrow(D3DTA_CONSTANT)),
+    ];
+    let reads_temp_and_texture = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEMP),
+        color_arg2: narrow(D3DTA_TEXTURE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        alpha_arg2: narrow(D3DTA_TEXTURE),
+        flags: stage_flags(true, false),
+    };
+    let third_stages = [
+        stage_disable(),
+        reads_temp_and_texture,
+        FfStage {
+            color_op: bump_ops[1],
+            color_arg1: narrow(D3DTA_TEXTURE),
+            color_arg2: narrow(D3DTA_CURRENT),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_TEXTURE),
+            alpha_arg2: narrow(D3DTA_CURRENT),
+            flags: stage_flags(true, false),
+        },
+    ];
+    let sample_kinds = [
+        VariantKey::default(),
+        VariantKey {
+            cube_sampler_mask: 0b10,
+            ..VariantKey::default()
+        },
+        VariantKey {
+            depth_sampler_mask: 0b10,
+            ..VariantKey::default()
+        },
+        VariantKey {
+            depth_sampler_mask: 0b10,
+            depth_fetch_mask: 0b10,
+            raw_depth_red_mask: 0b10,
+            ..VariantKey::default()
+        },
+        VariantKey {
+            fetch4_mask: 0b10,
+            ..VariantKey::default()
+        },
+        VariantKey {
+            flags: VariantFlags::LOD_BIAS | VariantFlags::POINT_SPRITE,
+            ..VariantKey::default()
+        },
+    ];
+    for &bump_op in &bump_ops {
+        for &(bump_arg1, bump_arg2) in &bump_args {
+            for bump_texture in [false, true] {
+                for &op in &ops {
+                    for next_texture in [false, true] {
+                        for next_temp in [false, true] {
+                            for third in &third_stages {
+                                let mut ps = default_ps_key();
+                                ps.stages[0] = FfStage {
+                                    color_op: bump_op,
+                                    color_arg1: bump_arg1,
+                                    color_arg2: bump_arg2,
+                                    alpha_op: narrow(D3DTOP_SELECTARG1),
+                                    alpha_arg1: narrow(D3DTA_TEMP),
+                                    alpha_arg2: narrow(D3DTA_CURRENT),
+                                    flags: stage_flags(bump_texture, false),
+                                };
+                                ps.stages[1] = FfStage {
+                                    color_op: op,
+                                    color_arg1: narrow(D3DTA_TEXTURE),
+                                    color_arg2: narrow(D3DTA_CURRENT),
+                                    alpha_op: op,
+                                    alpha_arg1: narrow(D3DTA_TEXTURE),
+                                    alpha_arg2: narrow(D3DTA_TEMP),
+                                    flags: stage_flags(next_texture, next_temp),
+                                };
+                                ps.stages[2] = *third;
+                                ps.stages[3] = reads_temp_and_texture;
+                                for projected in [0u8, 0b10] {
+                                    ps.tt_projected_mask = projected;
+                                    for &variant in &sample_kinds {
+                                        check(&ps, variant);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let report = reported
         .iter()
         .map(|(local, key)| format!("  {local} at {key}"))
@@ -3960,4 +4064,395 @@ fn tci_entry_clamps_without_changing_the_emitted_shader() {
         emit_vs_ff(&vs)
     };
     assert_eq!(msl(5), msl(0x14));
+}
+
+/// A bump-environment stage with the default arguments, `TEXTURE` and `CURRENT`.
+fn bump_stage(op: u32, texture: bool) -> FfStage {
+    let mut flags = FfStageFlags::empty();
+    flags.set(FfStageFlags::HAS_TEXTURE, texture);
+    FfStage {
+        color_op: narrow(op),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags,
+    }
+}
+
+/// A textured stage selecting its texture for colour and alpha.
+fn select_texture_stage() -> FfStage {
+    FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::HAS_TEXTURE,
+    }
+}
+
+/// The displaced coordinate stage `i` samples at, displaced by bump stage `n` from `base`.
+fn displaced(i: usize, n: usize, base: &str) -> String {
+    let m = n * 2;
+    format!(
+        "float4 bc{i} = float4({base}.xy + float2(bump_env[{m}].x * t{n}.x + bump_env[{m}].z * t{n}.y, bump_env[{m}].y * t{n}.x + bump_env[{m}].w * t{n}.y), {base}.zw);"
+    )
+}
+
+#[test]
+fn bump_stage_displaces_the_next_sample_with_its_own_matrix() {
+    use mtld3d_types::D3DTOP_BUMPENVMAP;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[1] = select_texture_stage();
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        msl.contains("constant float4 *bump_env [[buffer(12)]]"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xy);"),
+        "{msl}"
+    );
+    assert!(msl.contains(&displaced(1, 0, "in.texcoord1")), "{msl}");
+    assert!(
+        msl.contains("float4 t1 = s1.sample(samp1, bc1.xy);"),
+        "{msl}"
+    );
+    // The bump stage writes no register: the only CURRENT write is stage 1's.
+    assert_eq!(msl.matches("    current = ").count(), 1, "{msl}");
+    assert!(msl.contains("current = float4((t1).rgb, (t1).a);"), "{msl}");
+    assert!(!msl.contains("*="), "{msl}");
+
+    // A bump stage further down reads its own rows, not the destination's.
+    let mut later = default_ps_key();
+    later.stages[0] = select_texture_stage();
+    later.stages[1] = select_texture_stage();
+    later.stages[2] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    later.stages[3] = select_texture_stage();
+    let msl = emit_ps_ff(&later, VariantKey::default());
+    assert!(msl.contains(&displaced(3, 2, "in.texcoord3")), "{msl}");
+    assert!(msl.contains("bump_env[4]"), "{msl}");
+    assert!(!msl.contains("bump_env[6]"), "{msl}");
+}
+
+#[test]
+fn luminance_bump_stage_scales_all_four_channels_of_the_next_sample() {
+    use mtld3d_types::D3DTOP_BUMPENVMAPLUMINANCE;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAPLUMINANCE, true);
+    ps.stages[1] = select_texture_stage();
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(msl.contains(&displaced(1, 0, "in.texcoord1")), "{msl}");
+    assert!(
+        msl.contains("t1 *= saturate(t0.z * bump_env[1].x + bump_env[1].y);"),
+        "{msl}"
+    );
+
+    // On stage 2 the luminance terms are that stage's row.
+    let mut later = default_ps_key();
+    later.stages[0] = select_texture_stage();
+    later.stages[1] = select_texture_stage();
+    later.stages[2] = bump_stage(D3DTOP_BUMPENVMAPLUMINANCE, true);
+    later.stages[3] = select_texture_stage();
+    let msl = emit_ps_ff(&later, VariantKey::default());
+    assert!(
+        msl.contains("t3 *= saturate(t2.z * bump_env[5].x + bump_env[5].y);"),
+        "{msl}"
+    );
+}
+
+#[test]
+fn a_projected_destination_is_divided_before_the_displacement() {
+    use mtld3d_types::D3DTOP_BUMPENVMAP;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[1] = select_texture_stage();
+    ps.tt_projected_mask = 0b10;
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        msl.contains(
+            "float4 pc1 = in.texcoord1.w != 0.0 ? float4(in.texcoord1.xyz / in.texcoord1.w, 1.0) : float4(0.0, 0.0, 0.0, 1.0);"
+        ),
+        "{msl}"
+    );
+    assert!(msl.contains(&displaced(1, 0, "pc1")), "{msl}");
+    // The divided coordinate is not divided again.
+    assert!(
+        msl.contains("float4 t1 = s1.sample(samp1, bc1.xy);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("bc1.w"), "{msl}");
+}
+
+#[test]
+fn every_destination_kind_samples_the_displaced_coordinate() {
+    use mtld3d_types::D3DTOP_BUMPENVMAP;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[1] = select_texture_stage();
+    let with = |set: fn(&mut VariantKey)| {
+        let mut variant = VariantKey::default();
+        set(&mut variant);
+        variant
+    };
+    for (variant, sample) in [
+        (
+            with(|v| v.cube_sampler_mask = 0b10),
+            "float4 t1 = s1.sample(samp1, bc1.xyz);",
+        ),
+        (
+            with(|v| v.volume_sampler_mask = 0b10),
+            "float4 t1 = s1.sample(samp1, bc1.xyz);",
+        ),
+        (
+            with(|v| v.depth_sampler_mask = 0b10),
+            "float4 t1 = float4(s1.sample_compare(samp1, bc1.xy, saturate(bc1.z), level(0)));",
+        ),
+        (
+            with(|v| {
+                v.depth_sampler_mask = 0b10;
+                v.depth_fetch_mask = 0b10;
+            }),
+            "float4 t1 = float4(s1.sample(samp1, bc1.xy, level(0)));",
+        ),
+        (
+            with(|v| v.fetch4_mask = 0b10),
+            "float4 t1 = s1.gather(samp1, (bc1.xy) + 0.5",
+        ),
+    ] {
+        let msl = emit_ps_ff(&ps, variant);
+        // Only `xy` moves: the third coordinate and `w` are the stage's own.
+        assert!(msl.contains(&displaced(1, 0, "in.texcoord1")), "{msl}");
+        assert!(msl.contains(sample), "{variant:?}:\n{msl}");
+    }
+}
+
+#[test]
+fn an_unbound_bump_stage_follows_the_unbound_texture_rules() {
+    use mtld3d_types::{D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE};
+
+    // An argument naming the missing texture makes the stage SELECTARG1 of
+    // CURRENT, which is no bump stage: nothing is displaced.
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, false);
+    ps.stages[1] = select_texture_stage();
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(!msl.contains("bump_env"), "{msl}");
+    assert!(
+        msl.contains("float4 t1 = s1.sample(samp1, in.texcoord1.xy);"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("current = float4((current).rgb, (current).a);"),
+        "{msl}"
+    );
+
+    // With no argument naming it the stage stays a bump stage reading a zero
+    // texel: no displacement, and a luminance of `saturate(loffset)`.
+    for (op, luminance) in [
+        (D3DTOP_BUMPENVMAP, None),
+        (
+            D3DTOP_BUMPENVMAPLUMINANCE,
+            Some("t1 *= saturate(bump_env[1].y);"),
+        ),
+    ] {
+        let mut ps = default_ps_key();
+        ps.stages[0] = FfStage {
+            color_arg1: narrow(D3DTA_DIFFUSE),
+            ..bump_stage(op, false)
+        };
+        ps.stages[1] = select_texture_stage();
+        let msl = emit_ps_ff(&ps, VariantKey::default());
+        assert!(
+            msl.contains("float4 t1 = s1.sample(samp1, in.texcoord1.xy);"),
+            "{msl}"
+        );
+        assert!(!msl.contains("bc1"), "{msl}");
+        assert_eq!(msl.matches("    current = ").count(), 1, "{msl}");
+        match luminance {
+            Some(line) => {
+                assert!(msl.contains(line), "{msl}");
+                assert!(msl.contains("bump_env [[buffer(12)]]"), "{msl}");
+            }
+            None => assert!(!msl.contains("bump_env"), "{msl}"),
+        }
+    }
+}
+
+#[test]
+fn a_bump_stage_without_a_sampled_next_stage_samples_nothing() {
+    use mtld3d_types::{D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE};
+
+    for op in [D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE] {
+        // Last active stage: the next one is DISABLE.
+        let mut terminal = default_ps_key();
+        terminal.stages[0] = bump_stage(op, true);
+        // An unbound next stage, and a textured one that reads no texture.
+        let mut unbound = terminal.clone();
+        unbound.stages[1] = FfStage {
+            flags: FfStageFlags::empty(),
+            ..select_texture_stage()
+        };
+        let mut unread = terminal.clone();
+        unread.stages[1] = FfStage {
+            color_arg1: narrow(D3DTA_DIFFUSE),
+            alpha_arg1: narrow(D3DTA_DIFFUSE),
+            ..select_texture_stage()
+        };
+        for ps in [terminal, unbound, unread] {
+            let msl = emit_ps_ff(&ps, VariantKey::default());
+            assert!(!msl.contains("float4 t0"), "{msl}");
+            assert!(!msl.contains("float4 t1"), "{msl}");
+            assert!(!msl.contains("bump_env"), "{msl}");
+        }
+    }
+}
+
+#[test]
+fn consecutive_bump_stages_chain() {
+    use mtld3d_types::D3DTOP_BUMPENVMAP;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[1] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[2] = select_texture_stage();
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let order = [
+        "float4 t0 = s0.sample(samp0, in.texcoord0.xy);".to_string(),
+        displaced(1, 0, "in.texcoord1"),
+        "float4 t1 = s1.sample(samp1, bc1.xy);".to_string(),
+        displaced(2, 1, "in.texcoord2"),
+        "float4 t2 = s2.sample(samp2, bc2.xy);".to_string(),
+        "current = float4((t2).rgb, (t2).a);".to_string(),
+    ];
+    let mut at = 0;
+    for line in &order {
+        let found = msl[at..].find(line.as_str());
+        assert!(found.is_some(), "`{line}` missing or out of order:\n{msl}");
+        at += found.unwrap_or(0) + line.len();
+    }
+    assert_eq!(msl.matches("    current = ").count(), 1, "{msl}");
+}
+
+#[test]
+fn a_bump_stage_writes_neither_current_nor_temp() {
+    use mtld3d_types::{D3DTA_TEMP, D3DTA_TFACTOR, D3DTOP_BUMPENVMAP};
+
+    let mut ps = default_ps_key();
+    // Stage 0 writes TFACTOR to TEMP, the bump stage names TEMP as its result
+    // and reads it for alpha, and stage 3 reads TEMP back.
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TFACTOR),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TFACTOR),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::RESULT_TEMP,
+    };
+    ps.stages[1] = FfStage {
+        alpha_arg1: narrow(D3DTA_TEMP),
+        flags: FfStageFlags::HAS_TEXTURE | FfStageFlags::RESULT_TEMP,
+        ..bump_stage(D3DTOP_BUMPENVMAP, true)
+    };
+    ps.stages[2] = select_texture_stage();
+    ps.stages[3] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEMP),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::empty(),
+    };
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert_eq!(msl.matches("    temp = ").count(), 1, "{msl}");
+    assert!(
+        msl.contains("temp = float4((ps_c[0]).rgb, (ps_c[0]).a);"),
+        "{msl}"
+    );
+    assert!(msl.contains(&displaced(2, 1, "in.texcoord2")), "{msl}");
+    assert!(
+        msl.contains("current = float4((temp).rgb, (temp).a);"),
+        "{msl}"
+    );
+}
+
+#[test]
+fn a_bump_alpha_operation_keeps_the_register_alpha() {
+    use mtld3d_types::{D3DTA_TEMP, D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE};
+
+    for op in [D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE] {
+        let mut ps = default_ps_key();
+        ps.stages[0] = FfStage {
+            alpha_op: narrow(op),
+            alpha_arg1: narrow(D3DTA_TEMP),
+            ..select_texture_stage()
+        };
+        let msl = emit_ps_ff(&ps, VariantKey::default());
+        assert!(
+            msl.contains("current = float4((t0).rgb, (current).a);"),
+            "{msl}"
+        );
+        assert!(!msl.contains("temp"), "{msl}");
+        assert!(!msl.contains("bump_env"), "{msl}");
+    }
+}
+
+#[test]
+fn bump_env_is_declared_only_for_a_bump_colour_operation() {
+    use mtld3d_types::{D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE};
+
+    // Every operation in the colour and alpha roles of stage 0 ahead of a
+    // sampling stage 1, with and without textures and a projected stage 1.
+    // The uniform, the displaced coordinate and the luminance scale appear
+    // only behind a bump colour operation on an active stage.
+    let ops: Vec<u8> = (1u32..=26).map(narrow).collect();
+    for &op in &ops {
+        for role_alpha in [false, true] {
+            for texture in [false, true] {
+                for projected in [0u8, 0b10] {
+                    let mut ps = default_ps_key();
+                    let mut stage = select_texture_stage();
+                    stage.flags.set(FfStageFlags::HAS_TEXTURE, texture);
+                    if role_alpha {
+                        stage.alpha_op = op;
+                    } else {
+                        stage.color_op = op;
+                    }
+                    ps.stages[0] = stage;
+                    ps.stages[1] = select_texture_stage();
+                    ps.tt_projected_mask = projected;
+                    let msl = emit_ps_ff(&ps, VariantKey::default());
+                    let bump_colour = !role_alpha
+                        && matches!(
+                            u32::from(op),
+                            D3DTOP_BUMPENVMAP | D3DTOP_BUMPENVMAPLUMINANCE
+                        );
+                    if !bump_colour {
+                        for marker in ["bump_env", "bc1", "pc1", "*="] {
+                            assert!(
+                                !msl.contains(marker),
+                                "`{marker}` for op {op} alpha={role_alpha}:\n{msl}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A bump stage behind the cascade's end is no reader.
+    let mut ps = default_ps_key();
+    ps.stages[0] = select_texture_stage();
+    ps.stages[2] = bump_stage(D3DTOP_BUMPENVMAP, true);
+    ps.stages[3] = select_texture_stage();
+    assert!(!emit_ps_ff(&ps, VariantKey::default()).contains("bump_env"));
 }

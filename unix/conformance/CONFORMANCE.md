@@ -740,6 +740,62 @@ same rule, so with no texture bound and no argument naming it the stage
 yields its second argument, for colour and alpha alike; wined3d yields the
 first. Existing explicit-unbound-argument handling remains unchanged.
 
+## Fixed-function bump-environment mapping
+
+`D3DTOP_BUMPENVMAP` and `D3DTOP_BUMPENVMAPLUMINANCE` are advertised. A
+stage N whose colour operation is one of them writes no register, colour or
+alpha, CURRENT or TEMP. Its texel `(du, dv)` displaces stage N+1's lookup:
+the coordinate is divided by its `w` first when stage N+1 is projected, and
+then `xy += (m00 du + m10 dv, m01 du + m11 dv)`. The luminance variant then
+scales all four channels of stage N+1's sample by
+`saturate(l * lscale + loffset)`, `l` being the bump texel's third channel.
+The matrix and the luminance terms are stage N's own (`bump_env[2N]` and
+`bump_env[2N + 1]` of the slot-12 uniform the SM1 bump instructions also
+read), where `texbem` reads its destination stage's. Consecutive bump stages
+chain, and a bump stage that is the last active stage, or whose next stage
+samples nothing, samples nothing either. The shader key gains no field:
+`FfStage::color_op` already carries both values, so `build_ps_key`,
+`sampled_stage_mask` and `constant_rows` are unchanged, and a key whose
+active stages name no bump operation in either the colour or the alpha role
+emits byte-identical MSL. The draw binds the uniform for a fixed-function
+shader whenever any stage's raw `COLOROP` names a bump operation
+(`FixedPsSource::bump_env`), a superset of the shaders that read it.
+
+These are reference choices where the references differ or say nothing:
+
+- The displacement moves `xy` only, after the projective divide, for every
+  destination kind: 2D, cube, volume, depth compare, raw depth and Fetch4.
+  wined3d's GLSL fixed-function path also adds the `u` offset to `z` for an
+  unprojected lookup (`ret = ffp_texcoord + ret.xyxy`) and replaces `z` with
+  `w` for a projected one, which disagrees with its own `texbem`; DXVK's
+  fixed-function path, both of its `texbem` translators and the documented
+  formula move `xy` alone. No native result exists for a cube or volume
+  destination, and no Wine row binds one.
+- Luminance scales all four channels, as wined3d's fixed-function path does
+  (`tex *= clamp(...)`). The SM1 `texbeml` keeps scaling colour alone.
+- The bump stage evaluates neither its alpha operation nor its result
+  argument. visual.c:22811 and :22958 expect the alpha CURRENT had, and
+  :23061 expects TEMP to keep an earlier stage's value, which is what
+  wined3d emits by skipping both operations of a bump stage; DXVK's alpha
+  handling disagrees with :22811. A bump operation in the alpha role under
+  another colour operation keeps the register's alpha, as wined3d emits
+  nothing for it.
+- An unbound bump stage whose argument names `D3DTA_TEXTURE` takes the
+  existing unbound-texture rule, `SELECTARG1(CURRENT)` with its own alpha
+  (wined3d's `is_invalid_op`), and is then no bump stage. One whose
+  arguments name no texture reads a zero texel: no displacement, and a
+  luminance of `saturate(loffset)`. DXVK keeps the destination and evaluates
+  alpha against a zero sample instead, which shows only with a TEMP result or
+  an alpha operation reading the texture.
+- `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers yes for V8U8, V16U16 and Q8W8V8U8
+  2D textures: wined3d's `WINED3D_FORMAT_ATTR_BUMPMAP` set (utils.c) cut to
+  the formats mtld3d maps, since L6V5U5 and X8L8V8U8 are not creatable.
+
+fixed_function_bumpmap_test now runs its displacement half, the eight
+assertions at visual.c:10257 to :10271. Its luminance half still skips at
+visual.c:10286, because it needs an L6V5U5 texture. The twelve BUMPENVMAP
+rows of test_texture_blending run as well.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:
@@ -1886,7 +1942,9 @@ unused-buffer bind suppression.
 The dedicated test expects 0xa1b2c3, complement 0x5e4d3c, alpha-replicated
 0x808080 and alpha-blended 0x80007f at 19538/19556/19574/19596. Together with
 TSSARGTEMP, the capability also opens test_texture_blending after its two
-capability guards. Its individual cases still check TextureOpCaps. Raw
+capability guards. Its individual cases still check TextureOpCaps; the
+twelve BUMPENVMAP rows run since the bump-environment operations are
+advertised (see "Fixed-function bump-environment mapping"). Raw
 D3DTSS_CONSTANT defaults remain zero, as device.c:7746 asserts. ALL and
 recorded stateblocks retain the value; this feature preserves the existing
 PIXEL preset exclusion rather than changing capture policy.
@@ -1911,7 +1969,9 @@ stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
 level with no generated chain. DYNAMIC creation in the MANAGED and the SCRATCH
 pool is rejected for every format and every texture type, the way D3D9 rejects
 it, rather than for the signed and packed ten-bit formats alone or for volumes
-alone. X8L8V8U8 and L6V5U5 remain separate capabilities.
+alone. X8L8V8U8 and L6V5U5 remain separate capabilities. V8U8, V16U16 and
+Q8W8V8U8 2D textures answer `D3DUSAGE_QUERY_LEGACYBUMPMAP`, the source
+formats of the fixed-function bump-environment stages.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
 NOAUTOGEN and unavailable render/sRGB policies. All four lanes are

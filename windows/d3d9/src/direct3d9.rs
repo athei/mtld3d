@@ -1357,7 +1357,8 @@ extern "system" fn d3d9_check_device_format(
     // reports, and only the single-precision float family depends on the
     // device), D3DUSAGE_QUERY_SRGBWRITE (the render-target answer, the
     // encode being a property of the pass) and D3DUSAGE_QUERY_LEGACYBUMPMAP
-    // (no bump-environment operation is advertised).
+    // (the signed formats a bump-environment stage reads its displacement
+    // from).
     if !mtld3d_core::format::supports_usage_query(
         check_format,
         usage,

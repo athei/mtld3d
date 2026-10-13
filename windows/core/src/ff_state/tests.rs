@@ -1,30 +1,30 @@
 //! Unit tests for the Fixed-Function pipeline state stored on `DeviceInner`.
 //!
-//! Pins the light and texture-transform masks the setters maintain (and that a state-block
-//! restore must rebuild), the FF shader keys derived from render state (fog source, local
-//! viewer, texcoord routing past a disabled color op, vertex blend), sparse lights compacting
-//! into dense eye-space shader slots, the const-row extent checked against the `vs_c` rows the
-//! emitter reads, `inverse` round-tripping affine matrices while rejecting singular ones, and
-//! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
-//! bump-environment slots, which route to the texbem uniform alone, and the unimplemented
-//! texture-operation warning firing at the write, once per slot, while a value outside the
-//! `D3DTOP_*` space reads as the stage default instead, the draw-time narrowing of stage
-//! arguments and result registers reading the stage default with one warning per stage and
-//! state, the world-matrix palette sized from the blend mode with every unset matrix carried as
-//! identity, the FF VS source fingerprint moving on every light enable and light type change
-//! while holding across every matrix, material and light-parameter write, none of which moves
-//! the FF VS key or row count, and out-of-table texture-stage-state stages and types clamping to
-//! the last stage and to `D3DTSS_CONSTANT`.
+//! Pins the light, texture-transform and bump-stage masks the setters maintain (and that a
+//! state-block restore must rebuild), the FF shader keys derived from render state (fog source,
+//! local viewer, texcoord routing past a disabled color op, vertex blend), sparse lights
+//! compacting into dense eye-space shader slots, the const-row extent checked against the
+//! `vs_c` rows the emitter reads, `inverse` round-tripping affine matrices while rejecting
+//! singular ones, and the texture-stage-state warn latch firing per stage for unconsumed slots
+//! and never for the bump-environment slots, which route to the bump uniform alone, and the
+//! unimplemented texture-operation warning firing at the write, once per slot, while a value
+//! outside the `D3DTOP_*` space reads as the stage default instead, the draw-time narrowing of
+//! stage arguments and result registers reading the stage default with one warning per stage
+//! and state, the world-matrix palette sized from the blend mode with every unset matrix
+//! carried as identity, the FF VS source fingerprint moving on every light enable and light
+//! type change while holding across every matrix, material and light-parameter write, none of
+//! which moves the FF VS key or row count, and out-of-table texture-stage-state stages and
+//! types clamping to the last stage and to `D3DTSS_CONSTANT`.
 
 use std::sync::Mutex;
 
 use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_BUMPENVMAP, D3DTOP_LERP, D3DTOP_MODULATE,
-    D3DTOP_MULTIPLYADD, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE,
-    D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11,
-    D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
+    D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_LERP,
+    D3DTOP_MODULATE, D3DTOP_MULTIPLYADD, D3DTOP_PREMODULATE, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
     D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
@@ -505,8 +505,9 @@ fn tss_warn_latch_is_per_stage() {
 
 #[test]
 fn bump_env_tss_writes_do_not_warn() {
-    // The bump-environment matrix and luminance slots feed the texbem PS
-    // uniform, so a non-default write is consumed and must not fire the
+    // The bump-environment matrix and luminance slots feed the PS uniform
+    // the SM1 bump instructions and the FF bump-environment stages read, so
+    // a non-default write is consumed and must not fire the
     // "written but not consumed" latch on any stage.
     let slots = [
         D3DTSS_BUMPENVMAT00,
@@ -539,10 +540,17 @@ fn unimplemented_texture_op_write_warns_once_per_slot() {
     let mut state = FfState::new();
     state.set_texture_stage_state(0, color, D3DTOP_MODULATE);
     assert!(!state.texture_op_warn_fired(color, D3DTOP_MODULATE));
-    state.set_texture_stage_state(1, color, D3DTOP_BUMPENVMAP);
-    assert!(state.texture_op_warn_fired(color, D3DTOP_BUMPENVMAP));
-    assert!(!state.texture_op_warn_fired(alpha, D3DTOP_BUMPENVMAP));
+    state.set_texture_stage_state(1, color, D3DTOP_PREMODULATE);
+    assert!(state.texture_op_warn_fired(color, D3DTOP_PREMODULATE));
+    assert!(!state.texture_op_warn_fired(alpha, D3DTOP_PREMODULATE));
     assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
+    // The bump-environment operations are implemented in both slots.
+    for op in [D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE] {
+        state.set_texture_stage_state(3, color, op);
+        state.set_texture_stage_state(3, alpha, op);
+        assert!(!state.texture_op_warn_fired(color, op));
+        assert!(!state.texture_op_warn_fired(alpha, op));
+    }
     state.set_texture_stage_state(2, alpha, D3DTOP_MULTIPLYADD);
     assert!(state.texture_op_warn_fired(alpha, D3DTOP_MULTIPLYADD));
     assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
@@ -568,8 +576,10 @@ fn texture_op_outside_the_space_reads_the_stage_default() {
 #[test]
 fn bump_env_tss_writes_feed_only_the_bump_uniform() {
     // No FF key, variant or FF constant reads a bump-environment slot, so a
-    // write to one routes to the texbem uniform alone. The neighbouring
-    // slots keep their routing.
+    // write to one routes to the bump-environment uniform alone, which the
+    // SM1 bump instructions and the FF bump-environment stages read
+    // (`FixedPsSource::uses_bump_env`). The neighbouring slots keep their
+    // routing.
     for ty in [
         D3DTSS_BUMPENVMAT00,
         D3DTSS_BUMPENVMAT01,
@@ -863,11 +873,66 @@ fn set_tt_flags_toggles_tt_active_mask() {
 }
 
 #[test]
+fn colorop_writes_maintain_the_bump_stage_mask() {
+    // Either bump-environment operation on COLOROP sets the stage's bit and
+    // any other operation clears it. ALPHAOP leaves the mask alone: a bump
+    // operation there reads no uniform.
+    let color = D3DTSS_COLOROP as usize;
+    let alpha = D3DTSS_ALPHAOP as usize;
+    let mut state = FfState::new();
+    state.set_texture_stage_state(1, color, D3DTOP_BUMPENVMAP);
+    assert_eq!(state.bump_stage_mask(), 1 << 1);
+    state.set_texture_stage_state(6, color, D3DTOP_BUMPENVMAPLUMINANCE);
+    assert_eq!(state.bump_stage_mask(), (1 << 1) | (1 << 6));
+    state.set_texture_stage_state(3, alpha, D3DTOP_BUMPENVMAP);
+    assert_eq!(state.bump_stage_mask(), (1 << 1) | (1 << 6));
+    state.set_texture_stage_state(1, color, D3DTOP_MODULATE);
+    assert_eq!(state.bump_stage_mask(), 1 << 6);
+    state.set_texture_stage_state(6, alpha, D3DTOP_MODULATE);
+    assert_eq!(state.bump_stage_mask(), 1 << 6);
+    state.set_texture_stage_state(6, color, D3DTOP_LERP + 1);
+    assert_eq!(state.bump_stage_mask(), 0);
+}
+
+#[test]
+fn state_block_restores_rederive_the_bump_stage_mask() {
+    use mtld3d_types::StateBlockType;
+
+    use super::FfStateSnapshot;
+
+    // A restore writes the stage array past the setter, so the mask follows
+    // the restored COLOROP values for every block type that carries them.
+    let color = D3DTSS_COLOROP as usize;
+    let mut src = FfState::new();
+    src.set_texture_stage_state(2, color, D3DTOP_BUMPENVMAPLUMINANCE);
+    let snap = FfStateSnapshot::from(&src);
+
+    let fresh_target = || {
+        let mut state = FfState::new();
+        state.set_texture_stage_state(4, color, D3DTOP_BUMPENVMAP);
+        state
+    };
+    let mut all = fresh_target();
+    snap.restore_into(&mut all);
+    assert_eq!(all.bump_stage_mask(), 1 << 2, "restore_into");
+    for block_type in [StateBlockType::All, StateBlockType::Pixel] {
+        let mut target = fresh_target();
+        snap.restore_filtered(&mut target, block_type);
+        assert_eq!(target.bump_stage_mask(), 1 << 2, "{block_type:?}");
+    }
+    // A vertex block does not own COLOROP, so the target keeps its own.
+    let mut vertex = fresh_target();
+    snap.restore_filtered(&mut vertex, StateBlockType::Vertex);
+    assert_eq!(vertex.bump_stage_mask(), 1 << 4, "Vertex");
+}
+
+#[test]
 fn ff_state_new_clears_all_masks() {
     let state = FfState::new();
     assert_eq!(state.light_active_mask(), 0);
     assert_eq!(state.light_directional_mask(), 0);
     assert_eq!(state.tt_active_mask(), 0);
+    assert_eq!(state.bump_stage_mask(), 0);
 }
 
 #[test]

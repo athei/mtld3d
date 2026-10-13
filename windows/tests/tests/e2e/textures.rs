@@ -8185,6 +8185,7 @@ fn q8w8v8u8_queries_and_noautogen_contract() {
             ),
             0
         );
+        // A bump-environment source is a 2D texture.
         assert_eq!(
             h.check_device_format(
                 D3DFMT_X8R8G8B8,
@@ -8192,7 +8193,11 @@ fn q8w8v8u8_queries_and_noautogen_contract() {
                 rtype,
                 D3DFMT_Q8W8V8U8
             ),
-            D3DERR_NOTAVAILABLE
+            if rtype == D3DRTYPE_TEXTURE {
+                0
+            } else {
+                D3DERR_NOTAVAILABLE
+            }
         );
     }
     signed_texture_queries_and_noautogen(
