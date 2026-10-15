@@ -367,6 +367,31 @@ bitflags::bitflags! {
     }
 }
 
+/// Frames between `query.occlusionEarlySubmit` summary lines (~10 s at 60 fps).
+const EARLY_OCCLUSION_LOG_PRESENTS: u32 = 600;
+
+/// `query.occlusionEarlySubmit` state: split trigger, poll budget, counters.
+#[derive(Default)]
+struct EarlyOcclusion {
+    /// An occlusion END was recorded since the last early submit.
+    end_since_split: bool,
+    /// Early submits in the frame being recorded.
+    splits_this_frame: u32,
+    /// Microseconds of the poll budget spent since the last Present.
+    wait_spent_us: u32,
+    /// `coherent_seq` when the last visibility intake was requested.
+    ///
+    /// Every END that retired by then has been folded in, so a query at or
+    /// below it still pending will not become `Issued`: no second round trip.
+    intake_coherent: u64,
+    /// Window counters for the summary line.
+    presents: u32,
+    splits: u64,
+    reads_real: u64,
+    reads_visible: u64,
+    waits: u64,
+}
+
 pub struct DeviceInner {
     // Metal handles / presentation.
     device_handle: MetalHandle<MTLDeviceKind>,
@@ -580,6 +605,8 @@ pub struct DeviceInner {
     outstanding_reset_blockers: AtomicU32,
     /// The frame-latency bound `Present` enforces, and what `GetMaximumFrameLatency` reports.
     frame_latency: mtld3d_core::frame_latency::FrameLatency,
+    /// `query.occlusionEarlySubmit` bookkeeping.
+    early_occlusion: EarlyOcclusion,
     /// Monotonic submit seq.
     ///
     /// Each `present()` bumps this before stamping it onto the outgoing
@@ -1993,6 +2020,121 @@ impl DeviceInner {
         self.encoder.send_frame(frame)
     }
 
+    /// Note an occlusion `Issue(END)` for `query.occlusionEarlySubmit`.
+    pub fn note_occlusion_end(&mut self) {
+        if self.config.query_occlusion_early_submit {
+            self.early_occlusion.end_since_split = true;
+        }
+    }
+
+    /// Hand the open frame to the GPU early when occlusion ENDs precede a colour target change.
+    ///
+    /// `query.occlusionEarlySubmit`: the counting draws then retire while the
+    /// rest of the frame is recorded, so the next frame's reads find them
+    /// done instead of waiting for the whole frame. A no-present async
+    /// submit, like the EVENT path's; at most
+    /// `MAX_EARLY_OCCLUSION_SUBMITS` per presented frame.
+    pub fn maybe_early_occlusion_submit(&mut self) -> Result<(), i32> {
+        if !self.config.query_occlusion_early_submit
+            || !mtld3d_core::query_fence::early_occlusion_submit_due(
+                self.early_occlusion.end_since_split,
+                self.early_occlusion.splits_this_frame,
+            )
+        {
+            return Ok(());
+        }
+        self.early_occlusion.end_since_split = false;
+        self.early_occlusion.splits_this_frame += 1;
+        self.early_occlusion.splits += 1;
+        if self.frame_dump.active {
+            self.frame_dump_event("early occlusion submit (query.occlusionEarlySubmit)");
+        }
+        self.flush_current_frame_async()
+    }
+
+    /// Whether the submit `end_seq` names has retired, polling within the frame's budget.
+    ///
+    /// `query.occlusionWaitUs` bounds the total yield-poll per presented
+    /// frame; once it is spent, reads answer from what has retired so far.
+    /// Never a GPU wait: only the shared `coherent_seq` is read.
+    pub fn early_occlusion_retired(&mut self, end_seq: u64) -> bool {
+        let retired = |dev: &Self| {
+            mtld3d_core::query_fence::event_completed(
+                end_seq,
+                dev.coherent_seq.load(Ordering::Acquire),
+            )
+        };
+        if retired(self) {
+            return true;
+        }
+        let budget = u128::from(self.config.query_occlusion_wait_us);
+        let spent = u128::from(self.early_occlusion.wait_spent_us);
+        if spent >= budget {
+            return false;
+        }
+        self.early_occlusion.waits += 1;
+        let started = std::time::Instant::now();
+        let done = loop {
+            std::thread::yield_now();
+            if retired(self) {
+                break true;
+            }
+            if spent + started.elapsed().as_micros() >= budget {
+                break false;
+            }
+        };
+        let used = spent + started.elapsed().as_micros();
+        self.early_occlusion.wait_spent_us = u32::try_from(used.min(budget)).unwrap_or(u32::MAX);
+        done
+    }
+
+    /// Whether a visibility intake could still publish a result retired at `end_seq`.
+    ///
+    /// Records the request: the caller sends the intake right after.
+    pub fn early_occlusion_intake_due(&mut self, end_seq: u64) -> bool {
+        if end_seq <= self.early_occlusion.intake_coherent {
+            return false;
+        }
+        self.early_occlusion.intake_coherent = self.coherent_seq.load(Ordering::Acquire);
+        true
+    }
+
+    /// Count one early-submit occlusion answer (`real` = a retired count, else "visible").
+    pub const fn note_early_occlusion_read(&mut self, real: bool) {
+        if real {
+            self.early_occlusion.reads_real += 1;
+        } else {
+            self.early_occlusion.reads_visible += 1;
+        }
+    }
+
+    /// Per-presented-frame reset, plus a summary line every `EARLY_OCCLUSION_LOG_PRESENTS`.
+    fn early_occlusion_present(&mut self) {
+        if !self.config.query_occlusion_early_submit {
+            return;
+        }
+        let e = &mut self.early_occlusion;
+        e.end_since_split = false;
+        e.splits_this_frame = 0;
+        e.wait_spent_us = 0;
+        e.presents += 1;
+        if e.presents >= EARLY_OCCLUSION_LOG_PRESENTS {
+            info!(
+                target: LOG_TARGET,
+                "occlusionEarlySubmit: {} frames: early submits {}, reads real {} / visible-fallback {}, budget polls {}",
+                e.presents,
+                e.splits,
+                e.reads_real,
+                e.reads_visible,
+                e.waits
+            );
+            *e = EarlyOcclusion {
+                intake_coherent: e.intake_coherent,
+                ..EarlyOcclusion::default()
+            };
+        }
+    }
+
     /// Push the encoder op that binds `binding` as the depth/stencil attachment.
     ///
     /// Factored out of `device_set_depth_stencil_surface` so
@@ -2171,6 +2313,7 @@ impl DeviceInner {
         let new_frame = self.fresh_frame();
         let (mut frame, seq) = self.stamp_and_swap(new_frame, false);
         frame.present_texture = texture;
+        self.early_occlusion_present();
 
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
@@ -3565,6 +3708,7 @@ impl Direct3DDevice9 {
             frame_latency: mtld3d_core::frame_latency::FrameLatency::new(
                 info.config.present_max_frame_latency,
             ),
+            early_occlusion: EarlyOcclusion::default(),
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
@@ -10435,6 +10579,14 @@ extern "system" fn device_set_render_target(
             desc.usage
         );
         return D3DERR_INVALIDCALL;
+    }
+    // `query.occlusionEarlySubmit`: the colour target change after the
+    // occlusion boxes is where their pass ends anyway, so the part of the
+    // frame holding them goes to the GPU here, at no extra load/store.
+    if slot == 0
+        && let Err(hr) = dev.maybe_early_occlusion_submit()
+    {
+        return hr;
     }
 
     // Capture attachment info for the encoder thread. Texture-backed
