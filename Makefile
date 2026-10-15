@@ -11,17 +11,20 @@
 #                ARM64X DLLs into and `ARM64=1 make install` the x86 ones, and
 #                whose private clones the arm64-runtime test, conformance and
 #                benchmark legs of EC=1 and ARM64=1 run under, as do the arm64
-#                legs of `bench-variants`. Its `lib/wine/aarch64-windows`
-#                carries the ARM64X link archives, so the ARM64X build (EC=1)
-#                and its clippy leg take their SDK from it, and from nothing
-#                else.
+#                legs of `bench-variants`. The ARM64X build (EC=1) and its
+#                clippy leg take their SDK from it, and from nothing else, so
+#                for EC=1 it has to be an arm64 Wine built with its link
+#                libraries, whose `lib/wine/aarch64-windows` carries the ARM64X
+#                archives, such as wine-build's arm64 Wine. A runtime-only
+#                arm64 Wine such as CrossOver's serves ARM64=1 alone, with
+#                WINE_X86_64 set for the build.
 #
-# BUILD_WINE picks which of the two the i686 and x86_64 builds take their SDK
-# from, `x86_64` or `arm64`: WINE_X86_64 when it is set, WINE_ARM64 otherwise.
-# Either serves: winebuild is told the target of every module it writes, and
-# both carry Wine's i386 and x86_64 link archives. `WINE_SDK` below is that
-# choice; it is what `windows/shim/build.rs` reads, and it is not read from the
-# environment or the command line.
+# The i686 and x86_64 builds take their SDK from WINE_X86_64 when it is set
+# and from WINE_ARM64 otherwise. What winebuild writes is the same from either,
+# since every call names its target; the DLLs link the `unix_lib.o` of the
+# chosen Wine's `libwinecrt0.a`, which differs between the two. `WINE_SDK`
+# below is that choice; it is what `windows/shim/build.rs` reads, and it is not
+# read from the environment or the command line.
 #
 # ISOLATED=1 below clones the x86_64 Wine for the installs, and the arm64 one
 # under EC=1 or ARM64=1. The ARM64X build also reads two paths with no
@@ -37,12 +40,22 @@
 # the installs and end-to-end legs of either switch need only WINE_ARM64. The
 # arm64 conformance legs also read WINE_X86_64, whose d3d9 test binaries they
 # run.
+#
+# A shell still exporting the variables these two replaced would otherwise
+# build against whatever WINE_ARM64 names, or fail for want of a Wine with no
+# word about why, so a WINE_SDK or WINE_SDK_ARM64X from the environment stops
+# the run while WINE_X86_64 is unset. Only at the top level: the sub-makes see
+# the WINE_SDK this file exports, and `make bench-ab` passes both on the
+# command line to a BASE that predates them.
+ifeq ($(MAKELEVEL),0)
+ifeq ($(strip $(WINE_X86_64)),)
+ifneq ($(filter environment,$(origin WINE_SDK) $(origin WINE_SDK_ARM64X)),)
+$(error WINE_SDK and WINE_SDK_ARM64X are no longer read: WINE_X86_64 names the x86_64 Wine that WINE_SDK named, and WINE_ARM64 names the arm64 Wine, which also supplies the ARM64X link archives; set WINE_X86_64 and unset the old two)
+endif
+endif
+endif
 ifeq ($(strip $(WINE_X86_64)$(WINE_ARM64)),)
 $(error neither WINE_X86_64 nor WINE_ARM64 is set; they name the x86_64 and the arm64 Wine trees (WINE_SDK and WINE_SDK_ARM64X are no longer read))
-endif
-BUILD_WINE ?= $(if $(strip $(WINE_X86_64)),x86_64,arm64)
-ifeq ($(filter x86_64 arm64,$(BUILD_WINE)),)
-$(error BUILD_WINE is x86_64 or arm64, not '$(BUILD_WINE)')
 endif
 
 # Clone the directory tree $(1) to $(2), cheapest mechanism first. On one APFS
@@ -120,15 +133,23 @@ export WINEPREFIX
 $(info ==> ISOLATED=1: WINE_X86_64=$(WINE_X86_64) WINE_INSTALL_DIR=$(WINE_INSTALL_DIR) WINEPREFIX=$(WINEPREFIX))
 endif
 
-# The SDK the builds read, the tree BUILD_WINE picks (see the top of this
-# file), named WINE_SDK because that is what `windows/shim/build.rs` reads.
-# Overriding, so that a WINE_SDK on the command line, which `make bench-ab`
-# passes to a BASE whose Makefile predates WINE_X86_64, cannot redirect it.
-override WINE_SDK = $(if $(filter arm64,$(BUILD_WINE)),$(WINE_ARM64),$(WINE_X86_64))
-ifeq ($(strip $(WINE_SDK)),)
-$(error BUILD_WINE=$(BUILD_WINE) takes the SDK from $(if $(filter arm64,$(BUILD_WINE)),WINE_ARM64,WINE_X86_64), which is not set)
-endif
+# The SDK the i686 and x86_64 builds read (see the top of this file), named
+# WINE_SDK because that is what `windows/shim/build.rs` reads, and the name of
+# the variable it came from, for messages. Overriding, so that a WINE_SDK on
+# the command line, which `make bench-ab` passes to a BASE whose Makefile
+# predates WINE_X86_64, cannot redirect it.
+WINE_SDK_FROM := $(if $(strip $(WINE_X86_64)),WINE_X86_64,WINE_ARM64)
+override WINE_SDK = $(strip $(or $(WINE_X86_64),$(WINE_ARM64)))
 export WINE_SDK
+
+# What a leg that builds or lints for the PE arch whose Wine directory is $(1)
+# (`i386-windows`, `x86_64-windows`) checks first: that the SDK has the
+# winebuild and the `libwinecrt0.a` it takes. A runtime-only Wine, such as
+# CrossOver's, has neither, and without this check the build would stop in the
+# shim's build script or at the first winebuild call.
+define SDK_REQUIRE
+[ -x '$(WINE_SDK)/bin/winebuild' ] && [ -f '$(WINE_SDK)/lib/wine/$(1)/libwinecrt0.a' ] || { echo "$(WINE_SDK_FROM)=$(WINE_SDK) is no Wine SDK for $(1): the build takes bin/winebuild and lib/wine/$(1)/libwinecrt0.a from it, which a runtime-only Wine does not carry" >&2; exit 2; }
+endef
 
 # The prefix the test legs boot, named unconditionally: ISOLATED=1 points it at
 # the clone above, otherwise it is the ambient `WINEPREFIX` or Wine's default.
@@ -524,11 +545,13 @@ unix: unix-x64 unix-arm64
 # rather than wine/, for the case where that ordering does not hold: an
 # existing prefix, or a Wine installation we do not control.
 windows-i686:
+	$(call SDK_REQUIRE,i386-windows)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
 	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -b i686-windows --dll $(OUT_i386)/mtld3d.dll
 
 windows-x86_64:
+	$(call SDK_REQUIRE,x86_64-windows)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
 	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
@@ -1841,13 +1864,14 @@ BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
 # clones. A BASE whose Makefile predates WINE_X86_64 reads the Wine it builds
 # against and installs into from WINE_SDK, and its ARM64X archives from
 # WINE_SDK_ARM64X, so a leg's sub-make names both as well; this Makefile
-# ignores them.
+# ignores them. Such a BASE needs WINE_X86_64 set: it runs its winebuild
+# without a target, which only an x86_64 winebuild accepts, and builds only
+# against WINE_SDK.
 BENCH_X86_64_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_X86_64_SOURCE),$(WINE_X86_64))
 BENCH_ARM64_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_ARM64_SOURCE),$(WINE_ARM64))
 BENCH_PREFIX_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_PREFIX_SOURCE),$(or $(WINEPREFIX),$(HOME)/.wine))
 BENCH_LEG_MAKE = ISOLATED=1 PROD=1 PERF=1 WINE_X86_64='$(BENCH_X86_64_SOURCE)' WINE_ARM64='$(BENCH_ARM64_SOURCE)' \
-	BUILD_WINE=$(BUILD_WINE) WINEPREFIX='$(BENCH_PREFIX_SOURCE)' \
-	WINE_SDK='$(or $(BENCH_X86_64_SOURCE),$(BENCH_ARM64_SOURCE))' WINE_SDK_ARM64X='$(BENCH_ARM64_SOURCE)'
+	WINEPREFIX='$(BENCH_PREFIX_SOURCE)' WINE_SDK='$(or $(BENCH_X86_64_SOURCE),$(BENCH_ARM64_SOURCE))' WINE_SDK_ARM64X='$(BENCH_ARM64_SOURCE)'
 BENCH_LEG_INSTALL = $(if $(BENCH_LEG),$(call arm64_builds,$(BENCH_LEG)),install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH))
 # `make` for the sub-makes that run beside each other in one bench-ab recipe
 # line. A line that names `$(MAKE)` itself runs even under `make -n`, and these
@@ -1979,9 +2003,8 @@ bench-ab:
 # benchmark does not run, since no layout changes it.
 #
 # The two pairs answer different questions. The first mixes two things: the
-# arch of the host Wine and which Wine build it is (WINE_X86_64 is a patched
-# CrossOver 26, WINE_ARM64 is whatever it names, a stock CrossOver 27 on the
-# machines this was written for), so a difference there is not the arch's
+# arch of the host Wine and which Wine build it is (WINE_X86_64 and
+# WINE_ARM64 name two Wine builds), so a difference there is not the arch's
 # alone; that holds for the i686 pair as it does for the x86_64 one. The
 # ARM64X pair runs one Wine in both legs and changes only our DLLs, so it
 # isolates what the ARM64X build buys an x64 game.
@@ -2122,6 +2145,7 @@ clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native $(EC_LEG:%=clippy-pe-%)
 # by those runs, so its own per-crate pass lints all its targets (it has no apple
 # dev-deps).
 clippy-pe-i686:
+	$(call SDK_REQUIRE,i386-windows)
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_i386) $(DENY_WARNINGS)
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
 	# `unix/shared` ships into both worlds but is a member of only the unix
@@ -2132,6 +2156,7 @@ clippy-pe-i686:
 	cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
 
 clippy-pe-x86_64:
+	$(call SDK_REQUIRE,x86_64-windows)
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_x64) $(DENY_WARNINGS)
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
 

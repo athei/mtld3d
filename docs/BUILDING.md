@@ -32,12 +32,16 @@ needs, including the `d3d9_test.exe` binaries that `make conformance` runs,
 and is what CI uses.
 
 The i686 and x86_64 builds take `bin/winebuild` and the link archives from
-`WINE_X86_64` when it is set and from `WINE_ARM64` otherwise.
-`BUILD_WINE=x86_64` or `BUILD_WINE=arm64` picks one explicitly. The output
-is the same either way: `winebuild` may be built for either host, since the
-Makefile names the target of every module it writes. The ARM64X build
-(`EC=1`) always reads `WINE_ARM64`. `WINE_SDK` and `WINE_SDK_ARM64X` are not
-read.
+`WINE_X86_64` when it is set and from `WINE_ARM64` otherwise. What
+`winebuild` writes is the same from either, whichever host it was built
+for, since the Makefile names the target of every module it writes. The
+DLLs are not byte for byte the same: they link the `unix_lib.o` of the
+chosen Wine's `libwinecrt0.a`, which differs between the two Wines, while
+their ntdll imports are the same. The ARM64X build (`EC=1`) always reads
+`WINE_ARM64`, which therefore has to be an arm64 Wine built with its link
+libraries, such as wine-build's arm64 Wine (see `EC=1` below). `WINE_SDK`
+and `WINE_SDK_ARM64X` are not read, and the Makefile stops when one is set
+in the environment and `WINE_X86_64` is not.
 
 The versions CI pins (the Rust toolchains, the cargo tools, nextest and the
 wine-build release) are in the `env` block of
@@ -137,8 +141,9 @@ off for its test processes either way.
 
 Every test leg installs into the shared Wine tree first, so two checkouts
 testing at once overwrite each other's builds. `ISOLATED=1` avoids that: it
-clones the Wine trees and the prefix into `.wine-isolated/` inside the
-checkout and runs everything against the clones.
+clones `WINE_X86_64`, `WINE_ARM64` as well under the arm64 switches below,
+and the prefix into `.wine-isolated/` inside the checkout and runs everything
+against the clones.
 
 `make conformance` runs Wine's own d3d9 test suite against the installed
 build and compares the failures per site against a baseline.
@@ -151,7 +156,7 @@ conformance suite and its baseline.
 ## arm64 Wine
 
 Two opt-in switches build, install, test and benchmark mtld3d under an arm64
-Wine such as CrossOver 27's. Neither runs in CI or goes into release bundles.
+Wine. Neither runs in CI or goes into release bundles.
 
 Every arm64 test, conformance and benchmark leg runs in a private clone of
 the Wine that `WINE_ARM64` names, with a prefix created for the run, so the
@@ -198,7 +203,9 @@ The build needs a toolchain the x86 builds do not:
   ARM64 view's TLS callbacks.
 - Wine's ARM64X link archives, which the arm64 Wine carries in its
   `lib/wine/aarch64-windows` when it is built with its link libraries, as
-  wine-build's arm64 Wine is.
+  wine-build's arm64 Wine is. A runtime-only arm64 Wine such as CrossOver's
+  carries none, so it serves `ARM64=1`, with `WINE_X86_64` set for the
+  build, but not `EC=1`, whose build and legs read the same `WINE_ARM64`.
 
 ### Which target reads which path
 

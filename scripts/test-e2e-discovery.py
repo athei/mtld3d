@@ -62,7 +62,6 @@ class E2eDiscoveryTests(unittest.TestCase):
                 "-f",
                 str(MAKEFILE),
                 f"WINE_X86_64={self.wine_sdk}",
-                "BUILD_WINE=x86_64",
                 "BUILD_ID=e2e-discovery-test",
                 f"E2E_EXES_BUILD={self.fake_build} $(1)",
                 *arguments,

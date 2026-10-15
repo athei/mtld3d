@@ -43,7 +43,7 @@ class MakeTestCase(unittest.TestCase):
         )
         self.environment = os.environ.copy()
         for name in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES",
-                     "MAKELEVEL", "ISOLATED", "EC", "ARM64", "WINE_ARM64", "BUILD_WINE",
+                     "MAKELEVEL", "ISOLATED", "EC", "ARM64", "WINE_ARM64", "STAGE",
                      "WINE_SDK", "WINE_SDK_ARM64X", *self.sources):
             self.environment.pop(name, None)
         self.environment.update(self.sources)
@@ -110,31 +110,65 @@ class IsolationTests(MakeTestCase):
                 self.assertFalse((self.work / ".wine-isolated").exists())
 
 
-class BuildSdkTests(MakeTestCase):
-    """Which of the two Wines the builds take their SDK from."""
+class WineChoiceTests(MakeTestCase):
+    """Which Wine the builds, the installs and the bench-ab legs take, and the refusals."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm64 = self.root / "arm64"
+        (self.arm64 / "bin").mkdir(parents=True)
+        (self.arm64 / "bin" / "wine").touch()
+
+    def arm64_alone(self):
+        for name in ("WINE_X86_64", "WINE_INSTALL_DIR"):
+            self.environment.pop(name)
+        self.environment["WINE_ARM64"] = str(self.arm64)
 
     def resolved(self, output):
         return dict(line[len("resolved:"):].split("=", 1) for line in output.splitlines()
                     if line.startswith("resolved:"))
 
-    def test_build_wine_arm64_takes_the_sdk_from_the_arm64_wine(self):
-        arm64 = str(self.root / "arm64")
-        values = self.resolved(self.run_make(f"WINE_ARM64={arm64}", "BUILD_WINE=arm64", "inspect"))
-        self.assertEqual(values["WINE_SDK"], arm64)
-        self.assertEqual(values["WINEBUILD"], f"{arm64}/bin/winebuild")
-        self.assertEqual(values["WINE"], f"{self.sources['WINE_X86_64']}/bin/wine")
+    def test_the_x86_64_wine_is_the_sdk_when_both_are_set(self):
+        values = self.resolved(self.run_make(f"WINE_ARM64={self.arm64}", "inspect"))
+        self.assertEqual(values["WINE_SDK"], self.sources["WINE_X86_64"])
+        self.assertEqual(values["WINEBUILD"], f"{self.sources['WINE_X86_64']}/bin/winebuild")
 
     def test_the_arm64_wine_alone_serves_the_build(self):
-        arm64 = str(self.root / "arm64")
-        for name in ("WINE_X86_64", "WINE_INSTALL_DIR"):
-            self.environment.pop(name)
-        values = self.resolved(self.run_make(f"WINE_ARM64={arm64}", "inspect"))
-        self.assertEqual(values["WINE_SDK"], arm64)
-        self.assertEqual(values["WINEBUILD"], f"{arm64}/bin/winebuild")
+        self.arm64_alone()
+        values = self.resolved(self.run_make("inspect"))
+        self.assertEqual(values["WINE_SDK"], str(self.arm64))
+        self.assertEqual(values["WINEBUILD"], f"{self.arm64}/bin/winebuild")
         self.assertEqual(values["INSTALL_DIRS"], "")
+
+    def test_isolation_with_the_arm64_wine_alone_clones_no_x86_64_tree(self):
+        self.arm64_alone()
+        values = self.resolved(self.run_make("ISOLATED=1", "inspect"))
+        self.assertEqual(values["WINE_X86_64"], "")
+        self.assertEqual(values["WINE_INSTALL_DIR"], "")
+        self.assertEqual(values["INSTALL_DIRS"], "")
+        self.assertEqual(values["WINE_SDK"], str(self.arm64))
+        self.assertFalse((self.work / ".wine-isolated/sdk").exists())
+        values = self.resolved(self.run_make("ISOLATED=1", "ARM64=1", "inspect"))
+        self.assertEqual(values["WINE_SDK"], str(self.work / ".wine-isolated/sdk-arm64"))
+        self.assertTrue((self.work / ".wine-isolated/sdk-arm64/bin/wine").exists())
 
     def test_a_wine_sdk_from_the_command_line_is_ignored(self):
         values = self.resolved(self.run_make(f"WINE_SDK={self.root / 'elsewhere'}", "inspect"))
+        self.assertEqual(values["WINE_SDK"], self.sources["WINE_X86_64"])
+
+    def test_an_old_variable_in_the_environment_stops_the_run_without_wine_x86_64(self):
+        self.arm64_alone()
+        for name in ("WINE_SDK", "WINE_SDK_ARM64X"):
+            with self.subTest(name=name):
+                self.environment[name] = str(self.root / "old")
+                output = self.run_make("inspect", succeeds=False)
+                self.assertIn("WINE_SDK and WINE_SDK_ARM64X are no longer read", output)
+                self.assertIn("set WINE_X86_64", output)
+                del self.environment[name]
+
+    def test_an_old_variable_beside_wine_x86_64_is_ignored(self):
+        self.environment["WINE_SDK"] = str(self.root / "old")
+        values = self.resolved(self.run_make("inspect"))
         self.assertEqual(values["WINE_SDK"], self.sources["WINE_X86_64"])
 
     def test_without_either_wine_the_makefile_names_both(self):
@@ -142,9 +176,35 @@ class BuildSdkTests(MakeTestCase):
         output = self.run_make("inspect", succeeds=False)
         self.assertIn("neither WINE_X86_64 nor WINE_ARM64 is set", output)
 
-    def test_build_wine_naming_an_unset_wine_fails(self):
-        output = self.run_make("BUILD_WINE=arm64", "inspect", succeeds=False)
-        self.assertIn("BUILD_WINE=arm64 takes the SDK from WINE_ARM64, which is not set", output)
+    def test_install_with_the_arm64_wine_alone_refuses(self):
+        self.arm64_alone()
+        output = self.run_make("install", succeeds=False)
+        self.assertIn("make install: nothing to install into", output)
+
+    def test_an_x86_install_leaf_without_a_tree_refuses(self):
+        self.arm64_alone()
+        output = self.run_make(f"STAGE={self.root / 'stage'}", "install-unix-x64", succeeds=False)
+        self.assertIn("no x86_64 Wine tree to install into", output)
+
+    def test_a_build_against_a_runtime_only_wine_refuses(self):
+        for target, arch in (("windows-i686", "i386-windows"), ("clippy-pe-x86_64", "x86_64-windows")):
+            with self.subTest(target=target):
+                output = self.run_make(target, succeeds=False)
+                self.assertIn(f"WINE_X86_64={self.sources['WINE_X86_64']} is no Wine SDK for {arch}",
+                              output)
+
+    def test_bench_ab_legs_name_both_variable_sets(self):
+        wrapper = self.root / "show.mk"
+        wrapper.write_text(f"include {MAKEFILE}\nshow:\n\t@printf '%s\\n' \"$(BENCH_LEG_MAKE)\"\n")
+        output = subprocess.run(
+            ["make", "--no-print-directory", "-f", str(wrapper), f"WINE_ARM64={self.arm64}", "show"],
+            cwd=MAKEFILE.parent, env=self.environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, check=True,
+        ).stdout
+        x86 = self.sources["WINE_X86_64"]
+        for assignment in (f"WINE_X86_64='{x86}'", f"WINE_ARM64='{self.arm64}'",
+                           f"WINE_SDK='{x86}'", f"WINE_SDK_ARM64X='{self.arm64}'"):
+            self.assertIn(assignment, output)
 
 
 USER_REG = """WINE REGISTRY Version 2

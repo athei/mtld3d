@@ -321,9 +321,9 @@ pair is a `bench-ab` run of its own whose report names each leg's runtime and
 DLL variant. Such a run has one commit in both legs, so a binary the two
 layouts share loads as one image, which the comparison notes instead of
 refusing, and the first pair runs two Wines. Read that first pair with care:
-it changes the host arch and the Wine build at once (`WINE_X86_64` is a
-patched CrossOver 26, `WINE_ARM64` a stock CrossOver 27), so its differences are not
-the arch's alone, for either arch. The ARM64X pair runs one Wine in both legs
+it changes the host arch and the Wine build at once, since `WINE_X86_64` and
+`WINE_ARM64` name two Wine builds, so its differences are not the arch's
+alone, for either arch. The ARM64X pair runs one Wine in both legs
 and changes only our DLLs, so it measures what the ARM64X build buys an x64
 game.
 
