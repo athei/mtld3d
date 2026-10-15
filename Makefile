@@ -117,6 +117,11 @@ TEST_PREFIX_LOCK := $(TEST_PREFIX)/.mtld3d-configure.lock
 # exported here is never consulted, so a bare name only resolves on a machine
 # whose shell already has the SDK on PATH. The loader needs no PATH of its own;
 # it finds wineserver and its libraries relative to its own location.
+#
+# Every `winebuild --fake-module` names its target with `-b`. Without one,
+# winebuild builds for the platform it runs on, which an x86_64 winebuild
+# accepts for an x86 module and an arm64 one refuses ("Non-PE builds are not
+# supported"), so the SDK's winebuild may be built for either host.
 WINE       := $(WINE_SDK)/bin/wine
 WINEBUILD  := $(WINE_SDK)/bin/winebuild
 WINESERVER := $(WINE_SDK)/bin/wineserver
@@ -490,13 +495,13 @@ unix: unix-x64 unix-arm64
 windows-i686:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
 	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
-	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -m32 --dll $(OUT_i386)/mtld3d.dll
+	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -b i686-windows --dll $(OUT_i386)/mtld3d.dll
 
 windows-x86_64:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
 	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
-	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
+	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -b x86_64-windows --dll $(OUT_x64)/mtld3d.dll
 
 # ARM64X `d3d9.dll` and `mtld3d.dll`, built with EC=1 only: the layout an arm64
 # Wine keeps its own builtins in, one image under `lib/wine/aarch64-windows`
@@ -759,8 +764,8 @@ install-windows-i686: $(if $(STAGE),,windows-i686)
 		$(WINEBUILD) --builtin $$tree/i386-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -f $$dir/lib/wine/i386-windows/d3d9.pdb $$dir/lib/wine/i386-windows/mtld3d.pdb ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/d3d9.dll   -m32 --dll $$tree/i386-windows/d3d9.dll ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/mtld3d.dll -m32 --dll $$tree/i386-windows/mtld3d.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/d3d9.dll   -b i686-windows --dll $$tree/i386-windows/d3d9.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/mtld3d.dll -b i686-windows --dll $$tree/i386-windows/mtld3d.dll ; \
 		fi ; \
 	done
 
@@ -774,8 +779,8 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 		$(WINEBUILD) --builtin $$tree/x86_64-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -f $$dir/lib/wine/x86_64-windows/d3d9.pdb $$dir/lib/wine/x86_64-windows/mtld3d.pdb ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d9.dll   -m64 --dll $$tree/x86_64-windows/d3d9.dll ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/mtld3d.dll -m64 --dll $$tree/x86_64-windows/mtld3d.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d9.dll   -b x86_64-windows --dll $$tree/x86_64-windows/d3d9.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/mtld3d.dll -b x86_64-windows --dll $$tree/x86_64-windows/mtld3d.dll ; \
 		fi ; \
 	done
 
@@ -848,8 +853,8 @@ tree=$$($(call MTLD3D_TREE,$(1))) && \
 rm -f $$tree/aarch64-windows/d3d9.pdb $$tree/aarch64-windows/mtld3d.pdb \
 	'$(1)/lib/wine/aarch64-windows/d3d9.pdb' '$(1)/lib/wine/aarch64-windows/mtld3d.pdb' && \
 { [ $$tree = '$(1)/lib/wine' ] || rm -f $$tree/aarch64-windows/d3d9.dll $$tree/aarch64-windows/mtld3d.dll ; } && \
-$(WINEBUILD) --fake-module -o '$(1)/lib/wine/aarch64-windows/d3d9.dll'   -m64 --dll $(OUT_x64)/d3d9.dll && \
-$(WINEBUILD) --fake-module -o '$(1)/lib/wine/aarch64-windows/mtld3d.dll' -m64 --dll $(OUT_x64)/mtld3d.dll
+$(WINEBUILD) --fake-module -o '$(1)/lib/wine/aarch64-windows/d3d9.dll'   -b x86_64-windows --dll $(OUT_x64)/d3d9.dll && \
+$(WINEBUILD) --fake-module -o '$(1)/lib/wine/aarch64-windows/mtld3d.dll' -b x86_64-windows --dll $(OUT_x64)/mtld3d.dll
 endef
 
 install-arm64:
