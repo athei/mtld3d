@@ -75,8 +75,8 @@ yet, what never will be, and the divergences from D3D9 kept on purpose.
 - A Wine from [wine-build](https://github.com/athei/wine-build), based on
   CrossOver 26; CI pins a release of it. Older Wine or CrossOver releases are
   not expected to work.
-- CrossOver 27's arm64 Wine is wired into the Makefile and tested locally,
-  but not run in CI.
+- wine-build's arm64 Wine, which runs x86 games through FEX, is wired into
+  the Makefile and tested locally, but not run in CI.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
 - Rosetta 2 for an x86_64 Wine. An arm64 Wine translates x86 itself.
 - [x87sidecar](https://github.com/athei/x87sidecar) under an x86_64 Wine.

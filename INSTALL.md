@@ -44,32 +44,32 @@ matching the arch of the Wine build itself: an x86_64 Wine takes
 round. Nothing to choose: copy both, or the one your Wine needs. The PE side
 is x86 in either case.
 
+Where the files go depends on two things, and the routes below spell out
+both:
+
+- The arch of the Wine. On an arm64 Wine an x64 program runs as an ARM64EC
+  process, which loads its builtins from `aarch64-windows`, never from
+  `x86_64-windows`. So on an arm64 Wine the two files of
+  `wine/x86_64-windows/` go into an `aarch64-windows` directory, and its
+  `aarch64-unix/mtld3d.so` replaces the `x86_64-unix` one.
+- The layout of the Wine. A Wine from
+  [wine-build](https://github.com/athei/wine-build), for either arch, keeps
+  each Direct3D implementation in a tree of its own and loads mtld3d from
+  `lib/wine/d3d9/mtld3d`, whose subdirectories mirror those of `lib/wine`; its
+  default directories hold only placeholders, which stay as they are. Any other
+  Wine loads mtld3d from `lib/wine` itself.
+
 A bundle built from source with `EC=1` (`docs/BUILDING.md` lists what that
-build needs, the environment variables naming its toolchain among it) also carries
-`wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as builtin-marked
-ARM64X images; release bundles do not. Copied into an arm64 Wine with the rest
-of `wine/`, they serve x64 games in prefixes created after the copy, which
-then run the PE side as native code. An x86_64 Wine never reads that
-directory.
-
-Which `d3d9.dll` an x64 process on an arm64 Wine gets is decided by
-`aarch64-windows`: `wineboot` fills a new prefix's `system32` from there, and
-a `d3d9.dll` in it that is an ARM64X image, ours or Wine's own, sends the
-loader to `aarch64-windows` for x64 processes too. The source tree's
-`make install` sets it up for either choice (see `docs/BUILDING.md`):
-
-- `EC=1 make install`: x64 processes get the ARM64X build; 32-bit processes
-  keep whatever `i386-windows` holds.
-- `ARM64=1 make install`: the i686 and x86_64 builds go into `i386-windows`
-  and `x86_64-windows`, and `aarch64-windows` gets x64 fake-module markers
-  for `d3d9.dll` and `mtld3d.dll` in place of any ARM64X copy, Wine's own
-  `d3d9.dll` included. x64 processes get the x86_64 build and 32-bit ones the
-  i686 build; an arm64 process has no `d3d9.dll`.
-- `EC=1 ARM64=1 make install`: all three. x64 processes get the ARM64X build,
-  32-bit processes the i686 one.
-
-Only prefixes created after the install see the change. A prefix keeps what
-`wineboot` copied into its `system32` when it was made.
+build needs, the environment variables naming its toolchain among it) also
+carries `wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as
+builtin-marked ARM64X images; release bundles do not. On an arm64 Wine they
+take the place of the x86_64 pair, and x64 games then run the PE side as
+native code. Copy them into the `aarch64-windows` of the tree mtld3d loads
+from, never over the placeholders in a wine-build Wine's default
+`lib/wine/aarch64-windows`: those are x64 ones, and an x64 process fails to
+load a DLL whose placeholder is not. An x86_64 Wine never reads that
+directory. The source tree's `make install` does all of this for a
+wine-build Wine (see `docs/BUILDING.md`).
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
@@ -100,7 +100,7 @@ through the bottle's DLL search path and never enters CrossOver's own
   on Apple Silicon and macOS 15 on Intel, because no macOS 26 Intel runners
   exist. Intel on macOS 26 is expected to work.
 - A Wine from [wine-build](https://github.com/athei/wine-build), based on
-  CrossOver 26; CI pins a release of it. CrossOver 27's arm64 Wine is tested
+  CrossOver 26; CI pins a release of it. wine-build's arm64 Wine is tested
   locally but not run in CI. Older Wine or CrossOver releases are not expected
   to work.
 - A **64-bit prefix / bottle**; 32-bit games run in it through WoW64.
@@ -139,8 +139,18 @@ registry override per prefix plus a `d3d9.dll` copy per game (or per prefix).
 ```sh
 tar -xf mtld3d.tar.xz
 
-# Replaces lib/wine's d3d9.dll and adds the mtld3d builtin pair.
-cp -R wine/* "$WINE/lib/wine/"
+# Where this Wine loads mtld3d from: its own tree in a wine-build Wine,
+# lib/wine itself otherwise.
+T="$WINE/lib/wine/d3d9/mtld3d"; [ -d "$T" ] || T="$WINE/lib/wine"
+
+# Replaces the d3d9.dll there and adds the mtld3d builtin pair. x86_64 Wine:
+cp wine/i386-windows/*.dll    "$T/i386-windows/"
+cp wine/x86_64-windows/*.dll  "$T/x86_64-windows/"
+cp wine/x86_64-unix/mtld3d.so "$T/x86_64-unix/"
+# arm64 Wine, instead: the 64-bit DLLs go into aarch64-windows.
+#cp wine/i386-windows/*.dll     "$T/i386-windows/"
+#cp wine/x86_64-windows/*.dll   "$T/aarch64-windows/"
+#cp wine/aarch64-unix/mtld3d.so "$T/aarch64-unix/"
 
 # One-time prefix markers, only needed because this prefix already existed.
 # Skip both lines if the prefix is created after the copy above.
@@ -159,11 +169,16 @@ Re-run the `lib/wine` copy after any Wine update or reinstall.
 tar -xf mtld3d.tar.xz
 
 # Only the mtld3d builtin pair goes into the installation — the stock
-# d3d9.dll stays in place.
-cp wine/i386-windows/mtld3d.dll   "$WINE/lib/wine/i386-windows/"
-cp wine/x86_64-windows/mtld3d.dll "$WINE/lib/wine/x86_64-windows/"
-cp wine/x86_64-unix/mtld3d.so     "$WINE/lib/wine/x86_64-unix/"    # x86_64 Wine
-#cp wine/aarch64-unix/mtld3d.so   "$WINE/lib/wine/aarch64-unix/"   # arm64 Wine
+# d3d9.dll stays in place. Where it goes, as in the builtin route:
+T="$WINE/lib/wine/d3d9/mtld3d"; [ -d "$T" ] || T="$WINE/lib/wine"
+# x86_64 Wine:
+cp wine/i386-windows/mtld3d.dll   "$T/i386-windows/"
+cp wine/x86_64-windows/mtld3d.dll "$T/x86_64-windows/"
+cp wine/x86_64-unix/mtld3d.so     "$T/x86_64-unix/"
+# arm64 Wine, instead:
+#cp wine/i386-windows/mtld3d.dll   "$T/i386-windows/"
+#cp wine/x86_64-windows/mtld3d.dll "$T/aarch64-windows/"
+#cp wine/aarch64-unix/mtld3d.so    "$T/aarch64-unix/"
 
 # One-time prefix markers, as in the builtin route.
 cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"

@@ -54,14 +54,9 @@ suite against the ARM64X build, beside a `make check` leg that lints its two
 halves. `make conformance` gets the matching `conformance-*-arm64` and
 `conformance-arm64x` legs (`unix/conformance/CONFORMANCE.md`, "The
 arm64-runtime legs"). Each of them installs into a private clone of
-`WINE_ARM64`, creates a fresh prefix for it (a prefix only knows the builtins
-that were installed when it was made) and runs one test at a time. The
-end-to-end ones leave out two tests with the runner's `--skip`,
-`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`
-and
-`device::concurrent_retargets_deliver_every_window_message_to_its_own_device`,
-which deadlock in that Wine's winemac; the Makefile says why beside the skip.
-The environment variables the legs read are listed in
+`WINE_ARM64` and creates a fresh prefix for it (a prefix only knows the
+builtins that were installed when it was made). The environment variables
+the legs read are listed in
 [`docs/BUILDING.md`](docs/BUILDING.md#which-target-reads-which-path).
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never

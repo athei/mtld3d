@@ -176,10 +176,13 @@ class WineChoiceTests(MakeTestCase):
         output = self.run_make("inspect", succeeds=False)
         self.assertIn("neither WINE_X86_64 nor WINE_ARM64 is set", output)
 
-    def test_install_with_the_arm64_wine_alone_refuses(self):
+    def test_the_exported_sdk_does_not_trip_the_old_variable_check_in_a_sub_make(self):
+        # The Makefile exports WINE_SDK, so a sub-make sees it in its environment
+        # while WINE_X86_64 is unset; the check holds only at the top level.
         self.arm64_alone()
-        output = self.run_make("install", succeeds=False)
-        self.assertIn("make install: nothing to install into", output)
+        output = self.run_make("recurse")
+        sdks = [line for line in output.splitlines() if line.startswith("resolved:WINE_SDK=")]
+        self.assertEqual(sdks, [f"resolved:WINE_SDK={self.arm64}"] * 2, output)
 
     def test_an_x86_install_leaf_without_a_tree_refuses(self):
         self.arm64_alone()
@@ -205,6 +208,148 @@ class WineChoiceTests(MakeTestCase):
         for assignment in (f"WINE_X86_64='{x86}'", f"WINE_ARM64='{self.arm64}'",
                            f"WINE_SDK='{x86}'", f"WINE_SDK_ARM64X='{self.arm64}'"):
             self.assertIn(assignment, output)
+
+
+class InstallLayoutTests(MakeTestCase):
+    """`make install` against two fake Wines: what goes where, and no arch directory created."""
+
+    X86_64_DIRS = ("bin", "lib/wine/x86_64-unix", "lib/wine/i386-windows", "lib/wine/x86_64-windows",
+                   "lib/wine/d3d9/mtld3d/i386-windows", "lib/wine/d3d9/mtld3d/x86_64-windows",
+                   "lib/wine/d3d9/mtld3d/x86_64-unix")
+    ARM64_DIRS = ("bin", "lib/wine/aarch64-unix", "lib/wine/i386-windows", "lib/wine/aarch64-windows",
+                  "lib/wine/x86_64-windows", "lib/wine/d3d9/mtld3d/i386-windows",
+                  "lib/wine/d3d9/mtld3d/aarch64-windows", "lib/wine/d3d9/mtld3d/aarch64-unix")
+
+    def setUp(self):
+        super().setUp()
+        self.x86_64 = self.make_wine("x86_64", self.X86_64_DIRS)
+        self.arm64 = self.make_wine("arm64", self.ARM64_DIRS)
+        (self.arm64 / "lib/wine/aarch64-unix/compatdb.so").touch()
+        # winebuild writes its arguments into the file `-o` names and leaves
+        # everything else as it is.
+        winebuild = self.x86_64 / "bin/winebuild"
+        winebuild.write_text("#!/bin/sh\nall=\"$*\"\n"
+                             "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && printf '%s\\n' \"$all\" > \"$2\"; shift; done\n")
+        winebuild.chmod(0o755)
+        self.arm64x = self.root / "arm64x"
+        self.arm64x.mkdir()
+        for name in ("d3d9.dll", "d3d9.pdb", "mtld3d.dll", "mtld3d.pdb"):
+            (self.arm64x / name).write_text("arm64x")
+        self.stage = self.root / "stage"
+        for arch in ("i386-windows", "x86_64-windows"):
+            (self.stage / arch).mkdir(parents=True)
+            for name in ("d3d9.dll", "d3d9.pdb", "mtld3d.dll", "mtld3d.pdb"):
+                (self.stage / arch / name).write_text(arch)
+        for arch in ("x86_64-unix", "aarch64-unix"):
+            (self.stage / arch / "mtld3d.so.dSYM").mkdir(parents=True)
+            (self.stage / arch / "mtld3d.so").write_text(arch)
+        self.environment.pop("WINE_INSTALL_DIR")
+        self.environment["WINE_X86_64"] = str(self.x86_64)
+
+    def make_wine(self, name, directories):
+        root = self.root / name
+        for directory in directories:
+            (root / directory).mkdir(parents=True)
+        for program in ("wine", "wineserver"):
+            path = root / "bin" / program
+            path.write_text("#!/bin/sh\n")
+            path.chmod(0o755)
+        return root
+
+    def directories(self, root):
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                      if path.is_dir() and not path.name.endswith(".dSYM"))
+
+    def install(self, *arguments, succeeds=True):
+        return self.run_make(f"STAGE={self.stage}", *arguments, "install", succeeds=succeeds)
+
+    def test_each_wine_gets_its_own_pieces_and_no_new_arch_directory(self):
+        before = {wine: self.directories(wine) for wine in (self.x86_64, self.arm64)}
+        self.install(f"WINE_ARM64={self.arm64}")
+        for wine in (self.x86_64, self.arm64):
+            self.assertEqual(self.directories(wine), before[wine])
+        tree = self.x86_64 / "lib/wine/d3d9/mtld3d"
+        self.assertEqual((tree / "x86_64-windows/d3d9.dll").read_text(), "x86_64-windows")
+        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertEqual((tree / "x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
+        self.assertTrue((self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
+        tree = self.arm64 / "lib/wine/d3d9/mtld3d"
+        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "x86_64-windows")
+        self.assertEqual((tree / "i386-windows/mtld3d.dll").read_text(), "i386-windows")
+        self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
+        self.assertTrue((self.arm64 / "lib/wine/aarch64-windows/d3d9.dll").exists())
+        self.assertFalse((self.arm64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
+
+    def test_the_x86_64_wine_alone_is_installed_without_the_arm64_pieces(self):
+        before = self.directories(self.x86_64)
+        self.install()
+        self.assertEqual(self.directories(self.x86_64), before)
+        self.assertFalse(list(self.x86_64.rglob("aarch64-*")))
+
+    def test_a_missing_arch_directory_fails_the_install_and_is_not_created(self):
+        missing = self.x86_64 / "lib/wine/d3d9/mtld3d/x86_64-windows"
+        missing.rmdir()
+        output = self.install(succeeds=False)
+        self.assertIn(f"{missing} does not exist", output)
+        self.assertFalse(missing.exists())
+
+    def test_the_64_bit_markers_are_x64_ones_in_both_wines(self):
+        self.install(f"WINE_ARM64={self.arm64}")
+        for marker in (self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll",
+                       self.arm64 / "lib/wine/aarch64-windows/d3d9.dll",
+                       self.arm64 / "lib/wine/aarch64-windows/mtld3d.dll"):
+            self.assertIn("-b x86_64-windows", marker.read_text())
+        self.assertIn("-b i686-windows", (self.arm64 / "lib/wine/i386-windows/d3d9.dll").read_text())
+
+    def test_ec_puts_the_arm64x_pair_into_aarch64_windows_behind_x64_markers(self):
+        self.install(f"WINE_ARM64={self.arm64}", "EC=1", f"OUT_arm64x={self.arm64x}")
+        tree = self.arm64 / "lib/wine/d3d9/mtld3d"
+        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "arm64x")
+        self.assertEqual((tree / "aarch64-windows/mtld3d.dll").read_text(), "arm64x")
+        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertIn("-b x86_64-windows", (self.arm64 / "lib/wine/aarch64-windows/d3d9.dll").read_text())
+
+    def test_an_isolated_install_writes_the_clones_and_not_the_wines(self):
+        before = {wine: sorted(str(path) for path in wine.rglob("*")) for wine in (self.x86_64, self.arm64)}
+        self.install("ISOLATED=1", f"WINE_ARM64={self.arm64}")
+        for wine in (self.x86_64, self.arm64):
+            self.assertEqual(sorted(str(path) for path in wine.rglob("*")), before[wine])
+        clones = self.work / ".wine-isolated"
+        self.assertEqual((clones / "sdk/lib/wine/d3d9/mtld3d/x86_64-windows/d3d9.dll").read_text(),
+                         "x86_64-windows")
+        self.assertEqual((clones / "sdk-arm64/lib/wine/d3d9/mtld3d/aarch64-windows/d3d9.dll").read_text(),
+                         "x86_64-windows")
+
+    def test_a_flat_x86_64_wine_gets_the_build_in_its_default_dirs(self):
+        for directory in ("i386-windows", "x86_64-windows", "x86_64-unix"):
+            (self.x86_64 / "lib/wine/d3d9/mtld3d" / directory).rmdir()
+        (self.x86_64 / "lib/wine/d3d9/mtld3d").rmdir()
+        (self.x86_64 / "lib/wine/d3d9").rmdir()
+        before = self.directories(self.x86_64)
+        self.install()
+        self.assertEqual(self.directories(self.x86_64), before)
+        self.assertEqual((self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll").read_text(), "x86_64-windows")
+        self.assertEqual((self.x86_64 / "lib/wine/i386-windows/mtld3d.dll").read_text(), "i386-windows")
+        self.assertEqual((self.x86_64 / "lib/wine/x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
+
+    def test_a_wine_with_both_unix_dirs_is_refused_naming_the_leftover(self):
+        (self.x86_64 / "lib/wine/aarch64-unix").mkdir()
+        output = self.install(succeeds=False)
+        self.assertIn("has both lib/wine/x86_64-unix and lib/wine/aarch64-unix", output)
+        self.assertIn("can be removed", output)
+
+    def test_an_install_dir_naming_the_arm64_wine_is_written_once(self):
+        output = self.run_make(f"WINE_ARM64={self.arm64}", f"WINE_INSTALL_DIR={self.arm64}", "inspect")
+        self.assertIn(f"resolved:INSTALL_DIRS={self.x86_64}\n", output)
+
+    def test_an_arm64_wine_without_the_mtld3d_tree_is_refused(self):
+        for directory in ("i386-windows", "aarch64-windows", "aarch64-unix"):
+            (self.arm64 / "lib/wine/d3d9/mtld3d" / directory).rmdir()
+        (self.arm64 / "lib/wine/d3d9/mtld3d").rmdir()
+        output = self.run_make(f"STAGE={self.stage}", f"WINE_ARM64={self.arm64}", "install-arm64",
+                               succeeds=False)
+        self.assertIn("no lib/wine/d3d9/mtld3d tree", output)
+        self.assertFalse((self.arm64 / "lib/wine/d3d9").joinpath("mtld3d").exists())
 
 
 USER_REG = """WINE REGISTRY Version 2
