@@ -537,7 +537,7 @@ jobs:
       # which is the one tag `git describe` needs for the stamp, so every
       # other tag would only add to the fetch.
       - uses: actions/checkout@v7
-      # The toolchain first, since every make target needs the WINE_SDK the
+      # The toolchain first, since every make target needs the WINE_X86_64 the
       # prepare action sets; then the version check, so a tag that disagrees
       # with the manifests is answered before the wait for main's run and the
       # bundle build below.

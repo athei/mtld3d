@@ -61,16 +61,17 @@ on `main` once the nightly shows the stale pin.
 
 `ARM64=1 make conformance` adds `conformance-i686-arm64` and
 `conformance-x86_64-arm64`, and `EC=1` adds `conformance-arm64x`. Each runs
-the SDK's own `d3d9_test.exe` of its arch, the binary `conformance-<arch>`
-runs (a PE test runs under any Wine), under the arm64 Wine that `WINE_ARM64`
-names: the two x86 legs against the i686 and x86_64 builds, the ARM64X leg
-the x86_64 binary against the ARM64X build. Every leg runs in a private clone
+the x86_64 Wine's own `d3d9_test.exe` of its arch, the binary
+`conformance-<arch>` runs (a PE test runs under any Wine, and the arm64 Wine
+carries none, so these legs read `WINE_X86_64` too), under the arm64 Wine
+that `WINE_ARM64` names: the two x86 legs against the i686 and x86_64
+builds, the ARM64X leg the x86_64 binary against the ARM64X build. Every leg runs in a private clone
 of that Wine with its own prefix, created afresh after the leg's install and
 configured by `configure-test-prefix` as the other legs' prefixes are.
 
 None of them has baseline entries of its own. Each records under its arch's
 label, so the runner judges it against that arch's entries, which were taken
-on the x86_64 Wine the SDK is (the header's `Wine:` line names it, and the
+on the x86_64 Wine `WINE_X86_64` names (the header's `Wine:` line names it, and the
 runner warns that the arm64 Wine's version differs), and on the same Apple GPU
 family. What a leg reports is therefore how its runtime differs from that
 baseline: CrossOver's arm64 Wine and its x86 translation, plus, for the
@@ -114,7 +115,7 @@ hang was: the raw log of a process parked in a syscall ends in that line and
 nothing else, and a thread parked in `wine_server_call` shows nothing of the
 server that owes it a reply. The server is matched on two things, so no other
 prefix's is ever read: the binary it was exec'd from, which the Makefile names
-with `--wineserver` out of the same Wine SDK as the loader, and the directory
+with `--wineserver` out of the same Wine as the loader, and the directory
 it works from, which wineserver names after the device and inode of the prefix
 it serves. When no such server is running, the file says so instead of failing
 the leg. A run without the framework's `tests executed` summary is a crash
@@ -150,7 +151,7 @@ is where AppKit reports the exception, if it logs it there and does not
 redact it.
 
 There is no conformance-specific input to set. The test binaries ship inside the
-Wine SDK bundle (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
+x86_64 Wine (`$WINE_X86_64/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
 published by the [wine-build](https://github.com/athei/wine-build) bundle step),
 which is the same install `make install` puts our builtin `d3d9.dll` into, so a
 CI job needs nothing but that tarball and no Wine build tree at all. The

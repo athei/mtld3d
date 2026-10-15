@@ -139,7 +139,7 @@ readable. If mtld3d does not seem to load at all, start with the
 ```sh
 make setup        # once: toolchains and SDKs, but not Wine
 make              # build every shipped binary
-make install      # install into the Wine tree WINE_SDK names
+make install      # install into the Wine tree WINE_X86_64 names
 ```
 
 [`docs/BUILDING.md`](docs/BUILDING.md) covers the prerequisites, the tests,

@@ -30,13 +30,13 @@ inputs:
 runs:
   using: composite
   steps:
-    # Mandatory for every `make` call (the Makefile hard-errors without it and
-    # prepends $WINE_SDK/bin to PATH so wine, wineserver and winebuild resolve).
+    # Mandatory for every `make` call (the Makefile hard-errors without a Wine,
+    # and takes wine, wineserver and winebuild from this one by absolute path).
     # Under $HOME rather than the workspace: checkout's `git clean` would take
     # anything inside the workspace with it.
-    - name: Point WINE_SDK at the extracted bundle
+    - name: Point WINE_X86_64 at the extracted bundle
       shell: bash
-      run: echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+      run: echo "WINE_X86_64=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
 
     # The tools key is built from the pinned versions themselves rather than from
     # a hash of the file that carries them: editing a comment in ci.yml must not
@@ -126,7 +126,7 @@ runs:
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
 
     # The tarball unpacks to `wine/`, so this lands at $HOME/wine-sdk/wine, which
-    # is what WINE_SDK points at above. `make install` writes our builtin into
+    # is what WINE_X86_64 points at above. `make install` writes our builtin into
     # this tree, which is why the legs restore it but never save it back.
     - name: Download the pinned Wine SDK
       if: inputs.pe == 'true' && steps.wine-cache.outputs.cache-hit != 'true'

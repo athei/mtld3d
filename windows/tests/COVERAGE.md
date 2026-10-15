@@ -239,7 +239,7 @@ hidden-window test suite. Build and install with an isolated SDK first, then bui
 the example for either PE architecture. For example, from the repository root:
 
 ```sh
-WINE_SDK=/path/to/wine make ISOLATED=1 test
+WINE_X86_64=/path/to/wine make ISOLATED=1 test
 (cd windows && WINE_SDK="$PWD/../.wine-isolated/sdk" cargo +stable build -p mtld3d-tests --target i686-pc-windows-msvc --example cursor_capture)
 WINEPREFIX="$PWD/.wine-isolated/prefix" RUST_LOG=mtld3d::unix::cursor=trace,mtld3d::d3d9::cursor=debug .wine-isolated/sdk/bin/wine windows/target/i686-pc-windows-msvc/debug/examples/cursor_capture.exe
 ```

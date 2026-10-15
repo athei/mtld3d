@@ -9,7 +9,7 @@ import unittest
 
 
 MAKEFILE = Path(__file__).resolve().parent.parent / "Makefile"
-FIELDS = ("WINE_SDK", "WINE_INSTALL_DIR", "WINEPREFIX", "WINE",
+FIELDS = ("WINE_X86_64", "WINE_SDK", "WINE_INSTALL_DIR", "WINEPREFIX", "WINE",
           "WINEBUILD", "WINESERVER", "INSTALL_DIRS", "TEST_PREFIX")
 
 
@@ -23,7 +23,7 @@ class MakeTestCase(unittest.TestCase):
         self.work = self.root / "work"
         self.work.mkdir()
         self.sources = {
-            "WINE_SDK": str(self.root / "sdk-source"),
+            "WINE_X86_64": str(self.root / "sdk-source"),
             "WINE_INSTALL_DIR": str(self.root / "install-source"),
             "WINEPREFIX": str(self.root / "prefix-source"),
         }
@@ -43,7 +43,8 @@ class MakeTestCase(unittest.TestCase):
         )
         self.environment = os.environ.copy()
         for name in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES",
-                     "MAKELEVEL", "ISOLATED", *self.sources):
+                     "MAKELEVEL", "ISOLATED", "EC", "ARM64", "WINE_ARM64", "BUILD_WINE",
+                     "WINE_SDK", "WINE_SDK_ARM64X", *self.sources):
             self.environment.pop(name, None)
         self.environment.update(self.sources)
 
@@ -62,10 +63,10 @@ class MakeTestCase(unittest.TestCase):
 
 class IsolationTests(MakeTestCase):
     def assert_paths(self, output, isolated, copies=1):
-        sdk = str(self.work / ".wine-isolated/sdk") if isolated else self.sources["WINE_SDK"]
+        sdk = str(self.work / ".wine-isolated/sdk") if isolated else self.sources["WINE_X86_64"]
         prefix = str(self.work / ".wine-isolated/prefix") if isolated else self.sources["WINEPREFIX"]
         install = sdk if isolated else self.sources["WINE_INSTALL_DIR"]
-        expected = dict(WINE_SDK=sdk, WINE_INSTALL_DIR=install, WINEPREFIX=prefix,
+        expected = dict(WINE_X86_64=sdk, WINE_SDK=sdk, WINE_INSTALL_DIR=install, WINEPREFIX=prefix,
                         WINE=f"{sdk}/bin/wine", WINEBUILD=f"{sdk}/bin/winebuild",
                         WINESERVER=f"{sdk}/bin/wineserver", TEST_PREFIX=prefix,
                         INSTALL_DIRS=" ".join(sorted({sdk, install})))
@@ -73,12 +74,12 @@ class IsolationTests(MakeTestCase):
         self.assertEqual(actual, [f"resolved:{name}={expected[name]}" for name in FIELDS] * copies,
                          output)
         if isolated:
-            banner = (f"==> ISOLATED=1: WINE_SDK={sdk} WINE_INSTALL_DIR={install} "
+            banner = (f"==> ISOLATED=1: WINE_X86_64={sdk} WINE_INSTALL_DIR={install} "
                       f"WINEPREFIX={prefix}")
             actual_banners = [line for line in output.splitlines()
                               if line.startswith("==> ISOLATED=1:")]
             self.assertEqual(actual_banners, [banner] * copies, output)
-            for directory, source in (("sdk", "WINE_SDK"), ("prefix", "WINEPREFIX")):
+            for directory, source in (("sdk", "WINE_X86_64"), ("prefix", "WINEPREFIX")):
                 self.assertEqual((self.work / ".wine-isolated" / directory / "sentinel").read_text(),
                                  source)
         else:
@@ -107,6 +108,43 @@ class IsolationTests(MakeTestCase):
             with self.subTest(goals=goals):
                 self.run_make("-n", "ISOLATED=1", *arguments, *goals)
                 self.assertFalse((self.work / ".wine-isolated").exists())
+
+
+class BuildSdkTests(MakeTestCase):
+    """Which of the two Wines the builds take their SDK from."""
+
+    def resolved(self, output):
+        return dict(line[len("resolved:"):].split("=", 1) for line in output.splitlines()
+                    if line.startswith("resolved:"))
+
+    def test_build_wine_arm64_takes_the_sdk_from_the_arm64_wine(self):
+        arm64 = str(self.root / "arm64")
+        values = self.resolved(self.run_make(f"WINE_ARM64={arm64}", "BUILD_WINE=arm64", "inspect"))
+        self.assertEqual(values["WINE_SDK"], arm64)
+        self.assertEqual(values["WINEBUILD"], f"{arm64}/bin/winebuild")
+        self.assertEqual(values["WINE"], f"{self.sources['WINE_X86_64']}/bin/wine")
+
+    def test_the_arm64_wine_alone_serves_the_build(self):
+        arm64 = str(self.root / "arm64")
+        for name in ("WINE_X86_64", "WINE_INSTALL_DIR"):
+            self.environment.pop(name)
+        values = self.resolved(self.run_make(f"WINE_ARM64={arm64}", "inspect"))
+        self.assertEqual(values["WINE_SDK"], arm64)
+        self.assertEqual(values["WINEBUILD"], f"{arm64}/bin/winebuild")
+        self.assertEqual(values["INSTALL_DIRS"], "")
+
+    def test_a_wine_sdk_from_the_command_line_is_ignored(self):
+        values = self.resolved(self.run_make(f"WINE_SDK={self.root / 'elsewhere'}", "inspect"))
+        self.assertEqual(values["WINE_SDK"], self.sources["WINE_X86_64"])
+
+    def test_without_either_wine_the_makefile_names_both(self):
+        self.environment.pop("WINE_X86_64")
+        output = self.run_make("inspect", succeeds=False)
+        self.assertIn("neither WINE_X86_64 nor WINE_ARM64 is set", output)
+
+    def test_build_wine_naming_an_unset_wine_fails(self):
+        output = self.run_make("BUILD_WINE=arm64", "inspect", succeeds=False)
+        self.assertIn("BUILD_WINE=arm64 takes the SDK from WINE_ARM64, which is not set", output)
 
 
 USER_REG = """WINE REGISTRY Version 2

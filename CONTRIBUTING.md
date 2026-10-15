@@ -68,11 +68,11 @@ The environment variables the legs read are listed in
 touched, that churn is its own pull request, not a hand-revert and not a passenger
 in yours.
 
-Every test leg installs the build into the Wine tree `WINE_SDK` names (and into
-`WINE_INSTALL_DIR` when set) before it runs, so two checkouts testing at once
+Every test leg installs the build into the Wine tree `WINE_X86_64` names (and
+into `WINE_INSTALL_DIR` when set) before it runs, so two checkouts testing at once
 overwrite each other's `d3d9.dll` and `mtld3d.so`, and a game launched from that
 tree meanwhile runs whichever build landed last. `make test ISOLATED=1` avoids
-both: it clones the SDK and the ambient prefix once into `.wine-isolated/`
+both: it clones that Wine and the ambient prefix once into `.wine-isolated/`
 inside the checkout (APFS clones, so neither costs space or a prefix boot) and
 points the tools, the install and the prefix at the clones. Each clone is one
 `clonefile(2)` on the directory (the Makefile's `clone_tree`), so it costs a
@@ -310,7 +310,7 @@ of that Wine with a fresh prefix, the way the arm64 test legs do. A benchmark
 measures one layout, so the two switches are not given together, and
 `EC=1 make bench-ab` needs a `BASE` whose Makefile has `windows-arm64x`: it
 stops with a message naming `BASE` otherwise. `make bench-variants` compares
-layouts instead of commits: this checkout's x86_64 build on the SDK's Wine
+layouts instead of commits: this checkout's x86_64 build on `WINE_X86_64`
 against the same build on `WINE_ARM64` (`x86_64-sdk-vs-arm64`), and with
 `EC=1` the x86_64 build against the ARM64X one on `WINE_ARM64`
 (`x86_64-vs-arm64x`). `ARCH=i686` runs the first pair for the i686 build
@@ -321,8 +321,8 @@ pair is a `bench-ab` run of its own whose report names each leg's runtime and
 DLL variant. Such a run has one commit in both legs, so a binary the two
 layouts share loads as one image, which the comparison notes instead of
 refusing, and the first pair runs two Wines. Read that first pair with care:
-it changes the host arch and the Wine build at once (the SDK is a patched
-CrossOver 26, `WINE_ARM64` a stock CrossOver 27), so its differences are not
+it changes the host arch and the Wine build at once (`WINE_X86_64` is a
+patched CrossOver 26, `WINE_ARM64` a stock CrossOver 27), so its differences are not
 the arch's alone, for either arch. The ARM64X pair runs one Wine in both legs
 and changes only our DLLs, so it measures what the ARM64X build buys an x64
 game.

@@ -16,10 +16,10 @@ runs:
   steps:
     # Mandatory for every `make` call. Under $HOME rather than the workspace:
     # checkout's `git clean` would take anything inside the workspace with it.
-    - name: Point WINE_SDK at the extracted bundle
+    - name: Point WINE_X86_64 at the extracted bundle
       shell: bash
       run: |
-        echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+        echo "WINE_X86_64=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
         echo "STAGE=$RUNNER_TEMP/stage" >> "$GITHUB_ENV"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
