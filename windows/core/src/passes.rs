@@ -1795,7 +1795,9 @@ pub struct PassState {
     /// Populated in `emit_command` from fragment and vertex texture commands.
     /// Consumed by Rule A (`ensure_pass_open`) and
     /// `finalize_load_actions` to skip / revert `LoadAction::DontCare` on
-    /// attachments whose content a sampler reads elsewhere in the frame,
+    /// attachments whose content a sampler reads elsewhere in the frame
+    /// (the back buffer excepted while the discard swap effect leaves it
+    /// undefined, see `undefined_backbuffer`),
     /// and by `finalize_store_actions` to skip `StoreAction::DontCare` on
     /// the same. Closes a hole in the original load/store optimiser that
     /// discarded CSM cascade content between the caster pass that wrote
@@ -3732,7 +3734,10 @@ impl PassState {
         // first-use predicate is evaluated per attachment. Only the back
         // buffer qualifies, and only when `Present` under the discard swap
         // effect left it undefined; every other target, and the back buffer
-        // under `FLIP` or `COPY`, keeps its contents into the next frame.
+        // under `FLIP` or `COPY`, keeps its contents into the next frame. An
+        // earlier read of that undefined back buffer (a sampler, a
+        // `StretchRect` source) does not make its contents defined, so the
+        // session-wide sampled set has no say here.
         let backbuffer = self.backbuffer_texture;
         let backbuffer_undefined =
             matches!(self.backbuffer_contents, BackbufferContents::Undefined);
@@ -3745,7 +3750,6 @@ impl PassState {
                     && texture == backbuffer
                     && backbuffer_undefined
                     && !self.seen_color_rts.contains(&(texture, subresource))
-                    && !self.seen_sampled_textures.contains(&texture)
                     && !self.blit_written_rts.contains(&texture) =>
                 {
                     ColorLoad::DontCare
@@ -5950,6 +5954,19 @@ impl PassState {
         None
     }
 
+    /// The back buffer, when `Present` under the discard swap effect left it undefined.
+    ///
+    /// Its contents at the frame's first use are undefined whatever read it
+    /// before, so a sampler or `StretchRect` read of it (in this frame or an
+    /// earlier one) gives Rule A no reason to load it. Every other texture
+    /// keeps its contents across frames and stays behind the session-wide
+    /// `seen_sampled_textures` test.
+    fn undefined_backbuffer(&self) -> Option<MetalHandle<MTLTextureKind>> {
+        (!self.backbuffer_texture.is_null()
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined))
+        .then_some(self.backbuffer_texture)
+    }
+
     /// Rule A correction: revert `Load = DontCare` on attachments a sampler reads.
     ///
     /// The revert fires whenever the attachment's content is read
@@ -5966,9 +5983,12 @@ impl PassState {
         if !ENABLE_FIRST_USE_DONTCARE && !ENABLE_FIRST_USE_STENCIL_DONTCARE {
             return;
         }
+        let undefined_backbuffer = self.undefined_backbuffer();
+        let keeps_discard = |texture: MetalHandle<MTLTextureKind>| {
+            undefined_backbuffer == Some(texture) || !self.seen_sampled_textures.contains(&texture)
+        };
         for pass in &mut self.passes {
-            if matches!(pass.color_load, ColorLoad::DontCare)
-                && self.seen_sampled_textures.contains(&pass.color_texture)
+            if matches!(pass.color_load, ColorLoad::DontCare) && !keeps_discard(pass.color_texture)
             {
                 pass.color_load = ColorLoad::Load;
                 if log_enabled!(target: TRACE_TARGET, Level::Trace) {
@@ -5981,7 +6001,7 @@ impl PassState {
             }
             for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
                 if matches!(attachment.load, ColorLoad::DontCare)
-                    && self.seen_sampled_textures.contains(&attachment.texture)
+                    && !keeps_discard(attachment.texture)
                 {
                     attachment.load = ColorLoad::Load;
                     if log_enabled!(target: TRACE_TARGET, Level::Trace) {
