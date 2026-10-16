@@ -23,7 +23,7 @@ use mtld3d_core::{
     },
     ids::BufferId,
     passes::{
-        NULL_TEXTURE_SAMPLER_SENTINEL, Rt0DropCandidate, VertexBufferBind,
+        CoveringDraw, NULL_TEXTURE_SAMPLER_SENTINEL, Rt0DropCandidate, VertexBufferBind,
         null_texture_tex_sentinel, sampler_cache_key,
     },
     perf::{CycleAddTimer, OpSub, OpSubDetail},
@@ -945,7 +945,23 @@ fn emit_draw_view(
     // After every return and every call that can end the pass, so the pass
     // opened or continued next is the one the decision describes.
     enc.set_rt0_dropped(rt0_drop);
-    enc.begin_render_pass_if_needed();
+    // `passes.discardFullscreen`: a pass opened for a draw that writes all
+    // of render target 0 does not load it.
+    let covers = enc.config().passes_discard_fullscreen && {
+        let clip_planes = match vs {
+            VsSourceView::Programmable(source) => source.clip_plane_count,
+            VsSourceView::FixedFunction(source) => source.key.clip_plane_count,
+        };
+        let draw = CoveringDraw {
+            primitive: metal_prim,
+            vertices: submitted_vertex_count(index_source).saturating_mul(instances),
+            ps_color_out_mask,
+            alpha_func: ps_variant.alpha_func,
+            clip_planes,
+        };
+        enc.draw_covers_color_target(render_state, &draw)
+    };
+    enc.begin_render_pass_if_needed(covers);
     debug_assert_eq!(
         enc.rt0_dropped(),
         !pipeline_snapshot.has_color_output(),
@@ -1957,5 +1973,18 @@ fn bind_crossing_stream(
         if bind != VertexBufferBind::Same {
             enc.emit_command(Command::set_vertex_buffer(buffer_handle, offset, slot));
         }
+    }
+}
+
+/// Vertices (indices for an indexed draw) one instance of the draw submits.
+const fn submitted_vertex_count(index_source: &IndexView<'_>) -> u32 {
+    match *index_source {
+        IndexView::None { vertex_count, .. } => vertex_count,
+        IndexView::Fan {
+            primitive_count, ..
+        } => primitive_count.saturating_mul(3),
+        IndexView::Bound { index_count, .. }
+        | IndexView::Generated { index_count, .. }
+        | IndexView::Up { index_count, .. } => index_count,
     }
 }

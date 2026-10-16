@@ -51,6 +51,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.adapter_spoof = AdapterSpoof::Amd;
     value.df_formats = !value.df_formats;
     value.max_resolutions = 32;
+    value.passes_discard_fullscreen = !value.passes_discard_fullscreen;
     assert_eq!(round_trip(&value), value);
 }
 

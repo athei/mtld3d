@@ -343,6 +343,19 @@ pub struct Mtld3dConfig {
     /// a fullscreen request for any size Wine lists is still set. Default:
     /// `0`. File key: `display.maxResolutions`.
     pub max_resolutions: u32,
+    /// Open a pass without loading its colour target when its first draw covers that target.
+    ///
+    /// Post-processing chains and scene-colour copies draw one quad or one
+    /// full-screen triangle over the whole render target, so the contents
+    /// the pass loads are overwritten before anything reads them. When
+    /// enabled, a pass opened for such a draw (at most six vertices, a
+    /// viewport and scissor over the whole target, solid fill, no blend,
+    /// a full write mask, no depth, stencil, alpha test or extra targets)
+    /// loads its colour target as `DontCare` instead. The vertex positions
+    /// are not checked, so a smaller quad drawn under that state would
+    /// leave undefined pixels around it. Default: `false`.
+    /// File key: `passes.discardFullscreen`.
+    pub passes_discard_fullscreen: bool,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -431,6 +444,7 @@ impl Default for Mtld3dConfig {
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
             max_resolutions: 0,
+            passes_discard_fullscreen: false,
         }
     }
 }
@@ -634,6 +648,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: display.maxResolutions = {}", cfg.max_resolutions
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: passes.discardFullscreen = {}", cfg.passes_discard_fullscreen
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -717,6 +735,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         "display.maxResolutions" => {
             assign_count(source, key, value, &mut cfg.max_resolutions);
+        }
+        "passes.discardFullscreen" => {
+            assign_bool(source, key, value, &mut cfg.passes_discard_fullscreen);
         }
         _ => log_once_warn!(
             target: crate::LOG_TARGET,

@@ -902,7 +902,7 @@ fn a_draw_that_fills_the_visibility_buffer_leaves_no_pass_without_a_draw() {
     let query = VisibilityQueryCore::new();
     let generation = query.mark_armed();
     enc.begin_visibility_query(&query, generation);
-    enc.begin_render_pass_if_needed();
+    enc.begin_render_pass_if_needed(false);
     enc.pass_state.emit_command(draw());
     let full = BufferNeed::Spill(enc.visibility.buffer_slots());
     while enc.visibility.buffer_need() != full {
@@ -915,7 +915,7 @@ fn a_draw_that_fills_the_visibility_buffer_leaves_no_pass_without_a_draw() {
         "the clear waits"
     );
 
-    enc.begin_render_pass_if_needed();
+    enc.begin_render_pass_if_needed(false);
     enc.pass_state.emit_command(draw());
     enc.end_current_pass("test");
 

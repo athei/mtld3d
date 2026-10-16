@@ -10928,6 +10928,240 @@ fn rule_k_leaves_a_covered_pass_rule_j_joins_onto_the_one_before() {
     assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
 }
 
+/// The render state of a full-target copy: no blend, depth, stencil or scissor, solid fill.
+fn copy_render_state() -> RenderStateSnapshot {
+    RenderStateSnapshot {
+        pipeline_rs: PipelineRsBits {
+            color_write_mask: 0xF,
+            ..PipelineRsBits::default()
+        },
+        depth_scissor: crate::draw_data::DepthScissorFlags::empty(),
+        depth_stencil_state: DepthStencilSnapshot::inert(),
+        cull_mode: u8::try_from(mtld3d_types::D3DCULL_NONE).unwrap(),
+        fill_mode: u8::try_from(D3DFILL_SOLID).unwrap(),
+        sample_mask: SAMPLE_MASK_ALL,
+        reserved: 0,
+        scissor_rect: [0; 4],
+        blend_factor: 0xFFFF_FFFF,
+        depth_bias: 0,
+        slope_scale_depth_bias: 0,
+        stencil_ref: 0,
+    }
+}
+
+/// A four-vertex strip writing `oC0` with no alpha test or clip plane.
+const COPY_QUAD: CoveringDraw = CoveringDraw {
+    primitive: PrimitiveType::TriangleStrip,
+    vertices: 4,
+    ps_color_out_mask: 1,
+    alpha_func: 0,
+    clip_planes: 0,
+};
+
+/// Bind `target` alone at 1280x720 under `viewport`, with no pass open.
+fn bind_copy_target(s: &mut PassState, target: MetalHandle<MTLTextureKind>, viewport: (u32, u32)) {
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, viewport.0, viewport.1, 0.0, 1.0);
+}
+
+/// Open or continue the pass for one draw as `emit_draw` does under `passes.discardFullscreen`.
+fn app_draw(s: &mut PassState, enabled: bool, rs: &RenderStateSnapshot, draw: &CoveringDraw) {
+    if s.draw_covers_color_target(enabled, rs, draw) {
+        s.open_pass_for_covering_draw();
+    } else {
+        s.ensure_pass_open();
+    }
+    s.emit_command(dummy_draw());
+}
+
+#[test]
+fn discard_fullscreen_discards_the_load_under_a_covering_app_draw() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    bind_copy_target(&mut s, target, (1280, 720));
+    app_draw(&mut s, true, &copy_render_state(), &COPY_QUAD);
+    s.end_current_pass("test");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes()[0].color_texture(), target);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+}
+
+#[test]
+fn discard_fullscreen_keeps_the_load_under_a_partial_viewport() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    bind_copy_target(&mut s, target, (640, 360));
+    assert!(!s.draw_covers_color_target(true, &copy_render_state(), &COPY_QUAD));
+    app_draw(&mut s, true, &copy_render_state(), &COPY_QUAD);
+    s.end_current_pass("test");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn discard_fullscreen_keeps_the_load_when_the_first_draw_does_not_cover() {
+    // A blended draw opens the pass; the covering draw after it joins that
+    // pass, whose load serves the blend.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    bind_copy_target(&mut s, target, (1280, 720));
+    let mut blended = copy_render_state();
+    blended
+        .pipeline_rs
+        .flags
+        .insert(PipelineRsFlags::BLEND_ENABLE);
+    blended.pipeline_rs.src_blend = u8::try_from(mtld3d_types::D3DBLEND_SRCALPHA).unwrap();
+    blended.pipeline_rs.dst_blend = u8::try_from(D3DBLEND_ZERO).unwrap();
+    blended.pipeline_rs.blend_op = u8::try_from(D3DBLENDOP_ADD).unwrap();
+    app_draw(&mut s, true, &blended, &COPY_QUAD);
+    app_draw(&mut s, true, &copy_render_state(), &COPY_QUAD);
+    s.end_current_pass("test");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn discard_fullscreen_off_keeps_the_load() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    bind_copy_target(&mut s, target, (1280, 720));
+    assert!(!s.draw_covers_color_target(false, &copy_render_state(), &COPY_QUAD));
+    app_draw(&mut s, false, &copy_render_state(), &COPY_QUAD);
+    s.end_current_pass("test");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn discard_fullscreen_takes_a_replacing_blend_a_triangle_and_a_covering_scissor() {
+    let mut s = fresh();
+    bind_copy_target(&mut s, tex(0x3000), (1280, 720));
+    let mut rs = copy_render_state();
+    rs.pipeline_rs.flags.insert(PipelineRsFlags::BLEND_ENABLE);
+    rs.pipeline_rs.src_blend = u8::try_from(D3DBLEND_ONE).unwrap();
+    rs.pipeline_rs.dst_blend = u8::try_from(D3DBLEND_ZERO).unwrap();
+    rs.pipeline_rs.blend_op = u8::try_from(D3DBLENDOP_ADD).unwrap();
+    rs.depth_scissor
+        .insert(crate::draw_data::DepthScissorFlags::SCISSOR_TEST);
+    rs.scissor_rect = [0, 0, 1280, 720];
+    let triangle = CoveringDraw {
+        primitive: PrimitiveType::Triangle,
+        vertices: 3,
+        alpha_func: u8::try_from(D3DCMP_ALWAYS).unwrap(),
+        ..COPY_QUAD
+    };
+    assert!(s.draw_covers_color_target(true, &rs, &triangle));
+}
+
+#[test]
+fn discard_fullscreen_rejects_every_state_that_can_leave_a_pixel() {
+    type RsEdit = fn(&mut RenderStateSnapshot);
+    let mut s = fresh();
+    bind_copy_target(&mut s, tex(0x3000), (1280, 720));
+    assert!(s.draw_covers_color_target(true, &copy_render_state(), &COPY_QUAD));
+    let state_cases: [(&str, RsEdit); 9] = [
+        ("blend", |rs| {
+            rs.pipeline_rs.flags.insert(PipelineRsFlags::BLEND_ENABLE);
+            rs.pipeline_rs.src_blend = u8::try_from(mtld3d_types::D3DBLEND_SRCALPHA).unwrap();
+        }),
+        ("write mask", |rs| rs.pipeline_rs.color_write_mask = 0x7),
+        ("depth test", |rs| {
+            rs.depth_scissor
+                .insert(crate::draw_data::DepthScissorFlags::DEPTH_ENABLE);
+        }),
+        ("stencil", |rs| rs.depth_stencil_state.stencil_enable = 1),
+        ("scissor", |rs| {
+            rs.depth_scissor
+                .insert(crate::draw_data::DepthScissorFlags::SCISSOR_TEST);
+            rs.scissor_rect = [0, 0, 640, 720];
+        }),
+        ("wireframe", |rs| {
+            rs.fill_mode = u8::try_from(mtld3d_types::D3DFILL_WIREFRAME).unwrap();
+        }),
+        ("sample mask", |rs| rs.sample_mask = 0x1),
+        ("alpha to coverage", |rs| {
+            rs.pipeline_rs
+                .flags
+                .insert(PipelineRsFlags::ALPHA_TO_COVERAGE);
+        }),
+        ("separate alpha blend", |rs| {
+            rs.pipeline_rs
+                .flags
+                .insert(PipelineRsFlags::BLEND_ENABLE | PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+            rs.pipeline_rs.src_blend = u8::try_from(D3DBLEND_ONE).unwrap();
+            rs.pipeline_rs.dst_blend = u8::try_from(D3DBLEND_ZERO).unwrap();
+            rs.pipeline_rs.blend_op = u8::try_from(D3DBLENDOP_ADD).unwrap();
+            rs.pipeline_rs.src_blend_alpha = u8::try_from(D3DBLEND_ZERO).unwrap();
+            rs.pipeline_rs.dst_blend_alpha = u8::try_from(D3DBLEND_ONE).unwrap();
+            rs.pipeline_rs.blend_op_alpha = u8::try_from(D3DBLENDOP_ADD).unwrap();
+        }),
+    ];
+    for (name, edit) in state_cases {
+        let mut rs = copy_render_state();
+        edit(&mut rs);
+        assert!(!s.draw_covers_color_target(true, &rs, &COPY_QUAD), "{name}");
+    }
+    let draw_cases = [
+        (
+            "seven vertices",
+            CoveringDraw {
+                vertices: 7,
+                ..COPY_QUAD
+            },
+        ),
+        (
+            "points",
+            CoveringDraw {
+                primitive: PrimitiveType::Point,
+                ..COPY_QUAD
+            },
+        ),
+        (
+            "no oC0",
+            CoveringDraw {
+                ps_color_out_mask: 0b10,
+                ..COPY_QUAD
+            },
+        ),
+        (
+            "alpha test",
+            CoveringDraw {
+                alpha_func: u8::try_from(mtld3d_types::D3DCMP_LESS).unwrap(),
+                ..COPY_QUAD
+            },
+        ),
+        (
+            "clip plane",
+            CoveringDraw {
+                clip_planes: 1,
+                ..COPY_QUAD
+            },
+        ),
+    ];
+    for (name, draw) in draw_cases {
+        assert!(
+            !s.draw_covers_color_target(true, &copy_render_state(), &draw),
+            "{name}"
+        );
+    }
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3100), (1280, 720))));
+    assert!(
+        !s.draw_covers_color_target(true, &copy_render_state(), &COPY_QUAD),
+        "an extra render target"
+    );
+}
+
 #[test]
 fn rule_k_discards_the_load_of_a_covered_multisampled_target() {
     // The quad writes every sample of each pixel it covers, so the companion

@@ -7,12 +7,15 @@ use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
     mtl::{
-        CullMode, PixelFormat, StencilOp, TriangleFillMode, VERTEX_STREAM_SLOTS,
+        CullMode, PixelFormat, PrimitiveType, StencilOp, TriangleFillMode, VERTEX_STREAM_SLOTS,
         VisibilityResultMode,
     },
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
-use mtld3d_types::D3DSWAPEFFECT_DISCARD;
+use mtld3d_types::{
+    D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DCMP_ALWAYS, D3DFILL_SOLID,
+    D3DSWAPEFFECT_DISCARD,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
@@ -20,7 +23,9 @@ use crate::{
     convert::d3d_to_metal_stencil_op,
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
     dirty_range::DirtyRange,
-    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits},
+    draw_data::RenderStateSnapshot,
+    multisample::SAMPLE_MASK_ALL,
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineRsFlags},
     render_scale::{RenderScale, TargetExtent},
 };
 
@@ -500,6 +505,23 @@ pub enum ColorClearOutcome {
         viewport: (u32, u32, u32, u32),
         color_format: PixelFormat,
     },
+}
+
+/// The per-draw facts [`PassState::draw_covers_color_target`] judges beside the render state.
+///
+/// What the encoder thread knows of a draw that the render-state snapshot
+/// does not carry: its primitive and size, and what its shaders resolved to.
+pub struct CoveringDraw {
+    /// The Metal primitive the draw rasterizes.
+    pub primitive: PrimitiveType,
+    /// Vertices the draw submits across all its instances (indices for an indexed draw).
+    pub vertices: u32,
+    /// Bit `i` set when the pixel shader writes `oCi`.
+    pub ps_color_out_mask: u8,
+    /// The resolved `D3DCMP_*` alpha test, `0` when the variant tests nothing.
+    pub alpha_func: u8,
+    /// User clip planes the vertex shader applies.
+    pub clip_planes: u8,
 }
 
 /// Render target 1..3 as currently bound, before any pass has frozen it.
@@ -3636,6 +3658,64 @@ impl PassState {
             );
             pass.color_flags.insert(PassColorFlags::FIRST_DRAW_COVERS);
         }
+    }
+
+    /// Whether a draw writes every pixel and sample of render target 0, by its state alone.
+    ///
+    /// The test behind `passes.discardFullscreen`: a quad or a full-screen
+    /// triangle (a triangle list or strip of at most six vertices) under a
+    /// viewport and scissor that span render target 0 exactly, solid fill,
+    /// blending off or `ONE`/`ZERO`, a full `RGBA` write mask, `oC0` written,
+    /// no other colour target, no depth or stencil test, no alpha test, no
+    /// alpha to coverage, every sample enabled and no user clip plane. The
+    /// vertex positions are not read, so the answer takes the caller's word
+    /// that so small a draw under such state spans the target; a discarding
+    /// pixel shader is not detected either. `enabled` is the key itself, so
+    /// a draw is never covering with it off. A `true` answer is meant for
+    /// [`Self::open_pass_for_covering_draw`], which marks only a pass it
+    /// opens.
+    #[must_use]
+    pub fn draw_covers_color_target(
+        &self,
+        enabled: bool,
+        rs: &RenderStateSnapshot,
+        draw: &CoveringDraw,
+    ) -> bool {
+        if !enabled || self.current_color_texture.is_null() || self.rt0_dropped() {
+            return false;
+        }
+        let full = (0, 0, self.current_color_size.0, self.current_color_size.1);
+        let prs = &rs.pipeline_rs;
+        let replaces = |src: u8, dst: u8, op: u8| {
+            u32::from(src) == D3DBLEND_ONE
+                && u32::from(dst) == D3DBLEND_ZERO
+                && u32::from(op) == D3DBLENDOP_ADD
+        };
+        let blend_replaces = !prs.blend_enable()
+            || (replaces(prs.src_blend, prs.dst_blend, prs.blend_op)
+                && (!prs.separate_alpha_blend_enable()
+                    || replaces(prs.src_blend_alpha, prs.dst_blend_alpha, prs.blend_op_alpha)));
+        matches!(
+            draw.primitive,
+            PrimitiveType::Triangle | PrimitiveType::TriangleStrip
+        ) && (3..=6).contains(&draw.vertices)
+            && self.effective_viewport() == full
+            && (!rs.scissor_test_enable()
+                || region_covers_extent(
+                    self.resolved_scissor_rect(true, rs.scissor_rect.map(u32::from)),
+                    self.current_color_size,
+                ))
+            && u32::from(rs.fill_mode) == D3DFILL_SOLID
+            && blend_replaces
+            && prs.color_write_mask & 0xF == 0xF
+            && draw.ps_color_out_mask & 1 != 0
+            && self.extra_color_attachments().present_mask == 0
+            && !rs.depth_enable()
+            && rs.depth_stencil_state.stencil_enable == 0
+            && (draw.alpha_func == 0 || u32::from(draw.alpha_func) == D3DCMP_ALWAYS)
+            && !prs.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE)
+            && rs.sample_mask == SAMPLE_MASK_ALL
+            && draw.clip_planes == 0
     }
 
     /// Open a new `Pass` for the next command.

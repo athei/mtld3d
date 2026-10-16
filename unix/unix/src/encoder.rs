@@ -18,7 +18,7 @@ use mtld3d_core::{
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, description_from_snapshot, key_from_snapshot},
-    draw_data::VsSourceView,
+    draw_data::{RenderStateSnapshot, VsSourceView},
     dxso::{
         DxsoProgram, FF_VS_PALETTE_BASE_ROW, LinkInputs, MAX_VERTEX_BLEND_MATRIX_INDEX,
         SemanticSet, declared_ps_samplers,
@@ -31,9 +31,9 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
-        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DrawWrites, ExtraColorSlot,
-        LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
-        StoreAction as PassStoreAction, UploadPassTarget,
+        ColorClearOutcome, ColorLoad, CoveringDraw, DepthClearOutcome, DepthLoad, DrawWrites,
+        ExtraColorSlot, LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome,
+        StencilLoad, StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
         CacheSizes, EncoderPerfState, FrameSummaryContext, MemoryGauges, OpSub, OpSubDetail,
@@ -5464,18 +5464,38 @@ impl FrameEncoder {
         }
     }
 
+    /// Whether the next draw writes every pixel and sample of render target 0.
+    ///
+    /// The `passes.discardFullscreen` test. Always `false` with the key off;
+    /// see `PassState::draw_covers_color_target` for the state it checks.
+    #[must_use]
+    pub fn draw_covers_color_target(&self, rs: &RenderStateSnapshot, draw: &CoveringDraw) -> bool {
+        self.pass_state
+            .draw_covers_color_target(self.config.passes_discard_fullscreen, rs, draw)
+    }
+
     /// Ensure a pass is live for the next draw.
     ///
     /// Retained as the draw-site entry point for `emit_draw`; delegates
     /// into `PassState`. When a new pass actually opens, flushes
     /// `last_bound` so the per-draw dedup in `emit_draw` re-emits the full
     /// state on the first draw of the new Metal render encoder.
-    pub fn begin_render_pass_if_needed(&mut self) {
+    ///
+    /// `covers` is [`Self::draw_covers_color_target`] for the draw. A pass
+    /// this call opens for such a draw is opened through
+    /// `PassState::open_pass_for_covering_draw`, so Rule K turns its colour
+    /// `Load` into `DontCare` once the other rules have run. A pass that is
+    /// already open keeps its load.
+    pub fn begin_render_pass_if_needed(&mut self, covers: bool) {
         // The slot comes first, since a full visibility buffer ends the
         // open pass while reserving it.
         let arm_slot = self.reserve_draw_visibility_slot();
         let passes_before = self.pass_state.passes().len();
-        self.pass_state.ensure_pass_open();
+        if covers {
+            self.pass_state.open_pass_for_covering_draw();
+        } else {
+            self.pass_state.ensure_pass_open();
+        }
         self.reset_last_bound_if_pass_opened(passes_before);
         // The draw-site entry, so this is where a draw is counted against
         // the open occlusion spans: a span holding no draw answers zero

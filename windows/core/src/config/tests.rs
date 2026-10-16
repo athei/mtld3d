@@ -256,6 +256,20 @@ fn depth_alias_same_size_defaults_off_and_round_trips() {
 }
 
 #[test]
+fn passes_discard_fullscreen_defaults_off_and_parses() {
+    assert!(
+        !parse(None, "", None).passes_discard_fullscreen,
+        "off by default"
+    );
+    assert!(parse(None, "passes.discardFullscreen = true\n", None).passes_discard_fullscreen);
+    assert!(!parse(None, "passes.discardFullscreen = false\n", None).passes_discard_fullscreen);
+    assert!(
+        !parse(None, "passes.discardFullscreen = maybe\n", None).passes_discard_fullscreen,
+        "an unparsable value keeps the default"
+    );
+}
+
+#[test]
 fn buffer_ignore_lock_bounds_defaults_off_and_round_trips() {
     let cfg = parse(None, "", None);
     assert!(!cfg.buffer_ignore_lock_bounds);
