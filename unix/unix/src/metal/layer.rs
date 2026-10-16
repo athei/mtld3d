@@ -4,7 +4,7 @@
 //! conversion and drawable sizing. None of it depends on Wine or `AppKit`.
 
 use log::debug;
-use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
+use mtld3d_shared::mtl::{ColorSpacePolicy, PresentOptions, SoftwareCursorPolicy};
 
 use super::bounded_cast;
 
@@ -99,6 +99,8 @@ pub struct LayerAttachRequest {
     pub client_surface_request_sink_ptr: u64,
     /// `cursor.software`, resolved by attach against the layer mode it picks.
     pub software_cursor: SoftwareCursorPolicy,
+    /// The present-path keys from `mtld3d.conf`, kept on the record.
+    pub present_options: PresentOptions,
 }
 
 /// What attach answers the PE side about the display and the cursor.

@@ -365,7 +365,7 @@ pub fn ensure_readback_pipeline(
 ///
 /// Two threads compiling at once both succeed and one copy is kept; the
 /// other's retain is released.
-fn ensure_library(
+pub fn ensure_library(
     device: &ProtocolObject<dyn MTLDevice>,
 ) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
     if let Some(&handle) = LIBRARY.get() {
@@ -546,7 +546,8 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
     })
 }
 
-fn build_pipeline(
+/// One present pipeline: the shared vertex stage, `ps`, one colour attachment of `color_format`.
+pub fn build_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     vs: &ProtocolObject<dyn MTLFunction>,
     ps: &ProtocolObject<dyn MTLFunction>,

@@ -1019,5 +1019,23 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Present-path options a layer keeps for its lifetime, from `AttachMetalLayerParams`.
+    ///
+    /// Each bit is one `mtld3d.conf` key, all off by default; with none set the
+    /// present path is the one the release shipped.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct PresentOptions: u32 {
+        /// `color.hdr.lut`: the HDR inverse tone map samples a baked 3D lookup table.
+        ///
+        /// The table is the same BT.2446 maths evaluated once per peak and
+        /// gamma ramp on a lattice of the sRGB-encoded input, so a present
+        /// costs one filtered fetch per pixel instead of the per-pixel
+        /// transcendentals.
+        const HDR_LUT = 1 << 0;
+    }
+}
+
 #[cfg(test)]
 mod tests;

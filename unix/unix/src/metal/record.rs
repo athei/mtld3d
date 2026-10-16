@@ -30,6 +30,7 @@ use super::{
     depth_transfer::PlanePool,
     gpu_time::GpuTime,
     handle::ReleaseRetain,
+    hdr_lut::HdrLut,
     presenter::{PresentState, Presented},
     transient::UploadRing,
     upscale::UpscaleCache,
@@ -47,6 +48,8 @@ pub struct DeviceRecord {
     present: PresentState,
     presented: Presented,
     upscale: UpscaleCache,
+    /// The baked HDR tone-map table and its pipelines (`color.hdr.lut`), built on first use.
+    hdr_lut: HdrLut,
     pending: PendingCmdBufs,
     /// The chunks inline indices and oversized inline vertices ride to the GPU.
     ///
@@ -81,6 +84,7 @@ impl DeviceRecord {
             present: PresentState::new(gate, present_debug),
             presented: Presented::new(),
             upscale: UpscaleCache::new(),
+            hdr_lut: HdrLut::default(),
             pending: PendingCmdBufs::new(),
             upload_ring: Mutex::new(UploadRing::default()),
             depth_planes: Mutex::new(PlanePool::default()),
@@ -106,6 +110,11 @@ impl DeviceRecord {
     /// The device's `MetalFX` scalers and scratch targets.
     pub const fn upscale(&self) -> &UpscaleCache {
         &self.upscale
+    }
+
+    /// The device's baked HDR tone-map table, for `color.hdr.lut`.
+    pub const fn hdr_lut(&self) -> &HdrLut {
+        &self.hdr_lut
     }
 
     /// The device's in-flight command buffers, by counter and sequence.

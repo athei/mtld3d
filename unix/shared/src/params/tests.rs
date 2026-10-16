@@ -27,10 +27,15 @@ fn attach_metal_layer_layout() {
     use super::AttachMetalLayerParams;
     // 2*u64 + 2*u32 + 2*u64 + 2*u32 + 1*u32 + 1*ColorSpacePolicy
     // + 2*u32 + 1*u64 + 1*SoftwareCursorPolicy + 1*u32 + 2*u64
-    // = 16 + 8 + 16 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 16 = 96 (the 4-byte
+    // + 1*PresentOptions + 1*u32 reserved
+    // = 16 + 8 + 16 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 16 + 8 = 104 (the 4-byte
     // fields pair up on both sides of each u64, so nothing needs a pad).
     assert_eq!(core::mem::align_of::<AttachMetalLayerParams>(), 8);
-    assert_eq!(core::mem::size_of::<AttachMetalLayerParams>(), 96);
+    assert_eq!(core::mem::size_of::<AttachMetalLayerParams>(), 104);
+    assert_eq!(
+        core::mem::offset_of!(AttachMetalLayerParams, present_options),
+        96
+    );
     assert_eq!(
         core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr),
         88

@@ -15,6 +15,7 @@ mod frame_signal;
 mod gamma;
 mod gpu_time;
 pub mod handle;
+mod hdr_lut;
 mod layer;
 mod macdrv;
 mod null_texture;

@@ -21,7 +21,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use mtld3d_shared::{MetalHandle, mtl_handle::CAMetalLayerKind};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLRenderCommandEncoder;
+use objc2_metal::{MTLComputeCommandEncoder, MTLRenderCommandEncoder};
 use rustc_hash::FxHashMap;
 
 use crate::{LOG_TARGET, metal::macdrv::attachment};
@@ -134,6 +134,28 @@ pub fn bind(enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, layer: usize) -> 
     }
     // Released here rather than at the end of the function: the lock spans the
     // copy `setFragmentBytes:` makes and nothing more.
+    drop(tables);
+    true
+}
+
+/// Hand the layer's table to a compute stage at [`FRAGMENT_BUFFER_INDEX`], as [`bind`] does.
+///
+/// For the HDR lookup-table bake, which folds the ramp into the table it
+/// builds. `false` when the layer has no table (the ramp went away), and the
+/// bake then runs without it.
+pub fn bind_compute(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, layer: usize) -> bool {
+    let tables = tables();
+    let Some(table) = tables.get(&layer) else {
+        return false;
+    };
+    // SAFETY: as in `bind`: the live entries, copied by `setBytes:`.
+    unsafe {
+        enc.setBytes_length_atIndex(
+            core::ptr::NonNull::from(&table.entries).cast(),
+            core::mem::size_of_val(&table.entries),
+            FRAGMENT_BUFFER_INDEX,
+        );
+    }
     drop(tables);
     true
 }

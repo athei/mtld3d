@@ -27,6 +27,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.managed_memory = !value.managed_memory;
     value.linear_align256 = !value.linear_align256;
     value.hdr_enable = !value.hdr_enable;
+    value.hdr_lut = !value.hdr_lut;
     value.color_space = ColorSpacePolicy::Accurate;
     value.cursor_scale = CursorScale::Fixed(7);
     value.cursor_software = SoftwareCursorPolicy::On;

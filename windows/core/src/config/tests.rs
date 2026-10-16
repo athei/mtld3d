@@ -678,3 +678,25 @@ fn df_formats_defaults_on_and_parses_off() {
     assert!(parse(None, "", None).df_formats);
     assert!(!parse(None, "caps.dfFormats = false\n", None).df_formats);
 }
+
+#[test]
+fn hdr_lut_defaults_off_and_parses_both_values() {
+    assert!(!parse(None, "", None).hdr_lut, "off by default");
+    assert!(parse(None, "color.hdr.lut = true\n", None).hdr_lut);
+    assert!(!parse(None, "color.hdr.lut = false\n", None).hdr_lut);
+    assert!(
+        !parse(None, "color.hdr.lut = maybe\n", None).hdr_lut,
+        "garbage keeps the default"
+    );
+}
+
+#[test]
+fn present_options_carry_one_bit_per_key() {
+    use mtld3d_shared::mtl::PresentOptions;
+    assert_eq!(
+        Mtld3dConfig::default().present_options(),
+        PresentOptions::empty()
+    );
+    let cfg = parse(None, "color.hdr.lut = true\n", None);
+    assert_eq!(cfg.present_options(), PresentOptions::HDR_LUT);
+}

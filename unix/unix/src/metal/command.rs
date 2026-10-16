@@ -13,8 +13,8 @@ use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
     NullTextureKind, PassDescriptor,
     mtl::{
-        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, SET_BYTES_MAX,
-        StoreAction, TriangleFillMode, VisibilityResultMode,
+        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PresentOptions, PrimitiveType,
+        SET_BYTES_MAX, StoreAction, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
@@ -40,6 +40,7 @@ use crate::{
     metal::{
         depth_transfer::PlanePool,
         handle::{BorrowRetained, IntoRetained},
+        hdr_lut::HdrLut,
         macdrv::attachment,
         null_texture,
         record::DeviceRecord,
@@ -909,6 +910,11 @@ pub fn encode_present(
     let gamma_layer = attachment
         .filter(|att| att.gamma_active())
         .map_or(0, |att| att.layer());
+    // `color.hdr.lut`: the device's baked tone-map table, which the HDR
+    // stages sample instead of evaluating the curve per pixel.
+    let lut = attachment
+        .filter(|att| att.present_options().contains(PresentOptions::HDR_LUT))
+        .map(|_| args.record.hdr_lut());
 
     let presented = if hdr {
         match route {
@@ -919,6 +925,7 @@ pub fn encode_present(
                 &drawable_texture,
                 current,
                 gamma_layer,
+                lut,
             ),
             // The tone-map pass samples through `filter::linear`, so
             // one encode covers both an exact present and a
@@ -929,6 +936,7 @@ pub fn encode_present(
                 &drawable_texture,
                 current,
                 gamma_layer,
+                lut,
             ),
         }
     } else {
@@ -1441,14 +1449,18 @@ fn encode_hdr_present_upscaled(
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
     gamma_layer: usize,
+    lut: Option<&HdrLut>,
 ) -> bool {
     encode_hdr_present_upscaled_with(
         cmd_buf,
         upscale,
         src,
         drawable,
-        peak,
-        gamma_layer,
+        HdrTone {
+            peak,
+            gamma_layer,
+            lut,
+        },
         |scratch| {
             super::upscale::encode(
                 cmd_buf,
@@ -1505,15 +1517,29 @@ fn encode_sdr_upscaled(
     encode_present_copy(cmd_buf, src, &scratch, gamma_layer) && scale(&scratch)
 }
 
+/// How an HDR stage maps the encoded frame: the peak, the gamma ramp and the baked table.
+#[derive(Clone, Copy)]
+struct HdrTone<'a> {
+    peak: f32,
+    /// Layer whose gamma table applies, `0` for none.
+    gamma_layer: usize,
+    /// The device's lookup table when `color.hdr.lut` is on.
+    lut: Option<&'a HdrLut>,
+}
+
 fn encode_hdr_present_upscaled_with(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
-    peak: f32,
-    gamma_layer: usize,
+    tone: HdrTone<'_>,
     scale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
 ) -> bool {
+    let HdrTone {
+        peak,
+        gamma_layer,
+        lut,
+    } = tone;
     let device = cmd_buf.device();
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
     let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
@@ -1539,11 +1565,11 @@ fn encode_hdr_present_upscaled_with(
             "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
              the present shader instead and will look softer"
         );
-        return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer);
+        return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer, lut);
     };
 
-    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && scale(&scratch))
-        || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer)
+    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer, lut) && scale(&scratch))
+        || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer, lut)
 }
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
@@ -1563,11 +1589,38 @@ fn encode_hdr_present(
     dst: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
     gamma_layer: usize,
+    lut: Option<&HdrLut>,
 ) -> bool {
     let device = cmd_buf.device();
     let Some(resources) = super::present::ensure_resources(&device) else {
         return false;
     };
+    // `color.hdr.lut`: the BT.2446 stage with its curve and the ramp baked
+    // into the device's table. A table that cannot be built or baked leaves
+    // the analytic stage below, which writes the same frame.
+    if peak > 1.0
+        && let Some(prepared) = lut.and_then(|lut| {
+            lut.prepare(
+                cmd_buf,
+                super::present::hdr_uniforms(peak),
+                peak,
+                gamma_layer,
+            )
+        })
+    {
+        return encode_present_pass(
+            cmd_buf,
+            src,
+            dst,
+            &PresentStage {
+                plain: prepared.pipeline,
+                ramp: None,
+                uniforms: None,
+                gamma_layer: 0,
+                lut: Some(&prepared.texture),
+            },
+        );
+    }
     // Pick the pass-through pipeline when the panel reports no EDR
     // headroom this frame, BT.2446 otherwise. The two pipelines share
     // the vertex stage and the sRGB EOTF; pass-through skips the
@@ -1606,6 +1659,7 @@ fn encode_hdr_present(
             ramp,
             uniforms,
             gamma_layer,
+            lut: None,
         },
     )
 }
@@ -1644,12 +1698,13 @@ fn encode_present_copy(
             ramp,
             uniforms: None,
             gamma_layer,
+            lut: None,
         },
     )
 }
 
 /// One present pass's fragment stage, with and without the guest's gamma ramp.
-struct PresentStage {
+struct PresentStage<'a> {
     /// The pipeline without a ramp.
     plain: u64,
     /// Its gamma-ramp twin, `None` when no ramp is set or its compile failed.
@@ -1658,6 +1713,8 @@ struct PresentStage {
     uniforms: Option<[f32; 4]>,
     /// Layer whose gamma table `ramp` reads.
     gamma_layer: usize,
+    /// The baked tone-map table `plain` samples at fragment texture 1, if it is the table stage.
+    lut: Option<&'a ProtocolObject<dyn MTLTexture>>,
 }
 
 /// Encode one present pass: a fullscreen triangle sampling `src` across `dst`.
@@ -1683,6 +1740,7 @@ fn encode_present_pass(
                 load_action: MTLLoadAction::DontCare,
                 label: "mtld3d-present-pass",
                 gamma_layer,
+                lut: stage.lut,
             },
         )
     };
@@ -1727,6 +1785,7 @@ pub fn encode_exact_copy(
             load_action: MTLLoadAction::DontCare,
             label: "mtld3d-exact-copy",
             gamma_layer: 0,
+            lut: None,
         },
     )
 }
@@ -1755,6 +1814,7 @@ pub fn encode_cursor_pass(
             load_action: MTLLoadAction::Clear,
             label: "mtld3d-cursor-pass",
             gamma_layer,
+            lut: None,
         },
     )
 }
@@ -1771,6 +1831,8 @@ struct FullscreenPass<'a> {
     /// Set only for a gamma pipeline, which indexes the table
     /// unconditionally, so the two travel together.
     gamma_layer: usize,
+    /// A second fragment texture at index 1, the HDR lookup table; `None` for every other stage.
+    lut: Option<&'a ProtocolObject<dyn MTLTexture>>,
 }
 
 /// One fullscreen-triangle pass sampling `src` across `dst` with `pass.pipeline_handle`.
@@ -1788,6 +1850,7 @@ fn encode_fullscreen_pass(
         load_action,
         label,
         gamma_layer,
+        lut,
     } = *pass;
     // SAFETY: pipeline_handle is a previously-retained MTLRenderPipelineState address.
     let Some(pipeline) =
@@ -1831,6 +1894,12 @@ fn encode_fullscreen_pass(
     // for the call.
     unsafe {
         enc.setFragmentTexture_atIndex(Some(src), 0);
+    }
+    if let Some(lut) = lut {
+        // SAFETY: objc2 typed binding; `lut` is a retained texture live for the call.
+        unsafe {
+            enc.setFragmentTexture_atIndex(Some(lut), 1);
+        }
     }
     if let Some(uniforms) = uniforms {
         // SAFETY: `&uniforms` is a fresh stack reference; the raw pointer is
@@ -3752,6 +3821,7 @@ fn encode_readback_resolve(
             // display's transfer function, so it belongs to the presented
             // frame alone and never to what `GetRenderTargetData` hands back.
             gamma_layer: 0,
+            lut: None,
         },
     )
     .then_some(target)

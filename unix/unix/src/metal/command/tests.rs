@@ -1265,7 +1265,7 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         .expect("clear encoder");
     encoder.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-source")));
     encoder.endEncoding();
-    assert!(super::encode_hdr_present(&cmd, &src, &dst, 2.0, 0));
+    assert!(super::encode_hdr_present(&cmd, &src, &dst, 2.0, 0, None));
     cmd.commit();
     cmd.waitUntilCompleted();
     let expected = upload_test_pixel(&queue, &dst);
@@ -1279,8 +1279,11 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         &cache,
         &src,
         &dst,
-        2.0,
-        0,
+        super::HdrTone {
+            peak: 2.0,
+            gamma_layer: 0,
+            lut: None,
+        },
         |_| {
             invoked.set(true);
             false
@@ -1752,6 +1755,7 @@ fn a_ramp_pass_that_fails_falls_back_to_the_plain_copy() {
             ramp: Some(0),
             uniforms: None,
             gamma_layer: 1,
+            lut: None,
         },
     ));
     cmd.commit();
@@ -1785,7 +1789,7 @@ fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
     let dst = drawable_shaped(&queue, MTLPixelFormat::RGBA16Float, width, height);
     let cmd = queue.commandBuffer().expect("command buffer");
     cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-passthrough")));
-    assert!(super::encode_hdr_present(&cmd, &src, &dst, 1.0, 0));
+    assert!(super::encode_hdr_present(&cmd, &src, &dst, 1.0, 0, None));
     cmd.commit();
     cmd.waitUntilCompleted();
     assert_eq!(
@@ -2016,5 +2020,166 @@ fn assert_texels_equal(actual: &[u8], expected: &[u8], bpp: usize, width: usize)
             &actual[first * bpp..(first + 1) * bpp],
             &expected[first * bpp..(first + 1) * bpp],
         );
+    }
+}
+
+/// `color.hdr.lut` reproduces the per-pixel BT.2446 stage over every 8-bit input.
+///
+/// Both stages present the same source, one texel per colour of the full
+/// 2²⁴ cube in sixteen 1024x1024 tiles, into `RGBA16Float` at matching extent,
+/// and the outputs are compared as `ΔE_ITP` (BT.2124, the HDR colour difference
+/// in `ICtCp` at `1.0` = 100 nits, where 1.0 is one just-noticeable
+/// difference). A per-channel PQ code is no measure here: a channel the
+/// curve clamps at zero beside two bright ones is invisible however steep PQ
+/// is at black. The table is baked
+/// by the same shader functions the analytic stage runs, so what this measures
+/// is the lattice's trilinear interpolation error plus half-float storage.
+#[test]
+fn hdr_lut_matches_the_analytic_tone_map_over_every_8_bit_input() {
+    const TILE: usize = 1024;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue = device.newCommandQueue().expect("command queue");
+    let texture = |format: MTLPixelFormat| {
+        // SAFETY: typed constructor with in-range dimensions.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                format, TILE, TILE, false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        device
+            .newTextureWithDescriptor(&desc)
+            .expect("test texture")
+    };
+    let src = texture(MTLPixelFormat::BGRA8Unorm);
+    let analytic = texture(MTLPixelFormat::RGBA16Float);
+    let baked = texture(MTLPixelFormat::RGBA16Float);
+    // BT.2100 ICtCp of a linear BT.709 colour at 1.0 = 100 nits, as the
+    // present shader's own matrices define it.
+    let dot = |m: [f64; 3], v: [f64; 3]| m[0].mul_add(v[0], m[1].mul_add(v[1], m[2] * v[2]));
+    let ictcp = |rgb: [f32; 3]| {
+        let lin = rgb.map(|c| f64::from(c.max(0.0)) * 100.0 / 10000.0);
+        let pq = |y: f64| {
+            let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+            let (c1, c2, c3) = (
+                3424.0 / 4096.0,
+                2413.0 / 4096.0 * 32.0,
+                2392.0 / 4096.0 * 32.0,
+            );
+            let p = y.clamp(0.0, 1.0).powf(m1);
+            (f64::mul_add(c2, p, c1) / f64::mul_add(c3, p, 1.0)).powf(m2)
+        };
+        let lms = [
+            [0.295_819_787_597_7, 0.623_092_102_050_8, 0.081_084_777_832],
+            [0.156_265_258_789_1, 0.727_233_886_718_8, 0.116_496_093_75],
+            [0.035_176_086_425_8, 0.156_478_906_25, 0.808_345_947_265_6],
+        ]
+        .map(|row| pq(dot(row, lin)));
+        [
+            [0.5, 0.5, 0.0],
+            [1.613_700_03, -3.323_396_2, 1.709_696_17],
+            [4.378_062_24, -4.245_539_66, -0.132_522_64],
+        ]
+        .map(|row| dot(row, lms))
+    };
+    // Rec. ITU-R BT.2124: 1.0 is one just-noticeable difference.
+    let delta_e_itp = |a: [f32; 3], b: [f32; 3]| {
+        let (x, y) = (ictcp(a), ictcp(b));
+        let d = [x[0] - y[0], 0.5 * (x[1] - y[1]), x[2] - y[2]];
+        720.0 * dot(d, d).sqrt()
+    };
+    let read_half = |tex: &ProtocolObject<dyn MTLTexture>| {
+        let mut out = vec![0u16; TILE * TILE * 4];
+        // SAFETY: a Shared texture of exactly this extent and an 8-byte texel;
+        // the command buffer that wrote it has completed.
+        unsafe {
+            tex.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                core::ptr::NonNull::new(out.as_mut_ptr().cast()).expect("vec pointer"),
+                TILE * 8,
+                objc2_metal::MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: TILE,
+                        height: TILE,
+                        depth: 1,
+                    },
+                },
+                0,
+            );
+        }
+        out.into_iter().map(half_to_f32).collect::<Vec<_>>()
+    };
+    for peak in [2.0_f32, 8.0] {
+        let lut = crate::metal::hdr_lut::HdrLut::default();
+        let (mut worst_de, mut worst_abs, mut worst_at) = (0.0_f64, 0.0_f32, 0_usize);
+        for tile in 0..16usize {
+            let bytes: Vec<u8> = (0..TILE * TILE)
+                .flat_map(|i| {
+                    let c = tile * TILE * TILE + i;
+                    // BGRA8 memory order: blue, green, red, alpha.
+                    [c >> 16, c >> 8, c, 255]
+                        .map(|v| u8::try_from(v & 0xff).expect("masked to a byte"))
+                })
+                .collect();
+            // SAFETY: a Shared texture of exactly this extent and a 4-byte texel.
+            unsafe {
+                src.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    objc2_metal::MTLRegion {
+                        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: MTLSize {
+                            width: TILE,
+                            height: TILE,
+                            depth: 1,
+                        },
+                    },
+                    0,
+                    core::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast()).expect("vec pointer"),
+                    TILE * 4,
+                );
+            }
+            let cmd = queue.commandBuffer().expect("command buffer");
+            assert!(super::encode_hdr_present(
+                &cmd, &src, &analytic, peak, 0, None
+            ));
+            assert!(super::encode_hdr_present(
+                &cmd,
+                &src,
+                &baked,
+                peak,
+                0,
+                Some(&lut)
+            ));
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+            let (a, b) = (read_half(&analytic), read_half(&baked));
+            for (i, (x, y)) in a
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<4>().0)
+                .enumerate()
+            {
+                let (x, y) = ([x[0], x[1], x[2]], [y[0], y[1], y[2]]);
+                let de = delta_e_itp(x, y);
+                if de > worst_de {
+                    (worst_de, worst_at) = (de, tile * TILE * TILE + i);
+                }
+                for c in 0..3 {
+                    worst_abs = worst_abs.max((x[c] - y[c]).abs());
+                }
+            }
+        }
+        eprintln!(
+            "hdr lut {}^3 at peak {peak}: max dE_ITP {worst_de:.4} (at bgr {:#08x}), max abs \
+             channel error {worst_abs:.5}",
+            crate::metal::hdr_lut::LATTICE,
+            worst_at
+        );
+        assert!(worst_de < 1.0, "peak {peak}: dE_ITP {worst_de}");
     }
 }

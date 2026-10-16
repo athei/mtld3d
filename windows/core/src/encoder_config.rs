@@ -26,6 +26,7 @@ impl WireValue for Mtld3dConfig {
         self.managed_memory.write_wire(writer)?;
         self.linear_align256.write_wire(writer)?;
         self.hdr_enable.write_wire(writer)?;
+        self.hdr_lut.write_wire(writer)?;
         self.color_space.write_wire(writer)?;
         self.cursor_scale.write_wire(writer)?;
         self.cursor_software.write_wire(writer)?;
@@ -63,6 +64,7 @@ impl WireValue for Mtld3dConfig {
             managed_memory: <bool>::read_wire(reader)?,
             linear_align256: <bool>::read_wire(reader)?,
             hdr_enable: <bool>::read_wire(reader)?,
+            hdr_lut: <bool>::read_wire(reader)?,
             color_space: <ColorSpacePolicy>::read_wire(reader)?,
             cursor_scale: <CursorScale>::read_wire(reader)?,
             cursor_software: <SoftwareCursorPolicy>::read_wire(reader)?,

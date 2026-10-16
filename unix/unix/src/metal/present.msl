@@ -271,6 +271,48 @@ fragment float4 mtld3d_present_ps_hdr_bt2446_gamma(
     return float4(bt2446_ictcp(srgb_eotf(ramped), u), sample.a);
 }
 
+// ── HDR lookup table (`color.hdr.lut`) ──
+//
+// The BT.2446 stage above is a function of the sRGB-encoded sample alone
+// (plus the peak and the gamma ramp, which move rarely), so it can be baked:
+// the kernel evaluates exactly `bt2446_ictcp(srgb_eotf(ramp(x)))` on an
+// N x N x N lattice of encoded inputs, and the fragment stage samples that
+// table with trilinear filtering. The lattice is square-root spaced: point i
+// sits at encoded value (i / (N - 1))^2, texel centre (i + 0.5) / N, so the
+// cells are finest near black, where the PQ and luminance curves bend
+// hardest, and a pixel indexes it by sqrt of its encoded value.
+kernel void mtld3d_hdr_lut_bake(
+    texture3d<half, access::write> lut [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]],
+    constant ushort4* ramp [[buffer(1)]],
+    constant uint& flags [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint n = lut.get_width();
+    if (gid.x >= n || gid.y >= n || gid.z >= n) {
+        return;
+    }
+    float3 shaped = float3(gid) / float(n - 1u);
+    float3 encoded = shaped * shaped;
+    if ((flags & 1u) != 0u) {
+        encoded = apply_gamma_ramp(encoded, ramp);
+    }
+    lut.write(half4(half3(bt2446_ictcp(srgb_eotf(encoded), u)), 1.0h), gid);
+}
+
+fragment float4 mtld3d_present_ps_hdr_lut(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    texture3d<float> lut [[texture(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    float n = float(lut.get_width());
+    float3 coord = (sqrt(saturate(sample.rgb)) * (n - 1.0f) + 0.5f) / n;
+    return float4(lut.sample(s, coord).rgb, sample.a);
+}
+
 // ── Cursor sprite stages ──
 //
 // The software cursor's sprite onto the overlay window's own drawable, sized

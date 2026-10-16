@@ -970,6 +970,7 @@ pub fn attach_metal_layer(
         cursor_kick_sink_ptr,
         client_surface_request_sink_ptr,
         software_cursor,
+        present_options,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
         return None;
@@ -1109,6 +1110,7 @@ pub fn attach_metal_layer(
             client_surface_request_sink: usize::try_from(client_surface_request_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface: surface,
+            present_options,
         },
     );
     // A new view's surface is the one Wine shows already; a kept view's may

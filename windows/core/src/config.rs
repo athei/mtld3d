@@ -9,7 +9,7 @@
 use log::info;
 use mtld3d_shared::{
     log_once_warn,
-    mtl::{ColorSpacePolicy, SoftwareCursorPolicy},
+    mtl::{ColorSpacePolicy, PresentOptions, SoftwareCursorPolicy},
 };
 
 use crate::app_profile::AppProfile;
@@ -116,6 +116,15 @@ pub struct Mtld3dConfig {
     /// display's native `CGColorSpace`, max-vibrance rendering. File
     /// key: `color.space` (`passthrough` | `accurate`).
     pub color_space: ColorSpacePolicy,
+    /// Bake the HDR inverse tone map into a 3D lookup table.
+    ///
+    /// The present pass then samples one baked table per pixel instead of
+    /// evaluating BT.2446-A in `ICtCp` (about twenty transcendentals) per
+    /// pixel. The table is the same maths run on a lattice of the
+    /// sRGB-encoded input, rebuilt when the peak or the gamma ramp changes.
+    /// No effect on the SDR path. Default: `false`. File key:
+    /// `color.hdr.lut`.
+    pub hdr_lut: bool,
     /// Cursor bitmap enlargement factor, hardware HCURSOR and software sprite alike.
     ///
     /// Default: [`CursorScale::Auto`], which follows Wine's retina mode (2
@@ -389,6 +398,16 @@ impl CursorScale {
     }
 }
 
+impl Mtld3dConfig {
+    /// The present-path keys as the attach wire carries them, one bit per key.
+    #[must_use]
+    pub fn present_options(&self) -> PresentOptions {
+        let mut options = PresentOptions::empty();
+        options.set(PresentOptions::HDR_LUT, self.hdr_lut);
+        options
+    }
+}
+
 impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
@@ -400,6 +419,7 @@ impl Default for Mtld3dConfig {
             managed_memory: false,
             linear_align256: false,
             hdr_enable: true,
+            hdr_lut: false,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
             cursor_software: SoftwareCursorPolicy::Off,
@@ -535,6 +555,7 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: intel.linearAlign256 = {}", cfg.linear_align256
     );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
+    info!(target: crate::LOG_TARGET, "config: color.hdr.lut = {}", cfg.hdr_lut);
     info!(
         target: crate::LOG_TARGET,
         "config: color.space = {}",
@@ -682,6 +703,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "intel.managedMemory" => assign_bool(source, key, value, &mut cfg.managed_memory),
         "intel.linearAlign256" => assign_bool(source, key, value, &mut cfg.linear_align256),
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
+        "color.hdr.lut" => assign_bool(source, key, value, &mut cfg.hdr_lut),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
         "cursor.software" => assign_cursor_software(source, value, &mut cfg.cursor_software),

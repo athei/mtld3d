@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy, PresentOptions};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -114,6 +114,8 @@ pub struct AttachLatches {
     /// The record owns one reference on it, taken at attach and given back
     /// by the teardown that unregisters the record.
     pub client_surface: usize,
+    /// The present-path keys from `mtld3d.conf`, fixed for the record's lifetime.
+    pub present_options: PresentOptions,
 }
 
 /// The display state of one attached metal view.
@@ -160,6 +162,8 @@ pub struct Attachment {
     drew_frame: AtomicBool,
     flags: AttachFlags,
     color_space: ColorSpacePolicy,
+    /// See [`AttachLatches::present_options`].
+    present_options: PresentOptions,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
     ///
     /// Written on the main thread, compared against the notification's own
@@ -271,6 +275,7 @@ impl Attachment {
             drew_frame: AtomicBool::new(false),
             flags: latches.flags,
             color_space: latches.color_space,
+            present_options: latches.present_options,
             window: AtomicUsize::new(0),
             hdr_active: AtomicBool::new(latches.flags.contains(AttachFlags::HDR_ACTIVE)),
             window_occluded: AtomicBool::new(false),
@@ -361,6 +366,12 @@ impl Attachment {
     #[must_use]
     pub const fn color_space(&self) -> ColorSpacePolicy {
         self.color_space
+    }
+
+    /// The present-path keys as the attach carried them.
+    #[must_use]
+    pub const fn present_options(&self) -> PresentOptions {
+        self.present_options
     }
 
     /// The raw `NSWindow*` the occlusion observer matches, `0` = none.
