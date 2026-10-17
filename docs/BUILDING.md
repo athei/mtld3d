@@ -41,8 +41,9 @@ decides the Makefile's mode, read once from the Wine's own `lib/wine`:
   link archives. The i686, x86_64 and ARM64X builds all take `winebuild` and
   their link archives from it, and an x64 game loads the ARM64X build.
 - The x86_64 mode, for an x86_64 Wine such as a wine-build x86_64 release,
-  whose `lib/wine` holds `x86_64-unix`: the Wine an Intel Mac runs natively
-  and CI's Intel image runs. An x64 game loads the x86_64 build there, and
+  whose `lib/wine` holds `x86_64-unix`: the Wine an Intel Mac runs natively,
+  and that CI's macos-15 image runs under Rosetta and its Intel image
+  natively. An x64 game loads the x86_64 build there, and
   the ARM64X build, which such a Wine cannot run, is not built, linted,
   installed, tested or bundled, so neither llvm-mingw nor LLD nor the two
   ARM64X Rust targets are needed. Every make run in this mode prints a line
@@ -58,9 +59,10 @@ The variables of the earlier two-Wine layout, `WINE_X86_64`, `WINE_ARM64` and
 of them in the environment or on the command line stops the run with a
 message naming `WINE_SDK`.
 
-The versions CI pins (the Rust toolchains, the cargo tools, nextest and the
-two wine-build releases, the arm64 Wine for the Apple Silicon images and the
-x86_64 one for the Intel image, and llvm-mingw) are in the `env` block of
+The versions CI pins (the Rust toolchains, the cargo tools, nextest, the two
+wine-build releases, the arm64 Wine that macos-26 runs and the x86_64 one
+that macos-15 and the Intel image run, and llvm-mingw) are in the `env`
+block of
 [`ci.yml`](../.github/workflows/ci.yml). The MSVC CRT and Windows SDK
 versions are pinned in the Makefile, and the macOS deployment target is in
 [`unix/.cargo/config.toml`](../unix/.cargo/config.toml).
@@ -274,8 +276,8 @@ mode, the bundle carries all three PE builds: the ARM64X pair in
 x86_64 one; [`INSTALL.md`](../INSTALL.md) says which goes where. Built in the
 x86_64 mode, it carries no `aarch64-windows` entries, and an arm64 Wine takes
 its x86_64 pair into `aarch64-windows` instead. CI's release job builds the
-bundle in the arm64 mode, on an Apple Silicon runner, from the release after
-0.13.0 on; 0.13.0 and older were built in the x86_64 mode.
+bundle in the arm64 mode, on macos-26 with the arm64 Wine, from the release
+after 0.13.0 on; 0.13.0 and older were built in the x86_64 mode.
 `make version-check TAG=vX.Y.Z` checks that a tag agrees with the version
 both workspaces carry. The release procedure is in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#cutting-a-release).

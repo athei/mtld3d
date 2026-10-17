@@ -12,24 +12,30 @@ inputs:
     description: >
       Leg builds for a PE target: needs the MSVC SDK splat, and the Wine SDK,
       since windows/shim links against Wine's import libraries and `winebuild`
-      marks the built DLLs. On an Apple Silicon runner the Wine is the arm64
-      one, which puts the Makefile in its arm64 mode, so the leg also gets the
-      ARM64X build's toolchain: llvm-mingw and LLD.
+      marks the built DLLs. With the arm64 Wine (`wine: arm64`), which puts
+      the Makefile in its arm64 mode, the leg also gets the ARM64X build's
+      toolchain: llvm-mingw and LLD.
     default: 'false'
+  wine:
+    description: >
+      Which Wine the job's image runs, `arm64` or `x86_64`, chosen per image
+      by the workflow. The Makefile reads its mode from the Wine it is given,
+      so this decides the job's legs.
+    required: true
   wine-release-arm64:
     description: >
-      wine-build release tag of the arm64 Wine, which an Apple Silicon runner
-      downloads on a cache miss. Read when `pe` is true.
+      wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+      Read when `pe` is true.
     default: ''
   wine-release-x86_64:
     description: >
-      wine-build release tag of the x86_64 Wine, which an Intel runner
-      downloads on a cache miss. Read when `pe` is true.
+      wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
+      Read when `pe` is true.
     default: ''
   llvm-mingw-release:
     description: >
-      llvm-mingw release an Apple Silicon PE leg downloads on a cache miss,
-      for the ARM64X build's CRT.
+      llvm-mingw release an arm64-Wine PE leg downloads on a cache miss, for
+      the ARM64X build's CRT.
     default: ''
   prime:
     description: >
@@ -44,15 +50,13 @@ runs:
     # and takes wine, wineserver and winebuild from this one by absolute path).
     # Under $HOME rather than the workspace: checkout's `git clean` would take
     # anything inside the workspace with it.
-    # Which Wine this runner takes: the arm64 one on Apple Silicon, the x86_64
-    # one on Intel. The Makefile reads the mode from the Wine it is given, so
-    # this choice is what decides the runner's legs.
+    # The Wine the job's image runs, as the `wine` input names it.
     - name: Point WINE_SDK at the extracted bundle
       id: wine
       shell: bash
       run: |
         echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
-        if [ "$RUNNER_ARCH" = ARM64 ]; then
+        if [ '${{ inputs.wine }}' = arm64 ]; then
           tag='${{ inputs.wine-release-arm64 }}' asset=arm64
         else
           tag='${{ inputs.wine-release-x86_64 }}' asset=x86_64
@@ -169,13 +173,13 @@ runs:
     - name: Restore llvm-mingw
       id: llvm-mingw-cache
       uses: actions/cache/restore@v6
-      if: inputs.pe == 'true' && runner.arch == 'ARM64'
+      if: inputs.pe == 'true' && inputs.wine == 'arm64'
       with:
         path: ~/llvm-mingw
         key: llvm-mingw-${{ runner.os }}-${{ inputs.llvm-mingw-release }}
 
     - name: Download the pinned llvm-mingw
-      if: inputs.pe == 'true' && runner.arch == 'ARM64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      if: inputs.pe == 'true' && inputs.wine == 'arm64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         release='${{ inputs.llvm-mingw-release }}'
@@ -185,7 +189,7 @@ runs:
         mv "$RUNNER_TEMP/llvm-mingw-$release-ucrt-macos-universal" "$HOME/llvm-mingw"
 
     - name: The ARM64X toolchain
-      if: inputs.pe == 'true' && runner.arch == 'ARM64'
+      if: inputs.pe == 'true' && inputs.wine == 'arm64'
       shell: bash
       env:
         HOMEBREW_NO_AUTO_UPDATE: '1'
@@ -194,6 +198,13 @@ runs:
         brew install lld
         echo "LLVM_MINGW=$HOME/llvm-mingw" >> "$GITHUB_ENV"
         echo "ARM64X_LLD=$(brew --prefix lld)/bin/lld-link" >> "$GITHUB_ENV"
+
+    # The x86_64 Wine's tools, winebuild among them, are x86_64 binaries,
+    # which an Apple Silicon image runs through Rosetta; a no-op on Intel.
+    - name: Rosetta
+      if: inputs.pe == 'true' && inputs.wine == 'x86_64'
+      shell: bash
+      run: make setup-rosetta
 
     - name: Warm the cargo registry
       if: inputs.prime == 'true'
@@ -236,7 +247,7 @@ runs:
 
     - name: Save llvm-mingw
       uses: actions/cache/save@v6
-      if: inputs.prime == 'true' && inputs.pe == 'true' && runner.arch == 'ARM64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      if: inputs.prime == 'true' && inputs.pe == 'true' && inputs.wine == 'arm64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
       with:
         path: ~/llvm-mingw
         key: llvm-mingw-${{ runner.os }}-${{ inputs.llvm-mingw-release }}
