@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::diff;
+use super::{diff, unrecorded_legs};
 use crate::{
     classify::Classification,
     model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
@@ -333,4 +333,28 @@ fn occlusion_skip_does_not_hide_a_truncated_or_signaled_subtest() {
         assert!(report.stale, "{}", report.text);
         assert!(!report.text.contains("SKIPPED"), "{}", report.text);
     }
+}
+
+#[test]
+fn a_leg_the_baseline_never_recorded_is_named_and_its_sites_regress() {
+    let base = baseline_with(&[(6780, 1)], false);
+    assert_eq!(
+        unrecorded_legs(&base, &current_with(&[(6780, 1)], false)),
+        Vec::<Leg>::new()
+    );
+    let arm64 = Leg {
+        arch: Arch::I686Arm64,
+        variant: Variant::Native,
+        gpu: Gpu::Apple,
+    };
+    let mut cur = current_with(&[(6780, 1)], false);
+    let result = cur.remove(&key()).expect("current_with fills key()");
+    cur.insert((arm64, Subtest::Device), result);
+    assert_eq!(unrecorded_legs(&base, &cur), vec![arm64]);
+    let report = diff(
+        &base,
+        &classes_with(&[(6780, Classification::Expected)]),
+        &cur,
+    );
+    assert!(report.regressed, "{}", report.text);
 }

@@ -19,7 +19,7 @@ pub struct Config {
     pub wineserver: Option<PathBuf>,
     /// `--exe`: the `d3d9_test.exe` to run.
     pub exe: PathBuf,
-    /// `--arch`: which architecture `exe` is, i.e. the label results record under.
+    /// `--arch`: which build `exe` runs against, i.e. the label results record under.
     pub arch: Arch,
     /// `--variant`: which device answers the run is measured under.
     ///
@@ -144,7 +144,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     }
     let wine = wine.ok_or_else(|| "missing --wine <path to the wine loader>".to_owned())?;
     let exe = exe.ok_or_else(|| "missing --exe <path to d3d9_test.exe>".to_owned())?;
-    let arch = arch.ok_or_else(|| "missing --arch <i686|x86_64>".to_owned())?;
+    let arch = arch.ok_or_else(|| "missing --arch <i686|x86_64|i686-arm64|arm64x>".to_owned())?;
     Ok(Config {
         update,
         wine,

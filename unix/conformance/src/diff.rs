@@ -182,5 +182,25 @@ fn total_failed(sub: &SubtestBaseline) -> u32 {
     sub.sites.values().sum()
 }
 
+/// The legs of `current` that `baseline` holds no entry for, for any subtest.
+///
+/// Such a leg was never recorded on the Wine it runs under, so every site it
+/// fails diffs as new; the caller says so once, naming the leg, rather than
+/// leaving a reader to infer it from a wall of new sites.
+#[must_use]
+pub fn unrecorded_legs(
+    baseline: &Baseline,
+    current: &BTreeMap<(Leg, Subtest), SubtestResult>,
+) -> Vec<Leg> {
+    let legs: BTreeSet<Leg> = current.keys().map(|&(leg, _)| leg).collect();
+    legs.into_iter()
+        .filter(|&leg| {
+            !Subtest::ALL
+                .iter()
+                .any(|&subtest| baseline.entries.contains_key(&(leg, subtest)))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

@@ -13,39 +13,54 @@ workflow and points there for the details.
   it.
 - `python3`, which the Makefile uses to clone directory trees and which
   `make check` uses for two of its checks. The Command Line Tools provide one.
-- Rosetta 2, to run the x86_64 Wine. `make setup` installs it when it is
-  missing.
 - A Wine tree, described below.
+- For the arm64 Wine, the ARM64X build's toolchain:
+  - [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20260826 or newer,
+    whose ARM64X CRT the ARM64X build links: its `aarch64-w64-mingw32`
+    sysroot carries the ARM64 and ARM64EC halves together. An older release
+    keeps ARM64EC in a sysroot of its own, which the link does not read.
+    `LLVM_MINGW` names the install.
+  - LLD 23 or newer as `lld-link`, such as Homebrew's (`brew install lld`).
+    `ARM64X_LLD` names it. An older LLD links an ARM64X image whose x64 view
+    runs the ARM64 view's TLS callbacks.
+- For an x86_64 Wine on Apple Silicon, Rosetta 2. `make setup` installs it
+  when it is missing. The arm64 Wine runs x86 code through its own
+  translator and does not need it.
 
-The Makefile knows two Wine trees, an x86_64 Wine that `WINE_X86_64` names
-and an arm64 Wine that `WINE_ARM64` names, so the two can sit side by side
-and be measured against each other. Each is a Wine build or install tree
-holding `bin/wine`, `bin/winebuild`, `bin/wineserver` and a `lib/wine` that
-carries Wine's link archives for each PE architecture it builds, and each
-serves as both the Wine a leg runs under and the SDK a build reads. At least
-one has to be set, and the Makefile stops at once when neither is.
+The Makefile knows one Wine, the one `WINE_SDK` names. It serves as both the
+Wine every leg runs under and the SDK every build reads: a tree holding
+`bin/wine`, `bin/winebuild`, `bin/wineserver` and a `lib/wine` that carries
+Wine's link archives for each PE architecture the builds link against, and
+the `d3d9_test.exe` binaries that `make conformance` runs. Which Wine it is
+decides the Makefile's mode, read once from the Wine's own `lib/wine`:
 
-`WINE_X86_64` is the one the test legs, `make conformance` and the benchmarks
-use without the arm64 switches below. `make install` installs into each of
-the two that is set. A
-[wine-build](https://github.com/athei/wine-build) release has everything it
-needs, including the `d3d9_test.exe` binaries that `make conformance` runs,
-and is what CI uses.
+- The arm64 mode, for wine-build's arm64 Wine
+  ([wine-build](https://github.com/athei/wine-build)), the primary target,
+  whose `lib/wine` holds `aarch64-unix`. It also carries the mtld3d tree
+  `lib/wine/d3d9/mtld3d` with the compatdb.so that loads it, and the ARM64X
+  link archives. The i686, x86_64 and ARM64X builds all take `winebuild` and
+  their link archives from it, and an x64 game loads the ARM64X build.
+- The x86_64 mode, for an x86_64 Wine such as a wine-build x86_64 release,
+  whose `lib/wine` holds `x86_64-unix`: the Wine an Intel Mac runs natively
+  and CI's Intel image runs. An x64 game loads the x86_64 build there, and
+  the ARM64X build, which such a Wine cannot run, is not built, linted,
+  installed, tested or bundled, so neither llvm-mingw nor LLD nor the two
+  ARM64X Rust targets are needed. Every make run in this mode prints a line
+  that says so.
 
-The i686 and x86_64 builds take `bin/winebuild` and the link archives from
-`WINE_X86_64` when it is set and from `WINE_ARM64` otherwise. What
-`winebuild` writes is the same from either, whichever host it was built
-for, since the Makefile names the target of every module it writes. The
-DLLs are not byte for byte the same: they link the `unix_lib.o` of the
-chosen Wine's `libwinecrt0.a`, which differs between the two Wines, while
-their ntdll imports are the same. The ARM64X build (`EC=1`) always reads
-`WINE_ARM64`, which therefore has to be an arm64 Wine built with its link
-libraries, such as wine-build's arm64 Wine (see `EC=1` below). `WINE_SDK`
-and `WINE_SDK_ARM64X` are not read, and the Makefile stops when one is set
-in the environment and `WINE_X86_64` is not.
+A build, lint or documentation target first checks that the Wine holds what
+its mode needs and stops naming what is missing; a runtime-only Wine is
+refused.
+
+`WINE_SDK` has no default, and the Makefile stops at once when it is unset.
+The variables of the earlier two-Wine layout, `WINE_X86_64`, `WINE_ARM64` and
+`WINE_SDK_ARM64X`, and its switches `EC` and `ARM64`, are no longer read: one
+of them in the environment or on the command line stops the run with a
+message naming `WINE_SDK`.
 
 The versions CI pins (the Rust toolchains, the cargo tools, nextest and the
-wine-build release) are in the `env` block of
+two wine-build releases, the arm64 Wine for the Apple Silicon images and the
+x86_64 one for the Intel image, and llvm-mingw) are in the `env` block of
 [`ci.yml`](../.github/workflows/ci.yml). The MSVC CRT and Windows SDK
 versions are pinned in the Makefile, and the macOS deployment target is in
 [`unix/.cargo/config.toml`](../unix/.cargo/config.toml).
@@ -53,9 +68,12 @@ versions are pinned in the Makefile, and the macOS deployment target is in
 ## Setup
 
 `make setup` bootstraps a machine once: the pinned Rust toolchains and
-targets, the PE linker symlinks, xwin and the MSVC SDK in `/opt/xwin` (about
-3 GB, needs `sudo`), nextest, cargo-edit and Rosetta 2. It does not install
-Wine. Each piece is also a `setup-*` target of its own.
+targets (among them `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`,
+the two halves of the ARM64X build, which only the arm64 mode builds), the PE
+linker symlinks, xwin and the
+MSVC SDK in `/opt/xwin` (about 3 GB, needs `sudo`), nextest, cargo-edit and
+Rosetta 2. It installs neither Wine, llvm-mingw nor LLD. Each piece is also
+a `setup-*` target of its own.
 
 ## Build
 
@@ -63,6 +81,12 @@ Wine. Each piece is also a `setup-*` target of its own.
 
 - `d3d9.dll` and `mtld3d.dll` for i686 and x86_64, under
   `windows/target/<target>/<profile>/`
+- in the arm64 mode, `d3d9.dll` and `mtld3d.dll` as ARM64X images, under
+  `windows/target/arm64x/<profile>/`: one image with an ARM64EC half, which
+  an x64 game on an arm64 Wine runs as native code instead of translating it,
+  and an ARM64 half for arm64 processes. Rust has no ARM64X target, so each
+  crate is built once per half as a static library and the Makefile links
+  both into one image (`windows-arm64x`, which says what that takes).
 - `mtld3d.so` for x86_64 and arm64 hosts, under
   `unix/target/<target>/<profile>/`, each with its `.dSYM`
 
@@ -84,11 +108,12 @@ describes the breadcrumb ring.
 
 ## Instruction-set baselines
 
-The PE DLLs are guest code, which an x86 translator runs: Rosetta under an
-x86_64 Wine, and the translator an arm64 Wine carries (FEX, in CrossOver
-27). [`windows/.cargo/config.toml`](../windows/.cargo/config.toml) sets their
-CPU baseline, for the Rust and for the C and C++ that build scripts compile.
-Neither goes past SSE4.2 or uses BMI; the comments there say why.
+The x86 PE DLLs are guest code, which an x86 translator runs: Rosetta under
+an x86_64 Wine, and the translator an arm64 Wine carries (FEX). The ARM64X
+build is native code and has no such baseline.
+[`windows/.cargo/config.toml`](../windows/.cargo/config.toml) sets the x86
+builds' CPU baseline, for the Rust and for the C and C++ that build scripts
+compile. Neither goes past SSE4.2 or uses BMI; the comments there say why.
 
 The i686 build targets `pentium4`, plain SSE2. The 32-bit build that matters
 today is the one World of Warcraft 1.12 and 3.3.5a load under Rosetta, and
@@ -108,22 +133,25 @@ anything measurable.
 
 ## Install
 
-`make install` puts the build into every Wine it is given: the one
-`WINE_X86_64` names, `WINE_INSTALL_DIR` when that is set, and the one
-`WINE_ARM64` names. `d3d9.dll` gets Wine's builtin signature there, so it
-replaces Wine's own d3d9 for that tree. A tree that keeps Direct3D
-implementations in their own subtrees (`lib/wine/d3d9/mtld3d`) gets the build
-there, with markers in the default directories.
+`make install` puts the build into the Wine `WINE_SDK` names and into
+`WINE_INSTALL_DIR` when that is set, a game's Wine tree, which may be an
+arm64 or an x86_64 Wine; a `WINE_INSTALL_DIR` naming `WINE_SDK` itself is
+written once. `d3d9.dll` gets Wine's builtin signature there, so it replaces
+Wine's own d3d9 for that tree. A tree that keeps Direct3D implementations in
+their own subtrees (`lib/wine/d3d9/mtld3d`) gets the build there, with
+markers in the default directories.
 
-Each Wine gets only what it loads, judged by its own `lib/wine`: an x86_64
-Wine, which holds `x86_64-unix`, gets the i686 build in `i386-windows`, the
-x86_64 build in `x86_64-windows` and the x86_64 `mtld3d.so`. An arm64 Wine,
-which holds `aarch64-unix`, gets the i686 build in `i386-windows`, the x86_64
-build (or with `EC=1` the ARM64X build) in `aarch64-windows`, from where an
-arm64 Wine loads the builtins of an x64 process, and the arm64 `mtld3d.so`.
-The install writes only into directories the Wine already has and fails on a
-missing one rather than creating it. An arm64 Wine has to be a wine-build
-arm64 bundle, whose compatdb.so loads mtld3d from its subtree.
+Each Wine gets only what it loads, judged by its own `lib/wine`. An arm64
+Wine, which holds `aarch64-unix`, gets the i686 build in `i386-windows`, the
+ARM64X build in `aarch64-windows`, from where an arm64 Wine loads the
+builtins of an x64 process, and the arm64 `mtld3d.so`. An x86_64 Wine, which
+holds `x86_64-unix`, gets the i686 build in `i386-windows`, the x86_64 build
+in `x86_64-windows` and the x86_64 `mtld3d.so`. The two 64-bit builds never
+meet in one tree: an arm64 Wine never reads its `x86_64-windows`, and an
+x86_64 Wine cannot run ARM64X. The install writes only into directories the
+Wine already has and fails on a missing one rather than creating it. An
+arm64 Wine has to be a wine-build arm64 bundle, whose compatdb.so loads
+mtld3d from its subtree.
 
 Wine only loads a builtin whose name has a marker in the prefix, and
 `wineboot` writes the markers when it creates a prefix. So a build installed
@@ -136,6 +164,22 @@ mechanism.
 `make check` is the lint and documentation gate, and `make test` runs the
 unit tests and the end-to-end suite; both are green before every commit.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gates) lists what each one runs.
+`make check` lints every PE build of the mode, in the arm64 mode the two
+halves of the ARM64X one included.
+
+`make test` runs two end-to-end legs under `WINE_SDK`, the builds a game
+loads there: `test-e2e-i686`, the 32-bit suite against the i686 build, and
+the x64 suite against the 64-bit build, `test-e2e-arm64x` against the ARM64X
+build in the arm64 mode, whose ARM64EC half its processes run, and
+`test-e2e-x86_64` against the x86_64 build in the x86_64 mode. Both install
+into the one tree and share one prefix, since the two builds go into
+different directories. In the arm64 mode `make test-e2e-x86_64` runs the x64
+suite against the x86_64 build, emulated under the same Wine; `make test`
+leaves it out there. That build would take the ARM64X build's place in
+`aarch64-windows`, so the leg installs it into a private clone of `WINE_SDK`
+with a prefix created for the run, and never writes into `WINE_SDK` itself.
+A leg of the other mode, such as `test-e2e-arm64x` under an x86_64 Wine,
+stops saying why.
 
 `make check` also lints and unit-tests a `PERF=1` build, the only build of a
 gate that compiles the perf telemetry and its tests. It goes into `target/perf`
@@ -153,12 +197,15 @@ off for its test processes either way.
 
 Every test leg installs into the shared Wine tree first, so two checkouts
 testing at once overwrite each other's builds. `ISOLATED=1` avoids that: it
-clones `WINE_X86_64` and the prefix into `.wine-isolated/` inside the
-checkout, and `WINE_ARM64` too for `make install` and under the arm64
-switches below, and runs everything against the clones.
+clones `WINE_SDK` and the prefix into `.wine-isolated/` inside the checkout
+once and runs everything against the clones.
 
 `make conformance` runs Wine's own d3d9 test suite against the installed
-build and compares the failures per site against a baseline.
+builds and compares the failures per site against a baseline: the i386
+`d3d9_test.exe` against the i686 build (`conformance-i686`) and the x86_64
+one against the 64-bit build (`conformance-arm64x` in the arm64 mode,
+`conformance-x86_64` in the x86_64 mode), both out of
+`$WINE_SDK/lib/wine/tests`.
 
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#reading-a-test-run) explains how to
 read a test run, and
@@ -167,95 +214,52 @@ conformance suite and its baseline.
 
 ## arm64 Wine
 
-Two opt-in switches build, test and benchmark mtld3d under the arm64 Wine
-that `WINE_ARM64` names, a wine-build arm64 bundle, which runs x86 programs
-through FEX. Neither runs in CI or goes into release bundles. `make install`
-installs into that Wine with or without them (see [Install](#install)).
+wine-build's arm64 Wine runs x86 programs through FEX. It keeps mtld3d in
+`lib/wine/d3d9/mtld3d`, and its compatdb.so prepends that tree to the builtin
+search of every x86 process, mtld3d being its d3d9 default for them. An x64
+program runs there as an ARM64EC process, which loads its builtins from
+`aarch64-windows`, so the 64-bit modules sit in the tree's `aarch64-windows`
+whatever their machine, and the placeholder the prefix gets for each name is
+an x64 one, since an ARM64 placeholder fails an x64 process's load. A
+runtime-only arm64 Wine without that tree, such as CrossOver's, is refused.
 
-The bundle keeps mtld3d in `lib/wine/d3d9/mtld3d`, and its compatdb.so
-prepends that tree to the builtin search of every x86 process, mtld3d being
-its d3d9 default for them. An x64 program runs there as an ARM64EC process,
-which loads its builtins from `aarch64-windows`, so the 64-bit modules sit in
-the tree's `aarch64-windows` whatever their machine, and the placeholder the
-prefix gets for each name is an x64 one, since an ARM64 placeholder fails an
-x64 process's load. A runtime-only arm64 Wine without that tree, such as
-CrossOver's, is refused.
+Under that Wine the PE side of a 32-bit game, and of the x86_64 build, runs
+translated, while the ARM64X build's ARM64EC half runs as native code, and
+everything in `mtld3d.so`, the encoder, submit, presenter and compile threads
+included, runs as native arm64 code.
 
-Every arm64 test, conformance and benchmark leg runs in a private clone of
-the Wine that `WINE_ARM64` names, with a prefix created for the run, so the
-legs never see each other's DLLs and never write into `WINE_ARM64` itself.
-Only `make install` writes there, and like any install it reaches prefixes
-created afterwards.
-
-### `ARM64=1`
-
-The i686 and x86_64 builds that ship, under the arm64 Wine. The PE DLLs run
-translated there, and everything in `mtld3d.so`, the encoder, submit,
-presenter and compile threads included, runs as native arm64 code.
-`ARM64=1 make test` and `ARM64=1 make conformance` add a leg per architecture
-under that Wine.
-
-### `EC=1`
-
-`d3d9.dll` and `mtld3d.dll` as ARM64X images, whose ARM64EC half an x64 game
-runs as native code instead of translating it. `EC=1 make` builds them under
-`windows/target/arm64x/<profile>/`. `EC=1 make install` puts them into the
-arm64 Wine in place of the x86_64 build, and 32-bit games keep loading the
-i686 build. `EC=1 make test` adds a leg that runs the x64 end-to-end suite
-against the pair, `EC=1 make conformance` one that runs the x86_64
-conformance binary against it, `EC=1 make check` lints both halves, and
-`EC=1 make bundle` adds the pair to both archives.
-
-The build needs a toolchain the x86 builds do not:
-
-- The Rust targets `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`,
-  which `EC=1 make setup-rust` adds.
-- [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20260826 or newer,
-  for its ARM64X CRT: its `aarch64-w64-mingw32` sysroot carries the ARM64 and
-  ARM64EC halves together. An older release keeps ARM64EC in a sysroot of its
-  own, which the link does not read. `LLVM_MINGW` names the install.
-- LLD 23 or newer as `lld-link`, such as Homebrew's (`brew install lld`).
-  `ARM64X_LLD` names it. An older LLD links an image whose x64 view runs the
-  ARM64 view's TLS callbacks.
-- Wine's ARM64X link archives, which the arm64 Wine carries in its
-  `lib/wine/aarch64-windows` when it is built with its link libraries, as
-  wine-build's arm64 Wine is.
+An x86_64 Wine runs the whole PE side as x86 code, natively on an Intel Mac
+and through Rosetta 2 on Apple Silicon, and loads the x86_64 `mtld3d.so`.
 
 ### Which target reads which path
 
-None of the four paths has a default. Each comes from the environment, and a
-target that needs one fails naming it when it is unset or points at the wrong
-thing.
+None of these paths has a default. Each comes from the environment or the
+command line, and a target that needs one fails naming it when it is unset
+or points at the wrong thing.
 
-- `LLVM_MINGW` and `ARM64X_LLD` are read by the `EC=1` build.
-- `WINE_ARM64` is read by `make install` when it is set, by the `EC=1` build
-  and by `EC=1 make check`, by the test and conformance targets under either
-  switch, by `make bench` and `make bench-ab` under either switch, and always
-  by `make bench-variants`.
-- `WINE_X86_64` is read by `make install` when it is set, by the targets that
-  run without the switches, which `make test` and `make conformance` run under
-  either switch too, by the arm64 conformance legs, which run its
-  `d3d9_test.exe` binaries, and by `make bench-variants`, whose first leg runs
-  under it. So the arm64 end-to-end legs and builds run without it.
+- `WINE_SDK` is read by every target: the builds, lints and docs take
+  `winebuild` and the link archives from it, `make install` and every test,
+  conformance and benchmark leg install into it or into a clone of it and run
+  under it, and the conformance legs run its `d3d9_test.exe` binaries.
+- `LLVM_MINGW` and `ARM64X_LLD` are read by the ARM64X build, which `make`,
+  `make bundle`, `make stage` and every target that installs the ARM64X build
+  run in the arm64 mode. The x86_64 mode reads neither.
+- `WINE_INSTALL_DIR`, optional, is read by `make install` and by every leg
+  that installs into `WINE_SDK`.
 
 The Makefile header describes each path.
-
-### Both switches
-
-With both switches, `make install` puts the ARM64X build into the arm64
-Wine, as with `EC=1` alone, and `make test` and `make conformance` run all
-three arm64 legs. A benchmark measures one layout, so `make bench` and
-`make bench-ab` take one switch at a time.
 
 ## Benchmarks
 
 `make bench` runs the synthetic benchmarks once against this checkout.
 `make bench-ab BASE=<ref>` builds `BASE` and this checkout and runs the
 benchmarks against both in alternating rounds, which is how a change is
-checked for a slowdown. `make bench-variants` compares one build in several
-layouts instead: on the x86_64 Wine, on the arm64 Wine and, with `EC=1`, as
-the ARM64X build. All three build the production profile, and `bench-ab` and
-`bench-variants` add the perf telemetry.
+checked for a slowdown. Both measure the i686 build by default and the
+mode's 64-bit build with `ARCH=arm64x` or, in the x86_64 mode,
+`ARCH=x86_64`. `make bench-variants` compares two builds of this checkout
+instead, in the arm64 mode: the x86_64 build, emulated, against the ARM64X
+build, both under `WINE_SDK`. All three build the production profile, and
+`bench-ab` and `bench-variants` add the perf telemetry.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#benchmarks) explains how to run them
 and how to read the results.
 
@@ -263,7 +267,15 @@ and how to read the results.
 
 `make bundle` builds the production profile and packs two archives into
 `windows/target/`: `mtld3d.tar.xz`, the bundle users install, and
-`mtld3d-debug.tar.xz`, the symbols for the same binaries.
+`mtld3d-debug.tar.xz`, the symbols for the same binaries. Built in the arm64
+mode, the bundle carries all three PE builds: the ARM64X pair in
+`wine/aarch64-windows` and its unmarked `d3d9.dll` in
+`native/aarch64-windows` for an arm64 Wine, and the x86_64 pair for an
+x86_64 one; [`INSTALL.md`](../INSTALL.md) says which goes where. Built in the
+x86_64 mode, it carries no `aarch64-windows` entries, and an arm64 Wine takes
+its x86_64 pair into `aarch64-windows` instead. CI's release job builds the
+bundle in the arm64 mode, on an Apple Silicon runner, from the release after
+0.13.0 on; 0.13.0 and older were built in the x86_64 mode.
 `make version-check TAG=vX.Y.Z` checks that a tag agrees with the version
 both workspaces carry. The release procedure is in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#cutting-a-release).

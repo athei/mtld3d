@@ -167,6 +167,13 @@ fn real_main() -> Result<ExitCode, String> {
     let classes = triage::load(&assets)?;
     let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
+    for leg in diff::unrecorded_legs(&baseline, &current) {
+        println!(
+            "conformance: baseline.txt has no [{leg}/...] entries: this leg was never recorded \
+             on the Wine it runs under, so every site it fails reads as new; `make \
+             conformance-baseline` on that Wine records them"
+        );
+    }
     Ok(verdict(&report, validation_errors))
 }
 

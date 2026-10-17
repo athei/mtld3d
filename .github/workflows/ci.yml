@@ -77,13 +77,24 @@ concurrency:
 # MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
 # the xwin call that consumes them.
 env:
-  # The wine-build release has two bounds. It is cx-26.3.0-2 or later, the
-  # first bundle without MoltenVK: with the library, win32u's display-device
+  # Two wine-build Wines, one per runner arch, and the Makefile reads its mode
+  # from the one it is given: the arm64 Wine on the Apple Silicon images (the
+  # arm64 mode, which builds, lints, tests and bundles the ARM64X build) and
+  # the x86_64 Wine on the Intel image (the x86_64 mode).
+  #
+  # The x86_64 release has two bounds. It is cx-26.3.0-2 or later, the first
+  # bundle without MoltenVK: with the library, win32u's display-device
   # enumeration created a Vulkan instance at every prefix boot, and on the
   # Intel image's paravirtual device Metal aborted inside explorer.exe, so no
   # prefix booted there. It is older than cx-26.3.0-8, which needs macOS 26
-  # and so would not run on the macos-15 and Intel images.
-  WINE_RELEASE: cx-26.3.0-7
+  # and so would not run on the Intel image.
+  WINE_RELEASE_X86_64: cx-26.3.0-7
+  # The arm64 Wine, a full bundle: the runtime, the link libraries of every PE
+  # architecture and Wine's own test binaries under lib/wine/tests.
+  WINE_RELEASE_ARM64: arm64-11.19-1
+  # The llvm-mingw release the ARM64X build links its CRT from (20260826 or
+  # newer; the Makefile checks).
+  LLVM_MINGW_RELEASE: '20261006'
   RUST_STABLE: 1.99.0
   RUST_NIGHTLY: nightly-2026-10-11
   CARGO_TOOLS: xwin@0.10.0
@@ -96,10 +107,11 @@ env:
 # one job, with the cheap checks first for earlier feedback. A tag push runs
 # only `release`, which reads the result the same commit already got on main.
 jobs:
-  # Everything a test machine needs, built once on the fast image: both PE
-  # arches, both unix `.so` builds, the e2e test binaries, and the e2e and
-  # conformance runners for both host arches. Primes the caches the check job
-  # restores too.
+  # Everything a test machine needs, built once on the fast image in the
+  # arm64 mode: the i686, x86_64 and ARM64X builds, both unix `.so` builds,
+  # the e2e test binaries, and the e2e and conformance runners for both host
+  # arches, so one stage serves the Apple images' arm64 legs and the Intel
+  # image's x86_64 ones. Primes the caches the check job restores too.
   #
   # It also decides, once for both test matrices, which images they run on.
   # A pull request runs the two arm64 images and gates on them. The Intel
@@ -124,8 +136,9 @@ jobs:
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
-          wine: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
           prime: 'true'
       - run: make stage
       - uses: actions/upload-artifact@v7
@@ -155,7 +168,9 @@ jobs:
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
       - name: fmt-check
         run: make fmt-check
       - name: audit
@@ -179,6 +194,11 @@ jobs:
       - name: clippy-pe-i686
         if: ${{ !cancelled() }}
         run: make clippy-pe-i686
+      # The two halves of the ARM64X build, linted in the arm64 mode, which
+      # this image's arm64 Wine selects.
+      - name: clippy-pe-arm64x
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-arm64x
       - name: clippy-native
         if: ${{ !cancelled() }}
         run: make clippy-native
@@ -193,7 +213,13 @@ jobs:
         run: make test-unit-perf
 
   # The end-to-end suite: the staged test binaries, run by the pinned Wine
-  # against a Metal device, one leg per image and PE arch.
+  # against a Metal device, one leg per image and PE arch. The image's Wine
+  # sets the Makefile's mode and so the build the x86_64 binaries run
+  # against: the ARM64X build under the arm64 Wine of the Apple images
+  # (`test-e2e-arm64x`), the x86_64 build under the x86_64 Wine of the Intel
+  # image (`test-e2e-x86_64`). The `arch` axis keeps naming the test
+  # binaries, so the job and artifact names stay as they were; LEG is the
+  # Makefile's name for the leg.
   #
   # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
   # on arm64, and the Intel image, whose paravirtual device has no unified
@@ -247,7 +273,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
-          wine-release: ${{ env.WINE_RELEASE }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
       # One test at a time (`JOBS=1`, against the Makefile's default of four):
       # concurrent device creation aborts or hangs on the paravirtual GPU
       # these images have. The whole suite is reported rather than the first
@@ -275,13 +302,14 @@ jobs:
       # step below for why the answer is a fresh machine).
       - run: |
           set -o pipefail
-          if ! make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR" | tee "$RUNNER_TEMP/e2e-stdout.txt"; then
+          if ! make test-e2e-$LEG STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR" | tee "$RUNNER_TEMP/e2e-stdout.txt"; then
             if grep -q '^e2e: GPU HANG in ' "$RUNNER_TEMP/e2e-stdout.txt"; then
               echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
             fi
             exit 1
           fi
         env:
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || (matrix.runner == 'macos-15-intel' && 'x86_64' || 'arm64x') }}
           E2E_FILTER: ${{ inputs.e2e_filter }}
           RUST_LOG: ${{ inputs.e2e_log }}
           LOG_DIR: ${{ runner.temp }}
@@ -356,7 +384,12 @@ jobs:
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum. The two arm64 images read the same entries.
+  # cross-environment maximum. Baseline keys are per Wine: the two arm64
+  # images run the arm64 Wine and read the same entries, `i686-arm64` and
+  # `arm64x` (the `x86_64` matrix value runs `conformance-arm64x` there,
+  # LEG below), while the Intel image runs the x86_64 Wine and reads `i686`
+  # and `x86_64`. A key baseline.txt has no entries for fails the leg with
+  # the runner's line naming it and `make conformance-baseline`.
   # The Intel image runs the `intel` variant for the reason given above the
   # e2e legs, and its GPU family gives it its own entries, `<arch>+intel@mac2`,
   # which only it can record (the step below does, on request). On an
@@ -390,7 +423,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
-          wine-release: ${{ env.WINE_RELEASE }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
       # The Intel image reads and, on a `record_intel_baseline` dispatch,
       # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
       # family is a runner, so its counts are recorded here and committed from
@@ -418,16 +452,17 @@ jobs:
       - run: |
           set -o pipefail
           if [ -n "$CONFORMANCE_REPEAT" ]; then
-            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH=${{ matrix.arch }} REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || matrix.variant || 'native' }} LOG=debug STAGE="$STAGE"
+            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH="$LEG" REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || matrix.variant || 'native' }} LOG=debug STAGE="$STAGE"
             exit
           fi
-          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}${{ matrix.arch }} STAGE="$STAGE" | tee "$RUNNER_TEMP/conformance-stdout.txt"; then
+          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}$LEG STAGE="$STAGE" | tee "$RUNNER_TEMP/conformance-stdout.txt"; then
             if grep -q '^conformance: GPU HANG in ' "$RUNNER_TEMP/conformance-stdout.txt"; then
               echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict; not a regression when the other conformance jobs are green. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
             fi
             exit 1
           fi
         env:
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || (matrix.runner == 'macos-15-intel' && 'x86_64' || 'arm64x') }}
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
           # `Got <actual>, expected <expected>` values behind each site. The
@@ -537,14 +572,16 @@ jobs:
       # which is the one tag `git describe` needs for the stamp, so every
       # other tag would only add to the fetch.
       - uses: actions/checkout@v7
-      # The toolchain first, since every make target needs the WINE_X86_64 the
+      # The toolchain first, since every make target needs the WINE_SDK the
       # prepare action sets; then the version check, so a tag that disagrees
       # with the manifests is answered before the wait for main's run and the
       # bundle build below.
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
       - name: version-check
         env:
           TAG: ${{ github.ref_name }}
@@ -587,7 +624,9 @@ jobs:
           exit 1
       # PROD=1 is this target's default, so the archives carry the production
       # profile, and the target verifies that every binary in them is stamped
-      # with the tag before it writes either one.
+      # with the tag before it writes either one. This image's arm64 Wine puts
+      # the Makefile in its arm64 mode, so the bundle carries the ARM64X pair
+      # (wine/aarch64-windows and native/aarch64-windows) beside the x86 builds.
       - name: bundle
         run: make bundle
       # Re-running the job after a failed upload finds the draft it already
@@ -706,14 +745,21 @@ jobs:
         run: |
           set +e
           mkdir -p "$HOME/wine-sdk"
+          # The Wine this image's legs run: the arm64 one on Apple Silicon,
+          # the x86_64 one on Intel.
+          if [ "$RUNNER_ARCH" = ARM64 ]; then
+            tag="$WINE_RELEASE_ARM64" asset=arm64 cpu=aarch64
+          else
+            tag="$WINE_RELEASE_X86_64" asset=x86_64 cpu=x86_64
+          fi
           curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
-            "https://github.com/athei/wine-build/releases/download/${{ env.WINE_RELEASE }}/wine-${{ env.WINE_RELEASE }}-macos-x86_64.tar.xz"
+            "https://github.com/athei/wine-build/releases/download/$tag/wine-$tag-macos-$asset.tar.xz"
           tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
           W="$HOME/wine-sdk/wine/bin/wine"
           capped() { perl -e 'alarm shift; exec @ARGV' "$@"; }
           file "$W"
           "$W" --version
-          otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
+          otool -l "$HOME/wine-sdk/wine/lib/wine/$cpu-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
           ls "$HOME/wine-sdk/wine/lib/external"
           echo "== prefix boot"
           WINEPREFIX="$RUNNER_TEMP/pfx" WINEDEBUG=+seh capped 240 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/boot.log" 2>&1

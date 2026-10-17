@@ -12,19 +12,21 @@ Because our `d3d9.dll` is installed as a Wine *builtin* (`make install`), runnin
 ## Running
 
 ```
-make conformance                # diff both arches vs baseline.txt
-make conformance-i686           # one arch, one runner process (what CI runs)
-make conformance-x86_64
-make conformance-intel          # both arches under the intel.* config keys
-make conformance-intel-i686     # one arch under the intel.* keys
-make conformance-scale          # both arches at render.scale = 0.75
-make conformance-scale-i686     # one arch at render.scale = 0.75 (what CI runs, on one image)
+make conformance                # diff both legs (i686, and arm64x or x86_64) vs baseline.txt
+make conformance-i686           # one leg, one runner process (what CI runs)
+make conformance-arm64x         # the x86_64 binary against the ARM64X build (arm64 Wine)
+make conformance-x86_64         # the x86_64 binary against the x86_64 build (x86_64 Wine)
+make conformance-intel          # both legs under the intel.* config keys
+make conformance-intel-i686     # one leg under the intel.* keys
+make conformance-scale          # both legs at render.scale = 0.75
+make conformance-scale-i686     # one leg at render.scale = 0.75 (what CI runs, on one image)
 make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
-ARM64=1 make conformance        # also both arches under the arm64 Wine (The arm64-runtime legs, below)
-EC=1 make conformance-arm64x    # the x86_64 binary against the ARM64X build, same Wine
 ```
 
-A leg is one architecture under one variant on one GPU family. The `intel`
+A leg is one build under one Wine, one variant and one GPU family. The build
+and the Wine are named by the runner's `--arch` label, and each Wine has keys
+of its own (The two Wines, below): `i686` and `x86_64` under an x86_64 Wine,
+`i686-arm64` and `arm64x` under the arm64 Wine. The `intel`
 variant (`--variant intel`) runs the same binary with every `intel.*` key of
 `mtld3d.conf` turned on, so the suite sees the answers an Intel/AMD Mac gives:
 packed 16-bit formats expanded, 32-bit float filtering denied, Managed
@@ -57,28 +59,37 @@ dispatch, `record_intel_baseline` with `intel_only`, best made on the pull
 request's branch before it merges so the `@mac2` sections land with it, or
 on `main` once the nightly shows the stale pin.
 
-### The arm64-runtime legs
+### The two Wines
 
-`ARM64=1 make conformance` adds `conformance-i686-arm64` and
-`conformance-x86_64-arm64`, and `EC=1` adds `conformance-arm64x`. Each runs
-the x86_64 Wine's own `d3d9_test.exe` of its arch, the binary
-`conformance-<arch>` runs (a PE test runs under any Wine, and the arm64 Wine
-carries none, so these legs read `WINE_X86_64` too), under the arm64 Wine
-that `WINE_ARM64` names: the two x86 legs against the i686 and x86_64
-builds, the ARM64X leg the x86_64 binary against the ARM64X build. Every leg runs in a private clone
-of that Wine with its own prefix, created afresh after the leg's install and
-configured by `configure-test-prefix` as the other legs' prefixes are.
+The Makefile runs two legs under the Wine `WINE_SDK` names, both against the
+builds `make install` puts there and both binaries out of that Wine's
+`lib/wine/tests`, and the Wine decides the keys they record under:
 
-None of them has baseline entries of its own. Each records under its arch's
-label, so the runner judges it against that arch's entries, which were taken
-on the x86_64 Wine `WINE_X86_64` names (the header's `Wine:` line names it, and the
-runner warns that the arm64 Wine's version differs), and on the same Apple GPU
-family. What a leg reports is therefore how its runtime differs from that
-baseline: CrossOver's arm64 Wine and its x86 translation, plus, for the
-ARM64X leg, the ARM64X build. How such runs should be keyed, as legs of their
-own or under the existing entries, is not decided, so none has a baseline
-target, and a site one of them moves is not reclassified here on its evidence
-alone.
+| Target | arm64 Wine (Apple CI images) | x86_64 Wine (Intel CI image) |
+| --- | --- | --- |
+| `conformance-i686` | the i386 binary against the i686 build, as `i686-arm64` | the same, as `i686` |
+| 64-bit leg | `conformance-arm64x`: the x86_64 binary against the ARM64X build, as `arm64x` | `conformance-x86_64`: the x86_64 binary against the x86_64 build, as `x86_64` |
+
+The `-intel` and `-scale` legs and the baseline targets follow the same two
+(`conformance-baseline-arm64x`, `conformance-intel-i686` and the like), each
+recording under its key's `+intel` or `+scale` form, `ARCH` takes `i686` or
+the 64-bit leg's name for `conformance-isolate`, and a leg of the other Wine
+stops saying why.
+
+Baseline keys are per Wine. The same i686 build reads other counts under the
+arm64 Wine's x86 translator than under Rosetta, and the two Wines carry
+their own Wine version, so a run under one Wine reads and writes only that
+Wine's keys: `make conformance-baseline` on the arm64 Wine rewrites the
+`i686-arm64` and `arm64x` sections and never touches `i686` or `x86_64`,
+which serve the x86_64 Wine and the Intel CI image. `i686-arm64` keeps the
+runner's `<arch>[+variant][@gpu]` grammar: the arch part names the build and
+the Wine together, as `arm64x` already does, so no new axis is needed and
+every existing key parses as before. A key with no entries yet makes its
+leg's run report every failing site as new and fail, and the runner says so
+in one line naming the key and `make conformance-baseline`. The header's
+`Wine:` line is one for the file, the version of the last Wine that
+recorded; the runner warns when the Wine it runs under differs. A site the
+arm64 Wine moves is reclassified only on the evidence of a recorded run.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
@@ -151,7 +162,7 @@ is where AppKit reports the exception, if it logs it there and does not
 redact it.
 
 There is no conformance-specific input to set. The test binaries ship inside the
-x86_64 Wine (`$WINE_X86_64/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
+Wine (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
 published by the [wine-build](https://github.com/athei/wine-build) bundle step),
 which is the same install `make install` puts our builtin `d3d9.dll` into, so a
 CI job needs nothing but that tarball and no Wine build tree at all. The

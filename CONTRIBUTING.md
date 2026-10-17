@@ -13,7 +13,7 @@ at it.
 | File | What it owns |
 | --- | --- |
 | [`README.md`](README.md) | The goal, the features, the requirements, and where everything else lives. |
-| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the arm64 Wine switches, benchmarks and the release bundle. |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the two Wines (arm64 and x86_64) and the paths the Makefile reads, benchmarks and the release bundle. |
 | [`docs/GAMES.md`](docs/GAMES.md) | The games tested so far and how far each one gets. |
 | [`docs/STATUS.md`](docs/STATUS.md) | What is implemented, what is not yet, what never will be, and the divergences kept on purpose. |
 | [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
@@ -42,28 +42,28 @@ Two commands, both green before you commit:
   `docs/CONVENTIONS.md` behind it; read that section rather than
   pattern-matching your way past the grep.
 - `make test` is the host-native unit tests plus the end-to-end suite under
-  Wine, one leg per PE architecture. Conformance is not part of it, on purpose:
-  many of its checks fail by design, so it gates on a regression against a
-  baseline instead of on zero failures.
+  the Wine `WINE_SDK` names, one leg per build a game loads there:
+  `test-e2e-i686`, the 32-bit suite against the i686 build, and the x64
+  suite against the 64-bit build, `test-e2e-arm64x` against the ARM64X build
+  under the arm64 Wine, the primary target, and `test-e2e-x86_64` against the
+  x86_64 build under an x86_64 Wine (the two modes of
+  [`docs/BUILDING.md`](docs/BUILDING.md#prerequisites)). Conformance is not
+  part of it, on purpose: many of its checks fail by design, so it gates on a
+  regression against a baseline instead of on zero failures.
 
-Two opt-in switches (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
-add legs that run under an arm64 Wine, the one `WINE_ARM64` names. `ARM64=1`
-adds `test-e2e-i686-arm64` and `test-e2e-x86_64-arm64` to `make test`, the
-shipping builds under that Wine, and `EC=1` adds `test-e2e-arm64x`, the x64
-suite against the ARM64X build, beside a `make check` leg that lints its two
-halves. `make conformance` gets the matching `conformance-*-arm64` and
-`conformance-arm64x` legs (`unix/conformance/CONFORMANCE.md`, "The
-arm64-runtime legs"). Each of them installs into a private clone of
-`WINE_ARM64` and creates a fresh prefix for it (a prefix only knows the
-builtins that were installed when it was made). The environment variables
-the legs read are listed in
+Under the arm64 Wine, `make test-e2e-x86_64` runs the x64 suite against the
+x86_64 build, emulated, and is not part of `make test`. It installs into a
+private clone of `WINE_SDK` and creates a fresh prefix for it, since the
+x86_64 build would take the ARM64X build's place in `aarch64-windows` (and a
+prefix only knows the builtins that were installed when it was made). The
+environment variables the targets read are listed in
 [`docs/BUILDING.md`](docs/BUILDING.md#which-target-reads-which-path).
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
 touched, that churn is its own pull request, not a hand-revert and not a passenger
 in yours.
 
-Every test leg installs the build into the Wine tree `WINE_X86_64` names (and
+Every test leg installs the build into the Wine tree `WINE_SDK` names (and
 into `WINE_INSTALL_DIR` when set) before it runs, so two checkouts testing at once
 overwrite each other's `d3d9.dll` and `mtld3d.so`, and a game launched from that
 tree meanwhile runs whichever build landed last. `make test ISOLATED=1` avoids
@@ -297,30 +297,28 @@ layer's own counters, read from the `perf-kv` line of its perf windows as
 `perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
 calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
 
-`ARM64=1` and `EC=1` (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
-move `make bench` and `make bench-ab` onto the arm64 Wine that `WINE_ARM64`
-names: `ARM64=1` runs the `ARCH` build there, `EC=1` the ARM64X build under
-the x86_64 benchmark binary, and each leg of `bench-ab` gets a private clone
-of that Wine with a fresh prefix, the way the arm64 test legs do. A benchmark
-measures one layout, so the two switches are not given together, and
-`EC=1 make bench-ab` needs a `BASE` whose Makefile has `windows-arm64x`: it
-stops with a message naming `BASE` otherwise. `make bench-variants` compares
-layouts instead of commits: this checkout's x86_64 build on `WINE_X86_64`
-against the same build on `WINE_ARM64` (`x86_64-sdk-vs-arm64`), and with
-`EC=1` the x86_64 build against the ARM64X one on `WINE_ARM64`
-(`x86_64-vs-arm64x`). `ARCH=i686` runs the first pair for the i686 build
-instead (`i686-sdk-vs-arm64`), the path World of Warcraft 1.12 and 3.3.5a
-take on an arm64 Wine, whose x86 translator runs our 32-bit DLLs; there is no
-ARM64X pair for it, since a 32-bit process never loads the ARM64X build. Every
-pair is a `bench-ab` run of its own whose report names each leg's runtime and
-DLL variant. Such a run has one commit in both legs, so a binary the two
-layouts share loads as one image, which the comparison notes instead of
-refusing, and the first pair runs two Wines. Read that first pair with care:
-it changes the host arch and the Wine build at once, since `WINE_X86_64` and
-`WINE_ARM64` name two Wine builds, so its differences are not the arch's
-alone, for either arch. The ARM64X pair runs one Wine in both legs
-and changes only our DLLs, so it measures what the ARM64X build buys an x64
-game.
+`make bench` and `make bench-ab` run under the Wine `WINE_SDK` names and
+measure one build: `ARCH=i686`, the default, the i686 build under the i686
+benchmark binary, the path World of Warcraft 1.12 and 3.3.5a take, whose x86
+translator runs our 32-bit DLLs, and `ARCH=arm64x` the ARM64X build under the
+x86_64 benchmark binary on the arm64 Wine, or `ARCH=x86_64` the x86_64 build
+on an x86_64 Wine. Each leg of `bench-ab` gets a private clone of that Wine
+with a fresh prefix, as the arm64 Wine's `test-e2e-x86_64` does, and
+`ARCH=arm64x make bench-ab` needs a `BASE` whose Makefile has
+`windows-arm64x`: it stops with a message naming `BASE` otherwise. A `BASE`
+whose Makefile predates `WINE_SDK` as the one Wine is given the variables of
+its own layout as well, all naming `WINE_SDK`, so `make bench-ab BASE=<an
+older commit>` still compares like with like. `bench-ab` and `bench-variants`
+set up isolated trees of their own and refuse `ISOLATED=1`. `make
+bench-variants` compares layouts instead of commits, under the arm64 Wine
+only: this checkout's x86_64 build, emulated, against its ARM64X build, both
+under `WINE_SDK` (`x86_64-vs-arm64x`). The pair is a `bench-ab` run whose
+report names each leg's runtime and DLL variant; it has one commit in both
+legs, so a binary the two layouts share loads as one image, which the
+comparison notes instead of refusing. It runs one Wine in both legs and
+changes only our DLLs, so it measures what the ARM64X build buys an x64 game.
+There is no pair for the i686 build, since a 32-bit process never loads the
+ARM64X build.
 
 On an arm64 Wine the benchmarks' clock is FEX's translation of `rdtsc`, a
 counter read that is not ordered after earlier stores (an `mfence` does not
@@ -513,11 +511,11 @@ instead of quietly simplifying.
 ## Working on conformance
 
 ```sh
-make conformance                       # both architectures, diffed against the baseline
-make conformance-i686                  # one architecture, one runner process
-make conformance-isolate ONLY=visual ARCH=x86_64 REPEAT=1
+make conformance                       # both legs (i686, and arm64x or x86_64), diffed against the baseline
+make conformance-i686                  # one leg, one runner process
+make conformance-isolate ONLY=visual ARCH=arm64x REPEAT=1
 make conformance-isolate ONLY=device ARCH=i686 REPEAT=20 VARIANT=intel LOG=debug
-make conformance-baseline-i686         # re-record this architecture's entries
+make conformance-baseline-i686         # re-record this leg's entries
 ```
 
 The rules that are easy to get wrong:
@@ -609,12 +607,19 @@ The description is what survives, and for anything non-trivial it carries:
 4. At least one considered alternative, including the dead ends.
 5. Verification: the commands you ran and what a reviewer should look for.
 
-CI compiles on two machines and replays everywhere else. One job builds the
-stage (`make stage`: both PE arches, both unix `.so` builds, the e2e test
-binaries, the e2e and conformance runners for both host arches) and another
-runs formatting and audit first, then documentation, Clippy and unit tests,
-with the `PERF=1` Clippy and unit-test legs of `make check`, as steps of one
-job. Production bundles are built by the release job only.
+CI pins two Wines, the arm64 one for the Apple Silicon images and the x86_64
+one for the Intel image, and each machine takes the one of its arch, which
+sets the Makefile's mode and so its legs. CI compiles on two machines and
+replays everywhere else. One job builds the stage on an Apple Silicon image
+in the arm64 mode (`make stage`: the i686, x86_64 and ARM64X builds, both
+unix `.so` builds, the e2e test binaries, the e2e and conformance runners
+for both host arches) and another runs formatting and audit first, then
+documentation, Clippy (the ARM64X halves included) and unit tests, with the
+`PERF=1` Clippy and unit-test legs of `make check`, as steps of one job.
+Production bundles are built by the release job only, also in the arm64
+mode, so they carry the ARM64X pair. The Apple images run the arm64 legs,
+`i686` and `arm64x`, against the arm64 Wine's conformance keys, and the Intel
+image runs the x86_64 legs, `i686` and `x86_64`, against the x86_64 Wine's.
 Every run on `main` has its own concurrency group so pending runs survive
 later pushes and every commit keeps its CI result. PR updates cancel the
 superseded run. The test machines carry no toolchain: they install the stage
