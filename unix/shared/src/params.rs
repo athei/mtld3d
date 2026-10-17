@@ -2,9 +2,9 @@ use super::{
     Thunk, Thunks,
     mtl::{
         BufferKind, ClientSurfaceRequest, ColorSpacePolicy, CursorOverlayFlags, DestroyKind,
-        DeviceCapsFlags, LoadAction, PixelFormat, PresentDebugFlags, PresentWaitPolicy,
-        SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
-        VertexStepFunction,
+        DeviceCapsFlags, LoadAction, PixelFormat, PresentDebugFlags, PresentOptions,
+        PresentWaitPolicy, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle, TextureUsage,
+        VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -37,7 +37,8 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
     assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 96);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 104);
+    assert!(core::mem::offset_of!(AttachMetalLayerParams, present_options) == 96);
     assert!(core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr) == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<PresentClientSurfaceParams>() == 16);
@@ -307,6 +308,13 @@ pub struct AttachMetalLayerParams {
     /// Wine thread. Same backing contract as `backing_scale_ptr`. `0` disables
     /// it.
     pub client_surface_request_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
+    /// The present-path options from `mtld3d.conf`, one bit per key.
+    ///
+    /// Read once at attach and kept on the layer's record for its lifetime;
+    /// the PE side resolves each bit from its config key.
+    pub present_options: PresentOptions, // in
+    /// Keeps the struct a multiple of its 8-byte alignment on every target.
+    pub reserved: u32,
 }
 
 impl Thunk for AttachMetalLayerParams {

@@ -4,7 +4,7 @@
 //! conversion and drawable sizing. None of it depends on Wine or `AppKit`.
 
 use log::debug;
-use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
+use mtld3d_shared::mtl::{ColorSpacePolicy, PresentOptions, SoftwareCursorPolicy};
 
 use super::bounded_cast;
 
@@ -99,6 +99,8 @@ pub struct LayerAttachRequest {
     pub client_surface_request_sink_ptr: u64,
     /// `cursor.software`, resolved by attach against the layer mode it picks.
     pub software_cursor: SoftwareCursorPolicy,
+    /// The present-path keys from `mtld3d.conf`, kept on the record.
+    pub present_options: PresentOptions,
 }
 
 /// What attach answers the PE side about the display and the cursor.
@@ -133,6 +135,29 @@ pub fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u
     )
 }
 
+/// The drawable size for a layer whose own size is `natural`, capped at `panel`.
+///
+/// A natural size that fits the panel in both axes is returned unchanged, so
+/// the cap only ever shrinks. One that overhangs is scaled down by one factor
+/// for both axes, which keeps the aspect the layer's `ResizeAspect` gravity
+/// fits, and rounded; the result fits the panel. Pure, so the rule is testable
+/// without a layer.
+#[must_use]
+pub fn fit_drawable_to_panel(natural: (u32, u32), panel: Option<(u32, u32)>) -> (u32, u32) {
+    let Some((panel_w, panel_h)) = panel else {
+        return natural;
+    };
+    let (w, h) = natural;
+    if w <= panel_w && h <= panel_h || w == 0 || h == 0 {
+        return natural;
+    }
+    let scale = (f64::from(panel_w) / f64::from(w)).min(f64::from(panel_h) / f64::from(h));
+    let fit = |n: u32, cap: u32| {
+        bounded_cast::f64_to_u32_saturating((f64::from(n) * scale).round()).clamp(1, cap)
+    };
+    (fit(w, panel_w), fit(h, panel_h))
+}
+
 /// Point `drawableSize` at the layer's own backing store.
 ///
 /// `CAMetalLayer` documents `drawableSize` as defaulting to `bounds ×
@@ -158,11 +183,14 @@ pub fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u
 /// `bounds`/`contentsScale` off the main thread races an in-flight `AppKit`
 /// resize; the cost of losing that race is one frame at the previous size,
 /// corrected on the next present.
-pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
+///
+/// `panel` is the `present.nativeDrawable` cap ([`fit_drawable_to_panel`]),
+/// `None` when the key is off or the panel is not known yet.
+pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer, panel: Option<(u32, u32)>) {
     use objc2_core_foundation::CGSize;
     use objc2_quartz_core::CATransaction;
 
-    let (native_w, native_h) = natural_drawable_size(layer);
+    let (native_w, native_h) = fit_drawable_to_panel(natural_drawable_size(layer), panel);
     if native_w == 0 || native_h == 0 {
         return;
     }

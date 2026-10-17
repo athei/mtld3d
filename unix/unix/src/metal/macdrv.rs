@@ -9,7 +9,7 @@ use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
     MetalHandle,
-    mtl::ColorSpacePolicy,
+    mtl::{ColorSpacePolicy, PresentOptions},
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
 };
 use objc2::{
@@ -970,6 +970,7 @@ pub fn attach_metal_layer(
         cursor_kick_sink_ptr,
         client_surface_request_sink_ptr,
         software_cursor,
+        present_options,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
         return None;
@@ -1109,6 +1110,7 @@ pub fn attach_metal_layer(
             client_surface_request_sink: usize::try_from(client_surface_request_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface: surface,
+            present_options,
         },
     );
     // A new view's surface is the one Wine shows already; a kept view's may
@@ -2391,6 +2393,12 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     // between displays reports none, and the layer is better left as it is
     // than reconfigured twice against a screen the window is leaving.
     if let Some(screen) = screen.as_deref() {
+        if att
+            .present_options()
+            .contains(PresentOptions::NATIVE_DRAWABLE)
+        {
+            follow_screen_panel_pixels(att, screen);
+        }
         follow_screen_layer_mode(att, screen, mtm);
         follow_screen_present_throttle(att, screen);
         follow_layer_backing_scale(att, mtm);
@@ -2585,7 +2593,7 @@ fn configure_metal_layer_inner(
     // what keeps the frame on the pixel grid the screen actually has.
     // Present re-syncs this before every `nextDrawable`; the push here is
     // so the first frame does not have to.
-    sync_drawable_size(&layer);
+    sync_drawable_size(&layer, None);
     crate::hud_state::show_row(&layer);
     //
     // Confirm the install. `colorspace` is the label the SDR/HDR
@@ -2637,6 +2645,55 @@ fn log_layer_geometry(layer: &objc2_quartz_core::CAMetalLayer, width: u32, heigh
              so present resamples every frame",
         );
     }
+}
+
+/// `kDisplayModeNativeFlag` (`IOKit` `IOGraphicsTypes.h`): the panel's own resolution.
+const DISPLAY_MODE_NATIVE_FLAG: u32 = 0x0200_0000;
+
+/// Publish the native pixel size of the panel `screen` is on, for `present.nativeDrawable`.
+///
+/// The panel is the display's mode flagged native, whatever scaled mode is
+/// current. A screen with no display id or no native mode publishes nothing,
+/// and the drawable then keeps the layer's own size. **Main thread only.**
+fn follow_screen_panel_pixels(att: &Attachment, screen: &objc2_app_kit::NSScreen) {
+    let pixels = native_panel_pixels(screen);
+    if pixels != att.panel_pixels() {
+        info!(
+            target: LOG_TARGET,
+            "present: panel native pixels {pixels:?} (present.nativeDrawable caps the drawable there)"
+        );
+    }
+    att.set_panel_pixels(pixels);
+}
+
+/// The native pixel size of the display behind `screen`, if it reports one.
+fn native_panel_pixels(screen: &objc2_app_kit::NSScreen) -> Option<(u32, u32)> {
+    use objc2_core_graphics::{CGDisplayCopyAllDisplayModes, CGDisplayMode};
+
+    let number = screen
+        .deviceDescription()
+        .objectForKey(&objc2_foundation::NSString::from_str("NSScreenNumber"))?;
+    // `NSScreenNumber` is documented as an `NSNumber` holding the `CGDirectDisplayID`.
+    let display = number
+        .downcast_ref::<objc2_foundation::NSNumber>()?
+        .unsignedIntValue();
+    // SAFETY: no options dictionary; the display id came from AppKit.
+    let modes = unsafe { CGDisplayCopyAllDisplayModes(display, None) }?;
+    (0..modes.count())
+        .find_map(|index| {
+            // SAFETY: `index` is in bounds of the array.
+            let element = unsafe { modes.value_at_index(index) };
+            // SAFETY: every element of this array is a `CGDisplayMode`, borrowed
+            // for as long as `modes` lives.
+            let mode = unsafe { &*element.cast::<CGDisplayMode>() };
+            (CGDisplayMode::io_flags(Some(mode)) & DISPLAY_MODE_NATIVE_FLAG != 0).then(|| {
+                (
+                    u32::try_from(CGDisplayMode::pixel_width(Some(mode))).unwrap_or(0),
+                    u32::try_from(CGDisplayMode::pixel_height(Some(mode))).unwrap_or(0),
+                )
+            })
+        })
+        .filter(|&(width, height)| width != 0 && height != 0)
 }
 
 /// Apply the layer's colour configuration, and report the colorspace label it picked.

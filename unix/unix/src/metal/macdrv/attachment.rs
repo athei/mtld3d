@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy, PresentOptions};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -114,6 +114,8 @@ pub struct AttachLatches {
     /// The record owns one reference on it, taken at attach and given back
     /// by the teardown that unregisters the record.
     pub client_surface: usize,
+    /// The present-path keys from `mtld3d.conf`, fixed for the record's lifetime.
+    pub present_options: PresentOptions,
 }
 
 /// The display state of one attached metal view.
@@ -160,6 +162,8 @@ pub struct Attachment {
     drew_frame: AtomicBool,
     flags: AttachFlags,
     color_space: ColorSpacePolicy,
+    /// See [`AttachLatches::present_options`].
+    present_options: PresentOptions,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
     ///
     /// Written on the main thread, compared against the notification's own
@@ -246,6 +250,11 @@ pub struct Attachment {
     current_backing_scale: AtomicU32,
     /// Consecutive presents at one geometry; gates the `MetalFX` route.
     present_streak: GeometryStreak,
+    /// The native pixel size of the panel under the window, `width << 32 | height`; `0` = unknown.
+    ///
+    /// Published by the main-thread refresh only while `present.nativeDrawable`
+    /// is on, and read by the presenter before it sizes the drawable.
+    panel_pixels: AtomicU64,
     /// Whether the present pass applies this layer's gamma ramp.
     ///
     /// The ramp's 256 entries live in `metal::gamma`, which owns them for as
@@ -271,6 +280,7 @@ impl Attachment {
             drew_frame: AtomicBool::new(false),
             flags: latches.flags,
             color_space: latches.color_space,
+            present_options: latches.present_options,
             window: AtomicUsize::new(0),
             hdr_active: AtomicBool::new(latches.flags.contains(AttachFlags::HDR_ACTIVE)),
             window_occluded: AtomicBool::new(false),
@@ -284,6 +294,7 @@ impl Attachment {
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
+            panel_pixels: AtomicU64::new(0),
             gamma_active: AtomicBool::new(false),
         }
     }
@@ -361,6 +372,28 @@ impl Attachment {
     #[must_use]
     pub const fn color_space(&self) -> ColorSpacePolicy {
         self.color_space
+    }
+
+    /// The native pixel size of the panel under the window, if known.
+    #[must_use]
+    pub fn panel_pixels(&self) -> Option<(u32, u32)> {
+        let packed = self.panel_pixels.load(Ordering::Relaxed);
+        let (width, height) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+        (width != 0 && height != 0).then_some((width, height))
+    }
+
+    /// Publish the native pixel size of the panel under the window. **Main thread.**
+    pub fn set_panel_pixels(&self, pixels: Option<(u32, u32)>) {
+        let packed = pixels.map_or(0, |(width, height)| {
+            (u64::from(width) << 32) | u64::from(height)
+        });
+        self.panel_pixels.store(packed, Ordering::Relaxed);
+    }
+
+    /// The present-path keys as the attach carried them.
+    #[must_use]
+    pub const fn present_options(&self) -> PresentOptions {
+        self.present_options
     }
 
     /// The raw `NSWindow*` the occlusion observer matches, `0` = none.
