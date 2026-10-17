@@ -343,6 +343,19 @@ pub struct Mtld3dConfig {
     /// a fullscreen request for any size Wine lists is still set. Default:
     /// `0`. File key: `display.maxResolutions`.
     pub max_resolutions: u32,
+    /// Zero every subresource of a new sampled texture before its first use.
+    ///
+    /// Metal leaves a new `Private` texture's contents undefined, and the
+    /// memory it hands back is often a released texture's, so a level the
+    /// application never uploads (or whose upload was dropped) samples
+    /// another resource's bytes: on a block-compressed texture, rainbow
+    /// blocks. D3D9 on Windows backs a managed texture with zeroed system
+    /// memory, so such a level reads black there. When enabled, every new
+    /// texture that is neither a render target nor depth gets one blit from
+    /// a zero buffer in the creation-time initialisation command buffer,
+    /// which commits ahead of the frame that uploads into it. Default:
+    /// `true`. File key: `texture.zeroOnCreate`.
+    pub texture_zero_on_create: bool,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -431,6 +444,7 @@ impl Default for Mtld3dConfig {
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
             max_resolutions: 0,
+            texture_zero_on_create: true,
         }
     }
 }
@@ -634,6 +648,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: display.maxResolutions = {}", cfg.max_resolutions
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: texture.zeroOnCreate = {}", cfg.texture_zero_on_create
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -717,6 +735,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         "display.maxResolutions" => {
             assign_count(source, key, value, &mut cfg.max_resolutions);
+        }
+        "texture.zeroOnCreate" => {
+            assign_bool(source, key, value, &mut cfg.texture_zero_on_create);
         }
         _ => log_once_warn!(
             target: crate::LOG_TARGET,

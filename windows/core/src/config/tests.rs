@@ -256,6 +256,20 @@ fn depth_alias_same_size_defaults_off_and_round_trips() {
 }
 
 #[test]
+fn texture_zero_on_create_defaults_on_and_parses() {
+    assert!(
+        parse(None, "", None).texture_zero_on_create,
+        "on by default"
+    );
+    assert!(!parse(None, "texture.zeroOnCreate = false\n", None).texture_zero_on_create);
+    assert!(parse(None, "texture.zeroOnCreate = true\n", None).texture_zero_on_create);
+    assert!(
+        parse(None, "texture.zeroOnCreate = maybe\n", None).texture_zero_on_create,
+        "an unparsable value keeps the default"
+    );
+}
+
+#[test]
 fn buffer_ignore_lock_bounds_defaults_off_and_round_trips() {
     let cfg = parse(None, "", None);
     assert!(!cfg.buffer_ignore_lock_bounds);

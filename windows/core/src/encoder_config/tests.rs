@@ -51,6 +51,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.adapter_spoof = AdapterSpoof::Amd;
     value.df_formats = !value.df_formats;
     value.max_resolutions = 32;
+    value.texture_zero_on_create = !value.texture_zero_on_create;
     assert_eq!(round_trip(&value), value);
 }
 
