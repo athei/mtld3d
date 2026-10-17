@@ -1,4 +1,4 @@
-use super::{end_in_recording_frame, event_completed, event_needs_submit};
+use super::{end_in_recording_frame, event_completed, event_end_seq, event_needs_submit};
 
 /// An EVENT query completes only when its frame retires.
 ///
@@ -59,4 +59,31 @@ fn an_end_is_in_the_recording_frame_only_under_its_seq() {
         "ended in a frame already handed over"
     );
     assert!(!end_in_recording_frame(0, 7), "never ended");
+}
+
+/// An END issued before the new frame records anything fences the frame just handed over.
+///
+/// The fenced frame holds every command the END follows, and it needs no
+/// submission of its own.
+#[test]
+fn an_event_end_on_an_untouched_frame_fences_the_previous_one() {
+    assert_eq!(event_end_seq(8, false), 7);
+    assert!(
+        !event_needs_submit(event_end_seq(8, false), 8),
+        "the fenced frame was already handed over",
+    );
+}
+
+/// Once anything is recorded the END fences the recording frame.
+#[test]
+fn an_event_end_after_recording_keeps_the_recording_frame() {
+    assert_eq!(event_end_seq(8, true), 8);
+}
+
+/// The first seq is 1, so the previous one is 0, which reads as complete.
+#[test]
+fn an_event_end_before_the_first_frame_never_underflows() {
+    assert_eq!(event_end_seq(1, false), 0);
+    assert!(event_completed(event_end_seq(1, false), 0));
+    assert_eq!(event_end_seq(0, false), 0);
 }

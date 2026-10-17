@@ -586,6 +586,12 @@ pub struct DeviceInner {
     /// `FrameData`. Buffers captured in the frame's draws are stamped with the
     /// pre-bump value (i.e. the seq they're visible to the GPU in).
     current_seq: u64,
+    /// The recording frame's capture count right after the last swap, re-asserts included.
+    ///
+    /// Equal to the live length means the application has recorded nothing
+    /// into the recording frame yet, so an EVENT END fences the frame before it.
+    /// `usize::MAX` (never equal) when that cannot be told, e.g. after a reseed.
+    ops_at_swap: usize,
     /// All API-thread telemetry.
     ///
     /// Per-category timer buckets, Lock / texture counters, prev-present TSC.
@@ -1643,6 +1649,22 @@ impl DeviceInner {
         self.current_seq
     }
 
+    /// Whether anything has been recorded into the recording frame since the last swap.
+    ///
+    /// The bindings the swap itself re-asserts do not count. Errs towards
+    /// `true`, which keeps an EVENT END on the recording frame (see `ops_at_swap`).
+    pub const fn recorded_since_swap(&self) -> bool {
+        self.recorded_ops() != self.ops_at_swap
+    }
+
+    /// Captures in the recording frame so far, the swap's own re-asserted bindings included.
+    const fn recorded_ops(&self) -> usize {
+        match &self.current_frame.recorder {
+            Some(recorder) => recorder.len(),
+            None => 0,
+        }
+    }
+
     /// Push a VB/IB backing into the retention pipeline.
     ///
     /// Called from `vb_lock` / `ib_lock` rename paths and from VB/IB release
@@ -1848,6 +1870,7 @@ impl DeviceInner {
         // snapshot section on the first draw of the new frame.
         self.snapshot_dirty = SnapshotDirty::all();
         self.reassert_saved_bindings();
+        self.ops_at_swap = self.recorded_ops();
         (frame, this_seq)
     }
 
@@ -3135,6 +3158,10 @@ impl DeviceInner {
         let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
         self.current_frame.mark_gpu_capture(carried);
+        // The caller re-pushes bindings of its choosing, so the swap-time
+        // length no longer tells application recording apart; never equal
+        // keeps an EVENT END on the recording frame.
+        self.ops_at_swap = usize::MAX;
     }
 
     /// The window this device took fullscreen, or `None` when it is windowed.
@@ -3594,6 +3621,7 @@ impl Direct3DDevice9 {
             outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.
             current_seq: 1,
+            ops_at_swap: usize::MAX,
             perf: ApiPerfStorage::new(),
             pending_retention_bytes: 0,
             retention_cap_bytes: info.config.vbib_retention_cap_bytes,
