@@ -278,9 +278,9 @@ class FakeWineTestCase(MakeTestCase):
         return [line for line in output.splitlines() if line.startswith(start)]
 
     def winebuild_lines(self, output):
-        # The line the install prints when the Wine's winebuild cannot write a
-        # hybrid placeholder.
-        return self.printed(output, f"==> {self.arm64}/bin/winebuild writes no ARM64EC metadata")
+        # The line the install fails with when the Wine's winebuild cannot write
+        # a hybrid placeholder.
+        return self.printed(output, f"{self.arm64}/bin/winebuild is too old")
 
     def setUp(self):
         super().setUp()
@@ -554,31 +554,24 @@ class InstallLayoutTests(FakeWineTestCase):
             for wine in (self.arm64, self.x86_64):
                 self.assertIn("-b i686-windows", self.content(wine / f"lib/wine/i386-windows/{name}.dll"))
 
-    def test_a_winebuild_without_hybrid_placeholders_leaves_the_markers_amd64_and_says_so(self):
+    def test_a_winebuild_without_hybrid_placeholders_fails_the_install(self):
         # arm64-11.19-1's winebuild takes -marm64x but writes no load config,
-        # which an x64 process refuses; the install re-stamps such a marker AMD64.
+        # which an x64 process refuses, so the install stops at the first name.
         (self.arm64 / "bin/no-arm64ec").touch()
-        output = self.install()
-        lines = self.winebuild_lines(output)
-        self.assertEqual(lines, [
-            f"==> {self.arm64}/bin/winebuild writes no ARM64EC metadata into a hybrid placeholder, so "
-            f"d3d9.dll mtld3d.dll in {self.arm64}/lib/wine/aarch64-windows got AMD64 ones, which x64 "
-            "processes load; native ARM64 programs cannot load them until WINE_SDK is a Wine whose "
-            "winebuild writes hybrid placeholders"], output)
-        for name in ("d3d9", "mtld3d"):
-            marker = self.arm64 / f"lib/wine/aarch64-windows/{name}.dll"
-            self.assertTrue(self.content(marker).startswith("--fake-module "), self.content(marker))
-            self.assertIn("-b x86_64-windows", self.content(marker))
-            self.assertNotIn("marm64x", self.content(marker))
-            self.assertEqual(self.machine(marker), 0x8664)
-            self.assertEqual(self.machine(self.arm64 / f"lib/wine/i386-windows/{name}.dll"), 0x014c)
+        output = self.install(succeeds=False)
+        marker = self.arm64 / "lib/wine/aarch64-windows/d3d9.dll"
+        self.assertEqual(self.winebuild_lines(output), [
+            f"{self.arm64}/bin/winebuild is too old: it writes a -marm64x placeholder without the "
+            "ARM64EC metadata of a hybrid one, which an x64 process refuses "
+            f"({marker}); WINE_SDK has to be wine-build arm64-11.19-2 or later"], output)
+        self.assertFalse((self.arm64 / "lib/wine/aarch64-windows/mtld3d.dll").exists())
 
     def test_a_hybrid_marker_whose_load_config_cannot_be_read_fails_the_install_naming_it(self):
         (self.arm64 / "bin/truncated-arm64x").touch()
         output = self.install(succeeds=False)
         marker = self.arm64 / "lib/wine/aarch64-windows/d3d9.dll"
         self.assertEqual(self.printed(output, f"{marker}, "), [
-            f"{marker}, the marker {self.arm64}/bin/winebuild just wrote, is no PE32+ image "
+            f"{marker}, the placeholder {self.arm64}/bin/winebuild just wrote, is no PE32+ image "
             "whose load config make install can read"], output)
         self.assertEqual(self.winebuild_lines(output), [])
 

@@ -844,9 +844,9 @@ install: install-windows-i686 install-windows-x86_64 $(ARM64X_LEG:%=install-wind
 # PE machine (PE_MACHINE) and not the load config, so a plain ARM64 image
 # counts as ARM64X; neither kind of marker lets an x64 process load such an
 # image, and a wine-build Wine holds none. A hybrid marker also takes a
-# winebuild that writes that metadata into it: where WINE_SDK's does not, the
-# name gets an AMD64 marker instead and the install says so in one line
-# (HYBRID_MARKER_CHECK).
+# winebuild that writes that metadata into it, which wine-build's is from
+# arm64-11.19-2 on; with an older one the install fails
+# (HYBRID_PLACEHOLDER_CHECK).
 #
 # The d3d9.dll copies under lib/wine get the builtin signature in place: the
 # loader ignores unsigned PEs on the builtin search path. Symbols travel with
@@ -907,29 +907,24 @@ if [ "$(1)" = aarch64-windows ]; then \
 fi
 endef
 
-# Checks the hybrid marker just written to $(1) for `$$dll`, whose AMD64 target
-# is $(2). A winebuild that predates ARM64X placeholders, such as the one of
+# Fails unless $(1), a placeholder WINEBUILD just wrote with `-marm64x`, is a
+# hybrid one. A winebuild that predates hybrid placeholders, such as the one of
 # wine-build's arm64-11.19-1, accepts `-marm64x` but writes a plain ARM64
 # placeholder with no load config, which an x64 process refuses
-# (STATUS_INVALID_IMAGE_FORMAT). Such a marker is stamped again as AMD64, which
-# an x64 process accepts, and the name is added to `$$amd64`, which
-# PE_PAIR_INSTALL reports in one line. A load config that is there stands for
-# the ARM64EC metadata: the known winebuilds write either none at all or a
-# full one whose CHPE pointer names that metadata. An unreadable marker, or one
-# that is no PE32+ image, fails the install.
-define HYBRID_MARKER_CHECK
-case "$$target" in *-marm64x) \
-	config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the marker $(WINEBUILD) just wrote, is no PE32+ image whose load config make install can read" >&2 ; exit 2 ; } ; \
-	if [ "$$config" = 0000000000000000 ]; then \
-		$(WINEBUILD) --fake-module -o "$(1)" -b $(2) --dll "$$tree/aarch64-windows/$$dll.dll" || exit ; \
-		amd64="$$amd64 $$dll.dll" ; \
-	fi ;; \
-esac
+# (STATUS_INVALID_IMAGE_FORMAT), so every x64 program would lose the name. A
+# load config that is there stands for the ARM64EC metadata: the known
+# winebuilds write either none at all or a full one whose CHPE pointer names
+# that metadata. An unreadable placeholder, or one that is no PE32+ image,
+# fails too. The install and `bundle` both run it.
+define HYBRID_PLACEHOLDER_CHECK
+config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBUILD) just wrote, is no PE32+ image whose load config make install can read" >&2 ; exit 2 ; } ; \
+[ "$$config" != 0000000000000000 ] || { echo "$(WINEBUILD) is too old: it writes a -marm64x placeholder without the ARM64EC metadata of a hybrid one, which an x64 process refuses ($(1)); WINE_SDK has to be wine-build arm64-11.19-2 or later" >&2 ; exit 2 ; }
 endef
 
 # $(1) = the Wine root, $(2) = the build directory of the pair, $(3) = the
 # Wine directory it goes into, $(4) = the winebuild target of its markers,
-# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies.
+# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies; a
+# hybrid one is held to HYBRID_PLACEHOLDER_CHECK.
 # Installs `d3d9.dll` and `mtld3d.dll` with their `.pdb`s.
 define PE_PAIR_INSTALL
 tree=$$($(call MTLD3D_TREE,"$(1)")) ; \
@@ -939,14 +934,12 @@ $(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || exit ; \
 if [ "$$tree" != "$(1)/lib/wine" ]; then \
 	[ -d "$(1)/lib/wine/$(3)" ] || { echo "$(1)/lib/wine/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
 	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
-	amd64= ; \
 	for dll in d3d9 mtld3d; do \
 		target=$(4) ; \
 		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3)) ;)) \
 		$(WINEBUILD) --fake-module -o "$(1)/lib/wine/$(3)/$$dll.dll" -b $$target --dll "$$tree/$(3)/$$dll.dll" || exit ; \
-		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_CHECK,$(1)/lib/wine/$(3)/$$dll.dll,$(4)) ;)) \
+		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,if [ "$$target" != "$(4)" ]; then $(call HYBRID_PLACEHOLDER_CHECK,$(1)/lib/wine/$(3)/$$dll.dll) ; fi ;)) \
 	done ; \
-	[ -z "$$amd64" ] || echo "==> $(WINEBUILD) writes no ARM64EC metadata into a hybrid placeholder, so$$amd64 in $(1)/lib/wine/$(3) got AMD64 ones, which x64 processes load; native ARM64 programs cannot load them until WINE_SDK is a Wine whose winebuild writes hybrid placeholders" ; \
 fi
 endef
 

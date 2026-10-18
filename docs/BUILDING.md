@@ -243,11 +243,11 @@ stamps its own by: hybrid ones (`winebuild -marm64x`, an ARM64 placeholder
 with ARM64EC metadata) when every d3d9 tree that has the DLL holds an ARM64X
 build of it, as after an install of the ARM64X build, and AMD64 ones
 otherwise, as when the x86_64 build is installed there. A hybrid one also
-takes a winebuild that writes the ARM64EC metadata into it; the one of
-arm64-11.19-1 does not, and writes a plain ARM64 placeholder an x64 process
-refuses, so against such a Wine the install stamps AMD64 ones and says so in
-one line. An x64 process accepts both kinds; a native ARM64 one loads a name
-only behind a hybrid placeholder. A prefix copies the placeholders when it
+takes a winebuild that writes the ARM64EC metadata into it, which
+wine-build's does from arm64-11.19-2 on; an older one writes a plain ARM64
+placeholder an x64 process refuses, and the install fails naming it. An x64
+process accepts both kinds; a native ARM64 one loads a name only behind a
+hybrid placeholder. A prefix copies the placeholders when it
 is created and takes a changed one on its next `wineboot -u`. A runtime-only
 arm64 Wine without that tree, such as CrossOver's, is refused.
 

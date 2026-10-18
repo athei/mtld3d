@@ -78,11 +78,11 @@ pair into the `aarch64-windows` of the tree mtld3d loads from, never over the
 placeholders in a wine-build Wine's default `lib/wine/aarch64-windows`. Leave
 those placeholders as they are: an x64 process loads the ARM64X pair behind
 either kind the Wine may ship, AMD64 or hybrid (ARM64X). `make install`
-re-stamps them the way wine-build's bundle does, hybrid for the ARM64X pair
-where the Wine's winebuild can write hybrid ones, so that a native ARM64
-program can load the names too, and AMD64 otherwise; a prefix takes a
-changed placeholder on its next `wineboot -u`.
-The routes below spell out both layouts. The source tree's `make install`
+re-stamps them the way wine-build's bundle does, hybrid for the ARM64X pair,
+so that a native ARM64 program can load the names too, and AMD64 for the
+x86_64 pair; it needs wine-build's arm64-11.19-2 or later, whose winebuild
+writes hybrid placeholders. A prefix takes a changed placeholder on its next
+`wineboot -u`. The routes below spell out both layouts. The source tree's `make install`
 does all of this for a wine-build Wine (see `docs/BUILDING.md`).
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
