@@ -976,7 +976,7 @@ cp -c $(2)/mtld3d.dll $(2)/mtld3d.pdb $(2)/d3d9.dll $(2)/d3d9.pdb "$$tree/$(3)/"
 $(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
 if [ -n "$$stamped" ]; then \
 	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
-	mv -f "$$stamped/d3d9.dll" "$$stamped/mtld3d.dll" "$(1)/lib/wine/$(3)/" || exit ; \
+	mv -f "$$stamped/d3d9.dll" "$$stamped/mtld3d.dll" "$(1)/lib/wine/$(3)/" || { rm -rf "$$stamped" ; exit 1 ; } ; \
 	rmdir "$$stamped" ; \
 fi
 endef
@@ -2695,7 +2695,7 @@ setup-xwin: setup-rust xwin-dir
 	fi; \
 	missing= ; \
 	for arch in $$(echo $(XWIN_ARCH) | tr ',' ' '); do \
-		[ -d /opt/xwin/crt/lib/$$arch ] && [ -d /opt/xwin/sdk/lib/um/$$arch ] || missing="$$missing $$arch" ; \
+		[ -d /opt/xwin/crt/lib/$$arch ] && [ -d /opt/xwin/sdk/lib/um/$$arch ] && [ -d /opt/xwin/sdk/lib/ucrt/$$arch ] || missing="$$missing $$arch" ; \
 	done; \
 	if [ -n "$$installed" ] && [ "$$upstream" = "$$installed" ] && [ -z "$$missing" ]; then \
 		echo "    up to date, skipping splat"; \

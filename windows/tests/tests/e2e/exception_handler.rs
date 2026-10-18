@@ -277,7 +277,8 @@ fn fault_in_a_freed_module_workload() {
     let handler = unsafe { AddVectoredExceptionHandler(0, resume_past_trap) };
     assert!(!handler.is_null(), "AddVectoredExceptionHandler");
     let mut protect = 0u32;
-    // SAFETY: the three bytes at the DLL's entry point, mapped while it is loaded.
+    // SAFETY: the `TRAP_RET.len()` bytes at the DLL's entry point (3 on x86,
+    // 8 on ARM64), mapped while it is loaded.
     let unprotected = unsafe {
         VirtualProtect(
             code.cast(),
