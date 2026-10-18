@@ -55,11 +55,21 @@ rustflags = [
 
 # The two halves of the ARM64X DLLs. Rust has no ARM64X target, so each crate
 # is built once per half as a static library and the Makefile links both into
-# one image with `lld-link /machine:arm64x` (see `windows-arm64x` there). Cargo
-# never links a PE for these targets, so there is no linker and no library
-# search path here: the Makefile names every import library itself.
+# one image with `lld-link /machine:arm64x` (see `windows-arm64x` there),
+# naming every import library itself; cargo links no DLL for these targets.
+# It does link one thing for aarch64: the e2e test executables of the native
+# ARM64 leg (`test-e2e-arm64`), which are ordinary MSVC programs like the x86
+# legs' and link the same way, through `lld-link` and the xwin splat's
+# aarch64 libraries (`XWIN_ARCH` in the Makefile). A static library is never
+# linked, so the DLL halves do not see these.
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=-crt-static"]
+linker = "lld-link"
+rustflags = [
+    "-C", "target-feature=-crt-static",
+    "-Lnative=/opt/xwin/crt/lib/aarch64",
+    "-Lnative=/opt/xwin/sdk/lib/um/aarch64",
+    "-Lnative=/opt/xwin/sdk/lib/ucrt/aarch64",
+]
 
 [target.arm64ec-pc-windows-msvc]
 rustflags = ["-C", "target-feature=-crt-static"]

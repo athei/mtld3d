@@ -47,7 +47,10 @@ Two commands, both green before you commit:
   suite against the 64-bit build, `test-e2e-arm64x` against the ARM64X build
   under the arm64 Wine, the primary target, and `test-e2e-x86_64` against the
   x86_64 build under an x86_64 Wine (the two modes of
-  [`docs/BUILDING.md`](docs/BUILDING.md#prerequisites)). Conformance is not
+  [`docs/BUILDING.md`](docs/BUILDING.md#prerequisites)). Under the arm64 Wine
+  a third leg, `test-e2e-arm64`, runs the suite as native ARM64 processes
+  against the ARM64X build's ARM64 half, in a private clone of `WINE_SDK` and
+  a prefix made after its install. Conformance is not
   part of it, on purpose: many of its checks fail by design, so it gates on a
   regression against a baseline instead of on zero failures.
 
@@ -614,16 +617,17 @@ The description is what survives, and for anything non-trivial it carries:
 
 CI pins two Wines and runs one per image, which sets the Makefile's mode and
 so its legs: macos-26 runs the arm64 Wine (the arm64 legs, `i686` and
-`arm64x`, against the arm64 Wine's conformance keys), and macos-15, under
-Rosetta, and the Intel image run the x86_64 Wine (the x86_64 legs, `i686`
-and `x86_64`, against the x86_64 Wine's keys). The arm64 Wine needs macOS
-26.4, which macos-15 does not have. Every conformance leg runs the arm64
-Wine release's `d3d9_test.exe`: the x86_64-Wine images fetch that release's
-`lib/wine/tests` alone, cached by its pin, and name it in `WINE_TESTS`. CI
-compiles on two machines and replays everywhere else, both on macos-26 in
-the arm64 mode. One job builds the stage (`make stage`: the i686, x86_64
-and ARM64X builds, both unix `.so` builds, the e2e test binaries, the e2e
-and conformance runners for both host arches), which serves the legs of both
+`arm64x`, against the arm64 Wine's conformance keys, and the native ARM64 e2e
+leg, `aarch64`), and macos-15, under Rosetta, and the Intel image run the
+x86_64 Wine (the x86_64 legs, `i686` and `x86_64`, against the x86_64 Wine's
+keys). The arm64 Wine needs macOS 26.4, which macos-15 does not have. Every
+conformance leg runs the arm64 Wine release's `d3d9_test.exe`: the
+x86_64-Wine images fetch that release's `lib/wine/tests` alone, `VERSION`
+included, cached by its pin, and name it in `WINE_TESTS`. CI compiles on two
+machines and replays everywhere else, both on macos-26 in the arm64 mode.
+One job builds the stage (`make stage`: the i686, x86_64 and ARM64X builds,
+both unix `.so` builds, the e2e test binaries of every leg, the e2e and
+conformance runners for both host arches), which serves the legs of both
 Wines, and another runs formatting and audit first, then documentation,
 Clippy (the ARM64X halves included) and unit tests, with the `PERF=1` Clippy
 and unit-test legs of `make check`, as steps of one job. Production bundles

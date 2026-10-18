@@ -1403,3 +1403,14 @@ pub fn d3d9_export(name: &core::ffi::CStr) -> *mut c_void {
     // SAFETY: kernel32 export; `module` is a loaded module and `name` is NUL-terminated.
     unsafe { GetProcAddress(module, name.as_ptr()) }
 }
+
+/// Whether the process has loaded `mtld3d.dll`, the layer's bridge to its unix half.
+///
+/// Only the layer's `d3d9.dll` imports it, so after `Direct3DCreate9` it says
+/// the `d3d9.dll` the process loaded is the layer's and not Wine's own, which
+/// a Wine's compat database or a stale placeholder in the prefix can pick.
+#[must_use]
+pub fn layer_loaded() -> bool {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    unsafe { GetModuleHandleA(c"mtld3d.dll".as_ptr()) != 0 }
+}

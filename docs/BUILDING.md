@@ -170,19 +170,30 @@ unit tests and the end-to-end suite; both are green before every commit.
 `make check` lints every PE build of the mode, in the arm64 mode the two
 halves of the ARM64X one included.
 
-`make test` runs two end-to-end legs under `WINE_SDK`, the builds a game
-loads there: `test-e2e-i686`, the 32-bit suite against the i686 build, and
+`make test` runs two end-to-end legs under `WINE_SDK` in either mode, the
+builds a game loads there: `test-e2e-i686`, the 32-bit suite against the i686
+build, and
 the x64 suite against the 64-bit build, `test-e2e-arm64x` against the ARM64X
 build in the arm64 mode, whose ARM64EC half its processes run, and
 `test-e2e-x86_64` against the x86_64 build in the x86_64 mode. Both install
 into the one tree and share one prefix, since the two builds go into
-different directories. In the arm64 mode `make test-e2e-x86_64` runs the x64
-suite against the x86_64 build, emulated under the same Wine; `make test`
-leaves it out there. That build would take the ARM64X build's place in
-`aarch64-windows`, so the leg installs it into a private clone of `WINE_SDK`
-with a prefix created for the run, and never writes into `WINE_SDK` itself.
-A leg of the other mode, such as `test-e2e-arm64x` under an x86_64 Wine,
-stops saying why.
+different directories. The arm64 mode's `make test` runs a third leg,
+`test-e2e-arm64`: the suite built for `aarch64-pc-windows-msvc`, native ARM64
+processes, against the ARM64X build's ARM64 half, which the arm64 Wine's
+compatdb gives them from arm64-11.19-2 on. A native ARM64 process loads a
+builtin only behind a hybrid placeholder in the prefix's `system32`, and a
+prefix made before an install stamped hybrid ones keeps the AMD64 copies it
+took then, so this leg installs into a private clone of `WINE_SDK` with a
+prefix created after the install. Its test binaries link like the x86 legs',
+through `lld-link` and the xwin splat, which holds aarch64 libraries for them
+(`make setup-xwin` adds them to a splat that lacks them). In the arm64 mode
+`make test-e2e-x86_64` runs the x64 suite against the x86_64 build, emulated
+under the same Wine; `make test` leaves it out there. That build would take
+the ARM64X build's place in `aarch64-windows`, so the leg installs it into a
+private clone of `WINE_SDK` with a prefix created for the run, and neither
+leg ever writes into `WINE_SDK` itself. A leg of the other mode, such as
+`test-e2e-arm64x` or `test-e2e-arm64` under an x86_64 Wine, stops saying
+why.
 
 `make check` also lints and unit-tests a `PERF=1` build, the only build of a
 gate that compiles the perf telemetry and its tests. It goes into `target/perf`

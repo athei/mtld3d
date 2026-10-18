@@ -375,8 +375,14 @@ class ModeTests(FakeWineTestCase):
         self.assertNotIn("x86_64-pc-windows-msvc/release/d3d9.dll", arm64)
         self.assertIn("x86_64-pc-windows-msvc/release/d3d9.dll", x86_64)
         self.assertNotIn("arm64x", x86_64)
-        for output in (arm64, x86_64):
-            self.assertNotIn(".wine-isolated/leg-", output)
+        # The arm64 mode's `make test` adds the native ARM64 leg, in a tree and
+        # prefix of its own, running the aarch64 test binaries; the x86_64 mode
+        # has none.
+        self.assertIn(".wine-isolated/leg-arm64/sdk/bin/wine", arm64)
+        self.assertIn("--target aarch64-pc-windows-msvc --message-format", arm64)
+        self.assertNotIn(".wine-isolated/leg-x86_64", arm64)
+        self.assertNotIn(".wine-isolated/leg-", x86_64)
+        self.assertNotIn("aarch64-pc-windows-msvc", x86_64)
         self.assertIn(".wine-isolated/leg-x86_64", self.dry_run(self.arm64, "test-e2e-x86_64"))
         self.assertNotIn(".wine-isolated", self.dry_run(self.x86_64, "test-e2e-x86_64"))
         # Each Wine records under keys of its own, so neither rewrites the other's.
@@ -454,7 +460,8 @@ class ModeTests(FakeWineTestCase):
 
     def test_the_other_modes_legs_refuse(self):
         for wine, goal in ((self.arm64, "conformance-x86_64"), (self.arm64, "conformance-baseline-intel-x86_64"),
-                           (self.x86_64, "conformance-arm64x"), (self.x86_64, "test-e2e-arm64x")):
+                           (self.x86_64, "conformance-arm64x"), (self.x86_64, "test-e2e-arm64x"),
+                           (self.x86_64, "test-e2e-arm64")):
             with self.subTest(wine=wine.name, goal=goal):
                 output = self.run_make(f"WINE_SDK={wine}", goal, succeeds=False)
                 self.assertIn(f"{goal} runs the", output)
@@ -731,6 +738,32 @@ class InstallLayoutTests(FakeWineTestCase):
             self.assertIn("-b x86_64-windows", marker)
             self.assertNotIn("marm64x", marker)
         self.assertIn(f"--wine {clone}/bin/wine", output)
+
+    def test_the_native_arm64_leg_runs_the_aarch64_binaries_in_a_tree_of_its_own(self):
+        # The ARM64X build in a clone with a prefix booted after the install,
+        # so the prefix's system32 takes the hybrid placeholders a native
+        # ARM64 process needs.
+        before = sorted(str(path) for path in self.arm64.rglob("*"))
+        (self.stage / "tests/aarch64").mkdir(parents=True)
+        (self.stage / "tests/aarch64/e2e-fixture.exe").touch()
+        runner = self.stage / "e2e" / os.uname().machine / "mtld3d-e2e"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nprintf 'runner:%s\\n' \"$*\"\n")
+        runner.chmod(0o755)
+        output = self.run_make(f"STAGE={self.stage}", "LEG_SUBMAKE=true", "test-e2e-arm64")
+        self.assertEqual(sorted(str(path) for path in self.arm64.rglob("*")), before)
+        root = self.work / ".wine-isolated/leg-arm64"
+        tree = root / "sdk/lib/wine/d3d9/mtld3d"
+        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "aarch64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
+        self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
+        for name in ("d3d9", "mtld3d"):
+            marker = root / f"sdk/lib/wine/aarch64-windows/{name}.dll"
+            self.assertIn("-b aarch64-windows -marm64x", self.content(marker))
+        runs = self.printed(output, "runner:")
+        self.assertEqual(len(runs), 1, output)
+        self.assertIn(f"--wine {root}/sdk/bin/wine", runs[0])
+        self.assertIn(f"{self.stage}/tests/aarch64/e2e-fixture.exe", runs[0])
 
 
 USER_REG = """WINE REGISTRY Version 2

@@ -230,7 +230,11 @@ jobs:
   # (`test-e2e-arm64x`), the x86_64 build under the x86_64 Wine of macos-15
   # and the Intel image (`test-e2e-x86_64`). The `arch` axis keeps naming the test
   # binaries, so the job and artifact names stay as they were; LEG is the
-  # Makefile's name for the leg.
+  # Makefile's name for the leg. macos-26 runs one more, `aarch64`: the
+  # native ARM64 test binaries against the ARM64X build's ARM64 half
+  # (`test-e2e-arm64`), which only the arm64 Wine runs. It is an `include`
+  # entry rather than an axis value, as the scaled leg below is, so the other
+  # images grow no leg they cannot run.
   #
   # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
   # on arm64, and the Intel image, whose paravirtual device has no unified
@@ -279,7 +283,7 @@ jobs:
         runner: ${{ fromJSON(needs.build.outputs.runners) }}
         arch: [i686, x86_64]
         scale: [""]
-        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"}]' || '[]') }}
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"},{"runner":"macos-26","arch":"aarch64"}]' || '[]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
@@ -321,7 +325,7 @@ jobs:
             exit 1
           fi
         env:
-          LEG: ${{ matrix.arch == 'i686' && 'i686' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || matrix.arch == 'aarch64' && 'arm64' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
           E2E_FILTER: ${{ inputs.e2e_filter }}
           RUST_LOG: ${{ inputs.e2e_log }}
           LOG_DIR: ${{ runner.temp }}
