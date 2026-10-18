@@ -59,17 +59,6 @@ dispatch, `record_intel_baseline` with `intel_only`, best made on the pull
 request's branch before it merges so the `@mac2` sections land with it, or
 on `main` once the nightly shows the stale pin.
 
-`baseline.txt` holds no `@mac2` section at the moment. Those sections were
-recorded against Wine 11.0's tests, whose line numbers the one
-classification list no longer follows since every leg runs the 11.19 build
-(The test binaries, below), so they were removed and are re-recorded on the
-11.19 tests by that same dispatch, `record_intel_baseline` with
-`intel_only`, before the change that moved the tests merges; the
-`@mac2`-only clusters below keep their prose and get their `Sites:` tokens
-back from that record. Pull requests do not run the Intel image, so their CI
-does not read the sections; until the record lands, an Intel run reports
-each `@mac2` key as never recorded and fails.
-
 ### The two Wines
 
 The Makefile runs two legs under the Wine `WINE_SDK` names, both against the
@@ -969,8 +958,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-18: 6 `real`, 167 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 185 unique sites in all.
+`Sites:` tokens below on 2026-10-18: 6 `real`, 183 `expected`, 3 `caps`,
+6 `ceiling`, 3 `flaky`, 0 `untriaged`, 201 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 note below says.
@@ -988,8 +977,13 @@ add eight sites in five clusters: the six `real` ones of
 every i686 `device` leg and every `+intel` `visual` leg records `crash=1`;
 both are the subtest's last test and the clusters say why. The desktop-mode
 `ceiling` pins of `test_reset`, `test_mode_change`, `test_cursor_clipping`
-and test_wndproc 4157/4227, which read zero on both Wines, and the `@mac2`
-sections, which wait for CI's record, left the baseline.)
+and test_wndproc 4157/4227, which read zero on both Wines, left the
+baseline. CI's `record_intel_baseline` dispatch recorded both `@mac2` keys
+on the 11.19 tests the same day: against their Wine 11.0 sections they add
+the same new sites the Apple legs add (15357 on `i686+intel@mac2` only, the
+test being i386-only), the same two `crash=1`, and test_fetch4 15686 reads 3
+where 15 and 13 were pinned, as it fell on the Apple legs; nothing else
+moved but the line numbers.)
 (2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
 extended devices and runs every test, adding the same 64 sites, 63
 `expected` and 1 `caps`, on each of the six Apple-family legs. The site set
@@ -1397,6 +1391,7 @@ the flag also covers (5175/5193/5234) now succeed inside their todo blocks,
 which the runner does not count.
 
 ### device.c/test_mode_change
+Sites: 5594=expected 5614=expected 5637=expected 5672=expected 5896=expected
 
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
@@ -1405,11 +1400,10 @@ mode and the test's own CDS calls pick a mode user32 accepts, on both Wines.
 5548/5550 (the back buffer must keep the size a fullscreen create asked for
 across an external mode change) pass because the back buffer honors the
 request and never follows the window. 5594/5614/5637/5672/5896 ("Failed to
-restore display modes") fired on the `@mac2` legs only, where the test's
-restore of the original display modes fails; they carry no token until CI
-re-records those legs on the 11.19 tests (see "Running"). Why it fails there is not established: the Intel CI image's display
-runs 3840x2160 at 30 Hz and user32 lists 25 sizes for it, so it is not a
-single-mode display. Desktop mode switching is out of scope, so `expected`.
+restore display modes") fire on the `@mac2` legs only, where the test's
+restore of the original display modes fails. Why it fails there is not
+established: the Intel CI image's display runs 3840x2160 at 30 Hz and user32
+lists 25 sizes for it, so it is not a single-mode display. Desktop mode switching is out of scope, so `expected`.
 
 ### device.c/test_device_window_reset
 Sites: 5971=expected 5974=expected
@@ -1621,6 +1615,7 @@ is absent here). The failing cycles read the gradient across Presents —
 the same Rule B depth-store elision as z_range_test.
 
 ### visual.c/pixelshader_blending_test
+Sites: 12006=expected
 
 Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
 G32R32F) with blending on, then samples it and expects absent channels to
@@ -1634,11 +1629,9 @@ lanes as zero despite reporting the requested view swizzle. The E2E controls
 compare those lanes with an ordinary same-format texture on that device and
 still verify stored lanes, mip and cube addressing, and view retirement.
 Physical-GPU tests additionally require the specified all-ones missing lanes.
-Its site, 12006, fired on the `@mac2` legs only and carries no token until
-CI re-records those legs on the 11.19 tests (see "Running").
 
 ### visual.c/test_fetch4
-Sites: 15686=ceiling
+Sites: 15686=ceiling 15745=expected
 
 Fetch4 uses native gather for point-filtered 2D L8/L16/R16F/R32F/A8 and
 INTZ/DF16/DF24 samplers. GET4 and GET1 commands through D3DSAMP_MIPMAPLODBIAS
@@ -1654,8 +1647,7 @@ is outside the supported Fetch4 format set and keeps ordinary sampling, with
 alpha one rather than a fourth gathered texel. A8R8G8B8 also keeps ordinary
 sampling; its unwritten texels can have alpha one rather than the expected zero.
 These cases account for the remaining format-site failures. Keep the higher pins
-because counts vary with allocation contents. 15745 (`@mac2` legs only, with
-no token until CI re-records them on the 11.19 tests) is the
+because counts vary with allocation contents. 15745 (`@mac2` legs only) is the
 3D section's `L8` volume texture, which reads its green and blue lanes through
 the channel swizzle the paravirtual device ignores (the swizzle cluster above):
 the sample carries red alone there.
@@ -1675,9 +1667,11 @@ The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
 device encodes its own way (0x00808000; `def1` reads the same value there).
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
+Sites: 5088=expected 5167=expected 6032=expected 18835=expected
+Sites: 18838=expected 18841=expected 18844=expected 20750=expected
+Sites: 20799=expected
 
-`@mac2` legs only, one mechanism, and no token until CI re-records those
-legs on the 11.19 tests (see "Running"). Every format whose D3D9 sample fills a
+`@mac2` legs only, one mechanism. Every format whose D3D9 sample fills a
 lane the Metal format lacks (R32F's green and blue, G16R16's alpha, V8U8's
 and V16U16's blue and alpha, X8R8G8B8's alpha, L8's green and blue) is handed out as a
 texture view with a channel swizzle. The paravirtual device on the Intel CI
