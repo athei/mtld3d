@@ -91,7 +91,7 @@ before. A key with no entries yet makes its
 leg's run report every failing site as new and fail, and the runner says so
 in one line naming the key and `make conformance-baseline`. The header's
 `Wine:` line is one for the file and names the build of the tests every
-section was recorded against, `wine-11.19-17-ge2e42653b41`: the version of
+section was recorded against, `wine-11.19-17-gd57b522eea5`: the version of
 the Wine the tests were built from, never of the Wine that runs them. The
 Makefile tells the runner that version (`--tests-wine-version`) from the
 first of these that answers:
@@ -100,11 +100,12 @@ first of these that answers:
    wine-build: a release that publishes the tests writes it into
    `lib/wine/tests`, holding the `wine --version` string of the build the
    tests came from, so a directory of tests extracted alone still says
-   which build it is. Releases up to arm64-11.19-1 do not write it yet;
+   which build it is. wine-build writes it from arm64-11.19-2 on;
 2. the `wine --version` of the Wine tree `WINE_TESTS` lies in
    (`$WINE_TESTS/../../../bin/wine`), when that tree has a runnable
    `bin/wine`. In the arm64 mode's default this is `WINE_SDK`'s own;
-3. nothing, as for the tests CI's x86_64-Wine images extract alone.
+3. nothing, for tests with neither; CI's x86_64-Wine images extract the
+   tests with their `VERSION`, so every CI image compares.
 
 A run compares the header with that version and warns when they differ, and
 `make conformance-baseline` writes it into the header. When it is unknown
@@ -188,7 +189,7 @@ The test binaries are the `{i386,x86_64}-windows/d3d9_test.exe` of
 wine-build's arm64 Wine release, under its `lib/wine/tests`, and every leg
 runs that one build whichever Wine it runs under: a site is named by its
 `file:line`, which moves between Wine versions (the x86_64 Wine cx-26.3.0-7
-ships Wine 11.0's tests, the arm64 Wine arm64-11.19-1 Wine 11.19's), so one
+ships Wine 11.0's tests, the arm64 Wine arm64-11.19-2 Wine 11.19's), so one
 classification list can only serve one build of the tests, and a PE test
 runs under any Wine. `WINE_TESTS` names the directory. Under the arm64 Wine
 it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
@@ -946,8 +947,12 @@ they disagree. When a re-baseline adds or removes sites, update the matching
 cluster block (and its rationale) in the same commit.
 
 Line numbers refer to the build of the tests the baseline header names,
-Wine 11.19's (`wine-11.19-17-ge2e42653b41`), including the dated notes below,
-which were renumbered from Wine 11.0's lines with the rest. A
+Wine 11.19's (`wine-11.19-17-gd57b522eea5`), including the dated notes below,
+which were renumbered from Wine 11.0's lines with the rest. (2026-10-18: the
+header moved from `wine-11.19-17-ge2e42653b41`, arm64-11.19-1's, to
+arm64-11.19-2's without a re-record: the two Wine commits differ only in
+winebuild, and `dlls/d3d9/tests` is the same in both, so every site and count
+holds.) A
 `Sites:` line lists every baseline site of the cluster as `<line>=<class>`;
 prose explains why. One source line can fire many assertions and can mix
 sub-causes — a `real` line may carry a by-design remainder (noted in prose),

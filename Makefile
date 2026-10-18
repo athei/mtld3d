@@ -488,11 +488,11 @@ D3D9_TEST_arm64x     := $(D3D9_TEST_x86_64)
 # header records and the runner holds it against (`--tests-wine-version`):
 # never the version of the Wine that runs them, since one build of the tests
 # runs under both Wines. The first line of WINE_TESTS's `VERSION`, the file
-# wine-build writes beside the tests from a later release on; else the
-# `wine --version` of the Wine tree WINE_TESTS lies in, when that tree has a
-# runnable `bin/wine` (WINE_SDK's own in the arm64 mode); else empty, the
-# tests extracted alone as CI's x86_64-Wine images have them, which the runner
-# reports as unknown. Expanded only by the conformance legs.
+# wine-build writes beside the tests from arm64-11.19-2 on, which CI's
+# x86_64-Wine images extract with the tests; else the `wine --version` of the
+# Wine tree WINE_TESTS lies in, when that tree has a runnable `bin/wine`
+# (WINE_SDK's own in the arm64 mode); else empty, tests without either, which
+# the runner reports as unknown. Expanded only by the conformance legs.
 WINE_TESTS_TREE    = $(abspath $(WINE_TESTS)/../../..)
 WINE_TESTS_VERSION = $(strip $(if $(wildcard $(WINE_TESTS)/VERSION),\
 	$(shell head -n 1 '$(WINE_TESTS)/VERSION'),\
