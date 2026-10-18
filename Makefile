@@ -595,7 +595,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	bundle version-check production-assert-gate mem-routine-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
-	test test-unit test-e2e-i686 test-e2e-arm64x test-e2e-x86_64 test-e2e-arm64 \
+	hybrid-winebuild-check test test-unit test-e2e-i686 test-e2e-arm64x test-e2e-x86_64 test-e2e-arm64 \
 	bench bench-ab bench-variants bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-arm64x conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-arm64x conformance-baseline-x86_64 \
@@ -899,10 +899,11 @@ endef
 # Sets `target` to the hybrid marker's winebuild target when the marker for
 # `$$dll` in the Wine directory $(1) is to be hybrid (the rule above): $(1) is
 # `aarch64-windows` and every tree beside `$$tree` in its family directory
-# that has the DLL, `$$tree` itself included, holds an ARM64 image of it. A
-# DLL there whose machine PE_MACHINE cannot read fails the install naming it,
-# as the bundle's rule does, rather than count as not ARM64 and cut native
-# ARM64 processes off the name.
+# that has the DLL holds an ARM64 image of it, `$$tree` itself counted by the
+# DLL about to be installed there, from the build directory $(2). A DLL whose
+# machine PE_MACHINE cannot read fails the install naming it, as the bundle's
+# rule does, rather than count as not ARM64 and cut native ARM64 processes
+# off the name; the failure removes PE_PAIR_INSTALL's scratch `$$stamped`.
 # PE_PAIR_INSTALL applies it to a 64-bit pair in the arm64 mode only: the
 # x86_64 mode installs no ARM64 image, so its markers are AMD64 by the rule.
 define HYBRID_MARKER_RULE
@@ -910,8 +911,9 @@ if [ "$(1)" = aarch64-windows ]; then \
 	hybrid=1 ; \
 	for impl in "$${tree%/*}"/*/; do \
 		f="$${impl}$(1)/$$dll.dll" ; \
+		[ "$$impl" != "$$tree/" ] || f="$(2)/$$dll.dll" ; \
 		[ -f "$$f" ] || continue ; \
-		machine=$$($(call PE_MACHINE,$$f)) || { echo "$$f is no PE image whose machine make install can read, so the marker of $$dll.dll cannot follow the rule that keeps it loadable for native ARM64 processes; replace or remove the file" >&2 ; exit 2 ; } ; \
+		machine=$$($(call PE_MACHINE,$$f)) || { echo "$$f is no PE image whose machine make install can read, so the marker of $$dll.dll cannot follow the rule that keeps it loadable for native ARM64 processes; replace or remove the file" >&2 ; rm -rf "$$stamped" ; exit 2 ; } ; \
 		[ "$$machine" = aa64 ] || hybrid= ; \
 	done ; \
 	[ -z "$$hybrid" ] || target="aarch64-windows -marm64x" ; \
@@ -926,31 +928,56 @@ endef
 # load config that is there stands for the ARM64EC metadata: the known
 # winebuilds write either none at all or a full one whose CHPE pointer names
 # that metadata. An unreadable placeholder, or one that is no PE32+ image,
-# fails too. The install and `bundle` both run it.
+# fails too. $(2), optional, are commands run before a failure exits, such as
+# the removal of a scratch directory. The install, `windows-arm64x` and
+# HYBRID_WINEBUILD_CHECK run it.
 define HYBRID_PLACEHOLDER_CHECK
-config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBUILD) just wrote, is no PE32+ image whose load config make can read" >&2 ; exit 2 ; } ; \
-[ "$$config" != 0000000000000000 ] || { echo "$(WINEBUILD) is too old: it writes a -marm64x placeholder without the ARM64EC metadata of a hybrid one, which an x64 process refuses ($(1)); WINE_SDK has to be wine-build arm64-11.19-2 or later" >&2 ; exit 2 ; }
+config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBUILD) just wrote, is no PE32+ image whose load config make can read" >&2 ; $(2) exit 2 ; } ; \
+[ "$$config" != 0000000000000000 ] || { echo "$(WINEBUILD) is too old: it writes a -marm64x placeholder without the ARM64EC metadata of a hybrid one, which an x64 process refuses ($(1)); WINE_SDK has to be wine-build arm64-11.19-2 or later" >&2 ; $(2) exit 2 ; }
+endef
+
+# Fails unless WINEBUILD writes hybrid placeholders, before an install leaf
+# of the arm64 mode touches any Wine: the leaves run one after another, so
+# the ARM64X one finding out last would leave the i686 pair and the unix
+# library already replaced. It stamps a scratch placeholder from one of
+# WINE_SDK's own ARM64X builtins and holds it to HYBRID_PLACEHOLDER_CHECK.
+HYBRID_PROBE_DLL := $(WINE_SDK)/lib/wine/aarch64-windows/kernel32.dll
+define HYBRID_WINEBUILD_CHECK
+probe=$$(mktemp -d "$${TMPDIR:-/tmp}/mtld3d-probe.XXXXXX") || exit ; \
+$(WINEBUILD) --fake-module -o "$$probe/probe.dll" -b aarch64-windows -marm64x --dll '$(HYBRID_PROBE_DLL)' || { rm -rf "$$probe" ; exit 1 ; } ; \
+$(call HYBRID_PLACEHOLDER_CHECK,$$probe/probe.dll,rm -rf "$$probe" ;) ; \
+rm -rf "$$probe"
 endef
 
 # $(1) = the Wine root, $(2) = the build directory of the pair, $(3) = the
 # Wine directory it goes into, $(4) = the winebuild target of its markers,
 # which HYBRID_MARKER_RULE replaces with the hybrid one where it applies; a
 # hybrid one is held to HYBRID_PLACEHOLDER_CHECK.
-# Installs `d3d9.dll` and `mtld3d.dll` with their `.pdb`s.
+# Installs `d3d9.dll` and `mtld3d.dll` with their `.pdb`s. The markers are
+# stamped into a scratch directory and checked there before anything in the
+# Wine changes, so a winebuild that cannot write them fails the install with
+# the Wine's pair and placeholders as they were: overwriting a working AMD64
+# placeholder with a plain ARM64 one would cut every x64 program off the name.
 define PE_PAIR_INSTALL
 tree=$$($(call MTLD3D_TREE,"$(1)")) ; \
 [ -d "$$tree/$(3)" ] || { echo "$$tree/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
-cp -c $(2)/mtld3d.dll $(2)/mtld3d.pdb $(2)/d3d9.dll $(2)/d3d9.pdb "$$tree/$(3)/" || exit ; \
-$(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || exit ; \
+stamped= ; \
 if [ "$$tree" != "$(1)/lib/wine" ]; then \
 	[ -d "$(1)/lib/wine/$(3)" ] || { echo "$(1)/lib/wine/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
-	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
+	stamped=$$(mktemp -d "$${TMPDIR:-/tmp}/mtld3d-markers.XXXXXX") || exit ; \
 	for dll in d3d9 mtld3d; do \
 		target=$(4) ; \
-		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3)) ;)) \
-		$(WINEBUILD) --fake-module -o "$(1)/lib/wine/$(3)/$$dll.dll" -b $$target --dll "$$tree/$(3)/$$dll.dll" || exit ; \
-		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,if [ "$$target" != "$(4)" ]; then $(call HYBRID_PLACEHOLDER_CHECK,$(1)/lib/wine/$(3)/$$dll.dll) ; fi ;)) \
+		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3),$(2)) ;)) \
+		$(WINEBUILD) --fake-module -o "$$stamped/$$dll.dll" -b $$target --dll "$(2)/$$dll.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
+		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,if [ "$$target" != "$(4)" ]; then $(call HYBRID_PLACEHOLDER_CHECK,$$stamped/$$dll.dll,rm -rf "$$stamped" ;) ; fi ;)) \
 	done ; \
+fi ; \
+cp -c $(2)/mtld3d.dll $(2)/mtld3d.pdb $(2)/d3d9.dll $(2)/d3d9.pdb "$$tree/$(3)/" || { rm -rf "$$stamped" ; exit 1 ; } ; \
+$(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
+if [ -n "$$stamped" ]; then \
+	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
+	mv -f "$$stamped/d3d9.dll" "$$stamped/mtld3d.dll" "$(1)/lib/wine/$(3)/" || exit ; \
+	rmdir "$$stamped" ; \
 fi
 endef
 
@@ -1047,14 +1074,20 @@ endef
 mem-routine-gate:
 	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 
-install-windows-i686: $(if $(STAGE),,windows-i686)
+# The probe every install leaf of the arm64 mode waits for, which make runs
+# once however many leaves an invocation takes.
+HYBRID_CHECK_LEAF := $(if $(ARM64X_LEG),hybrid-winebuild-check)
+hybrid-winebuild-check:
+	$(HYBRID_WINEBUILD_CHECK)
+
+install-windows-i686: $(if $(STAGE),,windows-i686) $(HYBRID_CHECK_LEAF)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
 		$(call WINE_HOST,$$dir) ; \
 		$(call PE_PAIR_INSTALL,$$dir,$(OUT_i386),i386-windows,i686-windows) ; \
 	done
 
-install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
+install-windows-x86_64: $(if $(STAGE),,windows-x86_64) $(HYBRID_CHECK_LEAF)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_x64)/d3d9.dll $(OUT_x64)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
 		$(call WINE_HOST,$$dir) ; \
@@ -1062,7 +1095,7 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 		$(call PE_PAIR_INSTALL,$$dir,$(OUT_x64),$$pe64,x86_64-windows) ; \
 	done
 
-install-windows-arm64x: $(if $(STAGE),,windows-arm64x)
+install-windows-arm64x: $(if $(STAGE),,windows-arm64x) $(HYBRID_CHECK_LEAF)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
 		$(call WINE_HOST,$$dir) ; \
@@ -1070,7 +1103,7 @@ install-windows-arm64x: $(if $(STAGE),,windows-arm64x)
 		$(call PE_PAIR_INSTALL,$$dir,$(OUT_arm64x),$$pe64,x86_64-windows) ; \
 	done
 
-install-unix-x64: $(if $(STAGE),,unix-x64)
+install-unix-x64: $(if $(STAGE),,unix-x64) $(HYBRID_CHECK_LEAF)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_x64)/mtld3d.so)
 	for dir in $(INSTALL_DIRS); do \
 		$(call WINE_HOST,$$dir) ; \
@@ -1078,7 +1111,7 @@ install-unix-x64: $(if $(STAGE),,unix-x64)
 		$(call UNIX_INSTALL,$$dir,$(OUT_unix_x64),$(UNIX_WINEDIR_x64)) ; \
 	done
 
-install-unix-arm64: $(if $(STAGE),,unix-arm64)
+install-unix-arm64: $(if $(STAGE),,unix-arm64) $(HYBRID_CHECK_LEAF)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_arm64)/mtld3d.so)
 	for dir in $(INSTALL_DIRS); do \
 		$(call WINE_HOST,$$dir) ; \
@@ -1256,6 +1289,7 @@ stage: all
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_i386))); cp -c $$exes $(STAGE_DIR)/tests/i686/
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_x64))); cp -c $$exes $(STAGE_DIR)/tests/x86_64/
+	$(if $(ARM64X_LEG),$(XWIN_AARCH64_REQUIRE))
 	$(if $(ARM64X_LEG),$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_arm64))); cp -c $$exes $(STAGE_DIR)/tests/aarch64/)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_arm64)
@@ -1555,6 +1589,19 @@ E2E_EXES_i686    = $(if $(STAGE),$(STAGE)/tests/i686/*.exe,$(call E2E_EXES,$(PE_
 E2E_EXES_x86_64  = $(if $(STAGE),$(STAGE)/tests/x86_64/*.exe,$(call E2E_EXES,$(PE_x64)))
 E2E_EXES_aarch64 = $(if $(STAGE),$(STAGE)/tests/aarch64/*.exe,$(call E2E_EXES,$(PE_arm64)))
 
+# The aarch64 test executables link against the xwin splat's aarch64
+# libraries (`windows/.cargo/config.toml`), which a splat made before
+# XWIN_ARCH named aarch64 lacks; lld-link would then fail on the first
+# missing `.lib` without saying why. Checked before every aarch64 test build.
+# XWIN_ROOT is the splat's fixed place (see `xwin-dir`), named once here so a
+# test of the check can point it elsewhere.
+XWIN_ROOT := /opt/xwin
+define XWIN_AARCH64_REQUIRE
+for dir in crt/lib sdk/lib/um sdk/lib/ucrt; do \
+	[ -d '$(XWIN_ROOT)/'$$dir/aarch64 ] || { echo "$(XWIN_ROOT) has no $$dir/aarch64, the libraries the native ARM64 test executables link against; \`make setup-xwin\` adds them" >&2; exit 2; }; \
+done
+endef
+
 # From a build here the runner is built and run through cargo, from its own
 # workspace so its `.cargo/config.toml` applies; from a stage it is the staged
 # binary for this machine's arch (compare `CONFORMANCE_BIN`).
@@ -1637,6 +1684,7 @@ test-e2e-x86_64: $(if $(STAGE),,windows-i686 windows-x86_64 unix-arm64)
 # testing it.
 ARM64_LEG := $(call leg_root,arm64)
 test-e2e-arm64: $(if $(STAGE),,windows-i686 windows-arm64x unix-arm64)
+	$(if $(STAGE),,$(XWIN_AARCH64_REQUIRE))
 	$(call LEG_TREE_SETUP,$(ARM64_LEG),$(call LEG_INSTALL,$(ARM64_LEG)/sdk,$(OUT_i386),$(OUT_arm64x),$(OUT_unix_arm64)))
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_aarch64)); cd $(E2E_RUNNER_DIR) && WINEPREFIX='$(ARM64_LEG)/prefix' $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine '$(ARM64_LEG)/sdk/bin/wine' $(E2E_FLAGS) -- $$exes; \

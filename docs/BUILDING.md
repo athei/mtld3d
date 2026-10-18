@@ -257,11 +257,12 @@ build of it, as after an install of the ARM64X build, and AMD64 ones
 otherwise, as when the x86_64 build is installed there. A hybrid one also
 takes a winebuild that writes the ARM64EC metadata into it, which
 wine-build's does from arm64-11.19-2 on; an older one writes a plain ARM64
-placeholder an x64 process refuses, and the install fails naming it. An x64
-process accepts both kinds; a native ARM64 one loads a name only behind a
-hybrid placeholder. A prefix copies the placeholders when it
-is created and takes a changed one on its next `wineboot -u`. A runtime-only
-arm64 Wine without that tree, such as CrossOver's, is refused.
+placeholder an x64 process refuses, and the install fails naming it before it
+changes anything in the Wine. An x64 process accepts both kinds; a native
+ARM64 one loads a name only behind a hybrid placeholder. A prefix copies the
+placeholders when it is created and takes a changed one on its next
+`wineboot -u`. A runtime-only arm64 Wine without that tree, such as
+CrossOver's, is refused.
 
 Under that Wine the PE side of a 32-bit game, and of the x86_64 build, runs
 translated, while the ARM64X build's ARM64EC half runs as native code, and
