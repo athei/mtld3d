@@ -72,11 +72,14 @@ yet, what never will be, and the divergences from D3D9 kept on purpose.
 - macOS 15 or 26, on Apple Silicon or Intel. CI covers macOS 15 and 26 on
   Apple Silicon and macOS 15 on Intel, because no macOS 26 Intel runners
   exist. Intel on macOS 26 is expected to work.
-- A Wine from [wine-build](https://github.com/athei/wine-build), based on
-  CrossOver 26; CI pins a release of it. Older Wine or CrossOver releases are
-  not expected to work.
-- wine-build's arm64 Wine, which runs x86 games through FEX, is wired into
-  the Makefile and tested locally, but not run in CI.
+- A Wine from [wine-build](https://github.com/athei/wine-build). Its arm64
+  Wine, which runs x86 games through FEX and loads an ARM64X build of mtld3d
+  into 64-bit games, is the primary target. An x86_64 Wine from wine-build,
+  based on CrossOver 26, which an Intel Mac runs and CI pins, takes the
+  x86_64 build. Older Wine or CrossOver releases are not expected to work.
+- macOS 26.4 or later for the arm64 Wine, whose binaries are built for it.
+  On an Apple Silicon Mac below that, such as one on macOS 15, the x86_64
+  Wine under Rosetta 2 is the route.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
 - Rosetta 2 for an x86_64 Wine. An arm64 Wine translates x86 itself.
 - [x87sidecar](https://github.com/athei/x87sidecar) under an x86_64 Wine.
@@ -139,9 +142,15 @@ readable. If mtld3d does not seem to load at all, start with the
 ```sh
 make setup        # once: toolchains and SDKs, but not Wine
 make              # build every shipped binary
-make install      # install into the Wine tree WINE_X86_64 names
+make install      # install into the Wine tree WINE_SDK names
 ```
 
+`WINE_SDK` names the Wine the build installs into and builds against:
+wine-build's arm64 Wine, or an x86_64 Wine on an Intel Mac. On the arm64 Wine
+the ARM64X build also needs
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20260826 or newer
+(`LLVM_MINGW`) and LLD 23 or newer (`ARM64X_LLD`); an x86_64 Wine cannot run
+it, and the build leaves it out there.
 [`docs/BUILDING.md`](docs/BUILDING.md) covers the prerequisites, the tests,
 the arm64 Wine and the release bundle.
 
@@ -152,8 +161,8 @@ d3d9.dll, which links mtld3d-core, records each frame and calls the function
 mtld3d_unix_call exported by mtld3d.dll; mtld3d.dll crosses the Wine PE/Unix
 boundary into mtld3d.so, the native runtime, whose encoder, submit, presenter
 and worker threads drive Metal. The PE side is i386 or x86_64, one chain per
-architecture, and with EC=1 an x64 game can load ARM64X builds of d3d9.dll
-and mtld3d.dll instead; the host side is Mach-O in Wine's own
+architecture, and on an arm64 Wine an x64 game loads ARM64X builds of
+d3d9.dll and mtld3d.dll instead; the host side is Mach-O in Wine's own
 architecture.](docs/architecture.svg)
 
 `d3d9.dll` implements the COM API, keeps the state the game can observe, and

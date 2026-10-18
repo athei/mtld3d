@@ -36,16 +36,19 @@ pub struct MergeSummary {
 ///
 /// Entries the prior baseline holds for any *other* leg survive verbatim: a
 /// run only ever measured its own arch under its own variant, so dropping the
-/// rest would record a regression-free score for tests that never ran.
+/// rest would record a regression-free score for tests that never ran. The
+/// header takes `tests_wine_version`, the Wine version the tests were built
+/// from, and keeps the prior header when the caller cannot tell it: the
+/// version of the Wine that ran them says nothing about their sites.
 #[must_use]
 pub fn merge(
     prior: &Baseline,
     leg: Leg,
     fresh: &BTreeMap<(Leg, Subtest), SubtestResult>,
-    wine_version: String,
+    tests_wine_version: Option<String>,
 ) -> (Baseline, MergeSummary) {
     let mut next = Baseline {
-        wine_version,
+        wine_version: tests_wine_version.unwrap_or_else(|| prior.wine_version.clone()),
         entries: prior
             .entries
             .iter()

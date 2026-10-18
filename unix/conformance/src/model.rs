@@ -15,11 +15,22 @@ use std::{
     str::FromStr,
 };
 
-/// The PE architectures the suite runs against, in baseline-output order.
+/// The PE builds the suite runs against, in baseline-output order.
+///
+/// Each names a test binary, the build it runs against and the Wine it runs
+/// under, so the counts of one Wine never land in another's entries. `I686`
+/// and `X64` are the i386 and `x86_64` test binaries against the build of
+/// their own architecture under an `x86_64` Wine. `I686Arm64` is the i386
+/// binary against the i686 build under the arm64 Wine, whose x86 translator
+/// moves counts of its own. `Arm64x` is the `x86_64` binary against the ARM64X
+/// build, which the arm64 Wine loads into an x64 process in place of the
+/// `x86_64` one.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Arch {
     I686,
     X64,
+    I686Arm64,
+    Arm64x,
 }
 
 /// Which device answers the run was measured under, in baseline-output order.
@@ -198,13 +209,13 @@ impl Gpu {
 
 impl Leg {
     /// Every leg, in baseline-output order: every variant of each architecture on each GPU family.
-    pub const ALL: [Self; 12] = {
+    pub const ALL: [Self; 24] = {
         let mut all = [Self {
             arch: Arch::I686,
             variant: Variant::Native,
             gpu: Gpu::Apple,
-        }; 12];
-        let archs = [Arch::I686, Arch::X64];
+        }; 24];
+        let archs = [Arch::I686, Arch::X64, Arch::I686Arm64, Arch::Arm64x];
         let variants = [Variant::Native, Variant::Intel, Variant::Scale];
         let gpus = [Gpu::Apple, Gpu::Mac2];
         let mut i = 0;
@@ -241,6 +252,8 @@ impl fmt::Display for Arch {
         f.write_str(match self {
             Self::I686 => "i686",
             Self::X64 => "x86_64",
+            Self::I686Arm64 => "i686-arm64",
+            Self::Arm64x => "arm64x",
         })
     }
 }
@@ -300,6 +313,8 @@ impl FromStr for Arch {
         match s {
             "i686" => Ok(Self::I686),
             "x86_64" => Ok(Self::X64),
+            "i686-arm64" => Ok(Self::I686Arm64),
+            "arm64x" => Ok(Self::Arm64x),
             other => Err(format!("unknown arch {other:?}")),
         }
     }

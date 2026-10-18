@@ -82,7 +82,13 @@ fn real_main() -> Result<ExitCode, String> {
         variant: config.variant,
         gpu: Gpu::host(),
     };
-    println!("Wine: {wine_version} ({leg})");
+    println!(
+        "Wine: {wine_version} ({leg}), tests from {}",
+        config
+            .tests_wine_version
+            .as_deref()
+            .unwrap_or("an unknown Wine version")
+    );
 
     // `--only` narrows the subtest set; absent = all four.
     let subtests: Vec<Subtest> = config
@@ -122,7 +128,14 @@ fn real_main() -> Result<ExitCode, String> {
             eprintln!("warning: ignoring unparseable prior baseline ({e}); new/dropped reporting incomplete");
             Baseline::default()
         });
-        let (next, summary) = merge::merge(&prior, leg, &current, wine_version);
+        if config.tests_wine_version.is_none() {
+            println!(
+                "conformance: the tests' Wine version is unknown, so the baseline keeps its \
+                 header ({})",
+                prior.wine_version
+            );
+        }
+        let (next, summary) = merge::merge(&prior, leg, &current, config.tests_wine_version);
         std::fs::write(&baseline_path, next.to_text())
             .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
         println!(
@@ -158,15 +171,28 @@ fn real_main() -> Result<ExitCode, String> {
     }
 
     let baseline = load_optional(&baseline_path)?;
-    if !baseline.wine_version.is_empty() && baseline.wine_version != wine_version {
-        eprintln!(
-            "warning: baseline taken against {}, running {} - file:line sites may have drifted; re-baseline expected",
-            baseline.wine_version, wine_version
-        );
+    match diff::tests_version_note(&baseline, config.tests_wine_version.as_deref()) {
+        Some(diff::VersionNote::Unknown) => println!(
+            "conformance: the tests' Wine version is unknown, so baseline.txt's ({}) is not \
+             compared",
+            baseline.wine_version
+        ),
+        Some(diff::VersionNote::Differs { baseline, tests }) => eprintln!(
+            "warning: baseline taken against the tests of {baseline}, running the tests of \
+             {tests} - file:line sites may have drifted; re-baseline expected"
+        ),
+        None => {}
     }
     let classes = triage::load(&assets)?;
     let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
+    for leg in diff::unrecorded_legs(&baseline, &current) {
+        println!(
+            "conformance: baseline.txt has no [{leg}/...] entries: this leg was never recorded \
+             on the Wine it runs under, so every site it fails reads as new; `make \
+             conformance-baseline` on that Wine records them"
+        );
+    }
     Ok(verdict(&report, validation_errors))
 }
 

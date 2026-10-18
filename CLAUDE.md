@@ -9,8 +9,8 @@ It points at the files that own the rules:
 - [`README.md`](README.md), the goal, the features, the requirements, and how
   to install, configure and log.
 - [`docs/BUILDING.md`](docs/BUILDING.md), building from source, the gates and
-  tests, the arm64 Wine switches and their paths, benchmarks and the release
-  bundle.
+  tests, the two Wines (arm64 and x86_64) and the paths the Makefile reads,
+  benchmarks and the release bundle.
 - [`docs/GAMES.md`](docs/GAMES.md), the games tested so far and how far each
   one gets.
 - [`docs/STATUS.md`](docs/STATUS.md), what is implemented, what is not, and

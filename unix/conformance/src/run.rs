@@ -250,8 +250,8 @@ pub fn run_subtest(
 ) -> Result<SubtestRun, String> {
     if !launch.exe.is_file() {
         return Err(format!(
-            "test exe not found: {}; a Wine SDK bundle carries these under \
-             lib/wine/tests, so re-bundle if yours predates them",
+            "test exe not found: {}; an arm64 Wine release from wine-build \
+             carries these under lib/wine/tests, the directory WINE_TESTS names",
             launch.exe.display()
         ));
     }

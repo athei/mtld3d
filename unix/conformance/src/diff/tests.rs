@@ -8,14 +8,14 @@
 
 use std::collections::BTreeMap;
 
-use super::diff;
+use super::{VersionNote, diff, tests_version_note, unrecorded_legs};
 use crate::{
     classify::Classification,
     model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
     triage::DocSite,
 };
 
-const OCCLUSION_SKIP: &str = "device.c:6706: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\r\n";
+const OCCLUSION_SKIP: &str = "device.c:6702: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\r\n";
 const DEVICE_SUMMARY: &str = "00dc:device: 58913 tests executed (75 marked as todo, 0 as flaky, 786 failures), 21 skipped.\r\n";
 
 fn key() -> (Leg, Subtest) {
@@ -246,15 +246,15 @@ fn baseline_site_without_a_class_entry_is_flagged_untriaged() {
 
 #[test]
 fn observed_occlusion_skip_is_not_a_passing_assertion() {
-    let base = baseline_with(&[(6780, 1)], false);
-    let classes = classes_with(&[(6780, Classification::Expected)]);
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
     let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
     let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
     let report = diff(&base, &classes, &cur);
     assert!(!report.regressed, "{}", report.text);
     assert!(!report.stale, "{}", report.text);
     assert!(
-        report.text.contains("device.c:6780  SKIPPED"),
+        report.text.contains("device.c:6776  SKIPPED"),
         "{}",
         report.text
     );
@@ -273,10 +273,10 @@ fn observed_occlusion_skip_is_not_a_passing_assertion() {
 
 #[test]
 fn occlusion_skip_requires_the_reviewed_site_and_message() {
-    let base = baseline_with(&[(6780, 1)], false);
-    let classes = classes_with(&[(6780, Classification::Expected)]);
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
     for skip in [
-        OCCLUSION_SKIP.replace("6706", "6707"),
+        OCCLUSION_SKIP.replace("6702", "6703"),
         OCCLUSION_SKIP.replace("device.c", "visual.c"),
         OCCLUSION_SKIP.replace("large query tests", "other tests"),
         OCCLUSION_SKIP.replace("100 ms", "70 ms"),
@@ -293,9 +293,9 @@ fn occlusion_skip_requires_the_reviewed_site_and_message() {
 
 #[test]
 fn occlusion_skip_does_not_excuse_other_missing_or_failing_sites() {
-    let base = baseline_with(&[(6780, 1), (5975, 1)], false);
+    let base = baseline_with(&[(6776, 1), (5975, 1)], false);
     let classes = classes_with(&[
-        (6780, Classification::Expected),
+        (6776, Classification::Expected),
         (5975, Classification::Expected),
     ]);
     let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
@@ -310,8 +310,8 @@ fn occlusion_skip_does_not_excuse_other_missing_or_failing_sites() {
 
     let output = format!(
         "{output}device.c:5975: Test failed: Got unexpected result.\n\
-        device.c:6780: Test failed: Got unexpected query result.\n\
-        device.c:6780: Test failed: Got unexpected query result.\n"
+        device.c:6776: Test failed: Got unexpected query result.\n\
+        device.c:6776: Test failed: Got unexpected query result.\n"
     );
     let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
     let report = diff(&base, &classes, &cur);
@@ -321,8 +321,8 @@ fn occlusion_skip_does_not_excuse_other_missing_or_failing_sites() {
 
 #[test]
 fn occlusion_skip_does_not_hide_a_truncated_or_signaled_subtest() {
-    let base = baseline_with(&[(6780, 1)], false);
-    let classes = classes_with(&[(6780, Classification::Expected)]);
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
     for (output, signaled) in [
         (OCCLUSION_SKIP.to_owned(), false),
         (format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}"), true),
@@ -332,5 +332,64 @@ fn occlusion_skip_does_not_hide_a_truncated_or_signaled_subtest() {
         assert!(report.regressed, "{}", report.text);
         assert!(report.stale, "{}", report.text);
         assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+    }
+}
+
+#[test]
+fn a_leg_the_baseline_never_recorded_is_named_and_its_sites_regress() {
+    let base = baseline_with(&[(6776, 1)], false);
+    assert_eq!(
+        unrecorded_legs(&base, &current_with(&[(6776, 1)], false)),
+        Vec::<Leg>::new()
+    );
+    let arm64 = Leg {
+        arch: Arch::I686Arm64,
+        variant: Variant::Native,
+        gpu: Gpu::Apple,
+    };
+    let mut cur = current_with(&[(6776, 1)], false);
+    let result = cur.remove(&key()).expect("current_with fills key()");
+    cur.insert((arm64, Subtest::Device), result);
+    assert_eq!(unrecorded_legs(&base, &cur), vec![arm64]);
+    let report = diff(
+        &base,
+        &classes_with(&[(6776, Classification::Expected)]),
+        &cur,
+    );
+    assert!(report.regressed, "{}", report.text);
+}
+
+fn baseline_of(version: &str) -> Baseline {
+    Baseline {
+        wine_version: version.to_owned(),
+        entries: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn the_header_is_held_against_the_tests_wine_version() {
+    let base = baseline_of("wine-11.19");
+    assert_eq!(tests_version_note(&base, Some("wine-11.19")), None);
+    assert_eq!(
+        tests_version_note(&base, Some("wine-11.20")),
+        Some(VersionNote::Differs {
+            baseline: "wine-11.19".to_owned(),
+            tests: "wine-11.20".to_owned(),
+        })
+    );
+    assert_eq!(
+        tests_version_note(&baseline_of(""), Some("wine-11.20")),
+        None,
+        "a baseline that names no version has nothing to compare"
+    );
+}
+
+#[test]
+fn an_unknown_tests_version_skips_the_comparison() {
+    for header in ["wine-11.19", ""] {
+        assert_eq!(
+            tests_version_note(&baseline_of(header), None),
+            Some(VersionNote::Unknown)
+        );
     }
 }

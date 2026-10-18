@@ -38,6 +38,18 @@ fn parses_flags_and_update() {
 }
 
 #[test]
+fn the_tests_wine_version_is_optional() {
+    assert_eq!(parse_args(base(&[])).unwrap().tests_wine_version, None);
+    let config = parse_args(base(&["--tests-wine-version", "wine-11.19"])).unwrap();
+    assert_eq!(config.tests_wine_version.as_deref(), Some("wine-11.19"));
+    let err = parse_args(base(&["--tests-wine-version"])).unwrap_err();
+    assert!(
+        err.contains("--tests-wine-version needs a version"),
+        "{err}"
+    );
+}
+
+#[test]
 fn variant_defaults_to_native_and_parses_intel() {
     let config = parse_args(base(&[])).unwrap();
     assert_eq!(config.variant, Variant::Native);

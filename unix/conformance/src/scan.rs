@@ -137,19 +137,19 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
 
 /// Map the reviewed timing skip to the assertion it bypasses.
 ///
-/// `test_occlusion_query` jumps from device.c:6706 to cleanup before 6780.
+/// `test_occlusion_query` jumps from device.c:6702 to cleanup before 6776.
 /// Match both the source location and complete message shape so unrelated
 /// skips and upstream source drift cannot excuse an absent failure.
 fn skipped_assertion(line: &str) -> Option<Site> {
     let elapsed = line
-        .strip_prefix("device.c:6706: Tests skipped: Test loop took too long (")?
+        .strip_prefix("device.c:6702: Tests skipped: Test loop took too long (")?
         .strip_suffix(" ms), skipping large query tests.")?;
     if !elapsed.parse::<u32>().is_ok_and(|ms| ms > 70) {
         return None;
     }
     Some(Site {
         file: "device.c".to_owned(),
-        line: 6780,
+        line: 6776,
     })
 }
 

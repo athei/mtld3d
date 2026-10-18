@@ -62,7 +62,7 @@ fn records_counts_and_reports_new_and_dropped_sites() {
         },
     );
 
-    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
+    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
     let sub = &next.entries[&key];
     assert!(sub.crash);
     assert_eq!(sub.sites[&site(1)], 7); // refreshed
@@ -72,6 +72,19 @@ fn records_counts_and_reports_new_and_dropped_sites() {
     assert_eq!(summary.new_sites, vec![site(3)]);
     assert_eq!(summary.dropped_sites, vec![site(2)]);
     assert_eq!(next.wine_version, "new");
+}
+
+#[test]
+fn a_re_record_writes_the_tests_wine_version_and_keeps_the_header_when_unknown() {
+    let prior = Baseline {
+        wine_version: "wine-11.19".to_owned(),
+        entries: BTreeMap::new(),
+    };
+    let fresh = BTreeMap::from([((I686, Subtest::Device), SubtestResult::default())]);
+    let (next, _) = merge(&prior, I686, &fresh, Some("wine-11.20".to_owned()));
+    assert_eq!(next.wine_version, "wine-11.20");
+    let (next, _) = merge(&prior, I686, &fresh, None);
+    assert_eq!(next.wine_version, "wine-11.19");
 }
 
 #[test]
@@ -96,7 +109,7 @@ fn a_single_leg_update_keeps_the_other_legs() {
     let mut fresh = BTreeMap::new();
     fresh.insert(mine, SubtestResult::default());
 
-    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
+    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
     let kept = &next.entries[&theirs];
     assert!(kept.crash);
     assert_eq!(kept.sites[&site(9)], 4);
@@ -115,31 +128,31 @@ fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
         key,
         SubtestBaseline {
             crash: false,
-            sites: BTreeMap::from([(site(6780), 1), (site(5975), 2)]),
+            sites: BTreeMap::from([(site(6776), 1), (site(5975), 2)]),
         },
     );
-    let output = "device.c:6706: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\n\
+    let output = "device.c:6702: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\n\
         device: 58913 tests executed (75 marked as todo, 0 as flaky, 786 failures), 21 skipped.\n";
     let result = crate::scan::parse_subtest_output(output, false);
     assert!(result.sites.is_empty(), "a skip is not a measured failure");
     let fresh = BTreeMap::from([(key, result)]);
-    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
-    assert_eq!(next.entries[&key].sites, BTreeMap::from([(site(6780), 1)]));
-    assert_eq!(summary.skipped_sites, vec![site(6780)]);
+    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    assert_eq!(next.entries[&key].sites, BTreeMap::from([(site(6776), 1)]));
+    assert_eq!(summary.skipped_sites, vec![site(6776)]);
     assert_eq!(summary.carried, 0, "no failures were measured");
     assert_eq!(summary.dropped_sites, vec![site(5975)]);
 
-    let (new, summary) = merge(&Baseline::default(), I686, &fresh, "new".to_owned());
+    let (new, summary) = merge(&Baseline::default(), I686, &fresh, Some("new".to_owned()));
     assert!(new.entries[&key].sites.is_empty(), "no pin to retain");
     assert_eq!(summary.skipped_sites, [] as [Site; 0]);
 
     let output = format!(
-        "{output}device.c:6780: Test failed: Got unexpected query result.\n\
-        device.c:6780: Test failed: Got unexpected query result.\n"
+        "{output}device.c:6776: Test failed: Got unexpected query result.\n\
+        device.c:6776: Test failed: Got unexpected query result.\n"
     );
     let fresh = BTreeMap::from([(key, crate::scan::parse_subtest_output(&output, false))]);
-    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
-    assert_eq!(next.entries[&key].sites[&site(6780)], 2);
+    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    assert_eq!(next.entries[&key].sites[&site(6776)], 2);
     assert!(
         summary.skipped_sites.is_empty(),
         "observed failures take precedence"

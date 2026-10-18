@@ -3,8 +3,8 @@ description: Restore the shared caches and bring up exactly the toolchain one CI
 
 # Every leg is one `make` target, so this holds no build logic: it restores the
 # caches the build job primed and then calls the `setup-*` leaves the Makefile
-# already exposes. The inputs are what a leg needs, not what it is: a lint leg
-# wants no Rosetta, and only the build leg saves the caches back. Test machines
+# already exposes. The inputs are what a leg needs, not what it is: a host-only
+# leg wants no Wine, and only the build leg saves the caches back. Test machines
 # use the `runner` action instead: they replay a staged build and need no
 # toolchain at all.
 inputs:
@@ -12,14 +12,30 @@ inputs:
     description: >
       Leg builds for a PE target: needs the MSVC SDK splat, and the Wine SDK,
       since windows/shim links against Wine's import libraries and `winebuild`
-      marks the built DLLs.
+      marks the built DLLs. With the arm64 Wine (`wine: arm64`), which puts
+      the Makefile in its arm64 mode, the leg also gets the ARM64X build's
+      toolchain: llvm-mingw, whose `lld-link` links it.
     default: 'false'
   wine:
     description: >
-      Leg runs the PE binaries it built, so it needs Rosetta. Implies `pe`.
-    default: 'false'
-  wine-release:
-    description: wine-build release tag to download on a cache miss. Read when `pe` is true.
+      Which Wine the job's image runs, `arm64` or `x86_64`, chosen per image
+      by the workflow. The Makefile reads its mode from the Wine it is given,
+      so this decides the job's legs.
+    required: true
+  wine-release-arm64:
+    description: >
+      wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+      Read when `pe` is true.
+    default: ''
+  wine-release-x86_64:
+    description: >
+      wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
+      Read when `pe` is true.
+    default: ''
+  llvm-mingw-release:
+    description: >
+      llvm-mingw release an arm64-Wine PE leg downloads on a cache miss, for
+      the ARM64X build's CRT.
     default: ''
   prime:
     description: >
@@ -34,18 +50,33 @@ runs:
     # and takes wine, wineserver and winebuild from this one by absolute path).
     # Under $HOME rather than the workspace: checkout's `git clean` would take
     # anything inside the workspace with it.
-    - name: Point WINE_X86_64 at the extracted bundle
+    # The Wine the job's image runs, as the `wine` input names it.
+    - name: Point WINE_SDK at the extracted bundle
+      id: wine
       shell: bash
-      run: echo "WINE_X86_64=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+      run: |
+        echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+        if [ '${{ inputs.wine }}' = arm64 ]; then
+          tag='${{ inputs.wine-release-arm64 }}' asset=arm64
+        else
+          tag='${{ inputs.wine-release-x86_64 }}' asset=x86_64
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "asset=wine-$tag-macos-$asset.tar.xz" >> "$GITHUB_OUTPUT"
 
     # The tools key is built from the pinned versions themselves rather than from
     # a hash of the file that carries them: editing a comment in ci.yml must not
     # throw away half a gigabyte of cache and recompile the tools from source.
+    # The Rust target list is hashed with them, since the toolchain directory
+    # holds those targets: `setup-rust`'s `rustup target add` command and the
+    # PE_*/UNIX_TARGET_* triples it names, and nothing else of the Makefile.
     - name: Compute the tools cache key
       id: keys
       shell: bash
       run: |
-        pins=$(printf '%s|%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" "$NEXTEST_VERSION" | shasum | cut -c1-16)
+        targets=$(sed -n -e '/^PE_[a-z0-9]* *:=/p' -e '/^UNIX_TARGET_[a-z0-9]* *:=/p' \
+          -e '/^[[:space:]]*rustup target add/,/[^\\]$/p' Makefile | shasum | cut -c1-16)
+        pins=$(printf '%s|%s|%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" "$NEXTEST_VERSION" "$targets" | shasum | cut -c1-16)
         echo "tools=tools-${{ runner.os }}-${{ runner.arch }}-$pins" >> "$GITHUB_OUTPUT"
 
     # Two caches, because the two halves of a cargo home change for different
@@ -123,10 +154,10 @@ runs:
       if: inputs.pe == 'true'
       with:
         path: ~/wine-sdk
-        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
 
     # The tarball unpacks to `wine/`, so this lands at $HOME/wine-sdk/wine, which
-    # is what WINE_X86_64 points at above. `make install` writes our builtin into
+    # is what WINE_SDK points at above. `make install` writes our builtin into
     # this tree, which is why the legs restore it but never save it back.
     - name: Download the pinned Wine SDK
       if: inputs.pe == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
@@ -134,12 +165,43 @@ runs:
       run: |
         mkdir -p "$HOME/wine-sdk"
         curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
-          "https://github.com/athei/wine-build/releases/download/${{ inputs.wine-release }}/wine-${{ inputs.wine-release }}-macos-x86_64.tar.xz"
+          "https://github.com/athei/wine-build/releases/download/${{ steps.wine.outputs.tag }}/${{ steps.wine.outputs.asset }}"
         tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
 
-    # The SDK is an x86_64 build and every PE it loads is x86 code.
+    # The ARM64X build's toolchain, which only the arm64 mode reads: the
+    # llvm-mingw release the link takes its CRT from, pinned and cached by
+    # release, and the `lld-link` that release ships (20261006 carries LLD
+    # 23.1.3), whose version the Makefile checks before it links. LLVM_MINGW
+    # and ARM64X_LLD name them.
+    - name: Restore llvm-mingw
+      id: llvm-mingw-cache
+      uses: actions/cache/restore@v6
+      if: inputs.pe == 'true' && inputs.wine == 'arm64'
+      with:
+        path: ~/llvm-mingw
+        key: llvm-mingw-${{ runner.os }}-${{ inputs.llvm-mingw-release }}
+
+    - name: Download the pinned llvm-mingw
+      if: inputs.pe == 'true' && inputs.wine == 'arm64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        release='${{ inputs.llvm-mingw-release }}'
+        curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+          "https://github.com/mstorsjo/llvm-mingw/releases/download/$release/llvm-mingw-$release-ucrt-macos-universal.tar.xz"
+        tar -xJf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+        mv "$RUNNER_TEMP/llvm-mingw-$release-ucrt-macos-universal" "$HOME/llvm-mingw"
+
+    - name: The ARM64X toolchain
+      if: inputs.pe == 'true' && inputs.wine == 'arm64'
+      shell: bash
+      run: |
+        echo "LLVM_MINGW=$HOME/llvm-mingw" >> "$GITHUB_ENV"
+        echo "ARM64X_LLD=$HOME/llvm-mingw/bin/lld-link" >> "$GITHUB_ENV"
+
+    # The x86_64 Wine's tools, winebuild among them, are x86_64 binaries,
+    # which an Apple Silicon image runs through Rosetta; a no-op on Intel.
     - name: Rosetta
-      if: inputs.wine == 'true'
+      if: inputs.pe == 'true' && inputs.wine == 'x86_64'
       shell: bash
       run: make setup-rosetta
 
@@ -180,4 +242,11 @@ runs:
       if: inputs.prime == 'true' && inputs.pe == 'true'
       with:
         path: ~/wine-sdk
-        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
+
+    - name: Save llvm-mingw
+      uses: actions/cache/save@v6
+      if: inputs.prime == 'true' && inputs.pe == 'true' && inputs.wine == 'arm64' && steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      with:
+        path: ~/llvm-mingw
+        key: llvm-mingw-${{ runner.os }}-${{ inputs.llvm-mingw-release }}

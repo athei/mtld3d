@@ -102,7 +102,7 @@ Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;
 
 ## End every edit cycle with `make fmt` + `make install`
 
-After any `.rs` change, run both before declaring the task done. `make` only rebuilds — it does **not** copy DLLs/.so into `$WINE_INSTALL_DIR`, so launching the game without `make install` tests stale bits. `make test` implicitly runs both.
+After any `.rs` change, run both before declaring the task done. `make` only rebuilds: it does **not** copy DLLs/.so into `$WINE_SDK` or `$WINE_INSTALL_DIR`, so launching the game without `make install` tests stale bits. `make test` implicitly runs both.
 
 ## winecrt0 TLS conflict
 

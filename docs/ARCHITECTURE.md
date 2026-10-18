@@ -12,11 +12,11 @@ test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 
 The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), so it is built and shipped for both `x86_64-apple-darwin` and `aarch64-apple-darwin`. An x86_64 Wine loads the first, with the PE side translated by Rosetta 2; an arm64 Wine loads the second and translates the PE side itself (FEX).
 
-An opt-in third chain serves an arm64 Wine without translating the PE side of an x64 game. `EC=1` builds `d3d9.dll` and `mtld3d.dll` a second time as ARM64X images, the form an arm64 Wine keeps its own builtins in under `lib/wine/aarch64-windows`: one image with an ARM64EC half, which an x64 process runs as native code beside the emulated code of the game, and an ARM64 half for arm64 processes. A 32-bit game still loads the i386 chain. The leg links llvm-mingw's CRT rather than MSVC's, and `windows-arm64x` in the Makefile says what that takes.
+A third chain serves an arm64 Wine without translating the PE side of an x64 game, and is the one an x64 game loads there. Every build against the arm64 Wine makes `d3d9.dll` and `mtld3d.dll` a second time as ARM64X images, the form an arm64 Wine keeps its own builtins in under `lib/wine/aarch64-windows`: one image with an ARM64EC half, which an x64 process runs as native code beside the emulated code of the game, and an ARM64 half for arm64 processes. A 32-bit game still loads the i386 chain, and an x86_64 Wine the x64 one. The build links llvm-mingw's CRT rather than MSVC's, and `windows-arm64x` in the Makefile says what that takes.
 
 ```
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(x64 PE)   (ARM64X)   (ARM64X)   (Mach-O arm64, EC=1 only)
+(x64 PE)   (ARM64X)   (ARM64X)   (Mach-O arm64, arm64 Wine only)
 ```
 
 - `d3d9.dll`: D3D9 API implementation. COM vtables, caps, state management
@@ -73,7 +73,7 @@ frame time, compilation stalls and memory pressure.
 
 ## Workspaces and crates
 
-Two Cargo workspaces, one per target platform: `windows/` builds the PE side for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, and with `EC=1` also for `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`, the two halves of the ARM64X images, as static libraries the Makefile links into one; `unix/` builds the Mach-O side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (the latter is also the native test target). Open each in its own editor window for rust-analyzer to work.
+Two Cargo workspaces, one per target platform: `windows/` builds the PE side for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, and against the arm64 Wine also for `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`, the two halves of the ARM64X images, as static libraries the Makefile links into one; `unix/` builds the Mach-O side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (the latter is also the native test target). Open each in its own editor window for rust-analyzer to work.
 
 | Crate               | Workspace  | Output                                                 |
 |---------------------|------------|--------------------------------------------------------|

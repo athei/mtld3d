@@ -19,7 +19,15 @@ pub struct Config {
     pub wineserver: Option<PathBuf>,
     /// `--exe`: the `d3d9_test.exe` to run.
     pub exe: PathBuf,
-    /// `--arch`: which architecture `exe` is, i.e. the label results record under.
+    /// `--tests-wine-version <version>`: the Wine version `exe` was built from.
+    ///
+    /// The baseline's `# Wine:` header records the version of the tests, not of
+    /// the Wine that runs them: one build of the tests runs under every Wine,
+    /// and their `file:line` sites move with their version. `None` when the
+    /// caller cannot tell, which skips the comparison and keeps the header on a
+    /// re-record.
+    pub tests_wine_version: Option<String>,
+    /// `--arch`: which build `exe` runs against, i.e. the label results record under.
     pub arch: Arch,
     /// `--variant`: which device answers the run is measured under.
     ///
@@ -49,8 +57,9 @@ pub struct Config {
 /// Parse CLI args (excluding `argv[0]`).
 ///
 /// Recognised flags: `--update-baseline`, `--wine <path>`, `--wineserver
-/// <path>`, `--exe <path>`, `--arch <arch>`, `--variant <native|intel|scale>`,
-/// `--assets <dir>`, `--only <subtest>`, `--repeat <N>`, `--log <filter>`.
+/// <path>`, `--exe <path>`, `--tests-wine-version <version>`, `--arch <arch>`,
+/// `--variant <native|intel|scale>`, `--assets <dir>`, `--only <subtest>`,
+/// `--repeat <N>`, `--log <filter>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
 /// invocation runs one test binary, which is what lets a 32-bit and a 64-bit CI
@@ -69,6 +78,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut wine: Option<PathBuf> = None;
     let mut wineserver: Option<PathBuf> = None;
     let mut exe: Option<PathBuf> = None;
+    let mut tests_wine_version: Option<String> = None;
     let mut arch: Option<Arch> = None;
     let mut variant = Variant::Native;
     let mut assets: Option<PathBuf> = None;
@@ -93,6 +103,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
             "--exe" => {
                 let value = args.next().ok_or_else(|| "--exe needs a path".to_owned())?;
                 exe = Some(PathBuf::from(value));
+            }
+            "--tests-wine-version" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--tests-wine-version needs a version".to_owned())?;
+                tests_wine_version = Some(value);
             }
             "--arch" => {
                 let value = args
@@ -144,12 +160,13 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     }
     let wine = wine.ok_or_else(|| "missing --wine <path to the wine loader>".to_owned())?;
     let exe = exe.ok_or_else(|| "missing --exe <path to d3d9_test.exe>".to_owned())?;
-    let arch = arch.ok_or_else(|| "missing --arch <i686|x86_64>".to_owned())?;
+    let arch = arch.ok_or_else(|| "missing --arch <i686|x86_64|i686-arm64|arm64x>".to_owned())?;
     Ok(Config {
         update,
         wine,
         wineserver,
         exe,
+        tests_wine_version,
         arch,
         variant,
         assets,

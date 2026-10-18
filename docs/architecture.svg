@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1146 500" width="1146" height="500" role="img" aria-labelledby="title desc">
   <title id="title">mtld3d component diagram</title>
-  <desc id="desc">game.exe calls d3d9.dll through the D3D9 COM API. d3d9.dll holds the COM API and application state, records each frame into fixed records, links mtld3d-core, and calls mtld3d.dll through its exported function mtld3d_unix_call, an ordinary function call. mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, the native runtime, which also links mtld3d-core. Inside mtld3d.so an encoder thread translates the recorded frame into Metal commands, a submit thread replays and commits them, a presenter thread acquires the drawable and presents, and worker threads compile shaders and pipelines and prewarm the shader cache; mtld3d.so drives the Metal framework. The PE side is i386 or x86_64, one chain per architecture, and with EC=1 an x64 game can load ARM64X builds of d3d9.dll and mtld3d.dll instead; the host side is Mach-O in Wine's own architecture.</desc>
+  <desc id="desc">game.exe calls d3d9.dll through the D3D9 COM API. d3d9.dll holds the COM API and application state, records each frame into fixed records, links mtld3d-core, and calls mtld3d.dll through its exported function mtld3d_unix_call, an ordinary function call. mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, the native runtime, which also links mtld3d-core. Inside mtld3d.so an encoder thread translates the recorded frame into Metal commands, a submit thread replays and commits them, a presenter thread acquires the drawable and presents, and worker threads compile shaders and pipelines and prewarm the shader cache; mtld3d.so drives the Metal framework. The PE side is i386 or x86_64, one chain per architecture, and on an arm64 Wine an x64 game loads ARM64X builds of d3d9.dll and mtld3d.dll instead; the host side is Mach-O in Wine's own architecture.</desc>
   <style>
     text { fill: #768390; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; }
     .mono { fill: #6e7b8b; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 700; }
@@ -30,7 +30,7 @@
   <path class="frame" d="M12 40 H116 V26 H12 Z"/>
   <text class="tab" x="20" y="37">Wine PE side</text>
   <rect class="frame" x="12" y="40" width="710" height="444"/>
-  <text class="muted" x="26" y="62">i386 or x86_64, one chain per architecture; ARM64X for x64 games with EC=1</text>
+  <text class="muted" x="26" y="62">i386 or x86_64, one chain per architecture; ARM64X for x64 games on an arm64 Wine</text>
 
   <!-- Host side package -->
   <path class="frame" d="M836 40 H922 V26 H836 Z"/>

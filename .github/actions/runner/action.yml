@@ -2,13 +2,20 @@ name: runner
 description: Bring up a test machine that replays a staged build, with no toolchain of its own.
 
 # A test leg builds nothing: it takes the stage the build job packed and runs
-# the suites against the pinned Wine. So this holds the Wine SDK, Rosetta where
-# the machine is arm64, and the unpacked stage, which carries the test
+# the suites against the pinned Wine of the job's image, which the workflow
+# names in `wine`. So this holds the Wine SDK, Rosetta where an x86_64 Wine
+# runs on Apple Silicon, and the unpacked stage, which carries the test
 # binaries and both runners, and nothing else. The Makefile does the rest
-# through `STAGE=`.
+# through `STAGE=`, and reads its mode, and so the legs it runs, from the Wine.
 inputs:
-  wine-release:
-    description: wine-build release tag to download on a cache miss.
+  wine:
+    description: Which Wine the job's image runs, `arm64` or `x86_64`.
+    required: true
+  wine-release-arm64:
+    description: wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+    required: true
+  wine-release-x86_64:
+    description: wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
     required: true
 
 runs:
@@ -16,23 +23,31 @@ runs:
   steps:
     # Mandatory for every `make` call. Under $HOME rather than the workspace:
     # checkout's `git clean` would take anything inside the workspace with it.
-    - name: Point WINE_X86_64 at the extracted bundle
+    - name: Point WINE_SDK at the extracted bundle
+      id: wine
       shell: bash
       run: |
-        echo "WINE_X86_64=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+        echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
         echo "STAGE=$RUNNER_TEMP/stage" >> "$GITHUB_ENV"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        if [ '${{ inputs.wine }}' = arm64 ]; then
+          tag='${{ inputs.wine-release-arm64 }}' asset=arm64
+        else
+          tag='${{ inputs.wine-release-x86_64 }}' asset=x86_64
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "asset=wine-$tag-macos-$asset.tar.xz" >> "$GITHUB_OUTPUT"
 
-    # Restore-and-save: the build job primes this cache for its own arch only,
-    # so the first leg on the other arch downloads the bundle and saves it for
-    # the rest. `make install` writes into the tree afterwards, which is why
+    # Restore-and-save: the build job primes this cache for its own image's
+    # Wine only, so the first leg of another Wine or arch downloads the bundle
+    # and saves it for the rest. `make install` writes into the tree afterwards, which is why
     # the save happens on a miss right here rather than at the end of the job.
     - name: Wine SDK
       id: wine-cache
       uses: actions/cache@v6
       with:
         path: ~/wine-sdk
-        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
 
     - name: Download the pinned Wine SDK
       if: steps.wine-cache.outputs.cache-hit != 'true'
@@ -40,12 +55,14 @@ runs:
       run: |
         mkdir -p "$HOME/wine-sdk"
         curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
-          "https://github.com/athei/wine-build/releases/download/${{ inputs.wine-release }}/wine-${{ inputs.wine-release }}-macos-x86_64.tar.xz"
+          "https://github.com/athei/wine-build/releases/download/${{ steps.wine.outputs.tag }}/${{ steps.wine.outputs.asset }}"
         tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
 
-    # The SDK is an x86_64 build and every PE it loads is x86 code; a no-op on
-    # an Intel machine.
+    # The x86_64 Wine and every PE it loads are x86 code, which an Apple
+    # Silicon image runs through Rosetta; a no-op on Intel. The arm64 Wine
+    # translates x86 code itself.
     - name: Rosetta
+      if: inputs.wine == 'x86_64'
       shell: bash
       run: make setup-rosetta
 

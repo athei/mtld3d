@@ -182,5 +182,56 @@ fn total_failed(sub: &SubtestBaseline) -> u32 {
     sub.sites.values().sum()
 }
 
+/// What a run says about the baseline's `# Wine:` header before its diff.
+///
+/// The header is the Wine version the tests were built from, since one build
+/// of the tests runs under every Wine and its sites move with its version, so
+/// it is held against the tests' version and never against the Wine that runs
+/// them.
+#[derive(PartialEq, Eq, Debug)]
+pub enum VersionNote {
+    /// The caller could not tell the tests' version, so nothing was compared.
+    Unknown,
+    /// The tests come from another Wine version than the one the baseline names.
+    Differs { baseline: String, tests: String },
+}
+
+/// Hold the baseline's header against the tests' Wine version.
+///
+/// `None` when they agree or the baseline names no version (a first record).
+#[must_use]
+pub fn tests_version_note(baseline: &Baseline, tests: Option<&str>) -> Option<VersionNote> {
+    match tests {
+        None => Some(VersionNote::Unknown),
+        Some(tests) if !baseline.wine_version.is_empty() && baseline.wine_version != tests => {
+            Some(VersionNote::Differs {
+                baseline: baseline.wine_version.clone(),
+                tests: tests.to_owned(),
+            })
+        }
+        Some(_) => None,
+    }
+}
+
+/// The legs of `current` that `baseline` holds no entry for, for any subtest.
+///
+/// Such a leg was never recorded on the Wine it runs under, so every site it
+/// fails diffs as new; the caller says so once, naming the leg, rather than
+/// leaving a reader to infer it from a wall of new sites.
+#[must_use]
+pub fn unrecorded_legs(
+    baseline: &Baseline,
+    current: &BTreeMap<(Leg, Subtest), SubtestResult>,
+) -> Vec<Leg> {
+    let legs: BTreeSet<Leg> = current.keys().map(|&(leg, _)| leg).collect();
+    legs.into_iter()
+        .filter(|&leg| {
+            !Subtest::ALL
+                .iter()
+                .any(|&subtest| baseline.entries.contains_key(&(leg, subtest)))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

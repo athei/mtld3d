@@ -110,6 +110,15 @@ fn leg_names_round_trip_with_implicit_native_and_apple() {
         ("x86_64+intel", Arch::X64, Variant::Intel, Gpu::Apple),
         ("i686@mac2", Arch::I686, Variant::Native, Gpu::Mac2),
         ("x86_64+intel@mac2", Arch::X64, Variant::Intel, Gpu::Mac2),
+        ("arm64x", Arch::Arm64x, Variant::Native, Gpu::Apple),
+        ("arm64x+scale", Arch::Arm64x, Variant::Scale, Gpu::Apple),
+        ("i686-arm64", Arch::I686Arm64, Variant::Native, Gpu::Apple),
+        (
+            "i686-arm64+intel",
+            Arch::I686Arm64,
+            Variant::Intel,
+            Gpu::Apple,
+        ),
     ] {
         let leg = Leg { arch, variant, gpu };
         assert_eq!(leg.to_string(), text);
@@ -130,4 +139,7 @@ fn every_leg_is_listed_once_in_output_order() {
     assert_eq!(Leg::ALL[5].to_string(), "i686+scale@mac2");
     assert_eq!(Leg::ALL[6].to_string(), "x86_64");
     assert_eq!(Leg::ALL[11].to_string(), "x86_64+scale@mac2");
+    assert_eq!(Leg::ALL[12].to_string(), "i686-arm64");
+    assert_eq!(Leg::ALL[18].to_string(), "arm64x");
+    assert_eq!(Leg::ALL[23].to_string(), "arm64x+scale@mac2");
 }
