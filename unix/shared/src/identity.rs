@@ -26,6 +26,25 @@
 /// manifest version (`v0.2.0`) when built outside a git checkout.
 pub const BUILD: &str = env!("MTLD3D_BUILD");
 
+/// The architecture this image was compiled for, as the startup lines name it.
+///
+/// One per half of a PE build: `i686`, `x86_64`, and for the ARM64X images
+/// `arm64ec` in the half an x64 process runs and `aarch64` in the one a
+/// native ARM64 process runs; the unix library is `x86_64` or `aarch64`. The
+/// line then says which build a process loaded, which its image ID alone
+/// cannot, since both halves of an ARM64X image share one.
+pub const ARCH: &str = if cfg!(target_arch = "x86") {
+    "i686"
+} else if cfg!(target_arch = "x86_64") {
+    "x86_64"
+} else if cfg!(target_arch = "arm64ec") {
+    "arm64ec"
+} else if cfg!(target_arch = "aarch64") {
+    "aarch64"
+} else {
+    "unknown-arch"
+};
+
 #[cfg(unix)]
 pub use platform::LoadedImage;
 pub use platform::image_id;

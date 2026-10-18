@@ -7,8 +7,11 @@
 //! directory through the `OpenLog` thunk once `mtld3d.conf` is resolved at
 //! `Direct3DCreate9`; the unix logger has been running since `DllMain`'s
 //! `InitLogger` by then, so the lines of that gap wait in a backlog and go
-//! out first. The d3d9.dll side needs no backlog of its own: its log thread
-//! starts after `OpenLog`, so its queue still holds every line from `DllMain`.
+//! out first. The d3d9.dll side needs no backlog of its own: its queue still
+//! holds every line from `DllMain` at `OpenLog`, and it forwards them, on the
+//! thread in `Direct3DCreate9`, before its log thread starts. A line written
+//! here goes straight to the file, unbuffered, so a process that ends right
+//! after loses none of them.
 //!
 //! The file is created on the first line written after the location is
 //! known, not when it is named: a process that logs nothing (`RUST_LOG=off`,

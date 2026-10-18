@@ -161,7 +161,13 @@ fn log_identity() {
     let id = identity::image_id();
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
-    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized");
+    let arch = identity::ARCH;
+    let execution = match crate::translation::translated() {
+        Some(true) => "translated",
+        Some(false) => "native",
+        None => "translation unknown",
+    };
+    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized as {arch}, {execution}");
     let Some(image) = core_foundation_image() else {
         warn!(target: LOG_TARGET, "CoreFoundation image identity unavailable");
         return;
