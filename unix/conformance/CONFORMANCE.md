@@ -1173,9 +1173,9 @@ exactly as on any other leg; the legs carry none today.
 Two defects, both first observed by the Wine 11.19 tests:
 `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` accepted with a multisampled
 back buffer (`device.c/test_lockable_backbuffer` and
-`device.c/test_swapchain_multisample_reset`, five sites), and the sign of
-the `D3DTSS_TCI_SPHEREMAP` denominator (`visual.c/test_generated_texcoords`,
-one site).
+`device.c/test_swapchain_multisample_reset`, five sites, issue #1160), and
+the sign of the `D3DTSS_TCI_SPHEREMAP` denominator
+(`visual.c/test_generated_texcoords`, one site, issue #1161).
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
@@ -1292,13 +1292,15 @@ line moves only with that decision.
 mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths. Both are
 pinned at one on the x86_64 Wine's native and `+intel` device legs (`i686`,
 `i686+intel`, `x86_64`, `x86_64+intel`), put back by hand after the
-2026-10-18 re-record read them as zero. The arm64 Wine's legs carry no pin
-yet, although they flap there too: in the runs of 2026-10-18, 4476 read one
-in four of the five native `arm64x` device runs, and at least once on
-`arm64x+scale`, `arm64x+intel` and `i686-arm64+scale`, reading zero only in
-the runs that recorded those sections, and 4471 read one once on
-`i686-arm64`. Without a pin a read of one is a new failing site, since the
-tolerance applies only to a site its leg's section holds.
+2026-10-18 re-record read them as zero, and on all six device legs of the
+arm64 Wine (`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms).
+They flap there too: in the runs of 2026-10-18, 4476 read one in four of the
+five native `arm64x` device runs, and at least once on `arm64x+scale`,
+`arm64x+intel` and `i686-arm64+scale`, reading zero only in the runs that
+recorded those sections, and 4471 read one once on `i686-arm64`. A re-record
+that reads them as zero drops the pins, and they are put back by hand: the
+tolerance applies only to a site its leg's section holds, so without a pin a
+read of one is a new failing site.
 
 ### device.c/test_reset
 
@@ -1518,7 +1520,7 @@ so the release reads "Device has 1 references left". The present-parameter
 check every create and reset shares
 (`mtld3d_core::present::present_params_are_valid`) never reads `Flags`, where
 wined3d refuses the combination in `wined3d_swapchain_desc_validate_flags`.
-A defect, on every leg of both Wines.
+A defect, on every leg of both Wines, issue #1160.
 
 ### device.c/test_swapchain_multisample_reset
 Sites: 13288=real 13290=real
@@ -1527,7 +1529,8 @@ The `Reset` counterpart of `test_lockable_backbuffer`: 13288 resets a
 two-sample swap chain with `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` and expects
 `D3DERR_INVALIDCALL`, and 13290 expects the `D3DERR_DEVICENOTRESET` a
 rejected `Reset` latches; both read `S_OK`/`D3D_OK` because the `Reset`
-succeeds. The same missing check, so the same fix moves all five sites.
+succeeds. The same missing check, so the same fix moves all five sites
+(issue #1160).
 
 ### device.c/test_cursor_clipping
 
@@ -1774,7 +1777,7 @@ pass. The fixed-function emitter (`windows/core/src/dxso/ff.rs`, the
 SPHEREMAP arm) divides by `m = 2 * length(R + (0, 0, 1))`; the test's
 geometry evaluated with that formula gives the value read, and with
 `R + (0, 0, -1)`, which wined3d emits, the value expected. DXVK uses the
-same sign we do. A defect, on every leg of both Wines.
+same sign we do. A defect, on every leg of both Wines, issue #1161.
 
 ### visual.c/test_blit_format_conversion
 Sites: 29210=caps
