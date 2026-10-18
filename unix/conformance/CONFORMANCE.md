@@ -981,9 +981,11 @@ and test_wndproc 4157/4227, which read zero on both Wines, left the
 baseline. CI's `record_intel_baseline` dispatch recorded both `@mac2` keys
 on the 11.19 tests the same day: against their Wine 11.0 sections they add
 the same new sites the Apple legs add (15357 on `i686+intel@mac2` only, the
-test being i386-only), the same two `crash=1`, and test_fetch4 15686 reads 3
-where 15 and 13 were pinned, as it fell on the Apple legs; nothing else
-moved but the line numbers.)
+test being i386-only) and the same two `crash=1`, and nothing else moved but
+the line numbers. test_fetch4 15686 read lower in every recording of that
+day, 3 to 9 where 13 to 17 were pinned; its cluster keeps the higher pins,
+so the earlier values were put back on every key, the arm64 Wine's keys
+taking those of the x86_64 Wine key of the same build and variant.)
 (2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
 extended devices and runs every test, adding the same 64 sites, 63
 `expected` and 1 `caps`, on each of the six Apple-family legs. The site set
@@ -1403,7 +1405,8 @@ request and never follows the window. 5594/5614/5637/5672/5896 ("Failed to
 restore display modes") fire on the `@mac2` legs only, where the test's
 restore of the original display modes fails. Why it fails there is not
 established: the Intel CI image's display runs 3840x2160 at 30 Hz and user32
-lists 25 sizes for it, so it is not a single-mode display. Desktop mode switching is out of scope, so `expected`.
+lists 25 sizes for it, so it is not a single-mode display. Desktop mode
+switching is out of scope, so `expected`.
 
 ### device.c/test_device_window_reset
 Sites: 5971=expected 5974=expected
