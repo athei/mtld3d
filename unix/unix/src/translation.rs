@@ -1,11 +1,11 @@
 //! Whether this process runs translated, read from the kernel.
 //!
 //! An `x86_64` `mtld3d.so` runs natively on an Intel Mac and through Rosetta
-//! 2 on Apple Silicon, and the two differ in cost: the startup line names
-//! which. macOS answers through the `sysctl.proc_translated` sysctl, 1 for a
-//! process Rosetta translates and 0 for a native one. A kernel without
-//! Rosetta, an Intel Mac's, has no such name and answers `ENOENT`, which
-//! means native too.
+//! 2 on Apple Silicon, and the two differ in cost: the startup line adds
+//! `, under Rosetta 2` to the arch in the second case. macOS answers through
+//! the `sysctl.proc_translated` sysctl, 1 for a process Rosetta translates
+//! and 0 for a native one. A kernel without Rosetta, an Intel Mac's, has no
+//! such name and answers `ENOENT`, which means native too.
 
 use core::ffi::{c_int, c_void};
 

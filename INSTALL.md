@@ -373,8 +373,8 @@ game draws anything, and no `RUST_LOG` setting is needed to see them:
 `<arch>` is the build the process runs: `i686` for a 32-bit game, `x86_64`
 for the x86_64 build, `arm64ec` for the ARM64X build in an x64 game on an
 arm64 Wine, and `aarch64` in a native ARM64 program. The unix side's own
-line, `mtld3d.so <version> <id> initialized as <arch>, <native or
-translated>`, says whether it runs through Rosetta 2.
+line, `mtld3d.so <version> <id> initialized as <arch>`, names its arch, and
+reads `as x86_64, under Rosetta 2` when it runs through Rosetta 2.
 
 If they are absent, `d3d9.dll` never mapped, and every other symptom follows
 from that. Check the prefix markers first, then the override.

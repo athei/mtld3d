@@ -11,7 +11,7 @@
 //! Each of the three startup lines also names the arch its half runs as:
 //! `i686` for a 32-bit process, `x86_64` or, for the ARM64X build, `arm64ec`
 //! for an x64 one, `aarch64` for a native ARM64 one, and the unix library its
-//! own arch and whether it runs translated.
+//! own arch, followed by `, under Rosetta 2` when Rosetta translates it.
 
 use mtld3d_tests::Harness;
 
@@ -72,8 +72,8 @@ fn a_process_ending_right_after_direct3dcreate9_keeps_its_startup_lines() {
         .split_once(" initialized as ")
         .expect("found by that text");
     assert!(
-        ["aarch64, native", "x86_64, native", "x86_64, translated"].contains(&execution),
-        "mtld3d.so names its arch and whether it runs translated: {unix}"
+        ["aarch64", "x86_64", "x86_64, under Rosetta 2"].contains(&execution),
+        "mtld3d.so names its arch, and Rosetta 2 when it runs under it: {unix}"
     );
 }
 
