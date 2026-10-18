@@ -971,7 +971,9 @@ Wine test source, the raw actual-vs-expected failure messages
 re-checked before retagging. Current classifications, counted from the
 `Sites:` tokens below on 2026-10-18: 6 `real`, 167 `expected`, 3 `caps`,
 6 `ceiling`, 3 `flaky`, 0 `untriaged`, 185 unique sites in all.
-The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
+11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
+note below says.
 (2026-10-18: every leg moved to Wine 11.19's tests, and the Apple-family
 sections of both Wines, 48 subtest-legs, were recorded against them; the
 `Sites:` tokens and the line numbers in the prose moved with the source. The
@@ -1359,7 +1361,7 @@ Sites: 4770=expected 4774=expected 4781=expected
 
 4697/4774 expect the focus window subclassed in fullscreen (we don't).
 The other six expect the device window's wndproc UNCHANGED and fail because
-of our cursor subclass — the same deliberate hook as test_wndproc 4215,
+of our cursor subclass, the same deliberate hook as test_wndproc 4215,
 kept on purpose (cursor realization is driven from it).
 
 ### device.c/test_reset_fullscreen

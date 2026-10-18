@@ -113,6 +113,9 @@ through the bottle's DLL search path and never enters CrossOver's own
   Wine is the primary target; an x86_64 Wine from wine-build, based on
   CrossOver 26, which an Intel Mac runs and CI pins, takes the x86_64 pair.
   Older Wine or CrossOver releases are not expected to work.
+- macOS 26.4 or later for the arm64 Wine, whose binaries are built for it.
+  On an Apple Silicon Mac below that, such as one on macOS 15, the x86_64
+  Wine under Rosetta 2 is the route.
 - A **64-bit prefix / bottle**; 32-bit games run in it through WoW64.
 - **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, under
   which the game and the whole PE side are x86. An arm64 Wine brings its own

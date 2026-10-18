@@ -619,16 +619,16 @@ Rosetta, and the Intel image run the x86_64 Wine (the x86_64 legs, `i686`
 and `x86_64`, against the x86_64 Wine's keys). The arm64 Wine needs macOS
 26.4, which macos-15 does not have. Every conformance leg runs the arm64
 Wine release's `d3d9_test.exe`: the x86_64-Wine images fetch that release's
-`lib/wine/tests` alone, cached by its pin, and name it in `WINE_TESTS`. CI compiles on two machines and replays
-everywhere else, both on macos-26 in the arm64 mode. One job builds the
-stage (`make stage`: the i686, x86_64 and ARM64X builds, both unix `.so`
-builds, the e2e test binaries, the e2e and conformance runners for both
-host arches), which serves the legs of both Wines, and another runs
-formatting and audit first, then documentation, Clippy (the ARM64X halves
-included) and unit tests, with the `PERF=1` Clippy and unit-test legs of
-`make check`, as steps of one job. Production bundles are built by the
-release job only, also on macos-26 in the arm64 mode, so they carry the
-ARM64X pair beside the x86 builds.
+`lib/wine/tests` alone, cached by its pin, and name it in `WINE_TESTS`. CI
+compiles on two machines and replays everywhere else, both on macos-26 in
+the arm64 mode. One job builds the stage (`make stage`: the i686, x86_64
+and ARM64X builds, both unix `.so` builds, the e2e test binaries, the e2e
+and conformance runners for both host arches), which serves the legs of both
+Wines, and another runs formatting and audit first, then documentation,
+Clippy (the ARM64X halves included) and unit tests, with the `PERF=1` Clippy
+and unit-test legs of `make check`, as steps of one job. Production bundles
+are built by the release job only, also on macos-26 in the arm64 mode, so
+they carry the ARM64X pair beside the x86 builds.
 Every run on `main` has its own concurrency group so pending runs survive
 later pushes and every commit keeps its CI result. PR updates cancel the
 superseded run. The test machines carry no toolchain: they install the stage

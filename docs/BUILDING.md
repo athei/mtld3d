@@ -20,9 +20,11 @@ workflow and points there for the details.
     sysroot carries the ARM64 and ARM64EC halves together. An older release
     keeps ARM64EC in a sysroot of its own, which the link does not read.
     `LLVM_MINGW` names the install.
-  - LLD 23 or newer as `lld-link`, such as Homebrew's (`brew install lld`).
-    `ARM64X_LLD` names it. An older LLD links an ARM64X image whose x64 view
-    runs the ARM64 view's TLS callbacks.
+  - LLD 23 or newer as `lld-link`, such as llvm-mingw's own `bin/lld-link`
+    (release 20261006 carries LLD 23.1.3, and CI links with it) or
+    Homebrew's (`brew install lld`). `ARM64X_LLD` names it. An older LLD
+    links an ARM64X image whose x64 view runs the ARM64 view's TLS
+    callbacks.
 - For an x86_64 Wine on Apple Silicon, Rosetta 2. `make setup` installs it
   when it is missing. The arm64 Wine runs x86 code through its own
   translator and does not need it.
@@ -43,11 +45,10 @@ Which Wine it is decides the Makefile's mode, read once from the Wine's own
 - The x86_64 mode, for an x86_64 Wine such as a wine-build x86_64 release,
   whose `lib/wine` holds `x86_64-unix`: the Wine an Intel Mac runs natively,
   and that CI's macos-15 image runs under Rosetta and its Intel image
-  natively. An x64 game loads the x86_64 build there, and
-  the ARM64X build, which such a Wine cannot run, is not built, linted,
-  installed, tested or bundled, so neither llvm-mingw nor LLD nor the two
-  ARM64X Rust targets are needed. Every make run in this mode prints a line
-  that says so.
+  natively. An x64 game loads the x86_64 build there, and the ARM64X build,
+  which such a Wine cannot run, is not built, linted, installed, tested or
+  bundled, so neither llvm-mingw nor LLD nor the two ARM64X Rust targets are
+  needed. Every make run in this mode prints a line that says so.
 
 A build, lint or documentation target first checks that the Wine holds what
 its mode needs and stops naming what is missing; a runtime-only Wine is

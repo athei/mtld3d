@@ -77,6 +77,9 @@ yet, what never will be, and the divergences from D3D9 kept on purpose.
   into 64-bit games, is the primary target. An x86_64 Wine from wine-build,
   based on CrossOver 26, which an Intel Mac runs and CI pins, takes the
   x86_64 build. Older Wine or CrossOver releases are not expected to work.
+- macOS 26.4 or later for the arm64 Wine, whose binaries are built for it.
+  On an Apple Silicon Mac below that, such as one on macOS 15, the x86_64
+  Wine under Rosetta 2 is the route.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
 - Rosetta 2 for an x86_64 Wine. An arm64 Wine translates x86 itself.
 - [x87sidecar](https://github.com/athei/x87sidecar) under an x86_64 Wine.

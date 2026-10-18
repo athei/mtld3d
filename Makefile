@@ -29,7 +29,8 @@
 #   LLVM_MINGW   an llvm-mingw install of release 20260826 or newer, whose
 #                `aarch64-w64-mingw32` sysroot carries the ARM64X CRT the link
 #                takes.
-#   ARM64X_LLD   an `lld-link` of LLD 23 or newer, such as Homebrew's `lld`.
+#   ARM64X_LLD   an `lld-link` of LLD 23 or newer, such as the `bin/lld-link`
+#                of llvm-mingw 20261006 (LLD 23.1.3) or Homebrew's `lld`.
 #
 # The conformance legs read one more, WINE_TESTS, the `lib/wine/tests` of
 # wine-build's arm64 Wine release, whose d3d9 test binaries every leg runs:
@@ -679,8 +680,10 @@ windows-x86_64:
 # callbacks; LLD 23 gives the EC view its own directory through an ARM64X
 # relocation, where LLD 22 hands both views the ARM64 one, so an x64 process
 # runs the ARM64 TLS callbacks under the x64 emulator and its EC code reads a
-# TLS index the loader never set. Homebrew's `lld` is one: its version follows
-# Homebrew's `llvm`, and llvm-mingw's own LLD may be older.
+# TLS index the loader never set. llvm-mingw ships its own `lld-link`, LLD
+# 23.1.3 in release 20261006, which CI links with; Homebrew's `lld` is another
+# one. An llvm-mingw release older than that may carry an older LLD, so the
+# version is checked here rather than implied by ARM64X_MINGW_MIN.
 #
 # LLVM_MINGW is the CRT, its `llvm-readobj` tells a hybrid object from a plain
 # one and its `llvm-nm` reads the static libraries for the checks below;
@@ -712,9 +715,9 @@ for tool in llvm-nm llvm-readobj; do \
 done; \
 [ -f '$(ARM64X_CRT)/dllcrt2.o' ] || { echo "ARM64X: LLVM_MINGW=$(LLVM_MINGW) has no aarch64-w64-mingw32/lib/dllcrt2.o; it names an llvm-mingw install, $(ARM64X_MINGW_MIN) or newer" >&2; exit 2; }; \
 '$(LLVM_MINGW)/bin/llvm-readobj' --file-headers '$(ARM64X_CRT)/dllcrt2.o' 2>/dev/null | grep -q IMAGE_FILE_MACHINE_ARM64EC || { echo "ARM64X: LLVM_MINGW=$(LLVM_MINGW) has an aarch64-w64-mingw32/lib/dllcrt2.o with no ARM64EC half; the ARM64X link needs llvm-mingw $(ARM64X_MINGW_MIN) or newer, whose aarch64 sysroot carries hybrid objects" >&2; exit 2; }; \
-[ -n '$(ARM64X_LLD)' ] || { echo "ARM64X: ARM64X_LLD is not set; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
+[ -n '$(ARM64X_LLD)' ] || { echo "ARM64X: ARM64X_LLD is not set; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as \$$LLVM_MINGW/bin/lld-link of llvm-mingw 20261006 or Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
 version=$$('$(ARM64X_LLD)' --version 2>/dev/null | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p'); \
-[ -n "$$version" ] || { echo "ARM64X: ARM64X_LLD=$(ARM64X_LLD) is no LLD; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
+[ -n "$$version" ] || { echo "ARM64X: ARM64X_LLD=$(ARM64X_LLD) is no LLD; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as \$$LLVM_MINGW/bin/lld-link of llvm-mingw 20261006 or Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
 [ "$$version" -ge $(ARM64X_LLD_MIN) ] || { echo "ARM64X: ARM64X_LLD=$(ARM64X_LLD) is LLD $$version, and the ARM64X link needs $(ARM64X_LLD_MIN) or newer" >&2; exit 2; }
 endef
 
