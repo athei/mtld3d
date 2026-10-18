@@ -180,19 +180,25 @@ Re-run the `lib/wine` copy after any Wine update or reinstall.
 ```sh
 tar -xf mtld3d.tar.xz
 
-# Only the mtld3d builtin pair goes into the installation — the stock
-# d3d9.dll stays in place. Where it goes, as in the builtin route:
+# The mtld3d builtin pair goes into the installation. Where it goes, as in
+# the builtin route:
 T="$WINE/lib/wine/d3d9/mtld3d"; [ -d "$T" ] || T="$WINE/lib/wine"
+# A wine-build Wine's tree T also holds a builtin d3d9.dll of the mtld3d it
+# shipped with, which every process without the override loads: copy it from
+# this bundle too (all of wine/<arch>/*.dll), so each process gets a d3d9.dll
+# and an mtld3d.dll of one build. Any other Wine's lib/wine holds Wine's own
+# d3d9.dll, which stays: copy only mtld3d.dll there (wine/<arch>/mtld3d.dll).
+[ "$T" = "$WINE/lib/wine" ] && P=mtld3d || P='*'
 # arm64 Wine:
-cp wine/i386-windows/mtld3d.dll    "$T/i386-windows/"
-cp wine/aarch64-windows/mtld3d.dll "$T/aarch64-windows/"
-cp wine/aarch64-unix/mtld3d.so     "$T/aarch64-unix/"
-# arm64 Wine, a bundle without wine/aarch64-windows: the x86_64 one instead.
-#cp wine/x86_64-windows/mtld3d.dll  "$T/aarch64-windows/"
+cp wine/i386-windows/$P.dll     "$T/i386-windows/"
+cp wine/aarch64-windows/$P.dll  "$T/aarch64-windows/"
+cp wine/aarch64-unix/mtld3d.so  "$T/aarch64-unix/"
+# arm64 Wine, a bundle without wine/aarch64-windows: the x86_64 pair instead.
+#cp wine/x86_64-windows/$P.dll  "$T/aarch64-windows/"
 # x86_64 Wine, instead:
-#cp wine/i386-windows/mtld3d.dll   "$T/i386-windows/"
-#cp wine/x86_64-windows/mtld3d.dll "$T/x86_64-windows/"
-#cp wine/x86_64-unix/mtld3d.so     "$T/x86_64-unix/"
+#cp wine/i386-windows/$P.dll    "$T/i386-windows/"
+#cp wine/x86_64-windows/$P.dll  "$T/x86_64-windows/"
+#cp wine/x86_64-unix/mtld3d.so  "$T/x86_64-unix/"
 
 # One-time prefix markers, as in the builtin route.
 cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"
@@ -218,18 +224,27 @@ Instead of the game directory, the native `d3d9.dll` can go into the prefix —
 copy wins when both exist. The prefix copy survives wineboot prefix updates,
 which only replace placeholder files, never real PEs.
 
+In a wine-build Wine the native `d3d9.dll` reaches the builtin `mtld3d.dll`
+only in a process whose builtin search includes the tree `T`: the Wine's
+compatdb.so prepends `T` for a process it selects mtld3d as the d3d9 of, and
+it does so by default for every x86 process, 32-bit and 64-bit. A process
+compatdb gives another d3d9 (a per-game rule, or a non-x86 process) does not
+search `T`, finds no `mtld3d.dll` and fails to load the native `d3d9.dll`.
+
 ### On an arm64 Wine
 
 A 64-bit game on an arm64 Wine runs as an ARM64EC process, so the route
 takes the ARM64X builds for its 64-bit half: the builtin `mtld3d.dll` from
 `wine/aarch64-windows/` in the tree's `aarch64-windows`, and the unmarked
 `d3d9.dll` from `native/aarch64-windows/` next to the game or in the
-prefix's `drive_c/windows/system32/`. The game then runs both as native
-code. A bundle without the `aarch64-windows` entries, one built against an
-x86_64 Wine, serves the same route with its x86_64 builds instead: the
-`mtld3d.dll` from `wine/x86_64-windows/` in the tree's `aarch64-windows` and
-the `d3d9.dll` from `native/x86_64-windows/`, both translated. The two files
-come from one build either way. A 32-bit game takes the i386 files, as on an
+prefix's `drive_c/windows/system32/`, with the tree's builtin `d3d9.dll`
+replaced from `wine/aarch64-windows/` as above. The game then runs both as
+native code. A bundle without the `aarch64-windows` entries, one built
+against an x86_64 Wine, serves the same route with its x86_64 builds
+instead: the pair from `wine/x86_64-windows/` in the tree's
+`aarch64-windows` and the `d3d9.dll` from `native/x86_64-windows/`, all
+translated. The files in the tree and the native `d3d9.dll` come from one
+build either way. A 32-bit game takes the i386 files, as on an
 x86_64 Wine, and the prefix markers are the same two files: the 64-bit one is
 an x64 placeholder on either Wine, which is what an x64 process looks a
 builtin up by. On a wine-build arm64 Wine the `mtld3d.dll` goes into

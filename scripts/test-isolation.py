@@ -57,7 +57,7 @@ class MakeTestCase(unittest.TestCase):
         )
         self.environment = os.environ.copy()
         for name in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES",
-                     "MAKELEVEL", "ISOLATED", "STAGE", *OLD_VARIABLES, *self.sources):
+                     "MAKELEVEL", "ISOLATED", "STAGE", "WINE_TESTS", *OLD_VARIABLES, *self.sources):
             self.environment.pop(name, None)
         self.environment.update(self.sources)
 
@@ -321,6 +321,23 @@ class ModeTests(FakeWineTestCase):
                                      expected * rounds)
                     for line in runs:
                         self.assertIn(variant, line)
+
+    def test_every_leg_runs_the_tests_wine_tests_names(self):
+        # One test build for both Wines: the arm64 Wine's own by default, and
+        # under an x86_64 Wine only the directory WINE_TESTS names.
+        tests = self.root / "arm64-release-tests"
+        for wine, arguments, expected in ((self.arm64, (), self.arm64 / "lib/wine/tests"),
+                                          (self.arm64, (f"WINE_TESTS={tests}",), tests),
+                                          (self.x86_64, (f"WINE_TESTS={tests}",), tests)):
+            with self.subTest(wine=wine.name, arguments=arguments):
+                output = self.dry_run(wine, *arguments, "conformance")
+                exes = re.findall(r"--exe (\S+)", output)
+                self.assertEqual(exes, [f"{expected}/i386-windows/d3d9_test.exe",
+                                        f"{expected}/x86_64-windows/d3d9_test.exe"])
+        output = self.run_make(f"WINE_SDK={self.x86_64}", "-o", "install-windows-i686", "-o",
+                               "install-unix-x64", "MAKE=true", "conformance-i686", succeeds=False)
+        self.assertIn("WINE_TESTS is not set: in the x86_64 mode", output)
+        self.assertNotIn("--exe", output)
 
     def test_conformance_isolate_takes_a_leg_of_the_mode(self):
         for wine, good, bad in ((self.arm64, ("i686", "arm64x"), "x86_64"),

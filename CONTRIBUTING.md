@@ -518,6 +518,11 @@ make conformance-isolate ONLY=device ARCH=i686 REPEAT=20 VARIANT=intel LOG=debug
 make conformance-baseline-i686         # re-record this leg's entries
 ```
 
+Every leg runs one build of Wine's d3d9 tests, the arm64 Wine release's, so
+the `file:line` sites of the baseline hold under either Wine. Under an
+x86_64 Wine, point `WINE_TESTS` at that release's `lib/wine/tests`
+(`docs/BUILDING.md` has the details).
+
 The rules that are easy to get wrong:
 
 - Classifications live only in `CONFORMANCE.md`, on its `Sites:` lines.
@@ -612,7 +617,9 @@ so its legs: macos-26 runs the arm64 Wine (the arm64 legs, `i686` and
 `arm64x`, against the arm64 Wine's conformance keys), and macos-15, under
 Rosetta, and the Intel image run the x86_64 Wine (the x86_64 legs, `i686`
 and `x86_64`, against the x86_64 Wine's keys). The arm64 Wine needs macOS
-26.4, which macos-15 does not have. CI compiles on two machines and replays
+26.4, which macos-15 does not have. Every conformance leg runs the arm64
+Wine release's `d3d9_test.exe`: the x86_64-Wine images fetch that release's
+`lib/wine/tests` alone, cached by its pin, and name it in `WINE_TESTS`. CI compiles on two machines and replays
 everywhere else, both on macos-26 in the arm64 mode. One job builds the
 stage (`make stage`: the i686, x86_64 and ARM64X builds, both unix `.so`
 builds, the e2e test binaries, the e2e and conformance runners for both

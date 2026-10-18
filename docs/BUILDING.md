@@ -30,9 +30,9 @@ workflow and points there for the details.
 The Makefile knows one Wine, the one `WINE_SDK` names. It serves as both the
 Wine every leg runs under and the SDK every build reads: a tree holding
 `bin/wine`, `bin/winebuild`, `bin/wineserver` and a `lib/wine` that carries
-Wine's link archives for each PE architecture the builds link against, and
-the `d3d9_test.exe` binaries that `make conformance` runs. Which Wine it is
-decides the Makefile's mode, read once from the Wine's own `lib/wine`:
+Wine's link archives for each PE architecture the builds link against.
+Which Wine it is decides the Makefile's mode, read once from the Wine's own
+`lib/wine`:
 
 - The arm64 mode, for wine-build's arm64 Wine
   ([wine-build](https://github.com/athei/wine-build)), the primary target,
@@ -206,8 +206,14 @@ once and runs everything against the clones.
 builds and compares the failures per site against a baseline: the i386
 `d3d9_test.exe` against the i686 build (`conformance-i686`) and the x86_64
 one against the 64-bit build (`conformance-arm64x` in the arm64 mode,
-`conformance-x86_64` in the x86_64 mode), both out of
-`$WINE_SDK/lib/wine/tests`.
+`conformance-x86_64` in the x86_64 mode). Every leg, under either Wine, runs
+one build of those tests, the one wine-build's arm64 Wine release publishes
+in its `lib/wine/tests`: the baseline names each failing site by its
+`file:line`, which moves between Wine versions, and a PE test runs under any
+Wine. `WINE_TESTS` names that directory. In the arm64 mode it defaults to
+`$WINE_SDK/lib/wine/tests`; in the x86_64 mode, whose Wine ships another
+build of the tests, it has no default and the conformance targets stop
+without it. Its `{i386,x86_64}-windows/d3d9_test.exe` are the two binaries.
 
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#reading-a-test-run) explains how to
 read a test run, and
@@ -235,14 +241,18 @@ and through Rosetta 2 on Apple Silicon, and loads the x86_64 `mtld3d.so`.
 
 ### Which target reads which path
 
-None of these paths has a default. Each comes from the environment or the
-command line, and a target that needs one fails naming it when it is unset
-or points at the wrong thing.
+None of these paths has a default, but for `WINE_TESTS` in the arm64 mode.
+Each comes from the environment or the command line, and a target that needs
+one fails naming it when it is unset or points at the wrong thing.
 
 - `WINE_SDK` is read by every target: the builds, lints and docs take
-  `winebuild` and the link archives from it, `make install` and every test,
-  conformance and benchmark leg install into it or into a clone of it and run
-  under it, and the conformance legs run its `d3d9_test.exe` binaries.
+  `winebuild` and the link archives from it, and `make install` and every
+  test, conformance and benchmark leg install into it or into a clone of it
+  and run under it.
+- `WINE_TESTS` is read by the conformance targets: the `lib/wine/tests` of
+  wine-build's arm64 Wine release, whose `d3d9_test.exe` binaries every leg
+  runs. `$WINE_SDK/lib/wine/tests` unless it is given in the arm64 mode,
+  required in the x86_64 mode.
 - `LLVM_MINGW` and `ARM64X_LLD` are read by the ARM64X build, which `make`,
   `make bundle`, `make stage` and every target that installs the ARM64X build
   run in the arm64 mode. The x86_64 mode reads neither.

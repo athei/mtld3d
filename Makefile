@@ -31,6 +31,11 @@
 #                takes.
 #   ARM64X_LLD   an `lld-link` of LLD 23 or newer, such as Homebrew's `lld`.
 #
+# The conformance legs read one more, WINE_TESTS, the `lib/wine/tests` of
+# wine-build's arm64 Wine release, whose d3d9 test binaries every leg runs:
+# WINE_SDK's own in the arm64 mode unless it is given, and required in the
+# x86_64 mode (see D3D9_TEST_* below).
+#
 # A shell still exporting the variables of the earlier two-Wine layout
 # (WINE_X86_64, WINE_ARM64, WINE_SDK_ARM64X) or its switches (EC, ARM64) would
 # otherwise build or run against a Wine it did not mean with no word about why,
@@ -446,11 +451,19 @@ XWIN := xwin --accept-license --arch x86,x86_64 \
 	--crt-version $(XWIN_CRT_VERSION) --sdk-version $(XWIN_SDK_VERSION) \
 	--cache-dir $(XWIN_CACHE)
 
-# Wine's own d3d9 test binaries, as published inside the Wine by wine-build's
-# bundle step (`make install` puts our builtin `d3d9.dll` into the same tree,
-# which is what the tests then exercise). The conformance runner takes explicit
-# paths and knows no Wine layout, so this is the only place the layout is
-# written down. One binary per leg, one runner process per binary, named by the
+# Wine's own d3d9 test binaries, which run against our builtin `d3d9.dll` in
+# the Wine `make install` puts it into. Every leg, under either Wine, runs one
+# test build, the one wine-build's arm64 Wine release publishes under its
+# `lib/wine/tests`: the baseline and CONFORMANCE.md name a site by its
+# `file:line`, which moves between Wine versions, so one classification list
+# can only serve one build of the tests. A PE test runs under any Wine, so the
+# x86_64 Wine runs that same build. WINE_TESTS names the directory, from the
+# environment or the command line; in the arm64 mode it defaults to WINE_SDK's
+# own `lib/wine/tests`, and the x86_64 mode, whose Wine ships another build of
+# the tests, has no default and the conformance legs refuse to run without it.
+# The conformance runner takes explicit paths and knows no Wine layout, so
+# this is the only place the layout is written down. One binary per leg, one
+# runner process per binary, named by the
 # leg: the i686 leg runs the i386 binary against the i686 build, the x86_64 leg
 # (the x86_64 mode's) the x86_64 binary against the x86_64 build, and the
 # arm64x leg (the arm64 mode's) the same binary, whose process an arm64 Wine
@@ -462,9 +475,12 @@ XWIN := xwin --accept-license --arch x86,x86_64 \
 # 64-bit legs as `x86_64` and `arm64x`, so a run under one Wine never reads or
 # rewrites the other's entries.
 I686_LEG := $(if $(ARM64X_LEG),i686-arm64,i686)
-D3D9_TEST_i686       := $(WINE_SDK)/lib/wine/tests/i386-windows/d3d9_test.exe
+ifneq ($(ARM64X_LEG),)
+WINE_TESTS ?= $(WINE_SDK)/lib/wine/tests
+endif
+D3D9_TEST_i686       := $(WINE_TESTS)/i386-windows/d3d9_test.exe
 D3D9_TEST_i686-arm64 := $(D3D9_TEST_i686)
-D3D9_TEST_x86_64     := $(WINE_SDK)/lib/wine/tests/x86_64-windows/d3d9_test.exe
+D3D9_TEST_x86_64     := $(WINE_TESTS)/x86_64-windows/d3d9_test.exe
 D3D9_TEST_arm64x     := $(D3D9_TEST_x86_64)
 
 # Hard-fail on any warning (cargo counts emitted warnings, including ones
@@ -1530,7 +1546,8 @@ CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_LOADER) --wineserver $(WINE_S
 # beside them.
 define conformance_leg
 	$(MAKE) configure-test-prefix
-	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: the conformance legs run the d3d9 test binaries of the Wine WINE_SDK names, and a Wine bundled without them needs bundling again" >&2; exit 2; }
+	test -n '$(WINE_TESTS)' || { echo "WINE_TESTS is not set: in the x86_64 mode the conformance legs run the d3d9 test binaries of wine-build's arm64 Wine release, the one test build every leg runs, and WINE_TESTS names its lib/wine/tests; the x86_64 Wine's own tests are another build" >&2; exit 2; }
+	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: the conformance legs run the d3d9 test binaries under WINE_TESTS=$(WINE_TESTS), the lib/wine/tests of wine-build's arm64 Wine release" >&2; exit 2; }
 	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2) $(if $(LOG),--log $(LOG))
 endef
 

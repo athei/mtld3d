@@ -435,6 +435,29 @@ jobs:
           wine: ${{ matrix.runner == 'macos-26' && 'arm64' || 'x86_64' }}
           wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
           wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+      # Every leg runs one build of Wine's d3d9 tests, the arm64 Wine
+      # release's, since the baseline names a site by its file:line and the
+      # x86_64 Wine ships another build. macos-26 runs that Wine and finds
+      # them in its own tree; the x86_64-Wine images take the release's
+      # lib/wine/tests alone, cached by the pin, and name it in WINE_TESTS.
+      - name: Restore the arm64 Wine release's tests
+        id: wine-tests
+        if: matrix.runner != 'macos-26'
+        uses: actions/cache@v6
+        with:
+          path: ~/wine-tests
+          key: wine-tests-${{ env.WINE_RELEASE_ARM64 }}
+      - name: The arm64 Wine release's tests
+        if: matrix.runner != 'macos-26'
+        run: |
+          if [ '${{ steps.wine-tests.outputs.cache-hit }}' != true ]; then
+            mkdir -p "$HOME/wine-tests"
+            curl -fsSL -o "$RUNNER_TEMP/wine-arm64.tar.xz" \
+              "https://github.com/athei/wine-build/releases/download/$WINE_RELEASE_ARM64/wine-$WINE_RELEASE_ARM64-macos-arm64.tar.xz"
+            tar -xJf "$RUNNER_TEMP/wine-arm64.tar.xz" -C "$HOME/wine-tests" --strip-components 4 wine/lib/wine/tests
+            rm -f "$RUNNER_TEMP/wine-arm64.tar.xz"
+          fi
+          echo "WINE_TESTS=$HOME/wine-tests" >> "$GITHUB_ENV"
       # The Intel image reads and, on a `record_intel_baseline` dispatch,
       # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
       # family is a runner, so its counts are recorded here and committed from
