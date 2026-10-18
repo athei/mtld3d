@@ -339,6 +339,33 @@ class ModeTests(FakeWineTestCase):
         self.assertIn("WINE_TESTS is not set: in the x86_64 mode", output)
         self.assertNotIn("--exe", output)
 
+    def test_the_runner_is_told_the_wine_version_the_tests_came_from(self):
+        # WINE_TESTS's VERSION first, then the `wine --version` of the tree the
+        # tests lie in, else no version: never the Wine that runs them.
+        (self.arm64 / "bin/wine").write_text(
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo wine-11.19-tree\n")
+        alone = self.root / "tests-alone"
+        stamped = self.root / "tests-stamped"
+        stamped.mkdir()
+        (stamped / "VERSION").write_text("wine-11.20-stamped\nanything after the first line\n")
+        inside = self.arm64 / "lib/wine/tests"
+        for wine, tests, expected in ((self.arm64, None, "wine-11.19-tree"),
+                                      (self.arm64, stamped, "wine-11.20-stamped"),
+                                      (self.x86_64, stamped, "wine-11.20-stamped"),
+                                      (self.x86_64, inside, "wine-11.19-tree"),
+                                      (self.x86_64, alone, None)):
+            with self.subTest(wine=wine.name, tests=tests and tests.name):
+                arguments = (f"WINE_TESTS={tests}",) if tests else ()
+                for goal in ("conformance", "conformance-baseline"):
+                    runs = [line for line in self.dry_run(wine, *arguments, goal).splitlines()
+                            if "--arch " in line]
+                    self.assertTrue(runs)
+                    for line in runs:
+                        if expected:
+                            self.assertIn(f"--tests-wine-version '{expected}'", line)
+                        else:
+                            self.assertNotIn("--tests-wine-version", line)
+
     def test_conformance_isolate_takes_a_leg_of_the_mode(self):
         for wine, good, bad in ((self.arm64, ("i686", "arm64x"), "x86_64"),
                                 (self.x86_64, ("i686", "x86_64"), "arm64x")):

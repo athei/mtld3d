@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{diff, unrecorded_legs};
+use super::{VersionNote, diff, tests_version_note, unrecorded_legs};
 use crate::{
     classify::Classification,
     model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
@@ -357,4 +357,39 @@ fn a_leg_the_baseline_never_recorded_is_named_and_its_sites_regress() {
         &cur,
     );
     assert!(report.regressed, "{}", report.text);
+}
+
+fn baseline_of(version: &str) -> Baseline {
+    Baseline {
+        wine_version: version.to_owned(),
+        entries: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn the_header_is_held_against_the_tests_wine_version() {
+    let base = baseline_of("wine-11.19");
+    assert_eq!(tests_version_note(&base, Some("wine-11.19")), None);
+    assert_eq!(
+        tests_version_note(&base, Some("wine-11.20")),
+        Some(VersionNote::Differs {
+            baseline: "wine-11.19".to_owned(),
+            tests: "wine-11.20".to_owned(),
+        })
+    );
+    assert_eq!(
+        tests_version_note(&baseline_of(""), Some("wine-11.20")),
+        None,
+        "a baseline that names no version has nothing to compare"
+    );
+}
+
+#[test]
+fn an_unknown_tests_version_skips_the_comparison() {
+    for header in ["wine-11.19", ""] {
+        assert_eq!(
+            tests_version_note(&baseline_of(header), None),
+            Some(VersionNote::Unknown)
+        );
+    }
 }

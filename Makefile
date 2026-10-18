@@ -483,6 +483,21 @@ D3D9_TEST_i686-arm64 := $(D3D9_TEST_i686)
 D3D9_TEST_x86_64     := $(WINE_TESTS)/x86_64-windows/d3d9_test.exe
 D3D9_TEST_arm64x     := $(D3D9_TEST_x86_64)
 
+# The Wine version the tests were built from, which the baseline's `# Wine:`
+# header records and the runner holds it against (`--tests-wine-version`):
+# never the version of the Wine that runs them, since one build of the tests
+# runs under both Wines. The first line of WINE_TESTS's `VERSION`, the file
+# wine-build writes beside the tests from a later release on; else the
+# `wine --version` of the Wine tree WINE_TESTS lies in, when that tree has a
+# runnable `bin/wine` (WINE_SDK's own in the arm64 mode); else empty, the
+# tests extracted alone as CI's x86_64-Wine images have them, which the runner
+# reports as unknown. Expanded only by the conformance legs.
+WINE_TESTS_TREE    = $(abspath $(WINE_TESTS)/../../..)
+WINE_TESTS_VERSION = $(strip $(if $(wildcard $(WINE_TESTS)/VERSION),\
+	$(shell head -n 1 '$(WINE_TESTS)/VERSION'),\
+	$(shell [ -x '$(WINE_TESTS_TREE)/bin/wine' ] && '$(WINE_TESTS_TREE)/bin/wine' --version 2>/dev/null)))
+tests_version_arg  = $(if $(1),--tests-wine-version '$(1)')
+
 # Hard-fail on any warning (cargo counts emitted warnings, including ones
 # replayed from cache, and errors at the end of the run) — applied only to the
 # `check` legs so normal builds and a plain `cargo +$(RUST_STABLE) clippy` stay
@@ -1532,7 +1547,8 @@ $(OTHER_MODE_LEGS):
 # server reply shows nothing of the server on its own stacks, so the server
 # that serves this prefix is sampled beside it.
 CONFORMANCE_BIN = $(if $(STAGE),$(STAGE)/conformance/$(HOST_ARCH)/mtld3d-conformance,cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance --)
-CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_LOADER) --wineserver $(WINE_SERVER) --assets $(CURDIR)/unix/conformance
+CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_LOADER) --wineserver $(WINE_SERVER) \
+	--assets $(CURDIR)/unix/conformance $(call tests_version_arg,$(WINE_TESTS_VERSION))
 
 # $(1) = the leg (i686, arm64x or x86_64), $(2) = extra runner args. Checks
 # the exe up front so a bundle that predates the published test binaries says

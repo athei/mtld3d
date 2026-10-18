@@ -215,6 +215,15 @@ Wine. `WINE_TESTS` names that directory. In the arm64 mode it defaults to
 build of the tests, it has no default and the conformance targets stop
 without it. Its `{i386,x86_64}-windows/d3d9_test.exe` are the two binaries.
 
+The baseline's header names the Wine version those tests were built from,
+and the conformance targets tell the runner that version: the first line of
+`$WINE_TESTS/VERSION`, which wine-build will write beside the tests (the
+`wine --version` string of their build), else the `wine --version` of the
+Wine tree `WINE_TESTS` lies in when that tree has a runnable `bin/wine`, as
+`WINE_SDK` does in the arm64 mode. Tests extracted alone without a
+`VERSION`, as on CI's x86_64-Wine images, have no known version: the run
+skips the comparison with the header and a re-record keeps it.
+
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#reading-a-test-run) explains how to
 read a test run, and
 [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md) explains the

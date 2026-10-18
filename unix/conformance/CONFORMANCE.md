@@ -102,12 +102,26 @@ before. A key with no entries yet makes its
 leg's run report every failing site as new and fail, and the runner says so
 in one line naming the key and `make conformance-baseline`. The header's
 `Wine:` line is one for the file and names the build of the tests every
-section was recorded against, `wine-11.19-17-ge2e42653b41`. The runner
-writes and compares the `wine --version` of the Wine that runs the leg
-instead, so a run under the x86_64 Wine (`wine-11.0`) warns that sites may
-have drifted although its tests are the same build, and a re-record there
-writes `wine-11.0` into the header, which is set back by hand. A site the
-arm64 Wine moves is reclassified only on the evidence of a recorded run.
+section was recorded against, `wine-11.19-17-ge2e42653b41`: the version of
+the Wine the tests were built from, never of the Wine that runs them. The
+Makefile tells the runner that version (`--tests-wine-version`) from the
+first of these that answers:
+
+1. the first line of `$WINE_TESTS/VERSION`. This file is the contract with
+   wine-build: a release that publishes the tests writes it into
+   `lib/wine/tests`, holding the `wine --version` string of the build the
+   tests came from, so a directory of tests extracted alone still says
+   which build it is. Releases up to arm64-11.19-1 do not write it yet;
+2. the `wine --version` of the Wine tree `WINE_TESTS` lies in
+   (`$WINE_TESTS/../../../bin/wine`), when that tree has a runnable
+   `bin/wine`. In the arm64 mode's default this is `WINE_SDK`'s own;
+3. nothing, as for the tests CI's x86_64-Wine images extract alone.
+
+A run compares the header with that version and warns when they differ, and
+`make conformance-baseline` writes it into the header. When it is unknown
+the run says so in one line and compares nothing, and a re-record keeps the
+header as it is. A site the arm64 Wine moves is reclassified only on the
+evidence of a recorded run.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
@@ -869,8 +883,8 @@ dropped (delete their tokens and trim the prose). A new build of the tests
 renumbers source lines, so moving `WINE_TESTS` to another release is a
 re-baseline of every section with the `Sites:` tokens here renumbered in the
 same change. The runner's warning that `file:line` sites may have drifted
-compares the running Wine's version with the header, not the tests' build
-(The two Wines, above).
+compares the header with the Wine version the tests came from (The two
+Wines, above), so it fires on exactly that move.
 
 ## Classification tags
 
