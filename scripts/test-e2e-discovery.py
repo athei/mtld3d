@@ -160,11 +160,9 @@ class E2eDiscoveryTests(unittest.TestCase):
         out_unix_arm64 = outputs / "unix-arm64"
         for directory in (out_i386, out_x64, out_arm64x, out_unix_x64, out_unix_arm64):
             directory.mkdir(parents=True)
-        for directory in (out_i386, out_x64):
+        for directory in (out_i386, out_x64, out_arm64x):
             for name in ("mtld3d.dll", "mtld3d.pdb", "mtld3d.fake.dll", "d3d9.dll", "d3d9.pdb"):
                 (directory / name).touch()
-        for name in ("mtld3d.dll", "mtld3d.pdb", "d3d9.dll", "d3d9.pdb"):
-            (out_arm64x / name).touch()
         for directory in (out_unix_x64, out_unix_arm64):
             (directory / "mtld3d.so").touch()
             (directory / "mtld3d.so.dSYM").mkdir()

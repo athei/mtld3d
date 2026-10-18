@@ -234,7 +234,8 @@ conformance suite and its baseline.
 
 wine-build's arm64 Wine runs x86 programs through FEX. It keeps mtld3d in
 `lib/wine/d3d9/mtld3d`, and its compatdb.so prepends that tree to the builtin
-search of every x86 process, mtld3d being its d3d9 default for them. An x64
+search of every x86 process and, from arm64-11.19-2 on, of every native ARM64
+one, mtld3d being its d3d9 default for them. An x64
 program runs there as an ARM64EC process, which loads its builtins from
 `aarch64-windows`, so the 64-bit modules sit in the tree's `aarch64-windows`
 whatever their machine. The placeholders `make install` stamps for them in

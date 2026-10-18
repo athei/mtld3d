@@ -625,7 +625,10 @@ unix: unix-x64 unix-arm64
 # for every builtin it finds in lib/wine when it creates a prefix, and the
 # install targets run first. Only `bundle` carries it, under prefix-markers/
 # rather than wine/, for the case where that ordering does not hold: an
-# existing prefix, or a Wine installation we do not control.
+# existing prefix, or a Wine installation we do not control. The ARM64X build
+# gets a hybrid one (`windows-arm64x`), which native ARM64 and x64 processes
+# both accept and an x86_64 Wine, whose loader takes no ARM64 placeholder,
+# never sees.
 windows-i686:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
@@ -769,6 +772,8 @@ windows-arm64x:
 	$(call arm64x_link,mtld3d,shim/mtld3d.def)
 	$(call arm64x_link,d3d9,d3d9/d3d9.def)
 	$(WINEBUILD) --builtin $(OUT_arm64x)/mtld3d.dll
+	$(WINEBUILD) --fake-module -o $(OUT_arm64x)/mtld3d.fake.dll -b aarch64-windows -marm64x --dll $(OUT_arm64x)/mtld3d.dll
+	$(call HYBRID_PLACEHOLDER_CHECK,$(OUT_arm64x)/mtld3d.fake.dll)
 
 # On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 # debug map in the dylib pointing at them by absolute path; `dsymutil` walks
@@ -917,7 +922,7 @@ endef
 # that metadata. An unreadable placeholder, or one that is no PE32+ image,
 # fails too. The install and `bundle` both run it.
 define HYBRID_PLACEHOLDER_CHECK
-config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBUILD) just wrote, is no PE32+ image whose load config make install can read" >&2 ; exit 2 ; } ; \
+config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBUILD) just wrote, is no PE32+ image whose load config make can read" >&2 ; exit 2 ; } ; \
 [ "$$config" != 0000000000000000 ] || { echo "$(WINEBUILD) is too old: it writes a -marm64x placeholder without the ARM64EC metadata of a hybrid one, which an x64 process refuses ($(1)); WINE_SDK has to be wine-build arm64-11.19-2 or later" >&2 ; exit 2 ; }
 endef
 
@@ -1142,11 +1147,13 @@ version-check:
 # for an arm64 one, as `install` lays them out, and both unix arches, so the
 # same tree drops into either Wine; each loads only the directories of its own
 # arch. native/ holds the unmarked d3d9.dll of all three builds, the ARM64X one
-# for a 64-bit game on an arm64 Wine. The 64-bit prefix marker is the x86_64
-# build's in either case: an AMD64 placeholder, which an x64 process accepts on
-# either Wine, in front of the ARM64X pair too, whose x64 view it then loads.
-# A bundle built in the x86_64 mode has no ARM64X build to carry, so it holds
-# no `aarch64-windows` directory in either wine/ or native/, nor its symbols.
+# for a 64-bit game on an arm64 Wine. The 64-bit prefix marker comes twice:
+# `system32/` holds the x86_64 build's, an AMD64 placeholder, the one an
+# x86_64 Wine accepts, and `system32-arm64/` the ARM64X build's hybrid one for
+# an arm64 Wine, which a native ARM64 process accepts as well as an x64 one.
+# The 32-bit marker in `syswow64/` serves both Wines. A bundle built in the
+# x86_64 mode has no ARM64X build to carry, so it holds no `aarch64-windows`
+# directory in either wine/ or native/, nor its symbols, nor `system32-arm64/`.
 #
 # Two archives come out of one run: the bundle users install, and the symbols
 # that make a crash report from one of them readable.
@@ -1176,6 +1183,8 @@ bundle: all
 	# second, useless marker under the name "mtld3d.fake.dll".
 	cp -c $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/prefix-markers/syswow64/mtld3d.dll
 	cp -c $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
+	$(if $(ARM64X_LEG),mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32-arm64 && \
+		cp -c $(OUT_arm64x)/mtld3d.fake.dll $(BUNDLE_STAGE)/prefix-markers/system32-arm64/mtld3d.dll)
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
 	cp -c $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
@@ -1189,7 +1198,7 @@ bundle: all
 	# assembled from a stale target dir is how a release ships DLLs naming the
 	# previous tag, and neither the version gate nor the archive itself can see
 	# that. A binary carries exactly one of these, so finding this one is
-	# enough. The two prefix markers are winebuild placeholders holding no code,
+	# enough. The prefix markers are winebuild placeholders holding no code,
 	# so they carry no stamp and are not swept.
 	test -n "$(BUILD_ID)" || { echo "bundle: this build has no identity to check the binaries against" >&2; exit 1; }
 	for f in $(BUNDLE_STAGE)/wine/i386-windows/*.dll \
@@ -1233,7 +1242,7 @@ stage: all
 		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
 	cp -c $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
 		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb $(STAGE_DIR)/x86_64-windows/
-	$(if $(ARM64X_LEG),cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb \
+	$(if $(ARM64X_LEG),cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $(OUT_arm64x)/mtld3d.fake.dll \
 		$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/d3d9.pdb $(STAGE_DIR)/aarch64-windows/)
 	cp -c $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
 	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)

@@ -360,7 +360,13 @@ class ModeTests(FakeWineTestCase):
                 for word in ("arm64x", "aarch64-pc-windows-msvc", "arm64ec", "LLVM_MINGW",
                              "lld-link", "aarch64-windows"):
                     self.assertNotIn(word, x86_64)
-        self.assertIn("native/aarch64-windows", self.dry_run(self.arm64, "-o", "all", "bundle"))
+                self.assertNotIn("system32-arm64", x86_64)
+        bundle = self.dry_run(self.arm64, "-o", "all", "bundle")
+        self.assertIn("native/aarch64-windows", bundle)
+        # An arm64 Wine's 64-bit prefix marker is the ARM64X build's hybrid one.
+        self.assertRegex(bundle, r"cp -c \S*/arm64x/\w+/mtld3d\.fake\.dll \S*/prefix-markers/system32-arm64/mtld3d\.dll")
+        self.assertIn("--fake-module -o windows/target/arm64x/release/mtld3d.fake.dll -b aarch64-windows -marm64x",
+                      self.dry_run(self.arm64, "windows"))
 
     def test_make_test_and_conformance_run_the_modes_own_legs(self):
         arm64 = self.dry_run(self.arm64, "test")
@@ -572,7 +578,7 @@ class InstallLayoutTests(FakeWineTestCase):
         marker = self.arm64 / "lib/wine/aarch64-windows/d3d9.dll"
         self.assertEqual(self.printed(output, f"{marker}, "), [
             f"{marker}, the placeholder {self.arm64}/bin/winebuild just wrote, is no PE32+ image "
-            "whose load config make install can read"], output)
+            "whose load config make can read"], output)
         self.assertEqual(self.winebuild_lines(output), [])
 
     def test_a_d3d9_tree_with_an_x86_64_build_keeps_the_d3d9_marker_amd64(self):

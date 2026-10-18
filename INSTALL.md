@@ -24,14 +24,16 @@ native/                     unmarked d3d9.dll for the DLL-override route
   aarch64-windows/d3d9.dll  ARM64X, for a 64-bit game on an arm64 Wine
 prefix-markers/             for a prefix wineboot never stamped (see below)
   syswow64/mtld3d.dll       stub, copy into the prefix dir of the same name
-  system32/mtld3d.dll       stub, 64-bit
+  system32/mtld3d.dll       stub, 64-bit, for an x86_64 Wine (AMD64)
+  system32-arm64/mtld3d.dll stub, 64-bit, for an arm64 Wine (hybrid ARM64X);
+                            copy it into system32
 mtld3d.conf                 sample configuration, self-documenting
 INSTALL.md                  this file
 LICENSE
 ```
 
 Only a bundle built against an arm64 Wine has the `aarch64-windows` entries
-of `wine/` and `native/`. Releases after 0.13.0 are built that way; 0.13.0
+of `wine/` and `native/` and `prefix-markers/system32-arm64/`. Releases after 0.13.0 are built that way; 0.13.0
 and older releases, and any bundle built against an x86_64 Wine, have
 neither, and on an arm64 Wine their x86_64 pair takes that place (see
 below).
@@ -98,11 +100,17 @@ here; `mtld3d` gets a marker for free as long as it was installed **before**
 the prefix was created.
 
 Installing by hand is usually the other case: the prefix already exists, so it
-never saw `mtld3d`. That is what `prefix-markers/` is for. The two directories
+never saw `mtld3d`. That is what `prefix-markers/` is for. The directories
 are named after their destination and the stubs already carry the right name,
-so each is a plain copy with no rename. `wineboot -u` would do the same job at
-the cost of a full prefix update. Nothing in `prefix-markers/` ever belongs in
-`lib/wine`.
+so each is a plain copy with no rename. The 64-bit stub comes in two machines,
+because each Wine's loader takes a different one: `system32/` holds an AMD64
+stub for an x86_64 Wine, and `system32-arm64/` a hybrid (ARM64X) one for an
+arm64 Wine, which both its x64 programs and its native ARM64 programs accept;
+an x86_64 Wine refuses that one, and a native ARM64 program refuses the AMD64
+one. Both go into the prefix's `system32`. `wineboot -u` would do the same
+job at the cost of a full prefix update, and a wine-build Wine's `wineboot`
+stamps markers of the right machine by itself. Nothing in `prefix-markers/`
+ever belongs in `lib/wine`.
 
 The CrossOver route below always needs them. There `mtld3d` reaches Wine
 through the bottle's DLL search path and never enters CrossOver's own
@@ -172,9 +180,11 @@ cp wine/aarch64-unix/mtld3d.so "$T/aarch64-unix/"
 #cp wine/x86_64-unix/mtld3d.so "$T/x86_64-unix/"
 
 # One-time prefix markers, only needed because this prefix already existed.
-# Skip both lines if the prefix is created after the copy above.
-cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"
-cp prefix-markers/system32/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
+# Skip both lines if the prefix is created after the copy above. arm64 Wine:
+cp prefix-markers/syswow64/mtld3d.dll       "$WINEPREFIX/drive_c/windows/syswow64/"
+cp prefix-markers/system32-arm64/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
+# x86_64 Wine, or a bundle without system32-arm64, the AMD64 stub instead:
+#cp prefix-markers/system32/mtld3d.dll      "$WINEPREFIX/drive_c/windows/system32/"
 
 # Optional: runtime configuration next to the game executable.
 cp mtld3d.conf "/path/to/MyGame/"
@@ -207,9 +217,11 @@ cp wine/aarch64-unix/mtld3d.so  "$T/aarch64-unix/"
 #cp wine/x86_64-windows/$P.dll  "$T/x86_64-windows/"
 #cp wine/x86_64-unix/mtld3d.so  "$T/x86_64-unix/"
 
-# One-time prefix markers, as in the builtin route.
-cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"
-cp prefix-markers/system32/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
+# One-time prefix markers, as in the builtin route. arm64 Wine:
+cp prefix-markers/syswow64/mtld3d.dll       "$WINEPREFIX/drive_c/windows/syswow64/"
+cp prefix-markers/system32-arm64/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
+# x86_64 Wine, or a bundle without system32-arm64, the AMD64 stub instead:
+#cp prefix-markers/system32/mtld3d.dll      "$WINEPREFIX/drive_c/windows/system32/"
 
 # Native d3d9.dll next to the game executable: pick the game's arch, and for
 # a 64-bit game the build whose mtld3d.dll went in above.
@@ -234,9 +246,10 @@ which only replace placeholder files, never real PEs.
 In a wine-build Wine the native `d3d9.dll` reaches the builtin `mtld3d.dll`
 only in a process whose builtin search includes the tree `T`: the Wine's
 compatdb.so prepends `T` for a process it selects mtld3d as the d3d9 of, and
-it does so by default for every x86 process, 32-bit and 64-bit. A process
-compatdb gives another d3d9 (a per-game rule, or a non-x86 process) does not
-search `T`, finds no `mtld3d.dll` and fails to load the native `d3d9.dll`.
+it does so by default for every x86 process, 32-bit and 64-bit, and, from
+arm64-11.19-2 on, for every native ARM64 process too. A process compatdb
+gives another d3d9 (a per-game rule) does not search `T`, finds no
+`mtld3d.dll` and fails to load the native `d3d9.dll`.
 
 ### On an arm64 Wine
 
@@ -251,12 +264,13 @@ against an x86_64 Wine, serves the same route with its x86_64 builds
 instead: the pair from `wine/x86_64-windows/` in the tree's
 `aarch64-windows` and the `d3d9.dll` from `native/x86_64-windows/`, all
 translated. The files in the tree and the native `d3d9.dll` come from one
-build either way. A 32-bit game takes the i386 files, as on an
-x86_64 Wine, and the prefix markers are the same two files: the 64-bit one is
-an x64 (AMD64) placeholder, which an x64 process accepts on either Wine. On
-a wine-build arm64 Wine the `mtld3d.dll` goes into `lib/wine/d3d9/mtld3d`
-(the `T` above), never over the placeholders in its default
-`lib/wine/aarch64-windows`.
+build either way. A 32-bit game takes the i386 files, as on an x86_64 Wine.
+The 64-bit prefix marker is the hybrid one from `system32-arm64/`, which an
+x64 process accepts as it does the AMD64 one and a native ARM64 process
+accepts too; a bundle without it leaves the AMD64 one from `system32/`, which
+serves x64 programs only. On a wine-build arm64 Wine the `mtld3d.dll` goes
+into `lib/wine/d3d9/mtld3d` (the `T` above), never over the placeholders in
+its default `lib/wine/aarch64-windows`.
 
 ## CrossOver
 
