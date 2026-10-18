@@ -161,7 +161,15 @@ fn log_identity() {
     let id = identity::image_id();
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
-    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized");
+    let arch = identity::ARCH;
+    // Rosetta is named where it runs; a native process, or one the kernel
+    // would not answer for (`translated` has logged why), says the arch alone.
+    let rosetta = if crate::translation::translated() == Some(true) {
+        ", under Rosetta 2"
+    } else {
+        ""
+    };
+    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized as {arch}{rosetta}");
     let Some(image) = core_foundation_image() else {
         warn!(target: LOG_TARGET, "CoreFoundation image identity unavailable");
         return;

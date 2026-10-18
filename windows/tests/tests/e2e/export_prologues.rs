@@ -12,17 +12,22 @@
 //!
 //! No shared harness: the point is the export table, as in `d3dperf.rs`.
 
-use core::ffi::{CStr, c_char, c_void};
+#[cfg(not(target_arch = "aarch64"))]
+use core::ffi::CStr;
+use core::ffi::{c_char, c_void};
+#[cfg(not(target_arch = "aarch64"))]
 use std::ffi::CString;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryA(name: *const c_char) -> *mut c_void;
     fn FreeLibrary(module: *mut c_void) -> i32;
+    #[cfg(not(target_arch = "aarch64"))]
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
 /// The `.def` file `d3d9.dll` links with: its `EXPORTS` section names every export.
+#[cfg(not(target_arch = "aarch64"))]
 const D3D9_DEF: &str = include_str!("../../../d3d9/d3d9.def");
 
 /// `mov edi, edi; push ebp; mov ebp, esp; pop ebp`, in the encodings MSVC emits.
@@ -39,38 +44,49 @@ fn every_api_export_starts_with_the_hook_prologue() {
     let lib = unsafe { LoadLibraryA(c"d3d9.dll".as_ptr()) };
     assert!(!lib.is_null(), "LoadLibrary(d3d9.dll)");
 
+    // The ARM64X build's exports are ARM64EC code in an x64 process and ARM64
+    // code in a native ARM64 one, which an x86 hook engine cannot decode
+    // whatever their first bytes are. A native ARM64 process loads only that
+    // image, so it checks nothing.
+    #[cfg(target_arch = "aarch64")]
+    eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64 code, not checked");
+    #[cfg(not(target_arch = "aarch64"))]
     if is_hybrid_image(lib) {
-        // The ARM64X build's exports are ARM64EC code, which an x64 hook
-        // engine cannot decode whatever its first bytes are.
         eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64EC code, not checked");
     } else {
-        let exports = def_exports();
-        assert!(
-            exports
-                .iter()
-                .any(|name| name.as_c_str() == c"Direct3DCreate9"),
-            "d3d9.def lists Direct3DCreate9: {exports:?}"
-        );
-        let wrong: Vec<String> = exports
-            .iter()
-            .filter_map(|name| {
-                let found = first_bytes(lib, name);
-                (found != PROLOGUE)
-                    .then(|| format!("{}: {found:02X?}", name.to_str().unwrap_or("?")))
-            })
-            .collect();
-        assert!(
-            wrong.is_empty(),
-            "exports that do not start with {PROLOGUE:02X?}:\n{}",
-            wrong.join("\n")
-        );
+        check_prologues(lib);
     }
 
     // SAFETY: balancing the LoadLibrary above.
     assert_ne!(unsafe { FreeLibrary(lib) }, 0, "FreeLibrary(d3d9.dll)");
 }
 
+/// Compare the first bytes of every export `d3d9.def` lists with [`PROLOGUE`].
+#[cfg(not(target_arch = "aarch64"))]
+fn check_prologues(lib: *mut c_void) {
+    let exports = def_exports();
+    assert!(
+        exports
+            .iter()
+            .any(|name| name.as_c_str() == c"Direct3DCreate9"),
+        "d3d9.def lists Direct3DCreate9: {exports:?}"
+    );
+    let wrong: Vec<String> = exports
+        .iter()
+        .filter_map(|name| {
+            let found = first_bytes(lib, name);
+            (found != PROLOGUE).then(|| format!("{}: {found:02X?}", name.to_str().unwrap_or("?")))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "exports that do not start with {PROLOGUE:02X?}:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// Every name the `EXPORTS` section of `d3d9.def` lists, the first word of each line.
+#[cfg(not(target_arch = "aarch64"))]
 fn def_exports() -> Vec<CString> {
     let (_, exports) = D3D9_DEF
         .split_once("EXPORTS")
@@ -83,6 +99,7 @@ fn def_exports() -> Vec<CString> {
 }
 
 /// The first bytes of the export `name`, as many as the prologue has.
+#[cfg(not(target_arch = "aarch64"))]
 fn first_bytes(lib: *mut c_void, name: &CStr) -> [u8; PROLOGUE.len()] {
     // SAFETY: `lib` is a live module handle and the name is NUL-terminated.
     let addr = unsafe { GetProcAddress(lib, name.as_ptr()) };

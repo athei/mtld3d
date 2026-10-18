@@ -93,10 +93,12 @@ env:
   # and so would not run on the macos-15 and Intel images.
   WINE_RELEASE_X86_64: cx-26.3.0-7
   # The arm64 Wine, a full bundle: the runtime, the link libraries of every PE
-  # architecture and Wine's own test binaries under lib/wine/tests. It needs
-  # macOS 26.4 or later (its ntdll.so and winebuild), so macos-26 alone runs
-  # it.
-  WINE_RELEASE_ARM64: arm64-11.19-1
+  # architecture and Wine's own test binaries under lib/wine/tests, with the
+  # VERSION file naming the Wine they came from. It needs macOS 26.4 or later
+  # (its ntdll.so and winebuild), so macos-26 alone runs it. arm64-11.19-2 or
+  # later, the first whose winebuild writes hybrid placeholders, which the
+  # install requires.
+  WINE_RELEASE_ARM64: arm64-11.19-2
   # The llvm-mingw release the ARM64X build links its CRT from (20260826 or
   # newer) with the release's own `lld-link` (LLD 23 or newer; 20261006
   # carries 23.1.3). The Makefile checks both.
@@ -228,7 +230,11 @@ jobs:
   # (`test-e2e-arm64x`), the x86_64 build under the x86_64 Wine of macos-15
   # and the Intel image (`test-e2e-x86_64`). The `arch` axis keeps naming the test
   # binaries, so the job and artifact names stay as they were; LEG is the
-  # Makefile's name for the leg.
+  # Makefile's name for the leg. macos-26 runs one more, `aarch64`: the
+  # native ARM64 test binaries against the ARM64X build's ARM64 half
+  # (`test-e2e-arm64`), which only the arm64 Wine runs. It is an `include`
+  # entry rather than an axis value, as the scaled leg below is, so the other
+  # images grow no leg they cannot run.
   #
   # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
   # on arm64, and the Intel image, whose paravirtual device has no unified
@@ -277,7 +283,7 @@ jobs:
         runner: ${{ fromJSON(needs.build.outputs.runners) }}
         arch: [i686, x86_64]
         scale: [""]
-        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"}]' || '[]') }}
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"},{"runner":"macos-26","arch":"aarch64"}]' || '[]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
@@ -319,7 +325,7 @@ jobs:
             exit 1
           fi
         env:
-          LEG: ${{ matrix.arch == 'i686' && 'i686' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || matrix.arch == 'aarch64' && 'arm64' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
           E2E_FILTER: ${{ inputs.e2e_filter }}
           RUST_LOG: ${{ inputs.e2e_log }}
           LOG_DIR: ${{ runner.temp }}

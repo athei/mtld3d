@@ -1,5 +1,5 @@
 # mtld3d d3d9 conformance baseline — per-site failure counts.
-# Wine: wine-11.19-17-ge2e42653b41
+# Wine: wine-11.19-17-gd57b522eea5
 # Regenerate with 'make conformance-baseline'. Classifications + triage prose
 # live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test
 # keeps the two files covering the same sites.

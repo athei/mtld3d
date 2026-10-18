@@ -96,7 +96,8 @@ fn log_identity(instance: *mut c_void) {
     let id = unsafe { identity::image_id(instance) };
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
-    info!(target: LOG_TARGET, "mtld3d.dll {build} {id}, unix call initialized");
+    let arch = identity::ARCH;
+    info!(target: LOG_TARGET, "mtld3d.dll {build} {id}, unix call initialized as {arch}");
 }
 
 /// Forwards to Wine's unix-call dispatcher.

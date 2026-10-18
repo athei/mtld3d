@@ -501,6 +501,12 @@ fn create_factory(entries: &str, factory: Factory) -> *mut c_void {
         d3d9
     };
     assert!(!d3d9.is_null(), "the factory export returned null");
+    assert!(
+        win32::layer_loaded(),
+        "Direct3DCreate9 answered, but no mtld3d.dll is loaded: this process got another \
+         d3d9.dll than the layer's (the Wine's own, through its compat database or a stale \
+         placeholder in the prefix), so a test here would not test the layer"
+    );
     d3d9
 }
 

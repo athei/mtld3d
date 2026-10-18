@@ -13,6 +13,7 @@ MAKEFILE = Path(__file__).resolve().parent.parent / "Makefile"
 PE_TARGETS = {
     "i686": "i686-pc-windows-msvc",
     "x86_64": "x86_64-pc-windows-msvc",
+    "aarch64": "aarch64-pc-windows-msvc",
 }
 # The legs of `make test` in each mode, each with the PE target of the test
 # binaries it runs, and the unix `.so` install leaf the mode's legs take: the
@@ -160,16 +161,19 @@ class E2eDiscoveryTests(unittest.TestCase):
         out_unix_arm64 = outputs / "unix-arm64"
         for directory in (out_i386, out_x64, out_arm64x, out_unix_x64, out_unix_arm64):
             directory.mkdir(parents=True)
-        for directory in (out_i386, out_x64):
+        for directory in (out_i386, out_x64, out_arm64x):
             for name in ("mtld3d.dll", "mtld3d.pdb", "mtld3d.fake.dll", "d3d9.dll", "d3d9.pdb"):
                 (directory / name).touch()
-        for name in ("mtld3d.dll", "mtld3d.pdb", "d3d9.dll", "d3d9.pdb"):
-            (out_arm64x / name).touch()
         for directory in (out_unix_x64, out_unix_arm64):
             (directory / "mtld3d.so").touch()
             (directory / "mtld3d.so.dSYM").mkdir()
         for mode in MODES:
+            # The test binaries the stage takes in this mode, in its order: the
+            # aarch64 ones, which the native ARM64 leg runs, in the arm64 mode alone.
+            order = ["i686", "x86_64", *(["aarch64"] if mode == "arm64" else [])]
             for failed_arch, failed_target in PE_TARGETS.items():
+                if failed_arch not in order:
+                    continue
                 with self.subTest(mode=mode, failed_arch=failed_arch):
                     stage_dir = self.root / f"stage-{mode}-{failed_arch}"
                     result = self.run_make(
@@ -188,13 +192,13 @@ class E2eDiscoveryTests(unittest.TestCase):
                     )
                     for arch, test_exe in self.test_exes.items():
                         staged = stage_dir / f"tests/{arch}" / test_exe.name
-                        if arch == "i686" and failed_arch == "x86_64":
-                            self.assertTrue(staged.exists())
-                        else:
-                            self.assertFalse(staged.exists(), result.stdout)
+                        # Only the binaries of the arches staged before the one that failed.
+                        before = arch in order and order.index(arch) < order.index(failed_arch)
+                        self.assertEqual(staged.exists(), before, result.stdout)
                     # The ARM64X pair is staged in the arm64 mode alone.
                     self.assertEqual((stage_dir / "aarch64-windows/d3d9.dll").exists(),
                                      mode == "arm64", result.stdout)
+                    self.assertEqual((stage_dir / "tests/aarch64").is_dir(), mode == "arm64", result.stdout)
                     self.assertTrue((stage_dir / "x86_64-windows/d3d9.dll").exists())
                     self.assert_discovery_failed(result)
 

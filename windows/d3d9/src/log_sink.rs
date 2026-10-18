@@ -11,8 +11,10 @@
 //!
 //! The thread lives from the first `IDirect3D9` to the last: [`acquire`],
 //! from `Direct3DCreate9` (never from `DllMain`, which runs under the loader
-//! lock), starts it, and [`release`], from the last interface's drop, stops
-//! it and waits for it to be gone. The thread holds a reference on
+//! lock), first forwards what is queued on the calling thread, so the lines of
+//! a process that ends right after `Direct3DCreate9` reach the file before it
+//! returns, then starts it, and [`release`], from the last interface's drop,
+//! stops it and waits for it to be gone. The thread holds a reference on
 //! `d3d9.dll` for its lifetime and leaves through `FreeLibraryAndExitThread`,
 //! so a `FreeLibrary` cannot unmap the image under a running thread, and one
 //! that follows the last `Release` finds no thread of ours in the image.
@@ -262,6 +264,16 @@ fn start(worker: &mut Worker) {
         );
         return;
     };
+    // What waits in the queue is everything logged since `DllMain`, the build
+    // identity first. It goes out here, on the calling thread, before the
+    // thread exists: a process that ends right after `Direct3DCreate9`, a
+    // probe that only asks which d3d9 it got, ends the logging thread before
+    // that thread's first pass, and the lines would end with it.
+    while let Ok(message) = rx.try_recv() {
+        if let Message::Line(line) = message {
+            forward(&line, LogLineKind::Ordinary);
+        }
+    }
     let Some(module) = add_image_reference() else {
         *QUEUE.rx.lock().expect("log queue receiver lock poisoned") = Some(rx);
         return;

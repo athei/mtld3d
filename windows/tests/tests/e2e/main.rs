@@ -74,6 +74,7 @@ mod samplers;
 mod sampling_views;
 mod shaders;
 mod smoke;
+mod startup_log;
 mod state_block;
 mod streams;
 mod subresource_identity;

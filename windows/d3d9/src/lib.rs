@@ -302,15 +302,18 @@ fn create_interface(extended: bool) -> *mut Direct3D9 {
     // interface names it again and the unix side keeps the file it has.
     let cfg = config::load();
     log_sink::open(&cfg);
-    // The first entry point outside `DllMain`: the logging thread can start
-    // here (DllMain runs under the loader lock and must not spawn threads).
-    // It runs until the last interface is released, holding this image.
-    log_sink::acquire();
     // The page-box pool is one per process; the interface resolved most
     // recently sizes it.
     page_box_pool::PAGEBOX_POOL
         .set_cap(usize::try_from(cfg.pagebox_pool_cap_bytes).unwrap_or(usize::MAX));
-    Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg), extended)))
+    let interface = Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg), extended)));
+    // The first entry point outside `DllMain`: the logging thread can start
+    // here (DllMain runs under the loader lock and must not spawn threads).
+    // It runs until the last interface is released, holding this image. Last,
+    // so the lines the interface's creation logged are among those `acquire`
+    // forwards before it returns.
+    log_sink::acquire();
+    interface
 }
 
 extern "system" fn shader_validator_create9() -> *mut c_void {
@@ -398,8 +401,9 @@ fn log_identity(instance: *mut c_void) {
     let id = unsafe { identity::image_id(instance) };
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
+    let arch = identity::ARCH;
     let base = instance as usize;
-    log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded at {base:#x}");
+    log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded at {base:#x} as {arch}");
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     guest_mem::log_route();
 }
