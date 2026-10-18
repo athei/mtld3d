@@ -84,10 +84,10 @@ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 /// The bytes of `ud2`, the instruction the thread raises its exception with.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const UD2: [u8; 2] = [0x0F, 0x0B];
+const TRAP: [u8; 2] = [0x0F, 0x0B];
 /// The bytes of `udf #0`, ARM64's permanently undefined instruction, in its place.
 #[cfg(target_arch = "aarch64")]
-const UD2: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+const TRAP: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 /// Offset of the instruction pointer (`Eip`) in an i386 `CONTEXT`.
 #[cfg(target_arch = "x86")]
 const CONTEXT_PC_OFFSET: usize = 0xB8;
@@ -108,10 +108,10 @@ const HUNG_EXIT_CODE: u32 = 101;
 
 /// `ud2` then `ret`: the code the second test patches into a loaded DLL.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const UD2_RET: [u8; 3] = [0x0F, 0x0B, 0xC3];
+const TRAP_RET: [u8; 3] = [0x0F, 0x0B, 0xC3];
 /// `udf #0` then `ret`, ARM64's equivalent, each a little-endian word.
 #[cfg(target_arch = "aarch64")]
-const UD2_RET: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xC0, 0x03, 0x5F, 0xD6];
+const TRAP_RET: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xC0, 0x03, 0x5F, 0xD6];
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// Offset of `e_lfanew` in the DOS header: where the NT headers start.
 const E_LFANEW: usize = 0x3c;
@@ -164,7 +164,7 @@ fn exception_without_thread_locals_workload() {
     );
     // SAFETY: appending (first = 0) behind the layer's handler, which
     // registered itself first; the handler stays valid for the process.
-    let handler = unsafe { AddVectoredExceptionHandler(0, resume_past_ud2) };
+    let handler = unsafe { AddVectoredExceptionHandler(0, resume_past_trap) };
     assert!(!handler.is_null(), "AddVectoredExceptionHandler");
     // SAFETY: the export has the `NtCreateThreadEx` signature declared above.
     let create: NtCreateThreadExFn =
@@ -216,7 +216,7 @@ fn exception_without_thread_locals_workload() {
 ///
 /// Wine already leaves the pointer null on a thread started without thread
 /// attach; clearing it here keeps the test's precondition whatever the Wine.
-/// Nothing in this function or in [`resume_past_ud2`] reads a thread-local.
+/// Nothing in this function or in [`resume_past_trap`] reads a thread-local.
 /// `resumed` is the workload's `AtomicBool`.
 extern "system" fn raise_and_resume(resumed: *mut c_void) -> u32 {
     let saved = tls_array();
@@ -235,7 +235,7 @@ extern "system" fn raise_and_resume(resumed: *mut c_void) -> u32 {
 /// A handled fault inside another module leaves that module's reference count as it was.
 ///
 /// A DLL no test process loads is loaded once, its entry point patched to
-/// `ud2; ret` and called, the test's handler resumes it, and the code is put
+/// [`TRAP_RET`] and called, the test's handler resumes it, and the code is put
 /// back. One `FreeLibrary` then unloads the DLL. A handler that took a
 /// reference on the faulting module, to ask whether it is the layer's own or
 /// to name it, would leave the DLL mapped. In a process of its own, so the
@@ -270,18 +270,18 @@ fn fault_in_a_freed_module_workload() {
     // SAFETY: the NT headers the DOS header points at, in the same image.
     let entry_rva = unsafe { ((nt + ENTRY_POINT) as *const u32).read_unaligned() } as usize;
     assert_ne!(entry_rva, 0, "{PROBE_DLL:?} has an entry point to patch");
-    let code = (base + entry_rva) as *mut [u8; UD2_RET.len()];
+    let code = (base + entry_rva) as *mut [u8; TRAP_RET.len()];
 
     // SAFETY: appending (first = 0) behind the layer's handler; the handler
     // stays valid for the process.
-    let handler = unsafe { AddVectoredExceptionHandler(0, resume_past_ud2) };
+    let handler = unsafe { AddVectoredExceptionHandler(0, resume_past_trap) };
     assert!(!handler.is_null(), "AddVectoredExceptionHandler");
     let mut protect = 0u32;
     // SAFETY: the three bytes at the DLL's entry point, mapped while it is loaded.
     let unprotected = unsafe {
         VirtualProtect(
             code.cast(),
-            UD2_RET.len(),
+            TRAP_RET.len(),
             PAGE_EXECUTE_READWRITE,
             &raw mut protect,
         )
@@ -290,23 +290,23 @@ fn fault_in_a_freed_module_workload() {
     // SAFETY: the bytes were made writable above.
     let original = unsafe { code.read() };
     // SAFETY: as above.
-    unsafe { code.write(UD2_RET) };
+    unsafe { code.write(TRAP_RET) };
     // SAFETY: plain kernel32 call answering this process's pseudo-handle.
     let process = unsafe { GetCurrentProcess() };
     // SAFETY: the patched range, in this process.
-    unsafe { FlushInstructionCache(process, code.cast_const().cast(), UD2_RET.len()) };
-    // SAFETY: the patched code is `ud2; ret`, a function of no arguments
-    // once `resume_past_ud2` resumes it past the `ud2`.
-    let patched = unsafe { core::mem::transmute::<*mut [u8; UD2_RET.len()], Patched>(code) };
+    unsafe { FlushInstructionCache(process, code.cast_const().cast(), TRAP_RET.len()) };
+    // SAFETY: the patched code is [`TRAP_RET`], a function of no arguments
+    // once `resume_past_trap` resumes it past the trap.
+    let patched = unsafe { core::mem::transmute::<*mut [u8; TRAP_RET.len()], Patched>(code) };
     // SAFETY: as above.
     unsafe { patched() };
     // SAFETY: putting back the bytes read above, still writable.
     unsafe { code.write(original) };
     // SAFETY: the same range.
-    unsafe { FlushInstructionCache(process, code.cast_const().cast(), UD2_RET.len()) };
+    unsafe { FlushInstructionCache(process, code.cast_const().cast(), TRAP_RET.len()) };
     let mut ignored = 0u32;
     // SAFETY: the same range, back to the protection it had.
-    unsafe { VirtualProtect(code.cast(), UD2_RET.len(), protect, &raw mut ignored) };
+    unsafe { VirtualProtect(code.cast(), TRAP_RET.len(), protect, &raw mut ignored) };
     // SAFETY: `handler` came from AddVectoredExceptionHandler above.
     assert_ne!(unsafe { RemoveVectoredExceptionHandler(handler) }, 0);
 
@@ -322,8 +322,8 @@ fn fault_in_a_freed_module_workload() {
     );
 }
 
-/// Resume the thread's `ud2` at the instruction after it; pass every other exception on.
-extern "system" fn resume_past_ud2(ep: *mut ExceptionPointers) -> i32 {
+/// Resume the thread's [`TRAP`] at the instruction after it; pass every other exception on.
+extern "system" fn resume_past_trap(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: the dispatcher hands a valid EXCEPTION_POINTERS for the call.
     let record = unsafe { (*ep).record };
     // SAFETY: as above.
@@ -339,28 +339,28 @@ extern "system" fn resume_past_ud2(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: inside the context, as above; a byte array has no alignment.
     let pc = usize::from_ne_bytes(unsafe { pc_slot.read() });
     // SAFETY: the faulting instruction's bytes, mapped since it just ran.
-    let bytes = unsafe { (pc as *const [u8; UD2.len()]).read_unaligned() };
-    if bytes != UD2 {
+    let bytes = unsafe { (pc as *const [u8; TRAP.len()]).read_unaligned() };
+    if bytes != TRAP {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    // SAFETY: the same slot; the thread resumes past the two-byte `ud2`.
-    unsafe { pc_slot.write((pc + UD2.len()).to_ne_bytes()) };
+    // SAFETY: the same slot; the thread resumes past the trap instruction.
+    unsafe { pc_slot.write((pc + TRAP.len()).to_ne_bytes()) };
     EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Execute [`UD2`], which raises the illegal-instruction exception `resume_past_ud2` resumes.
+/// Execute [`TRAP`], which raises the illegal-instruction exception `resume_past_trap` resumes.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn raise_undefined_instruction() {
     // SAFETY: `ud2` raises an illegal-instruction exception, which
-    // `resume_past_ud2` resumes at the next instruction.
+    // `resume_past_trap` resumes at the next instruction.
     unsafe { core::arch::asm!("ud2") };
 }
 
-/// Execute [`UD2`], which raises the illegal-instruction exception `resume_past_ud2` resumes.
+/// Execute [`TRAP`], which raises the illegal-instruction exception `resume_past_trap` resumes.
 #[cfg(target_arch = "aarch64")]
 fn raise_undefined_instruction() {
     // SAFETY: `udf #0` raises an illegal-instruction exception, which
-    // `resume_past_ud2` resumes at the next instruction.
+    // `resume_past_trap` resumes at the next instruction.
     unsafe { core::arch::asm!("udf #0") };
 }
 

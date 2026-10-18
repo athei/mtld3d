@@ -44,13 +44,15 @@ fn every_api_export_starts_with_the_hook_prologue() {
     let lib = unsafe { LoadLibraryA(c"d3d9.dll".as_ptr()) };
     assert!(!lib.is_null(), "LoadLibrary(d3d9.dll)");
 
+    // The ARM64X build's exports are ARM64EC code in an x64 process and ARM64
+    // code in a native ARM64 one, which an x86 hook engine cannot decode
+    // whatever their first bytes are. A native ARM64 process loads only that
+    // image, so it checks nothing.
+    #[cfg(target_arch = "aarch64")]
+    eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64 code, not checked");
+    #[cfg(not(target_arch = "aarch64"))]
     if is_hybrid_image(lib) {
-        // The ARM64X build's exports are ARM64EC code in an x64 process and
-        // ARM64 code in a native ARM64 one, which an x86 hook engine cannot
-        // decode whatever their first bytes are.
-        eprintln!(
-            "[e2e] d3d9.dll is an ARM64X image: its exports are ARM64EC or ARM64 code, not checked"
-        );
+        eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64EC code, not checked");
     } else {
         check_prologues(lib);
     }
@@ -81,12 +83,6 @@ fn check_prologues(lib: *mut c_void) {
         "exports that do not start with {PROLOGUE:02X?}:\n{}",
         wrong.join("\n")
     );
-}
-
-/// A native ARM64 process loads no image but the ARM64X one, which is never checked.
-#[cfg(target_arch = "aarch64")]
-fn check_prologues(_lib: *mut c_void) {
-    unreachable!("is_hybrid_image answers true in a native ARM64 process");
 }
 
 /// Every name the `EXPORTS` section of `d3d9.def` lists, the first word of each line.
@@ -152,10 +148,4 @@ fn is_hybrid_image(lib: *mut c_void) -> bool {
 #[cfg(target_arch = "x86")]
 const fn is_hybrid_image(_lib: *mut c_void) -> bool {
     false
-}
-
-/// A native ARM64 process loads only an ARM64 image, which the layer's is as the ARM64X build.
-#[cfg(target_arch = "aarch64")]
-const fn is_hybrid_image(_lib: *mut c_void) -> bool {
-    true
 }

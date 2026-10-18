@@ -33,10 +33,11 @@ LICENSE
 ```
 
 Only a bundle built against an arm64 Wine has the `aarch64-windows` entries
-of `wine/` and `native/` and `prefix-markers/system32-arm64/`. Releases after 0.13.0 are built that way; 0.13.0
+of `wine/` and `native/`. Releases after 0.13.0 are built that way; 0.13.0
 and older releases, and any bundle built against an x86_64 Wine, have
 neither, and on an arm64 Wine their x86_64 pair takes that place (see
-below).
+below). `prefix-markers/system32-arm64/` comes in releases after 0.14.0,
+built against an arm64 Wine.
 
 The two `d3d9.dll` variants are the same binary in two loader flavors:
 
@@ -84,8 +85,9 @@ re-stamps them the way wine-build's bundle does, hybrid for the ARM64X pair,
 so that a native ARM64 program can load the names too, and AMD64 for the
 x86_64 pair; it needs wine-build's arm64-11.19-2 or later, whose winebuild
 writes hybrid placeholders. A prefix takes a changed placeholder on its next
-`wineboot -u`. The routes below spell out both layouts. The source tree's `make install`
-does all of this for a wine-build Wine (see `docs/BUILDING.md`).
+`wineboot -u`. The routes below spell out both layouts. The source tree's
+`make install` does all of this for a wine-build Wine (see
+`docs/BUILDING.md`).
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
