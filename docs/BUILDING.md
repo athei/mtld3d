@@ -237,9 +237,19 @@ wine-build's arm64 Wine runs x86 programs through FEX. It keeps mtld3d in
 search of every x86 process, mtld3d being its d3d9 default for them. An x64
 program runs there as an ARM64EC process, which loads its builtins from
 `aarch64-windows`, so the 64-bit modules sit in the tree's `aarch64-windows`
-whatever their machine, and the placeholder the prefix gets for each name is
-an x64 one, since an ARM64 placeholder fails an x64 process's load. A
-runtime-only arm64 Wine without that tree, such as CrossOver's, is refused.
+whatever their machine. The placeholders `make install` stamps for them in
+the default `lib/wine/aarch64-windows` follow the rule wine-build's bundle
+stamps its own by: hybrid ones (`winebuild -marm64x`, an ARM64 placeholder
+with ARM64EC metadata) when every d3d9 tree that has the DLL holds an ARM64X
+build of it, as after an install of the ARM64X build, and AMD64 ones
+otherwise, as when the x86_64 build is installed there. A hybrid one also
+takes a winebuild that writes the ARM64EC metadata into it; the one of
+arm64-11.19-1 does not, and writes a plain ARM64 placeholder an x64 process
+refuses, so against such a Wine the install stamps AMD64 ones and says so in
+one line. An x64 process accepts both kinds; a native ARM64 one loads a name
+only behind a hybrid placeholder. A prefix copies the placeholders when it
+is created and takes a changed one on its next `wineboot -u`. A runtime-only
+arm64 Wine without that tree, such as CrossOver's, is refused.
 
 Under that Wine the PE side of a 32-bit game, and of the x86_64 build, runs
 translated, while the ARM64X build's ARM64EC half runs as native code, and

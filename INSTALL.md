@@ -75,11 +75,15 @@ each Direct3D implementation in a tree of its own and loads mtld3d from
 default directories hold only placeholders, which stay as they are. Any other
 Wine loads mtld3d from `lib/wine` itself. On an arm64 Wine, copy the 64-bit
 pair into the `aarch64-windows` of the tree mtld3d loads from, never over the
-placeholders in a wine-build Wine's default `lib/wine/aarch64-windows`: those
-are x64 ones, as they have to be for either pair, since an x64 process fails
-to load a DLL whose placeholder is not. The routes below spell out both
-layouts. The source tree's `make install` does all of this for a wine-build
-Wine (see `docs/BUILDING.md`).
+placeholders in a wine-build Wine's default `lib/wine/aarch64-windows`. Leave
+those placeholders as they are: an x64 process loads the ARM64X pair behind
+either kind the Wine may ship, AMD64 or hybrid (ARM64X). `make install`
+re-stamps them the way wine-build's bundle does, hybrid for the ARM64X pair
+where the Wine's winebuild can write hybrid ones, so that a native ARM64
+program can load the names too, and AMD64 otherwise; a prefix takes a
+changed placeholder on its next `wineboot -u`.
+The routes below spell out both layouts. The source tree's `make install`
+does all of this for a wine-build Wine (see `docs/BUILDING.md`).
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
@@ -249,10 +253,10 @@ instead: the pair from `wine/x86_64-windows/` in the tree's
 translated. The files in the tree and the native `d3d9.dll` come from one
 build either way. A 32-bit game takes the i386 files, as on an
 x86_64 Wine, and the prefix markers are the same two files: the 64-bit one is
-an x64 placeholder on either Wine, which is what an x64 process looks a
-builtin up by. On a wine-build arm64 Wine the `mtld3d.dll` goes into
-`lib/wine/d3d9/mtld3d` (the `T` above), never over the placeholders in its
-default `lib/wine/aarch64-windows`.
+an x64 (AMD64) placeholder, which an x64 process accepts on either Wine. On
+a wine-build arm64 Wine the `mtld3d.dll` goes into `lib/wine/d3d9/mtld3d`
+(the `T` above), never over the placeholders in its default
+`lib/wine/aarch64-windows`.
 
 ## CrossOver
 

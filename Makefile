@@ -828,9 +828,25 @@ install: install-windows-i686 install-windows-x86_64 $(ARM64X_LEG:%=install-wind
 # bundle, which keeps the subtree. `MTLD3D_TREE` names the subtree a given root
 # uses, and each leaf writes into it, re-stamping the markers in the new
 # layout so a root whose markers an earlier install overwrote is whole again.
-# The placeholder's machine decides which module the loader looks for, so the
-# 64-bit marker says AMD64 in either Wine, for the ARM64X build too: an ARM64
-# one fails an x64 process's load with ERROR_BAD_EXE_FORMAT.
+# The placeholder's machine decides which module the loader accepts. In an
+# x86_64 Wine the 64-bit marker is AMD64. In an arm64 Wine's `aarch64-windows`
+# it follows the rule wine-build's bundle stamps its own markers by
+# (`hybrid_marker` in its bundle-wine.sh): a hybrid one (`-marm64x`, an ARM64
+# placeholder with ARM64EC metadata) when every tree of the family that has
+# the DLL holds an ARM64 image of it, as the ARM64X build and Wine's own
+# ARM64X builtins are, and AMD64 otherwise, as when an x86_64 pair is
+# installed there. An x64 process, which runs as ARM64EC, accepts both and
+# loads the module's x64 view behind an AMD64 one; behind a hybrid one the
+# view follows the main program, so a native ARM64 program can load the name
+# too (compatdb gives it Wine's own d3d9), where an AMD64 placeholder fails its
+# load with ERROR_BAD_EXE_FORMAT. A plain ARM64 placeholder, without that
+# metadata, would fail an x64 process's load the same way. The rule reads the
+# PE machine (PE_MACHINE) and not the load config, so a plain ARM64 image
+# counts as ARM64X; neither kind of marker lets an x64 process load such an
+# image, and a wine-build Wine holds none. A hybrid marker also takes a
+# winebuild that writes that metadata into it: where WINE_SDK's does not, the
+# name gets an AMD64 marker instead and the install says so in one line
+# (HYBRID_MARKER_CHECK).
 #
 # The d3d9.dll copies under lib/wine get the builtin signature in place: the
 # loader ignores unsigned PEs on the builtin search path. Symbols travel with
@@ -840,8 +856,80 @@ define MTLD3D_TREE
 if [ -d $(1)/lib/wine/d3d9/mtld3d ]; then echo $(1)/lib/wine/d3d9/mtld3d; else echo $(1)/lib/wine; fi
 endef
 
+# A field of the PE image $(1), in hex: the $(4) bytes at $(2) past the start
+# of its PE header, read as od's type $(3). The PE header starts at the offset
+# stored at 0x3c, with its four-byte `PE\0\0` signature; od reads in the host's
+# byte order, little-endian as the PE's is. od rather than llvm-readobj,
+# because an install from a stage runs on a machine with no toolchain. It
+# exits 1 when the file has no signature where its offset points or ends before
+# the field, and so runs only in a command substitution, whose status the
+# caller checks.
+define PE_FIELD
+off=$$(od -An -tu4 -j60 -N4 "$(1)" | tr -d ' ') ; \
+[ -n "$$off" ] && [ "$$(od -An -tx1 -j$$off -N4 "$(1)" | tr -d ' ')" = 50450000 ] || exit 1 ; \
+field=$$(od -An -t$(3) -j$$(( off + $(2) )) -N$(4) "$(1)" | tr -d ' ') ; \
+[ $${#field} = $$(( $(4) * 2 )) ] || exit 1 ; echo $$field
+endef
+
+# The COFF machine of the PE image $(1), as four hex digits: 8664 for AMD64,
+# 014c for i386, aa64 for ARM64, which an ARM64X image says too.
+PE_MACHINE = $(call PE_FIELD,$(1),4,x2,2)
+
+# The load-config entry of the data directory of the PE32+ image $(1), its RVA
+# and size as sixteen hex digits, all zero when the image has none: the entry
+# is the eleventh of the optional header's directories, 216 bytes past the PE
+# signature. The optional header's magic, 24 bytes past it, has to say PE32+
+# (0x20b), whose directories sit there; anything else exits 1 as PE_FIELD does.
+define PE_LOAD_CONFIG
+[ "$$($(call PE_FIELD,$(1),24,x2,2))" = 020b ] || exit 1 ; \
+$(call PE_FIELD,$(1),216,x4,8)
+endef
+
+# Sets `target` to the hybrid marker's winebuild target when the marker for
+# `$$dll` in the Wine directory $(1) is to be hybrid (the rule above): $(1) is
+# `aarch64-windows` and every tree beside `$$tree` in its family directory
+# that has the DLL, `$$tree` itself included, holds an ARM64 image of it. A
+# DLL there whose machine PE_MACHINE cannot read fails the install naming it,
+# as the bundle's rule does, rather than count as not ARM64 and cut native
+# ARM64 processes off the name.
+# PE_PAIR_INSTALL applies it to a 64-bit pair in the arm64 mode only: the
+# x86_64 mode installs no ARM64 image, so its markers are AMD64 by the rule.
+define HYBRID_MARKER_RULE
+if [ "$(1)" = aarch64-windows ]; then \
+	hybrid=1 ; \
+	for impl in "$${tree%/*}"/*/; do \
+		f="$${impl}$(1)/$$dll.dll" ; \
+		[ -f "$$f" ] || continue ; \
+		machine=$$($(call PE_MACHINE,$$f)) || { echo "$$f is no PE image whose machine make install can read, so the marker of $$dll.dll cannot follow the rule that keeps it loadable for native ARM64 processes; replace or remove the file" >&2 ; exit 2 ; } ; \
+		[ "$$machine" = aa64 ] || hybrid= ; \
+	done ; \
+	[ -z "$$hybrid" ] || target="aarch64-windows -marm64x" ; \
+fi
+endef
+
+# Checks the hybrid marker just written to $(1) for `$$dll`, whose AMD64 target
+# is $(2). A winebuild that predates ARM64X placeholders, such as the one of
+# wine-build's arm64-11.19-1, accepts `-marm64x` but writes a plain ARM64
+# placeholder with no load config, which an x64 process refuses
+# (STATUS_INVALID_IMAGE_FORMAT). Such a marker is stamped again as AMD64, which
+# an x64 process accepts, and the name is added to `$$amd64`, which
+# PE_PAIR_INSTALL reports in one line. A load config that is there stands for
+# the ARM64EC metadata: the known winebuilds write either none at all or a
+# full one whose CHPE pointer names that metadata. An unreadable marker, or one
+# that is no PE32+ image, fails the install.
+define HYBRID_MARKER_CHECK
+case "$$target" in *-marm64x) \
+	config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the marker $(WINEBUILD) just wrote, is no PE32+ image whose load config make install can read" >&2 ; exit 2 ; } ; \
+	if [ "$$config" = 0000000000000000 ]; then \
+		$(WINEBUILD) --fake-module -o "$(1)" -b $(2) --dll "$$tree/aarch64-windows/$$dll.dll" || exit ; \
+		amd64="$$amd64 $$dll.dll" ; \
+	fi ;; \
+esac
+endef
+
 # $(1) = the Wine root, $(2) = the build directory of the pair, $(3) = the
-# Wine directory it goes into, $(4) = the winebuild target of its markers.
+# Wine directory it goes into, $(4) = the winebuild target of its markers,
+# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies.
 # Installs `d3d9.dll` and `mtld3d.dll` with their `.pdb`s.
 define PE_PAIR_INSTALL
 tree=$$($(call MTLD3D_TREE,"$(1)")) ; \
@@ -851,9 +939,14 @@ $(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || exit ; \
 if [ "$$tree" != "$(1)/lib/wine" ]; then \
 	[ -d "$(1)/lib/wine/$(3)" ] || { echo "$(1)/lib/wine/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
 	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
+	amd64= ; \
 	for dll in d3d9 mtld3d; do \
-		$(WINEBUILD) --fake-module -o "$(1)/lib/wine/$(3)/$$dll.dll" -b $(4) --dll "$$tree/$(3)/$$dll.dll" || exit ; \
+		target=$(4) ; \
+		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3)) ;)) \
+		$(WINEBUILD) --fake-module -o "$(1)/lib/wine/$(3)/$$dll.dll" -b $$target --dll "$$tree/$(3)/$$dll.dll" || exit ; \
+		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_CHECK,$(1)/lib/wine/$(3)/$$dll.dll,$(4)) ;)) \
 	done ; \
+	[ -z "$$amd64" ] || echo "==> $(WINEBUILD) writes no ARM64EC metadata into a hybrid placeholder, so$$amd64 in $(1)/lib/wine/$(3) got AMD64 ones, which x64 processes load; native ARM64 programs cannot load them until WINE_SDK is a Wine whose winebuild writes hybrid placeholders" ; \
 fi
 endef
 
@@ -992,12 +1085,13 @@ install-unix-arm64: $(if $(STAGE),,unix-arm64)
 # The install of a tree a leg sets up for itself (LEG_TREE_SETUP, below), a
 # clone of WINE_SDK, from the build directories it names rather than from the
 # OUT_* ones: the i686 pair into `i386-windows`, a 64-bit pair into the
-# directory the tree's 64-bit processes load builtins from, behind x64
-# markers, and the `mtld3d.so` of the tree's arch. In the arm64 mode it is the
-# one way the x86_64 build reaches an arm64 Wine, which no install leaf takes
-# it to: it competes with the ARM64X build for the same file names in the same
-# directory. As for every builtin, what it installs reaches only a prefix
-# created afterwards, and every leg tree creates its own.
+# directory the tree's 64-bit processes load builtins from, behind markers of
+# the rule PE_PAIR_INSTALL applies (AMD64 for the x86_64 pair, hybrid for the
+# ARM64X one in an arm64 Wine), and the `mtld3d.so` of the tree's arch. In the
+# arm64 mode it is the one way the x86_64 build reaches an arm64 Wine, which no
+# install leaf takes it to: it competes with the ARM64X build for the same file
+# names in the same directory. As for every builtin, what it installs reaches
+# only a prefix created afterwards, and every leg tree creates its own.
 # $(1) = the tree's Wine root, $(2) = the build directory of the i686 pair,
 # $(3) = that of the 64-bit pair, or empty for none, $(4) = that of the
 # `mtld3d.so`.
@@ -1056,10 +1150,10 @@ version-check:
 # same tree drops into either Wine; each loads only the directories of its own
 # arch. native/ holds the unmarked d3d9.dll of all three builds, the ARM64X one
 # for a 64-bit game on an arm64 Wine. The 64-bit prefix marker is the x86_64
-# build's in either case: the marker's machine decides which module the loader
-# looks for, and an x64 process on an arm64 Wine looks for an x64 one. A bundle
-# built in the x86_64 mode has no ARM64X build to carry, so it holds no
-# `aarch64-windows` directory in either wine/ or native/, nor its symbols.
+# build's in either case: an AMD64 placeholder, which an x64 process accepts on
+# either Wine, in front of the ARM64X pair too, whose x64 view it then loads.
+# A bundle built in the x86_64 mode has no ARM64X build to carry, so it holds
+# no `aarch64-windows` directory in either wine/ or native/, nor its symbols.
 #
 # Two archives come out of one run: the bundle users install, and the symbols
 # that make a crash report from one of them readable.

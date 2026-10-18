@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -17,6 +18,44 @@ MODE_FIELDS = ("WINE_SDK_MODE", "PE64_BUILD", "UNIX_ARCH", "ARM64X_LEG")
 # The variables of the two-Wine layout, which the Makefile refuses at its top
 # level; a shell that still exports one would stop every run here.
 OLD_VARIABLES = ("WINE_X86_64", "WINE_ARM64", "WINE_SDK_ARM64X", "EC", "ARM64")
+
+# A fake PE image: the PE header at 0x40, as its offset at 0x3c says, with the
+# signature, the COFF machine, the PE32+ magic 24 bytes past the signature
+# and, 216 bytes past it, the load-config entry of the data directory (an RVA
+# and a size, zero for none), then a label. Source text, because the fake winebuild runs it too.
+PE_HEADER = 288
+FAKE_PE = """\
+def fake_pe(machine, label, load_config=False):
+    header = bytearray(288)
+    header[0:2] = b'MZ'
+    header[60:64] = (64).to_bytes(4, 'little')
+    header[64:68] = b'PE\\0\\0'
+    header[68:70] = machine.to_bytes(2, 'little')
+    header[88:90] = (0x20b).to_bytes(2, 'little')
+    if load_config:
+        header[280:288] = (0x2000).to_bytes(4, 'little') + (0x140).to_bytes(4, 'little')
+    return bytes(header) + label.encode()
+"""
+exec(FAKE_PE)
+
+# The fake winebuild writes into the file `-o` names a placeholder of the
+# machine `-b` names, labelled with its arguments, and with the load config a
+# hybrid one carries when `-marm64x` is given and `bin/no-arm64ec` is absent;
+# that file stands for the winebuild of a Wine that predates hybrid
+# placeholders. With `bin/truncated-arm64x` a `-marm64x` placeholder ends
+# before its data directory. Without `-o` it leaves everything as it is.
+FAKE_WINEBUILD = FAKE_PE + """\
+import os, sys
+args = sys.argv[1:]
+flag = lambda name: os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), name))
+if '-o' in args:
+    targets = {'i686-windows': 0x014c, 'x86_64-windows': 0x8664, 'aarch64-windows': 0xaa64}
+    machine = targets[args[args.index('-b') + 1]]
+    hybrid = '-marm64x' in args
+    data = fake_pe(machine, ' '.join(args) + '\\n', hybrid and not flag('no-arm64ec'))
+    with open(args[args.index('-o') + 1], 'wb') as out:
+        out.write(data[:200] if hybrid and flag('truncated-arm64x') else data)
+"""
 
 
 class MakeTestCase(unittest.TestCase):
@@ -216,6 +255,32 @@ class FakeWineTestCase(MakeTestCase):
                  "lib/wine/x86_64-windows/libwinecrt0.a", "lib/wine/aarch64-windows/libwinecrt0.a",
                  "lib/wine/aarch64-windows/libntdll.a")
     X86_64_SDK_FILES = ("lib/wine/i386-windows/libwinecrt0.a", "lib/wine/x86_64-windows/libwinecrt0.a")
+    MACHINES = {"i386-windows": 0x014c, "x86_64-windows": 0x8664, "aarch64-windows": 0xaa64}
+    PE_HEADER = PE_HEADER
+    FAKE_WINEBUILD = FAKE_WINEBUILD
+    fake_pe = staticmethod(fake_pe)
+
+    def content(self, path):
+        # A fake PE's label, or a text file as it is.
+        data = path.read_bytes()
+        return data[self.PE_HEADER:].decode() if data.startswith(b"MZ") else data.decode()
+
+    def machine(self, path):
+        return int.from_bytes(path.read_bytes()[68:70], "little")
+
+    @staticmethod
+    def printed(output, start):
+        # The lines a recipe printed that begin with `start`. Under CI the
+        # Makefile echoes every recipe (it is silent only without CI), and a
+        # recipe's text holds its own messages with their shell variables
+        # unexpanded, so a message is matched by the start of a line, which an
+        # echoed recipe never has, rather than anywhere in the output.
+        return [line for line in output.splitlines() if line.startswith(start)]
+
+    def winebuild_lines(self, output):
+        # The line the install prints when the Wine's winebuild cannot write a
+        # hybrid placeholder.
+        return self.printed(output, f"==> {self.arm64}/bin/winebuild writes no ARM64EC metadata")
 
     def setUp(self):
         super().setUp()
@@ -224,16 +289,18 @@ class FakeWineTestCase(MakeTestCase):
         for wine, files in ((self.arm64, self.SDK_FILES), (self.x86_64, self.X86_64_SDK_FILES)):
             for name in files:
                 (wine / name).touch()
-            # winebuild writes its arguments into the file `-o` names and leaves
-            # everything else as it is.
             winebuild = wine / "bin/winebuild"
-            winebuild.write_text("#!/bin/sh\nall=\"$*\"\n"
-                                 "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && printf '%s\\n' \"$all\" > \"$2\"; shift; done\n")
+            winebuild.write_text(f"#!{sys.executable} -I\n{self.FAKE_WINEBUILD}")
             winebuild.chmod(0o755)
+        # Each staged DLL is a PE header of its build's machine (the ARM64X
+        # build says ARM64) followed by the name of its directory, which
+        # `content` reads back.
         self.stage = self.root / "stage"
         for arch in ("i386-windows", "x86_64-windows", "aarch64-windows"):
             (self.stage / arch).mkdir(parents=True)
-            for name in ("d3d9.dll", "d3d9.pdb", "mtld3d.dll", "mtld3d.pdb"):
+            for name in ("d3d9.dll", "mtld3d.dll"):
+                (self.stage / arch / name).write_bytes(self.fake_pe(self.MACHINES[arch], arch))
+            for name in ("d3d9.pdb", "mtld3d.pdb"):
                 (self.stage / arch / name).write_text(arch)
         for arch in ("x86_64-unix", "aarch64-unix"):
             (self.stage / arch / "mtld3d.so.dSYM").mkdir(parents=True)
@@ -447,9 +514,9 @@ class InstallLayoutTests(FakeWineTestCase):
         self.install()
         self.assertEqual(self.directories(self.arm64), before)
         tree = self.arm64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "aarch64-windows")
-        self.assertEqual((tree / "aarch64-windows/mtld3d.dll").read_text(), "aarch64-windows")
-        self.assertEqual((tree / "i386-windows/mtld3d.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "aarch64-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/mtld3d.dll"), "aarch64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/mtld3d.dll"), "i386-windows")
         self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
         self.assertTrue((self.arm64 / "lib/wine/aarch64-windows/d3d9.dll").exists())
         self.assertFalse((self.arm64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
@@ -461,13 +528,13 @@ class InstallLayoutTests(FakeWineTestCase):
         for wine in (self.x86_64, self.arm64):
             self.assertEqual(self.directories(wine), before[wine])
         tree = self.x86_64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual((tree / "x86_64-windows/d3d9.dll").read_text(), "x86_64-windows")
-        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(tree / "x86_64-windows/d3d9.dll"), "x86_64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
         self.assertEqual((tree / "x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
         self.assertTrue((self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
         self.assertFalse(list(self.x86_64.rglob("aarch64-*")))
         tree = self.arm64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "aarch64-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "aarch64-windows")
 
     def test_a_missing_arch_directory_fails_the_install_and_is_not_created(self):
         missing = self.arm64 / "lib/wine/d3d9/mtld3d/aarch64-windows"
@@ -476,13 +543,77 @@ class InstallLayoutTests(FakeWineTestCase):
         self.assertIn(f"{missing} does not exist", output)
         self.assertFalse(missing.exists())
 
-    def test_the_64_bit_markers_are_x64_ones_in_both_wines(self):
-        self.install(f"WINE_INSTALL_DIR={self.x86_64}")
-        for marker in (self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll",
-                       self.arm64 / "lib/wine/aarch64-windows/d3d9.dll",
-                       self.arm64 / "lib/wine/aarch64-windows/mtld3d.dll"):
-            self.assertIn("-b x86_64-windows", marker.read_text())
-        self.assertIn("-b i686-windows", (self.arm64 / "lib/wine/i386-windows/d3d9.dll").read_text())
+    def test_the_arm64x_pair_gets_hybrid_markers_and_the_x86_64_pair_amd64_ones(self):
+        output = self.install(f"WINE_INSTALL_DIR={self.x86_64}")
+        self.assertEqual(self.winebuild_lines(output), [])
+        for name in ("d3d9", "mtld3d"):
+            marker = self.arm64 / f"lib/wine/aarch64-windows/{name}.dll"
+            self.assertIn("-b aarch64-windows -marm64x", self.content(marker))
+            self.assertEqual(self.machine(marker), 0xaa64)
+            self.assertIn("-b x86_64-windows", self.content(self.x86_64 / f"lib/wine/x86_64-windows/{name}.dll"))
+            for wine in (self.arm64, self.x86_64):
+                self.assertIn("-b i686-windows", self.content(wine / f"lib/wine/i386-windows/{name}.dll"))
+
+    def test_a_winebuild_without_hybrid_placeholders_leaves_the_markers_amd64_and_says_so(self):
+        # arm64-11.19-1's winebuild takes -marm64x but writes no load config,
+        # which an x64 process refuses; the install re-stamps such a marker AMD64.
+        (self.arm64 / "bin/no-arm64ec").touch()
+        output = self.install()
+        lines = self.winebuild_lines(output)
+        self.assertEqual(lines, [
+            f"==> {self.arm64}/bin/winebuild writes no ARM64EC metadata into a hybrid placeholder, so "
+            f"d3d9.dll mtld3d.dll in {self.arm64}/lib/wine/aarch64-windows got AMD64 ones, which x64 "
+            "processes load; native ARM64 programs cannot load them until WINE_SDK is a Wine whose "
+            "winebuild writes hybrid placeholders"], output)
+        for name in ("d3d9", "mtld3d"):
+            marker = self.arm64 / f"lib/wine/aarch64-windows/{name}.dll"
+            self.assertTrue(self.content(marker).startswith("--fake-module "), self.content(marker))
+            self.assertIn("-b x86_64-windows", self.content(marker))
+            self.assertNotIn("marm64x", self.content(marker))
+            self.assertEqual(self.machine(marker), 0x8664)
+            self.assertEqual(self.machine(self.arm64 / f"lib/wine/i386-windows/{name}.dll"), 0x014c)
+
+    def test_a_hybrid_marker_whose_load_config_cannot_be_read_fails_the_install_naming_it(self):
+        (self.arm64 / "bin/truncated-arm64x").touch()
+        output = self.install(succeeds=False)
+        marker = self.arm64 / "lib/wine/aarch64-windows/d3d9.dll"
+        self.assertEqual(self.printed(output, f"{marker}, "), [
+            f"{marker}, the marker {self.arm64}/bin/winebuild just wrote, is no PE32+ image "
+            "whose load config make install can read"], output)
+        self.assertEqual(self.winebuild_lines(output), [])
+
+    def test_a_d3d9_tree_with_an_x86_64_build_keeps_the_d3d9_marker_amd64(self):
+        # wine-build's rule: a name's marker is hybrid only when every tree of
+        # the family that has the DLL holds an ARM64 image of it.
+        wined3d = self.arm64 / "lib/wine/d3d9/wined3d/aarch64-windows"
+        wined3d.mkdir(parents=True)
+        for machine, expected in ((0xaa64, "-b aarch64-windows -marm64x"), (0x8664, "-b x86_64-windows")):
+            with self.subTest(machine=hex(machine)):
+                (wined3d / "d3d9.dll").write_bytes(self.fake_pe(machine, "wined3d"))
+                self.install()
+                marker = self.content(self.arm64 / "lib/wine/aarch64-windows/d3d9.dll")
+                self.assertIn(expected, marker)
+                self.assertNotIn("x86_64-windows" if "marm64x" in expected else "marm64x", marker)
+                # wined3d has no mtld3d.dll, so that name follows the ARM64X pair alone.
+                self.assertIn("-b aarch64-windows -marm64x",
+                              self.content(self.arm64 / "lib/wine/aarch64-windows/mtld3d.dll"))
+
+    def test_a_d3d9_tree_dll_whose_machine_cannot_be_read_fails_the_install_naming_it(self):
+        # Counting it as not ARM64 would silently stamp AMD64 and cut native
+        # ARM64 processes off d3d9.dll; the bundle's rule stops instead.
+        wined3d = self.arm64 / "lib/wine/d3d9/wined3d/aarch64-windows"
+        wined3d.mkdir(parents=True)
+        dll = wined3d / "d3d9.dll"
+        whole = self.fake_pe(0xaa64, "wined3d")
+        for name, data in (("truncated before the machine", whole[:66]),
+                           ("truncated before the PE offset", whole[:40]),
+                           ("no PE signature", whole[:64] + b"NE\0\0" + whole[68:]),
+                           ("not a PE at all", b"just text, no header")):
+            with self.subTest(name=name):
+                dll.write_bytes(data)
+                output = self.install(succeeds=False)
+                lines = self.printed(output, f"{dll} is no PE image whose machine make install can read")
+                self.assertEqual(len(lines), 1, output)
 
     def test_an_isolated_install_writes_the_clone_and_not_the_wines(self):
         before = {wine: sorted(str(path) for path in wine.rglob("*")) for wine in (self.x86_64, self.arm64)}
@@ -491,7 +622,7 @@ class InstallLayoutTests(FakeWineTestCase):
             self.assertEqual(sorted(str(path) for path in wine.rglob("*")), before[wine])
         clones = self.work / ".wine-isolated"
         self.assertEqual(sorted(path.name for path in clones.iterdir()), ["prefix", "sdk", "sdk.source"])
-        self.assertEqual((clones / "sdk/lib/wine/d3d9/mtld3d/aarch64-windows/d3d9.dll").read_text(),
+        self.assertEqual(self.content(clones / "sdk/lib/wine/d3d9/mtld3d/aarch64-windows/d3d9.dll"),
                          "aarch64-windows")
 
     def test_a_flat_x86_64_wine_gets_the_build_in_its_default_dirs(self):
@@ -502,8 +633,8 @@ class InstallLayoutTests(FakeWineTestCase):
         before = self.directories(self.x86_64)
         self.install(f"WINE_INSTALL_DIR={self.x86_64}")
         self.assertEqual(self.directories(self.x86_64), before)
-        self.assertEqual((self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll").read_text(), "x86_64-windows")
-        self.assertEqual((self.x86_64 / "lib/wine/i386-windows/mtld3d.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll"), "x86_64-windows")
+        self.assertEqual(self.content(self.x86_64 / "lib/wine/i386-windows/mtld3d.dll"), "i386-windows")
         self.assertEqual((self.x86_64 / "lib/wine/x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
 
     def test_a_wine_with_both_unix_dirs_is_refused_naming_the_leftover(self):
@@ -557,8 +688,8 @@ class InstallLayoutTests(FakeWineTestCase):
         self.install(f"WINE_SDK={self.x86_64}")
         self.assertEqual(self.directories(self.x86_64), before)
         tree = self.x86_64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual((tree / "x86_64-windows/d3d9.dll").read_text(), "x86_64-windows")
-        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(tree / "x86_64-windows/d3d9.dll"), "x86_64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
         self.assertEqual((tree / "x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
         self.assertFalse(list(self.x86_64.rglob("aarch64-*")))
 
@@ -570,12 +701,15 @@ class InstallLayoutTests(FakeWineTestCase):
         before = self.directories(self.arm64)
         self.install(f"WINE_SDK={self.x86_64}", f"WINE_INSTALL_DIR={self.arm64}")
         self.assertEqual(self.directories(self.arm64), before)
-        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "x86_64-windows")
-        self.assertEqual((tree / "aarch64-windows/mtld3d.dll").read_text(), "x86_64-windows")
-        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "x86_64-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/mtld3d.dll"), "x86_64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
         self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
-        self.assertIn("-b x86_64-windows", (self.arm64 / "lib/wine/aarch64-windows/d3d9.dll").read_text())
-        self.assertEqual((self.x86_64 / "lib/wine/d3d9/mtld3d/x86_64-windows/d3d9.dll").read_text(),
+        for name in ("d3d9", "mtld3d"):
+            marker = self.content(self.arm64 / f"lib/wine/aarch64-windows/{name}.dll")
+            self.assertIn("-b x86_64-windows", marker)
+            self.assertNotIn("marm64x", marker)
+        self.assertEqual(self.content(self.x86_64 / "lib/wine/d3d9/mtld3d/x86_64-windows/d3d9.dll"),
                          "x86_64-windows")
 
     def test_the_x86_64_leg_installs_the_x86_64_build_into_a_clone_of_its_own(self):
@@ -590,10 +724,13 @@ class InstallLayoutTests(FakeWineTestCase):
         self.assertEqual(sorted(str(path) for path in self.arm64.rglob("*")), before)
         clone = self.work / ".wine-isolated/leg-x86_64/sdk"
         tree = clone / "lib/wine/d3d9/mtld3d"
-        self.assertEqual((tree / "aarch64-windows/d3d9.dll").read_text(), "x86_64-windows")
-        self.assertEqual((tree / "i386-windows/d3d9.dll").read_text(), "i386-windows")
+        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "x86_64-windows")
+        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
         self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
-        self.assertIn("-b x86_64-windows", (clone / "lib/wine/aarch64-windows/d3d9.dll").read_text())
+        for name in ("d3d9", "mtld3d"):
+            marker = self.content(clone / f"lib/wine/aarch64-windows/{name}.dll")
+            self.assertIn("-b x86_64-windows", marker)
+            self.assertNotIn("marm64x", marker)
         self.assertIn(f"--wine {clone}/bin/wine", output)
 
 
