@@ -346,16 +346,16 @@ static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
 /// keeps for the device's view writes through them outside any thunk: the
 /// backing scale at attach and whenever the display-follow reconciliation
 /// derives another, the cursor kick when the pointer comes back from another
-/// process, the client surface request when Wine hides the device's client
-/// view. The window procedure sets the request too, when the window's client
-/// area may have moved. The box is created before the attach and owned by
-/// the device's `CursorState`, so the addresses hold for the device's
-/// lifetime. Ordering against teardown is what makes that enough: device
-/// release issues `DestroyCommandQueue` while the inner box is still alive,
-/// that thunk unregisters the record under the unix registry lock, every
-/// unix write into a sink runs under the same lock with a liveness check, and
-/// the inner box drops only after the thunk has returned. So a write lands
-/// before the record is gone or not at all.
+/// process, the client surface request at attach and when Wine hides the
+/// device's client view. The window procedure sets the request too, when the
+/// window's client area may have moved. The box is created before the attach
+/// and owned by the device's `CursorState`, so the addresses hold for the
+/// device's lifetime. Ordering against teardown is what makes that enough:
+/// device release issues `DestroyCommandQueue` while the inner box is still
+/// alive, that thunk unregisters the record under the unix registry lock,
+/// every unix write into a sink runs under the same lock with a liveness
+/// check, and the inner box drops only after the thunk has returned. So a
+/// write lands before the record is gone or not at all.
 pub struct DisplaySinks {
     /// Wine's retina factor for the layer (2 in retina mode, else 1); `0` until published.
     backing_scale: AtomicU32,
@@ -372,9 +372,11 @@ pub struct DisplaySinks {
     /// Some Wines hide the client view a device presents through whenever
     /// they flush the window surface, and leave its frame where it was when
     /// the window resizes, counting on winemac's `nextDrawable` override to
-    /// put both right; the layer presents without it. The next `Present`
-    /// takes the bits and sends `PresentClientSurface`, which has Wine show
-    /// the surface again, sized to the client area.
+    /// put both right; the layer presents without it. The attach sets
+    /// `ATTACHED` here too, so the device's first submitted frame tells Wine
+    /// it has drawn. The next `Present` that submits a frame takes the bits
+    /// and sends `PresentClientSurface`, which has Wine show the surface
+    /// again, sized to the client area.
     client_surface_request: AtomicU32,
 }
 
@@ -401,8 +403,9 @@ impl DisplaySinks {
     /// Take the client surface request, empty when nothing asked since the last take.
     ///
     /// One relaxed load on a frame nothing asked on, which is every frame but
-    /// the ones after a resize or a hidden client view; the swap that takes
-    /// the bits pairs its `Acquire` with the writers' `Release`.
+    /// the first after an attach and the ones after a resize or a hidden
+    /// client view; the swap that takes the bits pairs its `Acquire` with the
+    /// writers' `Release`.
     pub fn take_client_surface_request(&self) -> ClientSurfaceRequest {
         if self.client_surface_request.load(Ordering::Relaxed) == 0 {
             return ClientSurfaceRequest::empty();
@@ -654,10 +657,13 @@ impl CursorState {
 
     /// Have Wine show this device's client surface again, sized to the client area, if asked.
     ///
-    /// Called once per `Present`, on the API thread, a Wine thread, which
-    /// win32u's surface calls need. A frame nothing asked on pays one relaxed
-    /// load; one after the client view was hidden or the window's client area
-    /// moved sends `PresentClientSurface`.
+    /// Called once per `Present`, after the frame was handed to the encoder,
+    /// on the API thread, a Wine thread, which win32u's surface calls need. So
+    /// a request is taken only by a `Present` that submits a frame, and the
+    /// unix side reads the call as the device having drawn. A frame nothing
+    /// asked on pays one relaxed load; the device's first frame, and one
+    /// after the client view was hidden or the window's client area moved,
+    /// sends `PresentClientSurface`.
     pub fn present_client_surface_if_asked(&self) {
         if self.view_handle.is_null() {
             return;

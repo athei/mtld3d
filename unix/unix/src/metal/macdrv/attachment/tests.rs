@@ -17,11 +17,13 @@
 //! re-pacing makes one record's reconciliation due at once, defers to a
 //! refresh already in flight, and leaves the other records' cadence alone.
 //! They also pin which client surface a window's departing device hands the
-//! window to: the newest live record's on that window that holds one, that
-//! only that record's device is asked to show it again when Wine hides its
-//! client view, and when a window that reads visible counts as displaying
-//! nothing: after a run of undisplayed paced presents, until the next
-//! displayed one.
+//! window to: the newest live record's on that window that holds one, and
+//! only once that record's device has submitted a frame. Every attached
+//! record with a surface and a request word asks after its first frame, but
+//! only the newest one is asked to show its surface again when Wine hides its
+//! client view. They pin, too, when a window that reads visible counts as
+//! displaying nothing: after a run of undisplayed paced presents, until the
+//! next displayed one.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -32,9 +34,10 @@ use std::{
 use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
 
 use super::{
-    AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, UNDISPLAYED_PACED_LIMIT,
-    find, find_by_layer, live, next_unshown_release, publish_backing_scale, register,
-    request_client_surface, request_cursor_kick_all, retain_newest_surface_on, test_address_block,
+    AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, NewestSurface,
+    UNDISPLAYED_PACED_LIMIT, find, find_by_layer, live, next_unshown_release,
+    publish_backing_scale, register, request_client_surface, request_cursor_kick_all,
+    request_first_frame_present, retain_newest_surface_on, test_address_block,
     undisplayed_run_edge, unregister,
 };
 use crate::metal::{
@@ -513,42 +516,139 @@ fn the_newest_live_record_on_the_window_names_the_surface() {
     let retained = |surface: usize| surface;
     assert_eq!(
         retain_newest_surface_on(hwnd, retained),
-        None,
+        NewestSurface::None,
         "no record yet"
     );
 
-    register(view_a, view_a + 8, &surface_latches(hwnd, 0xa000));
+    let a = register(view_a, view_a + 8, &surface_latches(hwnd, 0xa000));
     std::thread::sleep(std::time::Duration::from_millis(2));
-    register(view_b, view_b + 8, &surface_latches(hwnd, 0xb000));
+    let b = register(view_b, view_b + 8, &surface_latches(hwnd, 0xb000));
     std::thread::sleep(std::time::Duration::from_millis(2));
     register(view_c, view_c + 8, &surface_latches(hwnd, 0));
-    register(
+    let other = register(
         view_other,
         view_other + 8,
         &surface_latches(hwnd + 1, 0xd000),
     );
+    for att in [&a, &b, &other] {
+        att.note_frame_submitted();
+    }
     assert_eq!(
         retain_newest_surface_on(hwnd, retained),
-        Some(0xb000),
+        NewestSurface::Retained(0xb000),
         "the newest record holding a surface, on this window only"
     );
 
     unregister(view_b);
     assert_eq!(
         retain_newest_surface_on(hwnd, retained),
-        Some(0xa000),
+        NewestSurface::Retained(0xa000),
         "an unregistered record names nothing"
     );
     assert_eq!(
         retain_newest_surface_on(hwnd, |_| 0),
-        None,
+        NewestSurface::None,
         "a surface the retain refuses is not handed back"
     );
 
     unregister(view_a);
-    assert_eq!(retain_newest_surface_on(hwnd, retained), None);
+    assert_eq!(
+        retain_newest_surface_on(hwnd, retained),
+        NewestSurface::None
+    );
     unregister(view_c);
     unregister(view_other);
+}
+
+/// The newest record's surface is not retained before its device has submitted a frame.
+///
+/// An older record that has drawn does not stand in for it: the window shows
+/// the newest device's surface, and that device presents it at its first
+/// frame.
+#[test]
+fn a_newest_record_that_has_not_drawn_is_not_retained() {
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
+    let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
+
+    let a = register(view_a, view_a + 8, &surface_latches(hwnd, 0xa000));
+    a.note_frame_submitted();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let b = register(view_b, view_b + 8, &surface_latches(hwnd, 0xb000));
+    assert!(!b.drew_frame(), "a new record has not drawn");
+
+    let mut retains = 0;
+    assert_eq!(
+        retain_newest_surface_on(hwnd, |surface| {
+            retains += 1;
+            surface
+        }),
+        NewestSurface::NotDrawn(0xb000),
+        "the newest record's surface waits for its device's first frame"
+    );
+    assert_eq!(
+        retains, 0,
+        "a surface that is not handed back takes no reference"
+    );
+
+    b.note_frame_submitted();
+    assert_eq!(
+        retain_newest_surface_on(hwnd, |surface| surface),
+        NewestSurface::Retained(0xb000),
+        "retained once its device has drawn"
+    );
+
+    unregister(view_a);
+    unregister(view_b);
+}
+
+/// The first-frame request reaches every record with a surface and a word, whatever its rank.
+#[test]
+fn every_attached_record_with_a_surface_asks_after_its_first_frame() {
+    let view_a = test_address_block();
+    let view_b = view_a + 0x1000;
+    let view_c = view_a + 0x2000;
+    let view_d = view_a + 0x3000;
+    let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
+
+    let sink_a = AtomicU32::new(0);
+    let sink_b = AtomicU32::new(0);
+    let sink_c = AtomicU32::new(0);
+    register(view_a, view_a + 8, &request_latches(hwnd, 0xa000, &sink_a));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    register(view_b, view_b + 8, &request_latches(hwnd, 0xb000, &sink_b));
+    register(view_c, view_c + 8, &request_latches(hwnd, 0, &sink_c));
+    register(view_d, view_d + 8, &surface_latches(hwnd, 0xd000));
+
+    assert!(
+        request_first_frame_present(view_a),
+        "a record a newer one outranks still asks"
+    );
+    assert!(request_first_frame_present(view_b));
+    assert!(
+        !request_first_frame_present(view_c),
+        "a record without a surface has nothing to present"
+    );
+    assert!(
+        !request_first_frame_present(view_d),
+        "a record without a request word asks nothing"
+    );
+    for (sink, expected) in [
+        (&sink_a, ClientSurfaceRequest::ATTACHED.bits()),
+        (&sink_b, ClientSurfaceRequest::ATTACHED.bits()),
+        (&sink_c, 0),
+    ] {
+        assert_eq!(sink.load(Ordering::Acquire), expected);
+    }
+
+    unregister(view_a);
+    assert!(
+        !request_first_frame_present(view_a),
+        "an unregistered record asks nothing"
+    );
+    unregister(view_b);
+    unregister(view_c);
+    unregister(view_d);
 }
 
 /// The unshown pace releases one present per duration, counted from the schedule.

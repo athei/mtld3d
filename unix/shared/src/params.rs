@@ -299,12 +299,13 @@ pub struct AttachMetalLayerParams {
     pub cursor_kick_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
     /// Address of a PE-side `AtomicU32` the unix side ORs a `ClientSurfaceRequest` into.
     ///
-    /// Set from the main thread when the client view the device's metal view
-    /// sits in is hidden, which a Wine that hides it on every window surface
-    /// flush does. The PE side takes the word back to zero at the next
-    /// `Present` and answers a non-zero one with `PresentClientSurface`, since
-    /// win32u's surface calls need a Wine thread. Same backing contract as
-    /// `backing_scale_ptr`. `0` disables it.
+    /// Set by the attach itself, and from the main thread when the client view
+    /// the device's metal view sits in is hidden, which a Wine that hides it
+    /// on every window surface flush does. The PE side takes the word back to
+    /// zero at the next `Present` that submits a frame and answers a non-zero
+    /// one with `PresentClientSurface`, since win32u's surface calls need a
+    /// Wine thread. Same backing contract as `backing_scale_ptr`. `0` disables
+    /// it.
     pub client_surface_request_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
 }
 
@@ -314,12 +315,14 @@ impl Thunk for AttachMetalLayerParams {
 
 /// Have Wine show and size the client surface of the newest device on a view's window.
 ///
-/// Sent from the API thread at `Present` when the device's request word
-/// (`AttachMetalLayerParams::client_surface_request_ptr`) is set, and only
-/// then. The unix side calls win32u's `client_surface_present` for the newest
-/// attachment record on the window `view_handle`'s record names, which
-/// updates the surface's frame from the window's client rect and makes it the
-/// surface Wine shows. A view no record names is ignored.
+/// Sent from the API thread at `Present`, after the frame was submitted, when
+/// the device's request word (`AttachMetalLayerParams::client_surface_request_ptr`)
+/// is set, and only then; the attach sets it, so a device's first submitted
+/// frame always sends it. The unix side notes that the device has drawn and
+/// calls win32u's `client_surface_present` for the newest attachment record
+/// on the window `view_handle`'s record names, once that record's device has
+/// drawn too, which updates the surface's frame from the window's client rect
+/// and makes it the surface Wine shows. A view no record names is ignored.
 #[repr(C, align(8))]
 pub struct PresentClientSurfaceParams {
     pub view_handle: MetalHandle<NSViewKind>, // in
