@@ -285,14 +285,14 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mtld3d-conformance"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "mtld3d-core"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-e2e"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "libc",
  "mtld3d-shared",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-shared"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "bitflags 2.13.2",
  "env_logger",
@@ -326,14 +326,14 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-types"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "bitflags 2.13.2",
 ]
 
 [[package]]
 name = "mtld3d-unix"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
