@@ -51,8 +51,9 @@ pub use cursor_overlay::{poll_from_present, set_cursor_overlay};
 /// view's retirement knows the window it served. A device that never
 /// attached finds no record, and another device's record is untouched,
 /// except that Wine is told to show the client surface of the newest device
-/// still attached to the same window. Runs on the API thread, a Wine thread,
-/// which win32u's client surface calls need.
+/// still attached to the same window, once that device has submitted a
+/// frame. Runs on the API thread, a Wine thread, which win32u's client
+/// surface calls need.
 pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<Attachment>> {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
@@ -61,13 +62,22 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
     // Another device still presenting into this window gets its surface
-    // shown again, rather than the window keeping this view's last frame.
+    // shown again, rather than the window keeping this view's last frame. A
+    // device that has not drawn yet presents its own surface at its first
+    // frame instead.
     if let Some(calls) = client_surface::SurfaceCalls::load() {
-        if let Some(sibling) =
-            attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
-        {
-            calls.present(sibling);
-            calls.release(sibling);
+        match attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface)) {
+            attachment::NewestSurface::Retained(sibling) => {
+                calls.present(sibling, "the device left on the window");
+                calls.release(sibling);
+            }
+            attachment::NewestSurface::NotDrawn(sibling) => debug!(
+                target: LOG_TARGET,
+                "present: client surface {sibling:#x}, the newest left on window {:#x}, waits \
+                 for its device's first frame",
+                att.hwnd(),
+            ),
+            attachment::NewestSurface::None => {}
         }
         calls.release(att.client_surface());
     }
@@ -82,14 +92,17 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
 
 /// Have Wine show and size the client surface of the newest device on a view's window.
 ///
-/// The device whose metal view is `view_handle` asks at its `Present` after
+/// The device whose metal view is `view_handle` asks at a `Present` that
+/// submitted a frame: its first one after the attach, and the next one after
 /// its client view was hidden or its window's client area changed
-/// (`reasons`). win32u's `client_surface_present` updates the surface's
-/// cocoa view to the window's client rect and makes it the one Wine shows,
-/// the two things winemac's `nextDrawable` override did on every present.
-/// The surface is the newest device's on the record's window, as at a
-/// teardown. Runs on the API thread, a Wine thread, which win32u's calls
-/// need; a view no record names asks for nothing, logged once.
+/// (`reasons`). The call is what marks the device as having drawn. win32u's
+/// `client_surface_present` updates the surface's cocoa view to the window's
+/// client rect and makes it the one Wine shows, the two things winemac's
+/// `nextDrawable` override did on every present. The surface is the newest
+/// device's on the record's window, as at a teardown, and only once that
+/// device has drawn: its own first frame presents it otherwise. Runs on the
+/// API thread, a Wine thread, which win32u's calls need; a view no record
+/// names asks for nothing, logged once.
 pub fn present_client_surface(
     view_handle: MetalHandle<NSViewKind>,
     reasons: mtld3d_shared::mtl::ClientSurfaceRequest,
@@ -104,14 +117,22 @@ pub fn present_client_surface(
         );
         return;
     };
+    att.note_frame_submitted();
     let Some(calls) = client_surface::SurfaceCalls::load() else {
         return;
     };
-    if let Some(surface) =
-        attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
-    {
-        calls.present_requested(surface, reasons);
-        calls.release(surface);
+    match attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface)) {
+        attachment::NewestSurface::Retained(surface) => {
+            calls.present_requested(surface, reasons);
+            calls.release(surface);
+        }
+        attachment::NewestSurface::NotDrawn(surface) => debug!(
+            target: LOG_TARGET,
+            "present: client surface {surface:#x}, the newest on window {:#x}, waits for its \
+             device's first frame ({reasons:?})",
+            att.hwnd(),
+        ),
+        attachment::NewestSurface::None => {}
     }
 }
 
@@ -1188,10 +1209,15 @@ pub fn attach_metal_layer(
         },
     );
     // A new view's surface is the one Wine shows already; a kept view's may
-    // have been hidden for a later surface of the same window since.
+    // have been hidden for a later surface of the same window since. This
+    // present also has win32u set the surface's frame and superview. The
+    // device's first submitted frame presents the surface again, which is
+    // the present after which Wine keeps the client view shown across its
+    // window surface flushes; until then no other device's call presents it.
     if let Some(calls) = &surface_calls {
-        calls.present(surface);
+        calls.present(surface, "attach");
     }
+    attachment::request_first_frame_present(view as usize);
     attachment::publish_backing_scale(&att, backing_scale);
     // `Auto` turns the software cursor on under HDR, where the hardware
     // cursor reads dim. The overlay window costs the game window its

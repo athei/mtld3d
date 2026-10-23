@@ -8,7 +8,8 @@
 //! without that override (`client_surface`), so a key-value observer on the
 //! client view's `hidden` stands in for it: when Wine hides the view of the
 //! newest device on a window, the observer sets that device's request word,
-//! and the device's next `Present` has Wine show its surface again.
+//! and the device's next `Present` that submits a frame has Wine show its
+//! surface again.
 //!
 //! The observer and the client view are retained by a box whose address the
 //! attachment record carries from the attach that installs the watch to the

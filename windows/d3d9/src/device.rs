@@ -2150,10 +2150,6 @@ impl DeviceInner {
         self.cursor_mut().follow_published_scale(cursor_scale);
         self.cursor_mut().sync_native_visibility();
         self.cursor_mut().note_present();
-        // What winemac's `nextDrawable` override did on every present, done
-        // only on a frame after the client view was hidden or the window's
-        // client area moved: Wine shows the surface again, sized to it.
-        self.cursor().present_client_surface_if_asked();
         // Input polling can deliver WM_SIZE and recreate the implicit textures.
         // Build the continuation only after those callbacks have returned.
         if self.needs_reset() {
@@ -2174,6 +2170,12 @@ impl DeviceInner {
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
         drop(stall);
+        // What winemac's `nextDrawable` override did on every present, done
+        // only once the frame is submitted, and only on the device's first
+        // frame and on one after the client view was hidden or the window's
+        // client area moved: Wine shows the surface again, sized to it. A
+        // `Present` that submits nothing leaves the request for the next one.
+        self.cursor().present_client_surface_if_asked();
         #[cfg(perf_tracking)]
         {
             let retired = self.coherent_seq.load(Ordering::Acquire);

@@ -7,7 +7,11 @@
 //! surface and leave its frame alone when the window resizes, counting on the
 //! override for both. So a device whose client view Wine hid, or whose
 //! window's client area moved, has Wine show its surface again, sized to the
-//! client area, at its next `Present`.
+//! client area, at its next `Present` that submits a frame. A device's first
+//! submitted frame asks too, since a winemac that keeps a client view shown
+//! across window surface flushes does so from the surface's second present
+//! on, and until a device has drawn no other device's call presents its
+//! surface.
 //!
 //! The Wine the suite runs on neither hides the view on a flush nor skips the
 //! surface on a resize, so each test makes Wine do what it can here and reads
@@ -22,7 +26,9 @@
 //! so the two workloads that need it end with a note there, which the run
 //! repeats.
 
-use mtld3d_tests::{Harness, set_opengl_pixel_format, set_window_pos};
+use std::time::{Duration, Instant};
+
+use mtld3d_tests::{Harness, HarnessConfig, set_opengl_pixel_format, set_window_pos};
 
 use super::device::{
     await_logged_lines, logged_lines, run_in_private_log_child, running_as, spawn_private_log_child,
@@ -86,6 +92,38 @@ fn a_released_device_no_longer_watches_its_client_view() {
     );
 }
 
+/// The name the first-frame workload child runs under.
+const FIRST_FRAME_CHILD_NAME: &str = "client-surface-first-frame.exe";
+
+#[test]
+fn a_new_device_asks_wine_once_at_its_first_submitted_frame() {
+    if running_as(FIRST_FRAME_CHILD_NAME) {
+        first_frame_workload();
+        return;
+    }
+    run_in_private_log_child(
+        FIRST_FRAME_CHILD_NAME,
+        "client_surface::a_new_device_asks_wine_once_at_its_first_submitted_frame",
+        CLIENT_SURFACE_LOG_FILTER,
+    );
+}
+
+/// The name the undrawn-sibling workload child runs under.
+const UNDRAWN_SIBLING_CHILD_NAME: &str = "client-surface-undrawn-sibling.exe";
+
+#[test]
+fn a_departing_device_leaves_an_undrawn_siblings_surface_to_its_first_frame() {
+    if running_as(UNDRAWN_SIBLING_CHILD_NAME) {
+        undrawn_sibling_workload();
+        return;
+    }
+    run_in_private_log_child(
+        UNDRAWN_SIBLING_CHILD_NAME,
+        "client_surface::a_departing_device_leaves_an_undrawn_siblings_surface_to_its_first_frame",
+        CLIENT_SURFACE_LOG_FILTER,
+    );
+}
+
 /// Run a workload that hides the client view through OpenGL, repeating its note when it could not.
 fn run_opengl_child(child_name: &str, test: &str) {
     let (output, dir) = spawn_private_log_child(child_name, test, CLIENT_SURFACE_LOG_FILTER, "");
@@ -146,8 +184,13 @@ fn released_device_workload() {
 
 /// The metal view and the client surface the device's attach line names.
 fn attached_view_and_surface() -> (String, String) {
-    let attached = await_logged_lines("presents through CAMetalLayer", 1);
-    let line = &attached[0];
+    attached_view_and_surface_of(0)
+}
+
+/// The metal view and the client surface the attach line of the `index`th device names.
+fn attached_view_and_surface_of(index: usize) -> (String, String) {
+    let attached = await_logged_lines("presents through CAMetalLayer", index + 1);
+    let line = &attached[index];
     let view = line
         .split_once("of view ")
         .and_then(|(_, rest)| rest.split_once(' '))
@@ -213,19 +256,132 @@ fn resized_window_workload() {
     let h = Harness::new();
     h.render_once(RED, |_| {});
     let (_, surface) = attached_view_and_surface();
+    // The first frame's own request is logged before anything the resize
+    // asks, and may carry a client area change of the device's creation.
+    await_request_lines(&surface, "ATTACHED", 1);
+    let before = request_lines(&surface, "CLIENT_AREA_CHANGED").len();
 
     set_window_pos(h.hwnd(), 0, 0, 320, 200);
     for _ in 0..3 {
         h.render_once(RED, |_| {});
     }
-    let shown = await_logged_lines(&format!("Wine shows client surface {surface} again"), 1);
+    await_request_lines(&surface, "CLIENT_AREA_CHANGED", before + 1);
+    assert_pixel_after_presents(&h);
+}
+
+/// The presents of `surface` the device asked for, whose reasons name `reason`.
+fn request_lines(surface: &str, reason: &str) -> Vec<String> {
+    logged_lines(&format!("Wine shows client surface {surface} again ("))
+        .into_iter()
+        .filter(|line| line.contains(reason))
+        .collect()
+}
+
+/// Wait for `expected` presents of `surface` the device asked for with `reason`.
+fn await_request_lines(surface: &str, reason: &str, expected: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lines = request_lines(surface, reason);
+        if lines.len() >= expected {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} request(s) of client surface {surface} for {reason} logged, expected \
+             {expected}: {lines:?}",
+            lines.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A new device has Wine present its surface at the attach, and once more at its first frame.
+///
+/// The attach present runs before the device has drawn; the device's first
+/// submitted frame asks again with `ATTACHED`, which is the present after
+/// which Wine keeps the client view shown across window surface flushes.
+/// Later frames ask nothing for it.
+///
+/// Every line counted here is the unix side's, logged on this thread inside
+/// the call that caused it (the attach in `CreateDevice`, a request in
+/// `Present`), and the unix log writes each line to the file with one
+/// unbuffered `write(2)` once the file is open, which the attach line read
+/// back shows it is. So a count read after the call returned is complete:
+/// none of these lines can still be on its way to the file.
+fn first_frame_workload() {
+    let h = Harness::new();
+    let (_, surface) = attached_view_and_surface();
+    let attach = await_logged_lines(&format!("Wine shows client surface {surface} (attach)"), 1);
+    assert_eq!(attach.len(), 1, "one present at the attach: {attach:?}");
+    let before_present = request_lines(&surface, "ATTACHED");
     assert!(
-        shown
-            .iter()
-            .any(|line| line.contains("CLIENT_AREA_CHANGED")),
-        "the device asked Wine to present its surface because the window resized: {shown:?}"
+        before_present.is_empty(),
+        "nothing asks before the device submits a frame: {before_present:?}"
+    );
+
+    h.render_once(RED, |_| {});
+    let first_frame = request_lines(&surface, "ATTACHED");
+    assert_eq!(
+        first_frame.len(),
+        1,
+        "the first submitted frame asks once: {first_frame:?}"
+    );
+    for _ in 0..3 {
+        h.render_once(RED, |_| {});
+    }
+    let later = request_lines(&surface, "ATTACHED");
+    assert_eq!(
+        later.len(),
+        1,
+        "the later frames do not ask for the attach again: {later:?}"
     );
     assert_pixel_after_presents(&h);
+}
+
+/// A device that leaves a window does not present the surface of a device there that has not drawn.
+///
+/// A second device on the first one's window attaches and has Wine show its
+/// surface, then the first device is released before the second presents.
+/// The release leaves the second device's surface to that device's first
+/// frame, logged, and presents nothing: one present of that surface so far,
+/// the attach's. The second device's first frame then asks with `ATTACHED`
+/// and reads back its own colour.
+fn undrawn_sibling_workload() {
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    first.render_once(RED, |_| {});
+    let second = Harness::create(&HarnessConfig {
+        device_window: first.hwnd(),
+        ..HarnessConfig::default()
+    });
+    let (_, surface) = attached_view_and_surface_of(1);
+    assert_eq!(first.release_device(), 0, "release the earlier device");
+    await_logged_lines(
+        &format!("client surface {surface}, the newest left on window"),
+        1,
+    );
+    let presents = logged_lines(&format!("Wine shows client surface {surface} ("));
+    assert_eq!(
+        presents.len(),
+        1,
+        "only the attach presented the surface of a device that has not drawn: {presents:?}"
+    );
+    assert!(
+        presents[0].contains("(attach)"),
+        "that present is the attach's: {presents:?}"
+    );
+
+    second.render_once(BLUE, |_| {});
+    await_request_lines(&surface, "ATTACHED", 1);
+    mtld3d_tests::assert_pixel_eq(
+        second.read_pixel(1, 1),
+        BLUE,
+        "the device left on the window",
+    );
+    // The window is the first harness's to destroy, after the device on it.
+    drop(second);
+    drop(first);
 }
 
 /// The device still presents its own colour after the client surface was presented again.

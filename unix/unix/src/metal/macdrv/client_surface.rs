@@ -15,14 +15,21 @@
 //! the view sits in is read on the main thread ([`client_surface_of`]),
 //! retained, and presented through win32u's own `client_surface_present`,
 //! which also sizes the surface's cocoa view to the window's client rect.
-//! That happens when a device attaches, when a device leaves a window another
-//! live device still presents into, and at the next `Present` after the
+//! That happens once when a device attaches, and after that only once the
+//! surface's own device has submitted a frame: at that device's first
+//! submitted frame, when a device leaves a window another live device still
+//! presents into, and at the next `Present` that submits a frame after the
 //! client view was hidden or the window's client area changed (the device's
 //! `PresentClientSurface` request, see `client_view_watch`). Some Wines hide
 //! the client view whenever they flush the window surface, and some leave the
 //! surface out of the updates a window move or resize makes, counting on the
-//! override for both. Wine showed the surface of whichever device presented
-//! last; this shows the surface of the newest device attached to the window.
+//! override for both. A winemac that keeps a client view shown across window
+//! surface flushes does so once the surface was presented while its view was
+//! hidden, or presented again after the present that attached it; a surface
+//! whose device has not drawn is therefore not presented again, since its
+//! view would then stay over the window surface with nothing in its layer.
+//! Wine showed the surface of whichever device presented last; this shows the
+//! surface of the newest device attached to the window.
 //!
 //! The surface functions are win32u's exports, called on the API thread,
 //! which is a Wine thread: `client_surface_present` takes win32u's surface
@@ -196,16 +203,17 @@ impl SurfaceCalls {
         surface
     }
 
-    /// Have Wine show `surface` as its window's client view; `0` does nothing.
+    /// Have Wine show `surface` as its window's client view, for `cause`; `0` does nothing.
     ///
     /// The caller holds a reference on `surface`. A surface whose window is
-    /// gone is one Wine has detached, and presenting it does nothing.
-    pub fn present(&self, surface: usize) {
+    /// gone is one Wine has detached, and presenting it does nothing. `cause`
+    /// names the event for the log line.
+    pub fn present(&self, surface: usize, cause: &str) {
         if surface == 0 {
             return;
         }
         self.call_present(surface);
-        info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x}");
+        info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x} ({cause})");
     }
 
     /// [`Self::present`] for a device's request, which can come every frame, logged quietly.

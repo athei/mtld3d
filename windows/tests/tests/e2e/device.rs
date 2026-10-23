@@ -4633,12 +4633,18 @@ fn shared_window_workload() {
         "the attach read the first device's client surface"
     );
     assert_eq!(second.release_device(), 0, "release the later device");
-    let needle = format!("Wine shows client surface {surface}");
+    // The attach and the handback each log their cause in parentheses; the
+    // present at a device's own first frame says `again` instead.
+    let needle = format!("Wine shows client surface {surface} (");
     let shown = await_logged_lines(&needle, 2);
     assert_eq!(
         shown.len(),
         2,
         "the first device's surface shown at its attach and after the release: {shown:?}"
+    );
+    assert!(
+        shown[1].contains("(the device left on the window)"),
+        "the second one is the handback: {shown:?}"
     );
     let last = logged_lines("Wine shows client surface");
     assert_eq!(

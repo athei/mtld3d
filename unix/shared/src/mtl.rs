@@ -902,16 +902,23 @@ bitflags! {
     /// Why a device asks Wine to show its window's client surface again.
     ///
     /// Written into the PE-side word `AttachMetalLayerParams::client_surface_request_ptr`
-    /// names, from the unix side's main thread and from the window procedure,
-    /// and carried by `PresentClientSurfaceParams` when the next `Present`
-    /// takes it. A `u32` for two bits because it is that `AtomicU32` word's
-    /// value and a 4-byte field of the thunk.
+    /// names, by the attach, from the unix side's main thread and from the
+    /// window procedure, and carried by `PresentClientSurfaceParams` when the
+    /// next `Present` that submits a frame takes it. A `u32` because it is that
+    /// `AtomicU32` word's value and a 4-byte field of the thunk.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ClientSurfaceRequest: u32 {
         /// The client view the device's metal view sits in was hidden.
         const VIEW_HIDDEN = 1 << 0;
         /// The window was resized, re-framed or shown, which can move its client area.
         const CLIENT_AREA_CHANGED = 1 << 1;
+        /// The device attached and has not submitted a frame since.
+        ///
+        /// Set by every attach, so the device's first submitted frame always
+        /// sends `PresentClientSurface`. That call is how the unix side learns
+        /// the device has drawn, and it is the present after which Wine keeps
+        /// the client view shown across window surface flushes.
+        const ATTACHED = 1 << 2;
     }
 }
 

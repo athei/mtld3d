@@ -145,6 +145,19 @@ pub struct Attachment {
     client_view_watch: AtomicUsize,
     /// When the record was registered, which orders the devices on one window.
     attached_at: Instant,
+    /// Whether the device has submitted a frame since this record was registered.
+    ///
+    /// Set by the device's first `PresentClientSurface`, which its first
+    /// submitted frame always sends, since attach asks with
+    /// [`ClientSurfaceRequest::ATTACHED`]. Until then the record's surface is
+    /// presented only by its attach: Wine keeps a client view shown across its
+    /// window surface flushes from the surface's second present on, and a
+    /// device that has not drawn has nothing in its layer to keep shown. A
+    /// kept view reused in place is the exception: its surface is the
+    /// previous device's, which Wine already counts as presented, so from the
+    /// attach on a flush keeps that view shown over the parked layer's last
+    /// frame until the new device's first frame replaces it.
+    drew_frame: AtomicBool,
     flags: AttachFlags,
     color_space: ColorSpacePolicy,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
@@ -255,6 +268,7 @@ impl Attachment {
             client_surface: latches.client_surface,
             client_view_watch: AtomicUsize::new(0),
             attached_at: Instant::now(),
+            drew_frame: AtomicBool::new(false),
             flags: latches.flags,
             color_space: latches.color_space,
             window: AtomicUsize::new(0),
@@ -311,6 +325,20 @@ impl Attachment {
     #[must_use]
     pub const fn client_surface(&self) -> usize {
         self.client_surface
+    }
+
+    /// The device submitted a frame: from now on its surface may be presented again.
+    ///
+    /// `Relaxed` is enough: the flag orders nothing else, and a reader that
+    /// misses the store skips a present the device's own request makes anyway.
+    pub fn note_frame_submitted(&self) {
+        self.drew_frame.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the device submitted a frame since the record was registered.
+    #[must_use]
+    pub fn drew_frame(&self) -> bool {
+        self.drew_frame.load(Ordering::Relaxed)
     }
 
     /// Hand the record the address of its client view watch, giving back any it held.
@@ -636,48 +664,107 @@ pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
     lock().values().find(|att| att.layer == layer).cloned()
 }
 
+/// What [`retain_newest_surface_on`] found on a window.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NewestSurface {
+    /// No live record on the window holds a surface, or the retain refused it.
+    None,
+    /// The newest record's device has not submitted a frame; its surface, not retained.
+    ///
+    /// The address is for the log only. That device's first submitted frame
+    /// presents the surface itself, through its `ATTACHED` request.
+    NotDrawn(usize),
+    /// The newest record's surface, with the reference the caller gives back.
+    Retained(usize),
+}
+
 /// The client surface of the newest live record on `hwnd`, retained through `retain`.
 ///
 /// `retain` takes a reference on the surface while the record is live under
 /// the registry lock, and the record's teardown gives its own reference
 /// back only after it unregistered the record, so the surface outlives the
 /// call whatever that device does meanwhile; the caller gives the reference
-/// back. `None` when no live record on `hwnd` holds a surface.
-pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> Option<usize> {
+/// back. A newest record whose device has not submitted a frame yet is
+/// reported and not retained: presenting its surface before then would have
+/// Wine keep a client view shown whose layer holds nothing.
+pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> NewestSurface {
     let map = lock();
-    let retained = newest_with_surface_on(&map, hwnd).map(|newest| retain(newest.client_surface));
+    let found = newest_with_surface_on(&map, hwnd).map(|newest| {
+        if newest.drew_frame() {
+            NewestSurface::Retained(retain(newest.client_surface))
+        } else {
+            NewestSurface::NotDrawn(newest.client_surface)
+        }
+    });
     drop(map);
-    retained.filter(|&surface| surface != 0)
+    match found {
+        Some(NewestSurface::Retained(0)) | None => NewestSurface::None,
+        Some(found) => found,
+    }
 }
 
 /// Ask the device that owns `view` to have Wine show its window's client surface again.
 ///
 /// ORs `reason` into the record's PE-side request word, which the device
-/// takes at its next `Present` and answers with `PresentClientSurface`. Only
-/// the newest record on its window that holds a surface asks: Wine shows one
-/// client surface per window, the newest device's, so an older device's view
-/// is hidden on purpose and asking for it would change nothing. `false`, and
-/// nothing written, for a view no live record names, a record without a
-/// surface or a request word, or one a newer device on its window outranks.
+/// takes at its next `Present` that submits a frame and answers with
+/// `PresentClientSurface`. Only the newest record on its window that holds a
+/// surface asks: Wine shows one client surface per window, the newest
+/// device's, so an older device's view is hidden on purpose and asking for
+/// it would change nothing. `false`, and nothing written, for a view no live
+/// record names, a record without a surface or a request word, or one a
+/// newer device on its window outranks.
 pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool {
     let map = lock();
     let Some(att) = map.get(&view) else {
         return false;
     };
-    if att.client_surface_request_sink == 0
-        || !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att))
-    {
+    if !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att)) {
+        return false;
+    }
+    let asked = write_request(att, reason);
+    // The write is what the lock guards: the record's teardown unregisters
+    // it under the same lock before the PE side drops the word.
+    drop(map);
+    asked
+}
+
+/// Ask the device that owns `view` to send `PresentClientSurface` after its first submitted frame.
+///
+/// Attach calls this once it registered the record, whatever the record's
+/// rank on its window, so every device with a surface and a request word
+/// tells the unix side when it has drawn ([`Attachment::note_frame_submitted`]),
+/// and the newest device's first frame presents its surface. `false`, and
+/// nothing written, for a view no live record names or a record without a
+/// surface or a request word.
+pub fn request_first_frame_present(view: usize) -> bool {
+    let map = lock();
+    let Some(att) = map.get(&view) else {
+        return false;
+    };
+    if att.client_surface == 0 {
+        return false;
+    }
+    let asked = write_request(att, ClientSurfaceRequest::ATTACHED);
+    // Held across the write, for the reason `request_client_surface` gives.
+    drop(map);
+    asked
+}
+
+/// OR `reason` into `att`'s request word; `false` when it has none. **Registry lock held.**
+///
+/// The caller found `att` in the locked registry and holds the lock across
+/// this call: the record's teardown unregisters it under the same lock before
+/// the PE side drops the word.
+fn write_request(att: &Attachment, reason: ClientSurfaceRequest) -> bool {
+    if att.client_surface_request_sink == 0 {
         return false;
     }
     // SAFETY: as in `publish_backing_scale`: the PE side backs this address
     // with an `AtomicU32` in a box it keeps until after the teardown thunk
-    // that unregisters the record has returned, and the record is live under
-    // the registry lock.
+    // that unregisters the record has returned, and the caller found the
+    // record live under the registry lock it still holds.
     let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU32) };
     sink.fetch_or(reason.bits(), Ordering::Release);
-    // The write above is what the lock guards: the record's teardown
-    // unregisters it under the same lock before the PE side drops the word.
-    drop(map);
     true
 }
 
