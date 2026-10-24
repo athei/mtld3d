@@ -54,6 +54,9 @@ unsafe extern "system" {
     fn ReleaseCapture() -> i32;
     fn GetCapture() -> usize;
     fn SetForegroundWindow(hwnd: usize) -> i32;
+    fn GetForegroundWindow() -> usize;
+    fn GetActiveWindow() -> usize;
+    fn GetFocus() -> usize;
     fn SetCursor(cursor: usize) -> usize;
     fn GetIconInfo(icon: usize, info: *mut ICONINFO) -> i32;
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
@@ -1261,6 +1264,44 @@ pub fn pump_messages(msg: &mut Msg) -> bool {
     msg.message != WM_QUIT
 }
 
+/// Pump the calling thread's queue until it stays quiet for `quiet`, for at most `cap`.
+///
+/// Quiet means no message was dispatched and [`activation`] did not change:
+/// the driver's own events (a Cocoa focus change reported back, say) are read
+/// inside `PeekMessageA` and land as messages sent to the thread's windows,
+/// which leave no posted message behind but do move the activation. Returns
+/// `false` once `WM_QUIT` is seen.
+#[must_use]
+pub fn pump_until_quiet(quiet: Duration, cap: Duration) -> bool {
+    let start = Instant::now();
+    let mut quiet_since = Instant::now();
+    let mut last = activation();
+    let mut msg = zeroed_msg();
+    while start.elapsed() < cap {
+        let mut dispatched = false;
+        // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, hwnd 0 pumps the thread queue.
+        while unsafe { PeekMessageA(&raw mut msg, 0, 0, 0, PM_REMOVE) } != 0 {
+            if msg.message == WM_QUIT {
+                return false;
+            }
+            dispatched = true;
+            // SAFETY: Win32 thunk; only reads the populated `msg`.
+            unsafe { TranslateMessage(&raw const msg) };
+            // SAFETY: Win32 thunk; only reads the populated `msg`.
+            unsafe { DispatchMessageA(&raw const msg) };
+        }
+        let now = activation();
+        if dispatched || now != last {
+            last = now;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= quiet {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 /// A zeroed `MSG` for the pump loop.
 ///
 /// The fields are overwritten by `PeekMessageA` before any are read.
@@ -1298,6 +1339,48 @@ pub fn capture_mouse(hwnd: usize, captured: bool) -> usize {
 pub fn foreground_window(hwnd: usize) -> bool {
     // SAFETY: the harness owns the live window handle.
     unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Which windows hold the activation.
+///
+/// As `GetForegroundWindow`, `GetActiveWindow` and `GetFocus` answer; the
+/// active and focus windows are the calling thread's.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Activation {
+    /// The desktop's foreground window, 0 for none.
+    pub foreground: usize,
+    /// The calling thread's active window, 0 for none.
+    pub active: usize,
+    /// The calling thread's focus window, 0 for none.
+    pub focus: usize,
+}
+
+impl Activation {
+    /// The activation of a thread whose window `hwnd` is foreground, active and focused.
+    #[must_use]
+    pub const fn all(hwnd: usize) -> Self {
+        Self {
+            foreground: hwnd,
+            active: hwnd,
+            focus: hwnd,
+        }
+    }
+}
+
+/// The foreground window and the calling thread's active and focus windows.
+#[must_use]
+pub fn activation() -> Activation {
+    // SAFETY: Win32 thunk with no arguments; reads the desktop's foreground window.
+    let foreground = unsafe { GetForegroundWindow() };
+    // SAFETY: Win32 thunk with no arguments; reads the calling thread's active window.
+    let active = unsafe { GetActiveWindow() };
+    // SAFETY: Win32 thunk with no arguments; reads the calling thread's focus window.
+    let focus = unsafe { GetFocus() };
+    Activation {
+        foreground,
+        active,
+        focus,
+    }
 }
 
 /// Put a window above every window that is not topmost, without moving or activating it.

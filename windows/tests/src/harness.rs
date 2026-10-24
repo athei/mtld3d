@@ -3514,6 +3514,22 @@ impl Harness {
     /// # Panics
     /// Panics if the back-buffer size does not fit a window's `i32` extent.
     pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        self.create_device_observed(pp, |_| ()).0
+    }
+
+    /// [`Self::create_device_hr`], calling `observe` with the new window while the device lives.
+    ///
+    /// `observe` runs after the create returned and before the device is
+    /// released, whether or not the create succeeded, and its result is
+    /// returned beside the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    pub fn create_device_observed<R>(
+        &self,
+        pp: &mut D3DPRESENT_PARAMETERS,
+        observe: impl FnOnce(usize) -> R,
+    ) -> (i32, R) {
         let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
         let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
         let hwnd =
@@ -3533,6 +3549,7 @@ impl Harness {
                 &raw mut device,
             )
         };
+        let observed = observe(hwnd);
         if !device.is_null() {
             // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
             let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
@@ -3540,7 +3557,7 @@ impl Harness {
             unsafe { (vtbl.release)(device) };
         }
         win32::destroy_window(hwnd);
-        hr
+        (hr, observed)
     }
 
     /// `IDirect3D9::CheckDeviceFormatConversion`.

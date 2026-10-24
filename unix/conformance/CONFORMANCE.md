@@ -967,8 +967,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-24: 7 `real`, 181 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 200 unique sites in all.
+`Sites:` tokens below on 2026-10-24: 7 `real`, 174 `expected`, 3 `caps`,
+6 `ceiling`, 3 `flaky`, 0 `untriaged`, 193 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
@@ -1119,9 +1119,11 @@ harness pins it, and so does the launcher) win32u leaves the physical display
 alone, answers the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, the
 client rect and every mouse coordinate in the mode, and scales the window
 onto the physical monitor; without it the mac driver would hand the change to
-`CGDisplaySetDisplayMode` and switch the whole desktop. The device leaves the
-z-order alone: raising the window to the topmost level deadlocks winemac (see
-test_window_style 5216).
+`CGDisplaySetDisplayMode` and switch the whole desktop. Before the mode-set
+the device activates the focus window, as native does, which raises it to the
+top of the windows that are not topmost (test_wndproc 4203). It never makes
+the window topmost: raising the window to the topmost level deadlocks winemac
+(see test_window_style 5216).
 
 The mode list `EnumAdapterModes` serves is a bounded subset of
 `EnumDisplaySettingsW`'s (the sizes that fill the display, largest first,
@@ -1260,7 +1262,7 @@ baseline.
 ### device.c clusters
 
 ### device.c/test_wndproc
-Sites: 4203=expected 4208=expected 4210=expected 4215=expected
+Sites: 4215=expected
 Sites: 4219=expected 4244=expected 4253=expected 4289=expected
 Sites: 4294=expected 4298=ceiling 4315=ceiling 4324=ceiling 4325=ceiling
 Sites: 4336=expected 4416=expected
@@ -1271,10 +1273,16 @@ Sites: 4476=flaky
 4157/4227, the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
 before any D3D9 object is involved, pass on both Wines now that the mode the
 test picks from `EnumAdapterModes` is one user32 accepts, and carry no pin.
-The rest of the fullscreen focus lifecycle we
-deliberately do not drive: no focus/foreground mutation (4208/4210), no focus-
+A fullscreen create activates the focus window as native does, one
+`SetWindowPos` to `HWND_TOP` without `SWP_NOACTIVATE` before the window is
+styled and shown, so the create's `WM_WINDOWPOSCHANGING`, `WM_ACTIVATE` and
+`WM_SETFOCUS` on the focus window (4203) and the focus and foreground
+windows read after it (4208/4210) pass in both iterations, the
+`D3DCREATE_NOWINDOWCHANGES` one included. The rest of the fullscreen focus
+lifecycle we deliberately do not drive: no focus-
 window subclass (4219/4568), no WM_* activation/mode message generation
-(4203/4244/4289/4315/4336/4428/4521/4541), no focus-window minimize
+on focus loss, re-activation or mode change
+(4244/4289/4315/4336/4428/4521/4541), no focus-window minimize
 (4416), device-never-lost TestCooperativeLevel (4253/4294/4420/4483).
 4298 (both iterations) expects the desktop still at the registry mode after
 the app is re-activated, native leaving the mode-set to the app's next
@@ -1408,12 +1416,6 @@ Sites: 4770=expected 4774=expected 4781=expected
 The other six expect the device window's wndproc UNCHANGED and fail because
 of our cursor subclass, the same deliberate hook as test_wndproc 4215,
 kept on purpose (cursor realization is driven from it).
-
-### device.c/test_reset_fullscreen
-Sites: 4867=expected
-
-WM_ACTIVATEAPP delivery on a windowed→fullscreen Reset; we do not
-force-show/activate the window.
 
 ### device.c/test_window_style
 Sites: 5216=expected
@@ -2022,13 +2024,16 @@ run under Wine counts it; 2049 and 2051 accept no `D3D_OK` at all. The
 `TestCooperativeLevel` and `Reset` assertions pass.
 
 ### d3d9ex.c/test_wndproc
-Sites: 2908=expected 2913=expected 2915=expected 2920=expected 2924=expected
+Sites: 2920=expected 2924=expected
 Sites: 2949=expected 2957=expected 3007=expected 3036=expected 3107=expected
 Sites: 3183=expected 3203=expected 3209=expected 3230=expected
 
-The extended copy of `device.c/test_wndproc`, and the same decisions: no
-activation or mode message generation (2908, 2949, 3007, 3036, 3183, 3203),
-no focus or foreground change (2913, 2915), the cursor subclass on the device
+The extended copy of `device.c/test_wndproc`, and the same decisions. The
+fullscreen create activates the focus window, so its messages (2908) and
+the focus and foreground windows after it (2913, 2915) pass, as `device.c`
+4203/4208/4210 do. Not driven: activation or mode message generation on
+focus loss, re-activation or mode change (2949, 3007, 3036, 3183, 3203),
+the cursor subclass on the device
 window rather than a subclass of the focus window (2920, 2924, 3230), no
 focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from

@@ -5672,6 +5672,19 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
     // it, and the new window is taken over exactly as a fullscreen create
     // takes one over, so the eventual leave gives back the window the device
     // presents into.
+    //
+    // Going from windowed to fullscreen activates the focus window first, as
+    // a fullscreen create does: the one the device was created with, else the
+    // window the device goes fullscreen on. A retarget between two fullscreen
+    // windows leaves activation alone, as native D3D9 does.
+    if dev.fullscreen.is_none() {
+        let focus = if dev.creation_focus_window == 0 {
+            target
+        } else {
+            dev.creation_focus_window as *mut c_void
+        };
+        crate::fullscreen::activate_focus_window(focus);
+    }
     dev.enter_fullscreen(target, mode);
 }
 

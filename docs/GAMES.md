@@ -16,6 +16,7 @@ the reason for each one.
 | Assassin's Creed II | Plays, with EaglePatch |
 | Age of Empires II: HD Edition | Plays |
 | Kane & Lynch: Dead Men | Plays |
+| LEGO Indiana Jones: The Original Adventures | Starts in fullscreen with keyboard focus, 32-bit |
 | LEGO Indiana Jones 2: The Adventure Continues | Plays |
 | League of Legends 4.20 | Plays |
 | Need for Speed: Underground | Plays, 32-bit, with the Widescreen Fix |

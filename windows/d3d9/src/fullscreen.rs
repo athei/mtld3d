@@ -1,9 +1,9 @@
 //! Display mode and device-window management for a fullscreen device.
 //!
-//! A fullscreen `CreateDevice` sets the display mode the game asked for
-//! through user32, exactly as native D3D9 does, then strips the window's
-//! decoration and stretches it over the monitor rect. What it deliberately
-//! does **not** do is touch the window's z-order.
+//! A fullscreen `CreateDevice` activates the focus window, sets the display
+//! mode the game asked for through user32, exactly as native D3D9 does, then
+//! strips the window's decoration and stretches it over the monitor rect. What
+//! it deliberately does **not** do is make the window topmost.
 //!
 //! The mode-set is what keeps the game's coordinate spaces in agreement. A
 //! game sizes its rendering and its mouse handling from the mode it picked;
@@ -43,10 +43,14 @@
 //! monitor again. A `CDS_FULLSCREEN` mode-set is also undone by explorer when
 //! the process exits, so a crash cannot strand the desktop in the game's mode.
 //!
-//! The z-order is left to the window manager. Raising the window to the
-//! topmost level deadlocks Wine's mac driver: it re-derives the Cocoa window's
-//! level and parent while holding winemac's per-window lock and hops to the
-//! main thread to do it, so a focus event arriving meanwhile re-enters
+//! Activating the focus window follows native as well, at a fullscreen
+//! create and at a `Reset` from windowed to fullscreen (see
+//! [`activate_focus_window`]): it raises the window to the top of the windows
+//! that are not topmost and makes it the foreground window. Beyond that the
+//! z-order is left to the window manager. Raising the window to the topmost
+//! level deadlocks Wine's mac driver: it re-derives the Cocoa window's level
+//! and parent while holding winemac's per-window lock and hops to the main
+//! thread to do it, so a focus event arriving meanwhile re-enters
 //! `NtUserSetWindowPos` on another thread and both stall. See
 //! `apply_fullscreen_window`.
 //!
@@ -54,8 +58,8 @@
 //! half. The flag hands window management to the app, so the device leaves
 //! the window's style, rect and visibility exactly as it found them, in
 //! fullscreen as in windowed mode, and never re-covers the monitor behind
-//! the app's back. The mode is still set and restored: neither is a window
-//! change.
+//! the app's back. The mode is still set and restored, and the focus window
+//! still activated, as native D3D9 does under the flag.
 //!
 //! Only the primary display is driven, so a device whose window lives on a
 //! secondary monitor is covered by the wrong rect. Matching the window's
@@ -570,7 +574,8 @@ fn window_rect(hwnd: *mut c_void) -> Option<Rect> {
     (ok != 0).then_some(rect)
 }
 
-fn set_window_pos(hwnd: *mut c_void, insert_after: *mut c_void, rect: Rect, flags: u32) {
+/// One `SetWindowPos` call, `true` when user32 accepted it.
+fn set_window_pos(hwnd: *mut c_void, insert_after: *mut c_void, rect: Rect, flags: u32) -> bool {
     // SAFETY: SetWindowPos accepts any HWND plus a z-order pseudo-handle and
     // an arbitrary rect; failure is a window-manager concern, not a
     // memory-safety one.
@@ -583,7 +588,7 @@ fn set_window_pos(hwnd: *mut c_void, insert_after: *mut c_void, rect: Rect, flag
             rect.width(),
             rect.height(),
             flags,
-        );
+        ) != 0
     }
 }
 
@@ -872,6 +877,44 @@ fn window_changes_suppressed(saved: &SavedWindow) -> bool {
         "D3DCREATE_NOWINDOWCHANGES: the device window keeps its style, rect and visibility",
     );
     true
+}
+
+/// `SetWindowPos`'s `HWND_TOP`: the top of the windows that are not topmost.
+const HWND_TOP: *mut c_void = core::ptr::null_mut();
+
+/// Activate `focus`, the window whose focus a device going fullscreen takes.
+///
+/// D3D9 activates the focus window when a device goes fullscreen, at a
+/// fullscreen `CreateDevice` and at a `Reset` from windowed to fullscreen,
+/// whatever the window's visibility and whether or not the device manages the
+/// window: one `SetWindowPos` to `HWND_TOP` without `SWP_NOACTIVATE`, which
+/// makes it the foreground, active and focus window and sends its procedure
+/// `WM_ACTIVATE` and `WM_SETFOCUS`. `WM_ACTIVATEAPP` follows only when the
+/// activation comes from another thread's window or from none, since it
+/// marks a change of the active thread. A game that never activates its
+/// window itself gets keyboard input from this alone; without it, a window
+/// shown by `SWP_SHOWWINDOW | SWP_NOACTIVATE` is activated only if winemac
+/// happens to activate the application, and otherwise not until it is
+/// clicked.
+///
+/// The caller runs it before [`enter`] styles and shows the window, and
+/// outside any [`DrivingGuard`], so the application's procedure receives the
+/// activation messages as it does on native. A hidden window is activated
+/// too; winemac gives its Cocoa window the focus once [`enter`] shows it.
+///
+/// `HWND_TOP` raises the window among the windows that are not topmost, the
+/// same raise winemac makes whenever it activates a window that is not in
+/// front. It never makes the window topmost; the module docs say why.
+pub fn activate_focus_window(focus: *mut c_void) {
+    if set_window_pos(focus, HWND_TOP, Rect::EMPTY, SWP_NOMOVE | SWP_NOSIZE) {
+        debug!(target: LOG_TARGET, "fullscreen: focus window {focus:p} activated");
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "fullscreen: activating the focus window {focus:p} failed; it takes keyboard input \
+             only once the user activates it",
+        );
+    }
 }
 
 /// Take `hwnd` fullscreen: set `mode`, then no decoration, covering the monitor.
