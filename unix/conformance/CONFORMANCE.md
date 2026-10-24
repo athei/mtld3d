@@ -964,11 +964,17 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-24: 7 `real`, 183 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 202 unique sites in all.
+`Sites:` tokens below on 2026-10-24: 7 `real`, 181 `expected`, 3 `caps`,
+6 `ceiling`, 3 `flaky`, 0 `untriaged`, 200 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-24: a 32-bit device sets the creating thread's x87 control word
+to single precision, round to nearest and every exception masked, unless
+`D3DCREATE_FPU_PRESERVE` is passed, as D3D9 does, so test_fpu_setup 5037
+and 5047 left every i686 key and the cluster left this document. The 64-bit
+legs never carried them: a 64-bit device leaves the word alone, which is
+what those checks expect.)
 (2026-10-24: every leg moved to Wine 11.20's tests, the build arm64-11.20-1
 publishes. Against Wine 11.19's, `dlls/d3d9/tests` changes only `visual.c`:
 `test_fog` gains ten lines and `test_texture_transform_flags` loses one, so
@@ -1405,13 +1411,6 @@ Sites: 4867=expected
 
 WM_ACTIVATEAPP delivery on a windowed→fullscreen Reset; we do not
 force-show/activate the window.
-
-### device.c/test_fpu_setup
-Sites: 5037=expected 5047=expected
-
-i686 only. Native D3D9 rewrites the x87 control word to single precision
-(0x7f) at device creation and keeps it for callbacks; we deliberately never
-touch the FPU control word. On x86_64 the same checks are todo_wine (free).
 
 ### device.c/test_window_style
 Sites: 5216=expected

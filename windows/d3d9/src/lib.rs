@@ -14,6 +14,7 @@ mod direct3d9;
 mod draw;
 mod encoder;
 mod exit_code_hook;
+mod fpu;
 mod fullscreen;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 mod guest_mem;

@@ -8,6 +8,12 @@ pub const D3DSDK_VERSION: u32 = 32;
 /// `D3DCREATE_HARDWARE_VERTEXPROCESSING` — `CreateDevice` behaviour flag.
 pub const D3DCREATE_HARDWARE_VERTEXPROCESSING: u32 = 0x40;
 
+/// `CreateDevice` behaviour flag `D3DCREATE_FPU_PRESERVE`.
+///
+/// The device leaves the calling thread's x87 control word as the app set
+/// it, instead of switching it to single precision.
+pub const D3DCREATE_FPU_PRESERVE: u32 = 0x2;
+
 /// `CreateDevice` behaviour flag `D3DCREATE_MULTITHREADED`.
 ///
 /// The app may call the device and its resources from any thread; every

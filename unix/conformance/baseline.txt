@@ -45,8 +45,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -200,8 +198,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -352,8 +348,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5594 count=1
   device.c:5614 count=1
@@ -505,8 +499,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1325,8 +1317,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1479,8 +1469,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1634,8 +1622,6 @@
   device.c:4774 count=1
   device.c:4781 count=1
   device.c:4867 count=1
-  device.c:5037 count=1
-  device.c:5047 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
