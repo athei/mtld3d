@@ -978,11 +978,21 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-24: 7 `real`, 174 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 194 unique sites in all.
+`Sites:` tokens below on 2026-10-24: 7 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 197 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-24: since every size is served, smallest first, the mode
+`test_mode_change` leaves in the registry on the `@mac2` legs, where its
+restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
+runs on a 4:3 desktop on the Intel image's 16:9 display.
+`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15039
+joined both `@mac2` device keys at one, `expected` like the
+`test_mode_change` sites whose failed restore they follow, and
+`d3d9ex.c/test_wndproc` skips its mode tests there, so its eleven sites left
+both `@mac2` d3d9ex keys. CI's `record_intel_baseline` dispatch with
+`intel_only` recorded the two keys; nothing else moved.)
 (2026-10-24: a 32-bit device sets the creating thread's x87 control word
 to single precision, round to nearest and every exception masked, unless
 `D3DCREATE_FPU_PRESERVE` is passed, as D3D9 does, so test_fpu_setup 5037
@@ -1459,6 +1469,16 @@ established: the Intel CI image's display runs 3840x2160 at 30 Hz and user32
 lists 25 sizes for it, so it is not a single-mode display. Desktop mode
 switching is out of scope, so `expected`.
 
+A failed restore leaves the mode the test's own `CDS_UPDATEREGISTRY` calls
+wrote in the registry, and the persistent wineserver serves it as the desktop
+to every later test of the leg and to the later subtests. The test takes that
+mode from the served list, which is ordered smallest first: on the Intel
+image it is 800x600, the second size of at least 640x480 there. So the
+`@mac2` legs run the rest of the suite on a 4:3 desktop on a 16:9 display,
+which is what `test_cursor_clipping` 14930 and 14955 and
+`test_window_position` 15039 read, and why `d3d9ex.c/test_wndproc` skips its
+mode tests there.
+
 ### device.c/test_device_window_reset
 Sites: 5971=expected 5974=expected
 
@@ -1597,20 +1617,50 @@ succeeds. The same missing check, so the same fix moves all five sites
 (issue #1160).
 
 ### device.c/test_cursor_clipping
-Sites: 14946=ceiling
+Sites: 14930=expected 14946=ceiling 14955=expected
 
 The test creates a fullscreen device at the first served mode of at least
 640x480 that differs from the desktop mode on both axes, and the cursor clip
-must then equal the virtual screen, i.e. the mode. Under Wine's emulated
-mode-set win32u clips the foreground fullscreen window to the physical
-monitor and reports that rect mapped back into the mode, so a mode of
-another aspect than the display's has its letterbox bars inside the clip:
-640x480 on a 3456x2234 panel reads "(-51,0)-(691,480)". That is win32u's
-mapping, not ours; the device sets the mode exactly as native does. The
-served list is ordered smallest first, as a driver lists it, so the pick is
-640x480 wherever Wine lists it: 14946 fires on a display of another shape (a
-MacBook panel, the Intel image's 3840x2160) and passes on the CI runner's 4:3
-virtual display, hence `ceiling` at 1 on every leg.
+must equal the virtual screen, i.e. the desktop mode, before the create
+(14930), while the device holds the mode (14946) and after its release
+(14955). Under Wine's emulated mode-set win32u clips the foreground
+fullscreen window to the physical monitor and reports that rect mapped back
+into the mode, so a mode of another aspect than the display's has its
+letterbox bars inside the clip: 640x480 on a 3456x2234 panel reads
+"(-51,0)-(691,480)". That is win32u's mapping, not ours; the device sets the
+mode exactly as native does. The served list is ordered smallest first, as a
+driver lists it, so the pick is 640x480 wherever Wine lists it: 14946 fires
+on a display of another shape (a MacBook panel, the Intel image) and passes
+on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
+
+14930 and 14955 fire on the `@mac2` legs only. There the desktop is already
+800x600 when the test starts, the mode `test_mode_change` leaves in the
+registry when its restore fails (see that cluster), and win32u maps the
+clip with no fullscreen window the same way: on the Intel image's 3840x2160
+display it reads "(-133,0)-(933,600)" against "(0,0)-(800,600)", before the
+create and again after the release. They read 1 on every run of the Intel
+image and appear on no Apple key, and they come from the same failed restore
+as the `test_mode_change` sites, so they are `expected` like those.
+
+### device.c/test_window_position
+Sites: 15039=expected
+
+The test creates a fullscreen device at the monitor's size, shrinks the
+window by one pixel on each axis, and after the second such resize expects
+the window to keep that rect once events are processed. It fires on the
+`@mac2` legs only, where the desktop is the 800x600 mode `test_mode_change`
+leaves behind (see that cluster), which win32u scales onto the 3840x2160
+display by 3.6 with bars at both sides: the window comes back from the event
+round trip one pixel lower, "(0,1)-(799,600)" for "(0,0)-(799,599)", the
+same size. The failure message prints the monitor rect, not the rect the
+test expects, so the log reads "Expect window rect (0,0)-(800,600)". The
+device sets no mode here, the request being the desktop's own size, and a
+window the layer re-covered the monitor with would read "(0,0)-(800,600)".
+That the pixel is lost rounding the window's frame through the 3.6 scale is
+conjecture. With a desktop of the display's shape it passes, as it did on
+the Intel image while the mode left behind was 3200x1800. It reads 1 on
+every run of the Intel image and comes from the same failed restore as the
+`test_mode_change` sites, so it is `expected` like those.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15104=ceiling
@@ -2045,6 +2095,12 @@ window rather than a subclass of the focus window (2920, 2924, 3230), no
 focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from
 `CheckDeviceState` after the focus loss, the occlusion decision above.
+
+None of these sites is measured on the `@mac2` legs. There the desktop is
+the 800x600 mode `device.c/test_mode_change` leaves behind, the served list
+holds no pair of other sizes the test's pick accepts, and the test skips its
+mode tests at 2838 ("Could not find adequate modes"), so the `@mac2` keys
+carry none of these entries.
 
 ### d3d9ex.c/test_wndproc_windowed
 Sites: 3331=expected 3345=expected 3349=expected 3356=expected 3399=expected
