@@ -77,13 +77,22 @@ static PROFILES: &[AppProfile] = &[
     // far ahead the CPU can get. As with FLUSH, this profile assumes the polls
     // do not gate reuse of CPU-writable dynamic storage, which an early answer
     // cannot fence.
+    //
+    // The 1.12 client fills its resolution dropdown from `EnumDisplaySettingsA`,
+    // not `EnumAdapterModes`: it keeps every mode of at least 640x480 at 16
+    // bits or more, sorts them, and lists each size of at least 800x600 and
+    // an aspect of at least 1.248 once, whatever its depths and refresh rates.
+    // The dropdown holds 32 buttons (40 on Turtle WoW's interface), and
+    // opening Video Options with more sizes than that fails with a Lua error.
+    // Wine's emulated mode list runs to forty-odd sizes, so the profile offers
+    // at most 32; the refresh rates of each kept size do not add buttons.
     AppProfile {
         name: "wow",
         exe: "WoW.exe",
         company: Some("Blizzard Entertainment"),
         product: Some("World of Warcraft"),
         original_filename: None,
-        settings: "query.flushImmediate=true;query.eventImmediate=true",
+        settings: "query.flushImmediate=true;query.eventImmediate=true;display.maxResolutions=32",
     },
 ];
 

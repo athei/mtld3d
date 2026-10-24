@@ -340,6 +340,19 @@ pub struct DrawIndexedUpParams {
     pub index_format: u32,
 }
 
+/// Run `f` under the shared environment lock, with the suite-wide `MTLD3D_CONFIG` in force.
+///
+/// For a call that lets the layer read its configuration outside
+/// `Direct3DCreate9`: d3d9's redirect of the main module's
+/// `EnumDisplaySettings` resolves `display.maxResolutions` on its first
+/// enumeration and keeps it for the process, so that first enumeration must
+/// never see the entries a harness holds in the variable for its own
+/// interface.
+pub fn with_suite_environment<R>(f: impl FnOnce() -> R) -> R {
+    let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
 /// The suite-wide `MTLD3D_CONFIG`, read under the shared environment lock.
 ///
 /// `None` when the variable is unset. The lock keeps a harness that is

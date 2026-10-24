@@ -39,8 +39,9 @@ pub use vtbl::deref_vtbl;
 pub use win32::{
     Activation, GuardedSlice, HARNESS_PROBE_REPLY, MemorySample, Rect, WA_ACTIVE, WA_INACTIVE,
     WM_ACTIVATE, WM_ACTIVATEAPP, WM_HARNESS_PROBE, WM_HARNESS_RESTORE, WM_SIZE, WS_CAPTION,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation, create_window, cursor_is_live,
-    cursor_mask_bits, destroy_window, enumerate_display_sizes, foreground_window,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation, create_window,
+    current_display_bits_per_pel, cursor_is_live, cursor_mask_bits, destroy_window,
+    enumerate_display_sizes, enumerate_user32_display_modes, foreground_window,
     harness_window_proc, move_window_on_next_display_change, post_quit_message, pump_until_quiet,
-    send_message, set_opengl_pixel_format, set_window_pos, window_proc, window_rect,
+    send_message, set_opengl_pixel_format, set_window_pos, system_dpi, window_proc, window_rect,
 };

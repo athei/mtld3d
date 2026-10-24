@@ -49,6 +49,7 @@ impl WireValue for Mtld3dConfig {
         self.render_lod_bias.write_wire(writer)?;
         self.adapter_spoof.write_wire(writer)?;
         self.df_formats.write_wire(writer)?;
+        self.max_resolutions.write_wire(writer)?;
         Ok(())
     }
 
@@ -85,6 +86,7 @@ impl WireValue for Mtld3dConfig {
             render_lod_bias: <bool>::read_wire(reader)?,
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,
             df_formats: <bool>::read_wire(reader)?,
+            max_resolutions: <u32>::read_wire(reader)?,
         })
     }
 }

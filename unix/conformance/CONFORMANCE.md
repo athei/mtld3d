@@ -479,6 +479,17 @@ record. A knob, where one makes sense, is named with its default.
   desktop's, which was 2992x1934 and aborted the `device` subtest on
   CrossOver 27. No knob: the sizes a knob would restore end the process on
   the Wine that lists them.
+- **`display.maxResolutions` bounds the sizes a game enumerates.** Unset, as
+  in the suite, the adapter lists every settable size at every refresh rate
+  Wine lists, as a driver does. Set, `EnumAdapterModes` and the main module's
+  `EnumDisplaySettings` offer at most that many sizes, the largest by pixel
+  count and always the desktop's, each still at every rate, while a
+  fullscreen request for any settable size is still set. It exists for menus
+  built with a fixed number of entries: World of Warcraft 1.12 lists each
+  size of at least 800x600 its `EnumDisplaySettingsA` walk finds once, in a
+  dropdown of 32 buttons, and Wine's emulated list of forty-odd sizes made
+  opening Video Options fail with a Lua error. The `wow` profile sets 32. No
+  site observes it.
 - **A windowed device's `SetGammaRamp` changes nothing on screen**, and only
   the implicit swap chain carries a ramp at all. The ramp is stored and
   `GetGammaRamp` reports it back either way, and it starts applying as soon as
@@ -968,7 +979,7 @@ Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
 `Sites:` tokens below on 2026-10-24: 7 `real`, 174 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 193 unique sites in all.
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 194 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
@@ -1125,20 +1136,18 @@ top of the windows that are not topmost (test_wndproc 4203). It never makes
 the window topmost: raising the window to the topmost level deadlocks winemac
 (see test_window_style 5216).
 
-The mode list `EnumAdapterModes` serves is a bounded subset of
-`EnumDisplaySettingsW`'s (the sizes that fill the display, largest first,
-which are those win32u's uniform scale onto the physical display leaves a bar
-of less than one physical pixel for, then the standard sizes of another shape
-that user32 lists, largest first: 2560x1440, 1920x1080, 1600x900, 1280x720,
-1024x768, 800x600 and 640x480, which win32u letterboxes), so an enumerated
-mode is one win32u accepts by construction, and a fullscreen request for any
-mode in the full list is set whether or not the bounded list carries it. Both
-lists leave out the sizes win32u cannot scale the monitor to (see Kept
-divergences). The test binary, being the process's main module, enumerates the
-same sizes through its own `EnumDisplaySettingsW` import, in user32's order
-rather than the served one (d3d9 redirects it at load; user32's list is
-untouched and `ENUM_CURRENT_SETTINGS` passes through), so a mode the test
-picks from either list is one user32 accepts. When the app requests one, the
+The mode list `EnumAdapterModes` serves is `EnumDisplaySettingsW`'s at the
+desktop's colour depth: every size no larger than the desktop, each at every
+refresh rate user32 lists for it, ordered by width, height and refresh rate,
+so an enumerated mode is one win32u accepts by construction. It leaves out
+only the sizes win32u cannot scale the monitor to (see Kept divergences).
+`display.maxResolutions` can bound it to the largest sizes; the suite sets no
+bound, and a fullscreen request for any mode in the full list is set whether
+or not a bounded list carries it. The test binary, being the process's main
+module, enumerates the same sizes through its own `EnumDisplaySettingsW`
+import, in user32's order rather than the served one (d3d9 redirects it at
+load; user32's list is untouched and `ENUM_CURRENT_SETTINGS` passes through),
+so a mode the test picks from either list is one user32 accepts. When the app requests one, the
 device sets it and the back buffer is that mode; present scales it to the
 drawable, which stays at the display's size (MetalFX when enlarging, the same
 resample `render.scale` rides). Both halves of the contract then agree with
@@ -1180,11 +1189,9 @@ walk further):
   `GetAdapterDisplayMode` come from `EnumDisplaySettingsW`, the same view
   win32u validates `ChangeDisplaySettingsW` against and derives
   `GetMonitorInfoW` from, instead of `NSScreen`: the current mode for
-  `GetAdapterDisplayMode` (read live, so it follows a mode-set), a bounded
-  subset of the enumerated list for `EnumAdapterModes`, the sizes that fill
-  the display and then the standard ones (so a mode a game picks is one user32
-  accepts, the sizes that fill the display come first, and a menu built for a
-  driver's short list does not overflow). On this machine the two views agree
+  `GetAdapterDisplayMode` (read live, so it follows a mode-set) and the
+  enumerated list for `EnumAdapterModes` (so a mode a game picks is one user32
+  accepts). On this machine the two views agree
   under the pinned Retina mode; on the runner's virtual display they disagreed
   by exactly 2x (Win32 2048x1536, `NSScreen` 1024x768), which split
   `GetDisplayMode` from the monitor rect (test_get_display_mode 14488/14490)
@@ -1590,6 +1597,7 @@ succeeds. The same missing check, so the same fix moves all five sites
 (issue #1160).
 
 ### device.c/test_cursor_clipping
+Sites: 14946=ceiling
 
 The test creates a fullscreen device at the first served mode of at least
 640x480 that differs from the desktop mode on both axes, and the cursor clip
@@ -1599,11 +1607,10 @@ monitor and reports that rect mapped back into the mode, so a mode of
 another aspect than the display's has its letterbox bars inside the clip:
 640x480 on a 3456x2234 panel reads "(-51,0)-(691,480)". That is win32u's
 mapping, not ours; the device sets the mode exactly as native does. The
-cluster carries no site: the served list puts the sizes that fill the display
-first, so the pick is one of them and 14946 passes, 2624x1696 on a 3456x2234
-panel and 1600x1200 on the CI runner's 4:3 virtual display. It would fire
-only where no second size fills the display and the pick is a standard size
-of another shape.
+served list is ordered smallest first, as a driver lists it, so the pick is
+640x480 wherever Wine lists it: 14946 fires on a display of another shape (a
+MacBook panel, the Intel image's 3840x2160) and passes on the CI runner's 4:3
+virtual display, hence `ceiling` at 1 on every leg.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15104=ceiling
