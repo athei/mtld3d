@@ -993,11 +993,13 @@ the `i686` ones. Recorded locally on an Apple Silicon machine: the arm64
 Wine's six keys (`i686-arm64`, `arm64x` and their `+intel` and `+scale`
 forms) under arm64-11.20-1, and the x86_64 Wine's six Apple keys (`i686`,
 `x86_64` and their `+intel` and `+scale` forms) under cx-26.3.0-7 through
-Rosetta, the Wine CI's macos-15 image runs. The two `@mac2` keys come from
-CI's `record_intel_baseline` dispatch with `intel_only` on the branch (see
-"Running"). The flaky and ceiling pins kept their values: test_wndproc 4471
-and 4476 read 0 on every key, 4324 and 4325 read 0 on `i686` and
-`i686+intel`, and test_fetch4 15686 read 3 to 9, all tolerated.)
+Rosetta, the Wine CI's macos-15 image runs. CI's `record_intel_baseline`
+dispatch with `intel_only` on the branch recorded the two `@mac2` keys (see
+"Running"): they add 18390 at four and renumber the two moved sites like
+the Apple keys, and nothing else moved. The flaky and ceiling pins kept
+their values: test_wndproc 4471 and 4476 read 0 on every key recorded here,
+4324 and 4325 read 0 on `i686` and `i686+intel`, and test_fetch4 15686 read
+3 to 9, all tolerated.)
 (2026-10-18: every leg moved to Wine 11.19's tests, and the Apple-family
 sections of both Wines, 48 subtest-legs, were recorded against them; the
 `Sites:` tokens and the line numbers in the prose moved with the source. The
