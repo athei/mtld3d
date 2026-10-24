@@ -108,10 +108,13 @@ first of these that answers:
    tests with their `VERSION`, so every CI image compares.
 
 A run compares the header with that version and warns when they differ, and
-`make conformance-baseline` writes it into the header. When it is unknown
-the run says so in one line and compares nothing, and a re-record keeps the
-header as it is. A site the arm64 Wine moves is reclassified only on the
-evidence of a recorded run.
+`make conformance-baseline` writes it into the header. Two `git describe`
+versions that differ only in how long they abbreviate one commit's hash
+(git picks the length per repository, so a local build can read
+`...-g9c44ed65ef4` where the release reads `...-g9c44ed65ef`) agree. When it
+is unknown the run says so in one line and compares nothing, and a re-record
+keeps the header as it is. A site the arm64 Wine moves is reclassified only
+on the evidence of a recorded run.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site

@@ -199,11 +199,16 @@ pub enum VersionNote {
 /// Hold the baseline's header against the tests' Wine version.
 ///
 /// `None` when they agree or the baseline names no version (a first record).
+/// Two `git describe` versions of one commit agree whatever length each
+/// abbreviates its hash to ([`same_wine_version`]).
 #[must_use]
 pub fn tests_version_note(baseline: &Baseline, tests: Option<&str>) -> Option<VersionNote> {
     match tests {
         None => Some(VersionNote::Unknown),
-        Some(tests) if !baseline.wine_version.is_empty() && baseline.wine_version != tests => {
+        Some(tests)
+            if !baseline.wine_version.is_empty()
+                && !same_wine_version(&baseline.wine_version, tests) =>
+        {
             Some(VersionNote::Differs {
                 baseline: baseline.wine_version.clone(),
                 tests: tests.to_owned(),
@@ -211,6 +216,31 @@ pub fn tests_version_note(baseline: &Baseline, tests: Option<&str>) -> Option<Ve
         }
         Some(_) => None,
     }
+}
+
+/// Whether two Wine version strings name one build.
+///
+/// A `git describe` version ends in `-g` and an abbreviated commit hash, and
+/// git picks the abbreviation's length per repository, so one commit can read
+/// `wine-11.20-32-g9c44ed65ef` in one build of the tests and
+/// `wine-11.20-32-g9c44ed65ef4` in another. Such versions name one build when
+/// everything before the hash agrees and the shorter hash, at least seven hex
+/// digits like git's shortest, is a prefix of the longer.
+#[must_use]
+pub fn same_wine_version(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some((a_base, a_hash)), Some((b_base, b_hash))) =
+        (a.rsplit_once("-g"), b.rsplit_once("-g"))
+    else {
+        return false;
+    };
+    let is_hash = |hash: &str| hash.len() >= 7 && hash.bytes().all(|c| c.is_ascii_hexdigit());
+    a_base == b_base
+        && is_hash(a_hash)
+        && is_hash(b_hash)
+        && (a_hash.starts_with(b_hash) || b_hash.starts_with(a_hash))
 }
 
 /// The legs of `current` that `baseline` holds no entry for, for any subtest.

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{VersionNote, diff, tests_version_note, unrecorded_legs};
+use super::{VersionNote, diff, same_wine_version, tests_version_note, unrecorded_legs};
 use crate::{
     classify::Classification,
     model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
@@ -382,6 +382,34 @@ fn the_header_is_held_against_the_tests_wine_version() {
         None,
         "a baseline that names no version has nothing to compare"
     );
+}
+
+#[test]
+fn two_abbreviations_of_one_commit_are_one_tests_version() {
+    let base = baseline_of("wine-11.20-32-g9c44ed65ef");
+    assert_eq!(
+        tests_version_note(&base, Some("wine-11.20-32-g9c44ed65ef4")),
+        None
+    );
+    assert!(same_wine_version(
+        "wine-11.20-32-g9c44ed65ef4",
+        "wine-11.20-32-g9c44ed65ef"
+    ));
+    // Another commit, another distance from the tag, another tag, or a hash
+    // too short to name a commit are other versions.
+    for other in [
+        "wine-11.20-32-g9c44ed65e0",
+        "wine-11.20-33-g9c44ed65ef4",
+        "wine-11.21-32-g9c44ed65ef4",
+        "wine-11.20-32-g9c44ed",
+        "wine-11.20-32-gnothexx",
+    ] {
+        assert!(
+            !same_wine_version("wine-11.20-32-g9c44ed65ef", other),
+            "{other}"
+        );
+    }
+    assert!(!same_wine_version("wine-11.20", "wine-11.20.1"));
 }
 
 #[test]
