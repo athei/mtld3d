@@ -45,6 +45,13 @@ fn a_window_that_takes_a_kept_view_at_once_displays_it_at_the_frame_cap() {
     // in the suite's process carries every other test's presents; the
     // workload runs in a process of its own, whose only kept view is its
     // first device's.
+    //
+    // The child's shown windows take the activation from whichever window
+    // holds it, and a fullscreen device that loses it puts the registry mode
+    // back, so the display mode is held while the child runs: no fullscreen
+    // test of any process is in fullscreen meanwhile.
+    let mode = Harness::factory_only();
+    mode.hold_display_mode();
     run_in_private_log_child(
         CHILD_NAME,
         "kept_view_display::a_window_that_takes_a_kept_view_at_once_displays_it_at_the_frame_cap",

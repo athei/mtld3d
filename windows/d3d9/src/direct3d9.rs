@@ -1967,9 +1967,17 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
     // back-buffer size is resolved from the resulting client rect, and the
     // metal view is sized from the window Wine hands us at attach time, so
     // both have to see the mode in place and the window covering the monitor.
+    // The focus window is activated first, as native D3D9 does: the focus
+    // window the app named, else the device window.
     let manage_window = behavior_flags & mtld3d_types::D3DCREATE_NOWINDOWCHANGES == 0;
     let fullscreen = (pp.windowed == 0).then(|| {
         let mode = fullscreen_mode_request(&pp);
+        let focus = if focus_window.is_null() {
+            pp.device_window as *mut c_void
+        } else {
+            focus_window
+        };
+        crate::fullscreen::activate_focus_window(focus);
         crate::fullscreen::enter(hwnd as *mut c_void, manage_window, mode)
     });
 

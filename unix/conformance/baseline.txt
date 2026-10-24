@@ -12,9 +12,6 @@
 [i686/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -44,7 +41,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -132,9 +128,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -165,9 +158,6 @@
 [i686+intel/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -197,7 +187,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -286,9 +275,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -319,9 +305,6 @@
 [i686+intel@mac2/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -347,7 +330,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5594 count=1
   device.c:5614 count=1
@@ -437,9 +419,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -470,9 +449,6 @@
 [i686+scale/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -498,7 +474,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -618,9 +593,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -651,9 +623,6 @@
 [x86_64/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -681,7 +650,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -769,9 +737,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -802,9 +767,6 @@
 [x86_64+intel/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -832,7 +794,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -921,9 +882,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -954,9 +912,6 @@
 [x86_64+intel@mac2/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -982,7 +937,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5594 count=1
   device.c:5614 count=1
@@ -1072,9 +1026,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1105,9 +1056,6 @@
 [x86_64+scale/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1133,7 +1081,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1253,9 +1200,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1286,9 +1230,6 @@
 [i686-arm64/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1316,7 +1257,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1405,9 +1345,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1438,9 +1375,6 @@
 [i686-arm64+intel/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1468,7 +1402,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1558,9 +1491,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1591,9 +1521,6 @@
 [i686-arm64+scale/device] crash=1
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1621,7 +1548,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1742,9 +1668,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1775,9 +1698,6 @@
 [arm64x/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1805,7 +1725,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -1893,9 +1812,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -1926,9 +1842,6 @@
 [arm64x+intel/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -1956,7 +1869,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -2045,9 +1957,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2
@@ -2078,9 +1987,6 @@
 [arm64x+scale/device] crash=0
   device.c:3681 count=2
   device.c:3696 count=2
-  device.c:4203 count=2
-  device.c:4208 count=2
-  device.c:4210 count=2
   device.c:4215 count=2
   device.c:4219 count=2
   device.c:4244 count=2
@@ -2108,7 +2014,6 @@
   device.c:4770 count=1
   device.c:4774 count=1
   device.c:4781 count=1
-  device.c:4867 count=1
   device.c:5216 count=1
   device.c:5971 count=1
   device.c:5974 count=1
@@ -2228,9 +2133,6 @@
   d3d9ex.c:2049 count=1
   d3d9ex.c:2051 count=1
   d3d9ex.c:2153 count=1
-  d3d9ex.c:2908 count=2
-  d3d9ex.c:2913 count=2
-  d3d9ex.c:2915 count=2
   d3d9ex.c:2920 count=2
   d3d9ex.c:2924 count=2
   d3d9ex.c:2949 count=2

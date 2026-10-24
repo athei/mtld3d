@@ -15,10 +15,11 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP,
-    WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var,
-    create_window, cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes,
-    run_child, spawn_scoped, window_rect,
+    Activation, Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex,
+    WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation,
+    assert_pixel_eq, config_var, create_window, cursor_is_live, cursor_mask_bits, destroy_window,
+    enumerate_display_sizes, foreground_window, pump_until_quiet, run_child, spawn_scoped,
+    window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -3897,6 +3898,116 @@ fn fullscreen_device_restores_the_mode_on_deactivation_and_re_sets_it_on_activat
         (640, 480),
         "the window covers the monitor again",
     );
+}
+
+/// A visible window of the test's thread made the foreground window.
+///
+/// The activation a fullscreen device takes is measured against it. Its own
+/// activation is a focus change, which a fullscreen device of another test
+/// would answer by putting the registry mode back, so the caller holds the
+/// display mode first.
+///
+/// Wine's mac driver hands the activation to the Cocoa window on the main
+/// thread and reports the Cocoa focus back as an event the window's thread
+/// reads when it next looks at its queue. Such an event arriving during the
+/// device's mode-set would hand the activation back to the bystander, so the
+/// thread pumps until the Cocoa side has settled before the device is made.
+fn foreground_bystander() -> usize {
+    let bystander = create_window(320, 240, true);
+    assert!(
+        foreground_window(bystander),
+        "SetForegroundWindow on the bystander"
+    );
+    settle_activation();
+    assert_eq!(
+        activation(),
+        Activation::all(bystander),
+        "the bystander holds the activation before the device goes fullscreen",
+    );
+    bystander
+}
+
+/// Pump until no message arrives and the activation stays put for a quiet spell.
+///
+/// Gives the Cocoa side of an activation change time to report back. Capped,
+/// so a queue that never settles ends the wait and the caller's assertion
+/// reports what the activation is then.
+fn settle_activation() {
+    const QUIET: Duration = Duration::from_millis(150);
+    const CAP: Duration = Duration::from_secs(2);
+    assert!(pump_until_quiet(QUIET, CAP), "no WM_QUIT expected");
+}
+
+/// A fullscreen `CreateDevice` activates the focus window, as native D3D9 does.
+///
+/// The device is created on a hidden window, with no focus window, while
+/// another window of the thread is the foreground window. The device window
+/// then stands in for the focus window, and once the create returns it is the
+/// foreground, active and focus window: a game that never activates its own
+/// window takes keyboard input from this alone. It still is once the thread
+/// has read what the window system reported back.
+#[test]
+fn fullscreen_create_activates_the_focus_window() {
+    let h = Harness::factory_only();
+    h.hold_display_mode();
+    let bystander = foreground_bystander();
+    let mut pp = fullscreen_params(0, 640, 480);
+    let (hr, observed) = h.create_device_observed(&mut pp, |hwnd| {
+        let returned = activation();
+        settle_activation();
+        (hwnd, returned, activation())
+    });
+    destroy_window(bystander);
+    assert_eq!(hr, D3D_OK, "fullscreen CreateDevice");
+    let (hwnd, returned, settled) = observed;
+    assert_eq!(
+        returned,
+        Activation::all(hwnd),
+        "a fullscreen create activates the device window, the focus window when none is named",
+    );
+    assert_eq!(
+        settled,
+        Activation::all(hwnd),
+        "the device window keeps the activation once the thread has pumped",
+    );
+}
+
+/// A `Reset` from windowed to fullscreen activates the focus window, as a fullscreen create does.
+///
+/// The windowed device's window is hidden and another window of the thread
+/// is the foreground window. `D3DCREATE_NOWINDOWCHANGES` leaves the window's
+/// style, rect and visibility to the application, but not the activation:
+/// native D3D9 activates the focus window under the flag too.
+#[test]
+fn fullscreen_reset_activates_the_focus_window() {
+    for flags in [
+        D3DCREATE_HARDWARE_VERTEXPROCESSING,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES,
+    ] {
+        let h = Harness::create(&HarnessConfig {
+            behavior_flags: flags,
+            ..HarnessConfig::default()
+        });
+        h.hold_display_mode();
+        let bystander = foreground_bystander();
+        let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+        let hr = h.reset_params(&mut pp);
+        let returned = activation();
+        settle_activation();
+        let settled = activation();
+        destroy_window(bystander);
+        assert_eq!(hr, D3D_OK, "fullscreen Reset (flags {flags:#x})");
+        assert_eq!(
+            returned,
+            Activation::all(h.hwnd()),
+            "a Reset to fullscreen activates the device window (flags {flags:#x})",
+        );
+        assert_eq!(
+            settled,
+            Activation::all(h.hwnd()),
+            "the device window keeps the activation once the thread has pumped (flags {flags:#x})",
+        );
+    }
 }
 
 #[test]
