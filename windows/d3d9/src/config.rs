@@ -34,6 +34,22 @@ unsafe extern "system" {
 /// process that creates several interfaces gives each the options in force
 /// when it was created.
 pub fn load() -> Mtld3dConfig {
+    let cfg = resolve();
+    log_options(&cfg);
+    cfg
+}
+
+/// The `display.maxResolutions` the process's configuration resolves to now.
+///
+/// For the `EnumDisplaySettings` redirect, which serves the main module
+/// before or without any `IDirect3D9`. Resolves the same three layers an
+/// interface would, without logging every option again.
+pub fn max_resolutions() -> u32 {
+    resolve().max_resolutions
+}
+
+/// The profile, the file and the environment, combined.
+fn resolve() -> Mtld3dConfig {
     let env_override = std::env::var("MTLD3D_CONFIG")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -42,13 +58,11 @@ pub fn load() -> Mtld3dConfig {
     if let Some(env) = &env_override {
         info!(target: LOG_TARGET, "mtld3d.conf: applying MTLD3D_CONFIG overrides: {env}");
     }
-    let cfg = parse(
+    parse(
         profile,
         file_src.as_deref().unwrap_or(""),
         env_override.as_deref(),
-    );
-    log_options(&cfg);
-    cfg
+    )
 }
 
 /// The built-in profile for the executable this library was loaded into.

@@ -50,6 +50,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.render_lod_bias = !value.render_lod_bias;
     value.adapter_spoof = AdapterSpoof::Amd;
     value.df_formats = !value.df_formats;
+    value.max_resolutions = 32;
     assert_eq!(round_trip(&value), value);
 }
 

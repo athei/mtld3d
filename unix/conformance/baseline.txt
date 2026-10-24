@@ -64,6 +64,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15176 count=1
   device.c:15357 count=1
 [i686/visual] crash=0
@@ -209,6 +210,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15176 count=1
   device.c:15357 count=1
 [i686+intel/visual] crash=1
@@ -357,6 +359,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15176 count=1
   device.c:15357 count=1
 [i686+intel@mac2/visual] crash=1
@@ -497,6 +500,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15176 count=1
   device.c:15357 count=1
 [i686+scale/visual] crash=0
@@ -673,6 +677,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [x86_64/visual] crash=0
@@ -816,6 +821,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [x86_64+intel/visual] crash=1
@@ -964,6 +970,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [x86_64+intel@mac2/visual] crash=1
@@ -1104,6 +1111,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [x86_64+scale/visual] crash=0
@@ -1280,6 +1288,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
   device.c:15357 count=1
@@ -1424,6 +1433,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
   device.c:15357 count=1
@@ -1571,6 +1581,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
   device.c:15357 count=1
@@ -1748,6 +1759,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [arm64x/visual] crash=0
@@ -1891,6 +1903,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [arm64x+intel/visual] crash=1
@@ -2037,6 +2050,7 @@
   device.c:13141 count=1
   device.c:13288 count=1
   device.c:13290 count=1
+  device.c:14946 count=1
   device.c:15104 count=1
   device.c:15176 count=1
 [arm64x+scale/visual] crash=0

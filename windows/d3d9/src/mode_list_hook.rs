@@ -2,20 +2,22 @@
 //!
 //! A game that builds its resolution menu from `EnumDisplaySettings` rather
 //! than `EnumAdapterModes` (`WoW` 1.12 walks every mode the primary display
-//! reports, keeps those of at least 640x480 at 16 bits or more and lists each
-//! size once) sees the whole list a fullscreen device may set, which under
-//! Wine's `EmulateModeset` is forty-odd sizes and overflows a menu built for
-//! a driver's short list. The `EnumDisplaySettings*` imports of the process's
-//! main module are redirected here at `DllMain`: an index into the list maps
-//! onto the n-th mode whose size `EnumAdapterModes` serves, so both menu
-//! paths show one bounded list ([`served_mode_sizes`]). `ENUM_CURRENT_SETTINGS`
-//! and `ENUM_REGISTRY_SETTINGS` pass through untouched, user32's own list is
-//! never changed (a mode-set validates against all of it), and this DLL's own
-//! imports are not patched, so `fullscreen::enumerate_display_modes` keeps
-//! seeing everything. A game that resolves the entry point through
-//! `GetProcAddress` is not covered.
+//! reports and keeps those of at least 640x480 at 16 bits or more; the menu
+//! it builds from them lists each size of at least 800x600 once, as the
+//! `wow` app profile records) sees user32's whole list. The `EnumDisplaySettings*` imports of
+//! the process's main module are redirected here at `DllMain`: an index into
+//! the list maps onto the n-th mode whose size `EnumAdapterModes` serves, so
+//! both menu paths show one list ([`served_sizes`]), every depth and refresh
+//! rate of each size included. With no `display.maxResolutions` bound that
+//! leaves out only the sizes a fullscreen device may not set; with one, the
+//! menu sees the same bounded sizes `EnumAdapterModes` serves.
+//! `ENUM_CURRENT_SETTINGS` and `ENUM_REGISTRY_SETTINGS` pass through
+//! untouched, user32's own list is never changed (a mode-set validates
+//! against all of it), and this DLL's own imports are not patched, so
+//! `fullscreen::enumerate_display_modes` keeps seeing everything. A game that
+//! resolves the entry point through `GetProcAddress` is not covered.
 //!
-//! [`served_mode_sizes`]: mtld3d_core::display_mode::served_mode_sizes
+//! [`served_sizes`]: mtld3d_core::display_mode::served_sizes
 
 use core::ffi::c_void;
 use std::sync::LazyLock;
@@ -47,16 +49,20 @@ static IMPORTS: PatchedImports<HOOKS> = PatchedImports::empty();
 ///
 /// Built on the first enumeration through a patched import, from this DLL's
 /// own (unpatched) enumeration of the primary display and the sizes the
-/// adapter table serves.
+/// adapter table serves under the `display.maxResolutions` the process's
+/// configuration resolves to at that moment, the one an interface created
+/// then would get.
 static SERVED_INDICES: LazyLock<Vec<u32>> = LazyLock::new(|| {
+    let max = crate::config::max_resolutions();
     let modes = crate::fullscreen::enumerate_display_modes();
     let indices = served_mode_indices(
         modes.iter().map(|mode| (mode.width, mode.height)),
-        crate::direct3d9::served_sizes(),
+        &crate::direct3d9::served_sizes_for(max),
     );
     info!(
         target: LOG_TARGET,
-        "display-mode list filter: the main module enumerates {} of user32's {} modes",
+        "display-mode list filter: the main module enumerates {} of user32's {} modes \
+         (display.maxResolutions = {max})",
         indices.len(),
         modes.len()
     );

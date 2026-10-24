@@ -66,6 +66,7 @@ unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
+    fn GetSystemDpiForProcess(process: *mut c_void) -> u32;
     fn SetWindowPos(
         hwnd: usize,
         insert_after: usize,
@@ -1063,8 +1064,27 @@ pub fn registry_display_mode() -> (u32, u32) {
     display_settings(ENUM_REGISTRY_SETTINGS, "ENUM_REGISTRY_SETTINGS")
 }
 
+/// The colour depth of the primary display's current mode, in bits per pixel.
+///
+/// The depth whose modes d3d9 builds its adapter mode table from.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+#[must_use]
+pub fn current_display_bits_per_pel() -> u32 {
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    display_settings_mode(ENUM_CURRENT_SETTINGS, "ENUM_CURRENT_SETTINGS").bits_per_pel
+}
+
 /// The size `EnumDisplaySettingsW` answers for one of its two pseudo-indices.
 fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
+    let dm = display_settings_mode(mode_num, name);
+    (dm.pels_width, dm.pels_height)
+}
+
+/// The mode `EnumDisplaySettingsW` answers for one of its two pseudo-indices.
+fn display_settings_mode(mode_num: u32, name: &str) -> DevModeW {
     // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
     // valid value.
     let mut dm: DevModeW = unsafe { core::mem::zeroed() };
@@ -1073,7 +1093,7 @@ fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
     // and `dm` is an owned local with `size` set per the API contract.
     let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
     assert!(ok != 0, "EnumDisplaySettingsW({name}) failed");
-    (dm.pels_width, dm.pels_height)
+    dm
 }
 
 /// Every size the primary display enumerates through this binary's own user32 import.
@@ -1084,21 +1104,93 @@ fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
 /// redirects for the process's main module.
 #[must_use]
 pub fn enumerate_display_sizes() -> Vec<(u32, u32)> {
-    let mut sizes = Vec::new();
+    // The walk can be the redirect's first enumeration, which latches the
+    // process's `display.maxResolutions`, so it reads under the suite-wide
+    // configuration only.
+    crate::harness::with_suite_environment(|| walk_display_modes(EnumDisplaySettingsW, None))
+        .into_iter()
+        .map(|(size, _)| size)
+        .collect()
+}
+
+/// Every mode the primary display enumerates at `bits_per_pel` through user32's own entry point.
+///
+/// As `((width, height), refresh_hz)`, in user32's order. The same walk as
+/// [`enumerate_display_sizes`], kept to the modes of one colour depth,
+/// through the address `GetProcAddress` resolves in `user32.dll` rather than
+/// this binary's import, so the list is user32's whole one, which d3d9's
+/// redirect of the main module's import leaves untouched.
+///
+/// # Panics
+///
+/// Panics if `user32.dll` is not loaded or exports no `EnumDisplaySettingsW`.
+#[must_use]
+pub fn enumerate_user32_display_modes(bits_per_pel: u32) -> Vec<((u32, u32), u32)> {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    let user32 = unsafe { GetModuleHandleA(c"user32.dll".as_ptr()) };
+    assert_ne!(user32, 0, "user32.dll is not loaded");
+    // SAFETY: kernel32 export; `user32` is a loaded module and the name is NUL-terminated.
+    let entry = unsafe { GetProcAddress(user32, c"EnumDisplaySettingsW".as_ptr()) };
+    assert!(
+        !entry.is_null(),
+        "user32.dll exports no EnumDisplaySettingsW"
+    );
+    // SAFETY: `entry` is user32's `EnumDisplaySettingsW`, whose signature is
+    // the function-pointer type it is turned into.
+    let enumerate = unsafe {
+        core::mem::transmute::<
+            *mut c_void,
+            unsafe extern "system" fn(*const u16, u32, *mut DevModeW) -> i32,
+        >(entry)
+    };
+    walk_display_modes(enumerate, Some(bits_per_pel))
+}
+
+/// The system DPI this process sees (`GetSystemDpiForProcess`).
+///
+/// The DPI win32u scales the monitor by after a mode-set, as d3d9 reads it
+/// to decide which sizes it may serve, with d3d9's fallback to 96 when the
+/// call answers 0.
+#[must_use]
+pub fn system_dpi() -> u32 {
+    const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+    // SAFETY: kernel32 export that takes no arguments and returns the
+    // current-process pseudo-handle.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: user32 export; `process` is the current-process pseudo-handle.
+    let dpi = unsafe { GetSystemDpiForProcess(process) };
+    if dpi == 0 {
+        USER_DEFAULT_SCREEN_DPI
+    } else {
+        dpi
+    }
+}
+
+/// The size and rate of every mode `enumerate` lists for the primary display, from index 0 on.
+///
+/// With `bits_per_pel`, only the modes of that colour depth.
+fn walk_display_modes(
+    enumerate: unsafe extern "system" fn(*const u16, u32, *mut DevModeW) -> i32,
+    bits_per_pel: Option<u32>,
+) -> Vec<((u32, u32), u32)> {
+    let mut modes = Vec::new();
     for mode_num in 0..u32::MAX {
         // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
         // valid value.
         let mut dm: DevModeW = unsafe { core::mem::zeroed() };
         dm.size = DEV_MODE_SIZE;
-        // SAFETY: Win32 thunk; a null device name selects the primary display
-        // and `dm` is an owned local with `size` set per the API contract.
-        let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+        // SAFETY: `enumerate` is an `EnumDisplaySettingsW`; a null device name
+        // selects the primary display and `dm` is an owned local with `size`
+        // set per the API contract.
+        let ok = unsafe { enumerate(core::ptr::null(), mode_num, &raw mut dm) };
         if ok == 0 {
             break;
         }
-        sizes.push((dm.pels_width, dm.pels_height));
+        if bits_per_pel.is_none_or(|bpp| dm.bits_per_pel == bpp) {
+            modes.push(((dm.pels_width, dm.pels_height), dm.display_frequency));
+        }
     }
-    sizes
+    modes
 }
 
 /// The primary display's current resolution (`SM_CXSCREEN` / `SM_CYSCREEN`).

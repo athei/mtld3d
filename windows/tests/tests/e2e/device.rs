@@ -13,13 +13,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_core::display_mode::MAX_SERVED_SIZES;
+use mtld3d_core::display_mode::{
+    drop_unscalable_sizes, listed_modes, physical_extent, select_mode_sizes, served_modes,
+    served_sizes,
+};
 use mtld3d_tests::{
     Activation, Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex,
     WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation,
-    assert_pixel_eq, config_var, create_window, cursor_is_live, cursor_mask_bits, destroy_window,
-    enumerate_display_sizes, foreground_window, pump_until_quiet, run_child, spawn_scoped,
-    window_rect,
+    assert_pixel_eq, config_var, create_window, current_display_bits_per_pel, cursor_is_live,
+    cursor_mask_bits, destroy_window, enumerate_display_sizes, enumerate_user32_display_modes,
+    foreground_window, pump_until_quiet, run_child, spawn_scoped, system_dpi, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -116,30 +119,12 @@ fn adapter_mode_enumeration() {
 fn the_main_module_enumerates_the_sizes_the_adapter_serves() {
     // The test binary is the process's main module, so its own
     // EnumDisplaySettingsW import is the one d3d9 redirects: the list it
-    // walks is user32's, thinned to the sizes EnumAdapterModes serves, each
-    // still at every depth and rate user32 lists it. The current mode stays
-    // readable through the same import.
+    // walks is user32's, kept to the sizes EnumAdapterModes serves, each
+    // still at every depth and rate user32 lists it. The suite sets no
+    // display.maxResolutions, so that is every size a fullscreen device may
+    // set. The current mode stays readable through the same import.
     let h = Harness::factory_only();
-    let mut served = Vec::new();
-    for index in 0..h.adapter_mode_count(D3DFMT_X8R8G8B8) {
-        let mut mode = D3DDISPLAYMODE {
-            width: 0,
-            height: 0,
-            refresh_rate: 0,
-            format: 0,
-        };
-        assert_eq!(
-            h.enum_adapter_modes(D3DFMT_X8R8G8B8, index, &mut mode),
-            D3D_OK,
-            "EnumAdapterModes({index})"
-        );
-        served.push((mode.width, mode.height));
-    }
-    assert!(
-        served.len() <= MAX_SERVED_SIZES,
-        "EnumAdapterModes serves at most the bound: {served:?}"
-    );
-
+    let served = served_modes_of(&h);
     let enumerated = enumerate_display_sizes();
     assert!(
         !enumerated.is_empty(),
@@ -147,21 +132,89 @@ fn the_main_module_enumerates_the_sizes_the_adapter_serves() {
     );
     for size in &enumerated {
         assert!(
-            served.contains(size),
+            served.iter().any(|(served_size, _)| served_size == size),
             "the main module enumerated {size:?}, which EnumAdapterModes does not serve"
         );
     }
-    let mut distinct = enumerated;
-    distinct.sort_unstable();
-    distinct.dedup();
-    assert!(
-        distinct.len() <= MAX_SERVED_SIZES,
-        "the main module enumerates more sizes than the bound: {distinct:?}"
-    );
+    for (size, _) in &served {
+        assert!(
+            enumerated.contains(size),
+            "EnumAdapterModes serves {size:?}, which the main module does not enumerate"
+        );
+    }
     let current = Harness::current_display_mode();
     assert!(
         current.0 > 0 && current.1 > 0,
         "ENUM_CURRENT_SETTINGS still answers"
+    );
+}
+
+#[test]
+fn enum_adapter_modes_serves_every_settable_size_at_every_listed_rate() {
+    // With no display.maxResolutions bound EnumAdapterModes serves every
+    // size of user32's own list (read past the main module's redirected
+    // import) at the desktop's colour depth that a fullscreen device may set,
+    // at every refresh rate user32 lists for it, by size and then rate. The
+    // desktop is the largest size on both axes, so it comes last. A rate
+    // user32 leaves at 0 or 1 reads as the desktop's, and the desktop's own
+    // mode is listed whatever user32 lists for its size.
+    let h = Harness::factory_only();
+    // Held so the adapter display mode read below is the desktop's, which the
+    // table was built from, and no other test's fullscreen mode.
+    h.hold_display_mode();
+    let served = served_modes_of(&h);
+    let &(desktop, _) = served.last().expect("EnumAdapterModes serves the desktop");
+    let mut current = D3DDISPLAYMODE {
+        width: 0,
+        height: 0,
+        refresh_rate: 0,
+        format: 0,
+    };
+    assert_eq!(h.adapter_display_mode(&mut current), D3D_OK);
+    assert_eq!(
+        (current.width, current.height),
+        desktop,
+        "the adapter display mode is the desktop's while the mode is held"
+    );
+    let listed = enumerate_user32_display_modes(current_display_bits_per_pel());
+    let listed_sizes: Vec<(u32, u32)> = listed.iter().map(|&(size, _)| size).collect();
+    let physical = physical_extent(desktop, listed_sizes.iter().copied());
+    let dpi = system_dpi();
+    let mut settable = select_mode_sizes(desktop, listed_sizes.iter().copied());
+    drop_unscalable_sizes(&mut settable, physical, dpi);
+    let modes = listed_modes(listed.iter().copied(), (desktop, current.refresh_rate));
+    let expected = served_modes(modes, &served_sizes(&settable, 0));
+    assert_eq!(
+        served, expected,
+        "EnumAdapterModes on a {physical:?} display at {dpi} dpi, user32 listing {listed:?}"
+    );
+    assert!(
+        served.iter().any(|&(size, _)| size == (640, 480)) || !settable.contains(&(640, 480)),
+        "user32 lists 640x480 and EnumAdapterModes leaves it out: {served:?}"
+    );
+}
+
+#[test]
+fn a_display_max_resolutions_bound_serves_the_largest_sizes_at_every_rate() {
+    // An interface whose configuration bounds the list to three sizes serves
+    // the three largest of those an unbounded one serves, by pixel count,
+    // the desktop among them, each at every rate the unbounded list carries.
+    let unbounded = served_modes_of(&Harness::factory_only());
+    let bounded = served_modes_of(&Harness::factory_only_with_config(
+        "display.maxResolutions=3",
+    ));
+    let &(desktop, _) = unbounded
+        .last()
+        .expect("the unbounded list serves the desktop");
+    // `served_sizes` takes the desktop as the first settable size.
+    let sizes: Vec<(u32, u32)> = core::iter::once(desktop)
+        .chain(unbounded.iter().map(|&(size, _)| size))
+        .collect();
+    let expected = served_modes(unbounded.iter().copied(), &served_sizes(&sizes, 3));
+    assert_eq!(bounded, expected, "unbounded list {unbounded:?}");
+    assert!(
+        bounded.iter().any(|&(size, _)| size == desktop),
+        "the bound leaves out the desktop {desktop:?}: {bounded:?}"
     );
 }
 
@@ -2394,6 +2447,26 @@ fn resized_drawable_workload() {
 /// mode tests have nothing to measure there.
 fn display_lists_640x480() -> bool {
     enumerate_display_sizes().contains(&(640, 480))
+}
+
+/// Every `X8R8G8B8` mode `EnumAdapterModes` serves, as `((width, height), hz)`, in its order.
+fn served_modes_of(h: &Harness) -> Vec<((u32, u32), u32)> {
+    (0..h.adapter_mode_count(D3DFMT_X8R8G8B8))
+        .map(|index| {
+            let mut mode = D3DDISPLAYMODE {
+                width: 0,
+                height: 0,
+                refresh_rate: 0,
+                format: 0,
+            };
+            assert_eq!(
+                h.enum_adapter_modes(D3DFMT_X8R8G8B8, index, &mut mode),
+                D3D_OK,
+                "EnumAdapterModes({index})"
+            );
+            ((mode.width, mode.height), mode.refresh_rate)
+        })
+        .collect()
 }
 
 /// Present parameters for a fullscreen Reset at `width`x`height`.

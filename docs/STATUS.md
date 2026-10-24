@@ -339,11 +339,12 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes
-  the primary display only and serves first the sizes that fill it (a bar
-  of less than one physical pixel once win32u has scaled them onto it), then
-  the standard sizes of another shape that user32 lists for it (2560x1440
-  down to 640x480), which win32u letterboxes in fullscreen, and nothing else
-  of user32's list. No knob.
+  the primary display only. No knob.
+- With `display.maxResolutions` set, the adapter mode list and the main
+  module's `EnumDisplaySettings` offer at most that many sizes, the largest
+  ones and always the desktop's, where a driver lists every mode it has. The
+  World of Warcraft profile sets it to 32, the entries its resolution menu
+  holds. `display.maxResolutions`, off by default.
 - A windowed device's `SetGammaRamp` is stored and reported back but changes
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.

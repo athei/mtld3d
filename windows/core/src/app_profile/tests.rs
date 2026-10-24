@@ -66,9 +66,12 @@ fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answers() {
         let stock = parse(None, "", None);
         assert!(!stock.query_flush_immediate);
         assert!(!stock.query_event_immediate);
+        assert_eq!(stock.max_resolutions, 0);
         let profiled = parse(Some(profile), "", None);
         assert!(profiled.query_flush_immediate);
         assert!(profiled.query_event_immediate);
+        // The resolution dropdown holds 32 buttons, one per size.
+        assert_eq!(profiled.max_resolutions, 32);
     }
     let nameless = AppIdentity::new("WoW.exe".to_owned(), None);
     assert!(lookup(&nameless).is_none());

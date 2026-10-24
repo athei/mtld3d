@@ -151,41 +151,6 @@ pub fn mode_set_attempts(request: ModeRequest) -> impl Iterator<Item = ModeReque
     core::iter::once(request).chain(without_rate)
 }
 
-/// How many sizes `EnumAdapterModes` serves at most, per adapter format.
-///
-/// Era games size their resolution menus for a driver's list, and Wine's
-/// Win32 view under `EmulateModeset` is long: the panel's own modes plus a
-/// synthesised bank of standard sizes, 43 sizes on a 3456x2234 MBP.
-/// `WoW` 1.12's video-options dropdown holds 32 buttons (40 on
-/// Turtle `WoW`) and overflowed with a Lua error once that many sizes were
-/// served at each of the two adapter formats; the fixed bank this list
-/// replaced came to 16 sizes on that display, 32 entries, and never
-/// overflowed. 15 per format keeps both formats under the 32 with a slot to
-/// spare. [`served_mode_sizes`] cuts its list at the bound from the end, so
-/// the standard sizes go first, smallest first, and then the smallest sizes
-/// that fill the display. The bound is on what a menu shows, not on what a
-/// fullscreen request may set.
-pub const MAX_SERVED_SIZES: usize = 15;
-
-// Two adapter formats inside the 32-button menu named above.
-const _: () = assert!(MAX_SERVED_SIZES * 2 < 32);
-
-/// The standard sizes [`served_mode_sizes`] lists after those that fill the display.
-///
-/// A size is served only when user32 lists it for the display and it is
-/// settable, so this adds no mode of its own: it picks from Win32's list the
-/// sizes a game's menu is expected to offer whatever the display's shape.
-/// The order here, largest first, is the order they are served in.
-const STANDARD_SIZES: [(u32, u32); 7] = [
-    (2560, 1440),
-    (1920, 1080),
-    (1600, 900),
-    (1280, 720),
-    (1024, 768),
-    (800, 600),
-    (640, 480),
-];
-
 /// The bound on the reduced numerator of win32u's monitor scale ratio.
 ///
 /// win32u packs the numerator and the denominator of that ratio into 16 bits
@@ -200,8 +165,8 @@ const MONITOR_RATIO_LIMIT: u64 = 1 << 16;
 /// more pixels than it has, whatever a mode list says) and degenerate sizes.
 /// A size of any aspect stays: win32u letterboxes a mode whose aspect is not
 /// the display's. The result is never empty: a list that filters down to
-/// nothing holds the desktop mode alone. [`served_mode_sizes`] bounds what
-/// games enumerate from it.
+/// nothing holds the desktop mode alone. [`served_sizes`] picks what games
+/// enumerate from it.
 pub fn select_mode_sizes(
     current: (u32, u32),
     candidates: impl IntoIterator<Item = (u32, u32)>,
@@ -273,42 +238,87 @@ pub fn drop_unscalable_sizes(
     dropped
 }
 
-/// The sizes `EnumAdapterModes` serves: those that fill the display, then the standard sizes.
+/// The sizes `EnumAdapterModes` serves, from the settable ones: smallest first, at most `max`.
 ///
-/// The desktop (the first entry, which doubles as the adapter display mode)
-/// comes first whatever its shape, then the other sizes that fill the
-/// `physical` display (scaled onto it they leave a bar of less than one
-/// physical pixel), largest first, then the standard sizes in the list that
-/// do not fill it (2560x1440, 1920x1080, 1600x900, 1280x720, 1024x768,
-/// 800x600 and 640x480), largest first, at most `max` in all. Under Wine's
-/// `EmulateModeset` win32u scales a mode uniformly onto the display and
-/// centres it, so a mode of another shape is letterboxed with the desktop
-/// showing in the bars. The sizes that fill the display therefore come first,
-/// and the standard sizes follow as further window sizes to pick from.
-/// `physical` is [`physical_extent`]'s answer: under `EmulateModeset` the
-/// extent win32u scales a mode onto, and without it the largest extent on
-/// each axis of the driver's own list. The sizes are the primary display's,
-/// the only one this layer describes. Every other settable size stays
-/// settable for a game's own config, since this never touches
-/// [`select_mode_sizes`]' list. A `max` of 0 still serves the desktop.
+/// Every settable size is served, ordered by width and then height as a
+/// display driver lists its modes, unless `max` is non-zero and smaller than
+/// the number of sizes. The bound then keeps the `max` largest sizes by pixel
+/// count, ties going to the wider size, and always keeps the desktop (the
+/// first entry of `settable`), which is the adapter display mode. The
+/// largest sizes stay because they are the display's own and the ones a
+/// bounded menu is least able to do without; the smallest go first. The
+/// bound is on what a menu shows, not on what a fullscreen request may set,
+/// since this never touches [`select_mode_sizes`]' list. `max` comes from
+/// `display.maxResolutions`, 0 for no bound.
 #[must_use]
-pub fn served_mode_sizes(
-    settable: &[(u32, u32)],
-    physical: (u32, u32),
-    max: usize,
-) -> Vec<(u32, u32)> {
-    let Some((&desktop, rest)) = settable.split_first() else {
+pub fn served_sizes(settable: &[(u32, u32)], max: usize) -> Vec<(u32, u32)> {
+    let Some(&desktop) = settable.first() else {
         return Vec::new();
     };
-    let filling = largest_first(rest, |size| fills_display(size, physical));
-    let standard = STANDARD_SIZES
+    let mut sizes = settable.to_vec();
+    sizes.sort_unstable();
+    sizes.dedup();
+    if max == 0 || sizes.len() <= max {
+        return sizes;
+    }
+    let mut by_area = sizes;
+    by_area.sort_unstable_by_key(|&size| Reverse((pixels(size), size)));
+    by_area.truncate(max);
+    if !by_area.contains(&desktop) {
+        by_area.pop();
+        by_area.push(desktop);
+    }
+    by_area.sort_unstable();
+    by_area
+}
+
+/// The refresh rate a Win32 mode means: its own, or `fallback` for Win32's "default" of 0 or 1.
+///
+/// `EnumDisplaySettings` reports 0 or 1 for a display whose rate it does not
+/// know; neither is a rate a game can ask for.
+#[must_use]
+pub const fn effective_refresh(hz: u32, fallback: u32) -> u32 {
+    if hz > 1 { hz } else { fallback }
+}
+
+/// The modes the adapter reads from Win32's list at the desktop's colour depth.
+///
+/// Each listed `((width, height), refresh_hz)` with its rate passed through
+/// [`effective_refresh`] against the desktop's rate, followed by the desktop
+/// mode itself, which a display that lists its own size only at other rates
+/// would otherwise leave out. Unsorted and possibly repeated; [`served_modes`]
+/// orders and dedups.
+#[must_use]
+pub fn listed_modes(
+    listed: impl IntoIterator<Item = ((u32, u32), u32)>,
+    desktop: ((u32, u32), u32),
+) -> Vec<((u32, u32), u32)> {
+    let (_, desktop_hz) = desktop;
+    listed
         .into_iter()
-        .filter(|&size| !fills_display(size, physical) && rest.contains(&size));
-    core::iter::once(desktop)
-        .chain(filling)
-        .chain(standard)
-        .take(max.max(1))
+        .map(|(size, hz)| (size, effective_refresh(hz, desktop_hz)))
+        .chain(core::iter::once(desktop))
         .collect()
+}
+
+/// The modes `EnumAdapterModes` serves: every listed refresh rate of each served size.
+///
+/// `modes` is the Win32 list as `((width, height), refresh_hz)` at the
+/// desktop's colour depth. Each mode whose size is in `served` is kept once,
+/// ordered by width, then height, then refresh rate, lowest first, so each
+/// size's rates sit together the way a driver lists them.
+#[must_use]
+pub fn served_modes(
+    modes: impl IntoIterator<Item = ((u32, u32), u32)>,
+    served: &[(u32, u32)],
+) -> Vec<((u32, u32), u32)> {
+    let mut kept: Vec<((u32, u32), u32)> = modes
+        .into_iter()
+        .filter(|(size, _)| served.contains(size))
+        .collect();
+    kept.sort_unstable();
+    kept.dedup();
+    kept
 }
 
 /// The positions in a mode list of the modes whose size is served.
@@ -330,40 +340,8 @@ pub fn served_mode_indices(
         .collect()
 }
 
-/// Whether a mode of `size` covers a display of `physical` pixels with no visible bar.
-///
-/// win32u scales a mode uniformly onto the physical display, as far as the
-/// tighter axis allows, and centres it. The mode covers the display when
-/// the bar left on the other axis, both sides together, is under one
-/// physical pixel: win32u rounds each edge of the scaled rectangle to a
-/// pixel, and half of less than one pixel rounds to none. A panel's own
-/// scaled modes pass although integer rounding leaves their aspects a hair
-/// apart (2624x1696 on 3456x2234 leaves a quarter of a pixel). A zero extent
-/// on either side fills nothing.
-fn fills_display(size: (u32, u32), physical: (u32, u32)) -> bool {
-    let (w, h) = (u64::from(size.0), u64::from(size.1));
-    let (phys_w, phys_h) = (u64::from(physical.0), u64::from(physical.1));
-    if w == 0 || h == 0 || phys_w == 0 || phys_h == 0 {
-        return false;
-    }
-    if w * phys_h >= h * phys_w {
-        // Fitted to the width: the bar is `phys_h - h * phys_w / w` rows.
-        phys_h * w - h * phys_w < w
-    } else {
-        // Fitted to the height: the bar is `phys_w - w * phys_h / h` columns.
-        phys_w * h - w * phys_h < h
-    }
-}
-
 fn pixels((w, h): (u32, u32)) -> u64 {
     u64::from(w) * u64::from(h)
-}
-
-/// The sizes `keep` accepts, largest first, ties in list order.
-fn largest_first(sizes: &[(u32, u32)], keep: impl Fn((u32, u32)) -> bool) -> Vec<(u32, u32)> {
-    let mut kept: Vec<(u32, u32)> = sizes.iter().copied().filter(|&size| keep(size)).collect();
-    kept.sort_by_key(|&size| Reverse(pixels(size)));
-    kept
 }
 
 /// One axis of [`monitor_ratio_fits`].

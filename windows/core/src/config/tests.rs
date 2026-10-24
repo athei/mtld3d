@@ -120,6 +120,25 @@ fn present_max_fps_garbage_keeps_default() {
 }
 
 #[test]
+fn display_max_resolutions_defaults_to_every_size_and_takes_a_count() {
+    assert_eq!(parse(None, "", None).max_resolutions, 0);
+    let cfg = parse(None, "display.maxResolutions = 32\n", None);
+    assert_eq!(cfg.max_resolutions, 32);
+    let cleared = parse(
+        None,
+        "display.maxResolutions = 32\n",
+        Some("display.maxResolutions=0"),
+    );
+    assert_eq!(cleared.max_resolutions, 0);
+    let garbage = parse(
+        None,
+        "display.maxResolutions = 32\ndisplay.maxResolutions = all\n",
+        None,
+    );
+    assert_eq!(garbage.max_resolutions, 32);
+}
+
+#[test]
 fn present_max_frame_latency_takes_a_frame_count() {
     assert_eq!(
         parse(None, "present.maxFrameLatency = 1\n", None).present_max_frame_latency,

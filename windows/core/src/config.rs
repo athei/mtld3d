@@ -331,6 +331,18 @@ pub struct Mtld3dConfig {
     /// the plain `INTZ` route (`INTZ` stays advertised). Default:
     /// `true`. File key: `caps.dfFormats`.
     pub df_formats: bool,
+    /// The most display sizes the adapter offers a game, `0` for every size.
+    ///
+    /// By default `EnumAdapterModes` and the main module's
+    /// `EnumDisplaySettings` offer every size Wine lists and a fullscreen
+    /// device can set, at every refresh rate, as a display driver does. Wine's
+    /// list under `EmulateModeset` runs to forty-odd sizes, which overflows a
+    /// resolution menu built with a fixed number of entries. A non-zero value
+    /// offers at most that many sizes, the largest ones and always the desktop,
+    /// each still at every refresh rate. Only what a game enumerates shrinks:
+    /// a fullscreen request for any size Wine lists is still set. Default:
+    /// `0`. File key: `display.maxResolutions`.
+    pub max_resolutions: u32,
 }
 
 /// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
@@ -418,6 +430,7 @@ impl Default for Mtld3dConfig {
             render_lod_bias: true,
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
+            max_resolutions: 0,
         }
     }
 }
@@ -617,6 +630,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: caps.dfFormats = {}", cfg.df_formats
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: display.maxResolutions = {}", cfg.max_resolutions
+    );
 }
 
 /// How `present.maxFrameLatency` reads in the log: `auto` for `0`, the frame count otherwise.
@@ -698,6 +715,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
+        "display.maxResolutions" => {
+            assign_count(source, key, value, &mut cfg.max_resolutions);
+        }
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
@@ -775,6 +795,19 @@ fn assign_cap_mb(source: &str, key: &str, value: &str, slot: &mut u64) {
             target: crate::LOG_TARGET,
             "{source}: '{key} = {value}' is not a non-negative integer (MiB) → kept {kept}",
             kept = *slot / (1024 * 1024)
+        );
+    }
+}
+
+fn assign_count(source: &str, key: &str, value: &str, slot: &mut u32) {
+    // A count, `0` meaning no limit.
+    if let Ok(count) = value.parse::<u32>() {
+        *slot = count;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: '{key} = {value}' is not a non-negative integer → kept {kept}",
+            kept = *slot
         );
     }
 }
