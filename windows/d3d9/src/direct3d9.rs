@@ -2227,6 +2227,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
             "CreateDevice: D3DCREATE_MULTITHREADED, device entry points serialised"
         );
     }
+    crate::fpu::apply_device_control_word(behavior_flags);
     info!(target: LOG_TARGET, "CreateDevice succeeded (extended={extended})");
     D3D_OK
 }

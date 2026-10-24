@@ -46,6 +46,7 @@ pub mod fetch4;
 pub mod ff_state;
 pub mod format;
 pub mod format_probe;
+pub mod fpu;
 pub mod frame_latency;
 pub mod fullscreen_log;
 pub mod fullscreen_resize;

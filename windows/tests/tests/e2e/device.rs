@@ -977,6 +977,94 @@ fn cooperative_level_ok() {
     );
 }
 
+/// An x87 control word whose precision and rounding fields differ from a device's.
+///
+/// Extended precision and truncation, with every exception masked so the
+/// harness's own x87 work cannot fault while it is in place.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const FOREIGN_X87_CONTROL_WORD: u16 = 0x0f7f;
+
+/// The x87 control word a thread starts with.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DEFAULT_X87_CONTROL_WORD: u16 = 0x027f;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn device_creation_sets_the_x87_control_word_unless_told_to_preserve_it() {
+    use mtld3d_tests::Factory;
+    use mtld3d_types::D3DCREATE_FPU_PRESERVE;
+
+    // A 32-bit device leaves single precision, round to nearest and every
+    // exception masked; a 64-bit device leaves the word alone.
+    let device_word = if cfg!(target_arch = "x86") {
+        0x007f
+    } else {
+        FOREIGN_X87_CONTROL_WORD
+    };
+    let creates = [
+        (Factory::Plain, "CreateDevice"),
+        (Factory::ExtendedDeviceEx, "CreateDeviceEx"),
+    ];
+    let flag_cases = [
+        (D3DCREATE_HARDWARE_VERTEXPROCESSING, device_word),
+        (
+            D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE,
+            FOREIGN_X87_CONTROL_WORD,
+        ),
+    ];
+    for (factory, create) in creates {
+        for (behavior_flags, expected) in flag_cases {
+            set_x87_control_word(FOREIGN_X87_CONTROL_WORD);
+            let h = Harness::create(&HarnessConfig {
+                behavior_flags,
+                factory,
+                ..HarnessConfig::default()
+            });
+            let after_create = x87_control_word();
+            drop(h);
+            let after_release = x87_control_word();
+            set_x87_control_word(DEFAULT_X87_CONTROL_WORD);
+            assert_eq!(
+                after_create, expected,
+                "{create} with flags {behavior_flags:#x} left control word {after_create:#06x}"
+            );
+            assert_eq!(
+                after_release, expected,
+                "releasing the device from {create} with flags {behavior_flags:#x} changed the \
+                 control word to {after_release:#06x}"
+            );
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x87_control_word() -> u16 {
+    let mut word: u16 = 0;
+    // SAFETY: `fnstcw` stores the 16-bit control word through the pointer,
+    // which names `word`, a live writable `u16`.
+    unsafe {
+        core::arch::asm!(
+            "fnstcw word ptr [{}]",
+            in(reg) &raw mut word,
+            options(nostack, preserves_flags),
+        );
+    }
+    word
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn set_x87_control_word(word: u16) {
+    // SAFETY: `fldcw` reads the 16-bit control word from `word`, a live `u16`;
+    // the callers' words mask every exception, so loading one raises none.
+    unsafe {
+        core::arch::asm!(
+            "fldcw word ptr [{}]",
+            in(reg) &raw const word,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+}
+
 #[test]
 fn failed_auto_resize_requires_a_reset_before_presenting() {
     const WM_SIZE: u32 = 0x0005;
