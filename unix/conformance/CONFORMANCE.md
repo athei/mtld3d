@@ -91,7 +91,7 @@ before. A key with no entries yet makes its
 leg's run report every failing site as new and fail, and the runner says so
 in one line naming the key and `make conformance-baseline`. The header's
 `Wine:` line is one for the file and names the build of the tests every
-section was recorded against, `wine-11.19-17-gd57b522eea5`: the version of
+section was recorded against, `wine-11.20-32-g9c44ed65ef`: the version of
 the Wine the tests were built from, never of the Wine that runs them. The
 Makefile tells the runner that version (`--tests-wine-version`) from the
 first of these that answers:
@@ -189,7 +189,7 @@ The test binaries are the `{i386,x86_64}-windows/d3d9_test.exe` of
 wine-build's arm64 Wine release, under its `lib/wine/tests`, and every leg
 runs that one build whichever Wine it runs under: a site is named by its
 `file:line`, which moves between Wine versions (the x86_64 Wine cx-26.3.0-7
-ships Wine 11.0's tests, the arm64 Wine arm64-11.19-2 Wine 11.19's), so one
+ships Wine 11.0's tests, the arm64 Wine arm64-11.20-1 Wine 11.20's), so one
 classification list can only serve one build of the tests, and a PE test
 runs under any Wine. `WINE_TESTS` names the directory. Under the arm64 Wine
 it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
@@ -947,8 +947,9 @@ they disagree. When a re-baseline adds or removes sites, update the matching
 cluster block (and its rationale) in the same commit.
 
 Line numbers refer to the build of the tests the baseline header names,
-Wine 11.19's (`wine-11.19-17-gd57b522eea5`), including the dated notes below,
-which were renumbered from Wine 11.0's lines with the rest. (2026-10-18: the
+Wine 11.20's (`wine-11.20-32-g9c44ed65ef`, arm64-11.20-1's), including the
+dated notes below, which were renumbered from Wine 11.0's and then Wine
+11.19's lines with the rest. (2026-10-18: the
 header moved from `wine-11.19-17-ge2e42653b41`, arm64-11.19-1's, to
 arm64-11.19-2's without a re-record: the two Wine commits differ only in
 winebuild, and `dlls/d3d9/tests` is the same in both, so every site and count
@@ -963,11 +964,40 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-18: 6 `real`, 183 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 201 unique sites in all.
+`Sites:` tokens below on 2026-10-24: 7 `real`, 183 `expected`, 3 `caps`,
+6 `ceiling`, 3 `flaky`, 0 `untriaged`, 202 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
-note below says.
+2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-24: every leg moved to Wine 11.20's tests, the build arm64-11.20-1
+publishes. Against Wine 11.19's, `dlls/d3d9/tests` changes only `visual.c`:
+`test_fog` gains ten lines and `test_texture_transform_flags` loses one, so
+the two sites after them move nine lines later, test_generated_texcoords
+from 29153 to 29162 and test_blit_format_conversion from 29210 to 29219,
+and no other site moves. Three `todo_wine` marks go, or no longer apply to
+us: the one on the `fog_special_test` check of the unfogged side, the one on
+the `test_fog` checks of the fixed-function table fog under an orthogonal
+projection, which now covers only an adapter of vendor 0x10de and device
+0x0041, and the one on the `test_texture_transform_flags` check of a
+projected `D3DTTFF_COUNT1` coordinate. The runner counts a failure inside a
+todo block apart and never gates on it, so the first adds
+`fog_special_test` 18390, `real`, at four on every Apple key; the checks
+under the other two pass. A `stretchrect_test` check whose `==` bound
+tighter than its `?:` now compares what it meant to and passes for the
+runner: on tests 7, 9, 15, 17, 23, 25 and 31 it is still under
+`todo_wine_if` and prints `Test succeeded inside todo block`, which the
+runner does not count. The pin move also brings a loadable d3d12.dll (from
+arm64-11.19-3 on), so `init_d3d9on12_modules` 15104 reads 1 on every arm64
+Wine key; on the x86_64 Wine it still reads 1 on the `x86_64` keys and 0 on
+the `i686` ones. Recorded locally on an Apple Silicon machine: the arm64
+Wine's six keys (`i686-arm64`, `arm64x` and their `+intel` and `+scale`
+forms) under arm64-11.20-1, and the x86_64 Wine's six Apple keys (`i686`,
+`x86_64` and their `+intel` and `+scale` forms) under cx-26.3.0-7 through
+Rosetta, the Wine CI's macos-15 image runs. The two `@mac2` keys come from
+CI's `record_intel_baseline` dispatch with `intel_only` on the branch (see
+"Running"). The flaky and ceiling pins kept their values: test_wndproc 4471
+and 4476 read 0 on every key, 4324 and 4325 read 0 on `i686` and
+`i686+intel`, and test_fetch4 15686 read 3 to 9, all tolerated.)
 (2026-10-18: every leg moved to Wine 11.19's tests, and the Apple-family
 sections of both Wines, 48 subtest-legs, were recorded against them; the
 `Sites:` tokens and the line numbers in the prose moved with the source. The
@@ -977,7 +1007,7 @@ read, and the flaky and ceiling pins the cluster prose names. The 11.19 tests
 add eight sites in five clusters: the six `real` ones of
 `test_lockable_backbuffer`, `test_swapchain_multisample_reset` and
 `test_generated_texcoords`, the `expected` 15357 of
-`test_device_vtbl_initialization_assembly_hook` and the `caps` 29210 of
+`test_device_vtbl_initialization_assembly_hook` and the `caps` 29219 of
 `test_blit_format_conversion`. Two of them end their subtest in a fault, so
 every i686 `device` leg and every `+intel` `visual` leg records `crash=1`;
 both are the subtest's last test and the clusters say why. The desktop-mode
@@ -1187,12 +1217,15 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-Two defects, both first observed by the Wine 11.19 tests:
+Three defects. Two were first observed by the Wine 11.19 tests:
 `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` accepted with a multisampled
 back buffer (`device.c/test_lockable_backbuffer` and
 `device.c/test_swapchain_multisample_reset`, five sites, issue #1160), and
 the sign of the `D3DTSS_TCI_SPHEREMAP` denominator
-(`visual.c/test_generated_texcoords`, one site, issue #1161).
+(`visual.c/test_generated_texcoords`, one site, issue #1161). The third was
+first counted by the Wine 11.20 tests: linear table fog with equal start and
+end fogs the whole primitive (`visual.c/fog_special_test`, one site, issue
+#1169).
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
@@ -1574,10 +1607,16 @@ counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
 Metal. Ceiling, not expected, because the site only fires where the Wine
 build ships a loadable d3d12.dll: the win_skip sits after the three
 LoadLibrary calls, and a failed load takes a plain `skip()` that counts
-nothing. The x86_64 Wine (cx-26.3.0-7) ships a d3d12.dll the 64-bit test
-process loads and reads 1 on its `x86_64` legs; the arm64 Wine and every
-i686 leg read 0. Not test-source drift: every leg runs the same build of the
-tests, so the difference is the Wine's own d3d12.
+nothing. wine-build's arm64 Wine ships a d3d12.dll that both the i386 and
+the x86_64 test process load from arm64-11.19-3 on (vkd3d-proton, in the
+dxmt tree its default rules select), so every arm64 Wine key reads 1:
+`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms. On the x86_64
+Wine (cx-26.3.0-7) only the 64-bit test process loads one, so its `x86_64`
+keys read 1 and its `i686` keys 0. Not test-source drift: every leg runs the
+same build of the tests, so the difference is the Wine's own d3d12.
+Exporting a stub `Direct3DCreate9On12` would not clear it: `test_d3d9on12`
+calls the function and checks what it creates, so the failures would move
+there.
 
 ### device.c/test_d3d9on12
 Sites: 15176=expected
@@ -1673,6 +1712,25 @@ No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
 returns its source, the zero vector the test's hardware gives, so it passes.
 The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
 device encodes its own way (0x00808000; `def1` reads the same value there).
+
+### visual.c/fog_special_test
+Sites: 18390=real
+
+Linear table fog with `D3DRS_FOGSTART` equal to `D3DRS_FOGEND` (both 0.5)
+over a quad whose depth runs from 0 on the left to 1 on the right. D3D9
+leaves the coordinates below the end unfogged and fogs those above it, a
+step at the end, so the left probe expects the green vertex colour and the
+right one the red fog colour. The four table-fog cases (4 to 7: fixed
+function and shader vertex and pixel stages in every combination) read
+`0x00ff0000` on the left: the pixel stage's linear table fog
+(`windows/core/src/dxso/emit.rs`) answers a factor of 0, fully fogged,
+whenever the range is zero, so the whole quad takes the fog colour. The
+right probes and the vertex-fog cases 0 to 3, which fog everything, pass.
+Earlier builds of the tests marked this check `todo_wine`, which the runner
+does not count; the Wine 11.20 build wine-build ships drops the mark, since
+its wined3d gives the step, so the site is new with that build and not a
+change in mtld3d. A defect, read on every Apple key of both Wines, issue
+#1169.
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
 Sites: 5088=expected 5167=expected 6032=expected 18835=expected
@@ -1787,7 +1845,7 @@ without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
 
 ### visual.c/test_generated_texcoords
-Sites: 29153=real
+Sites: 29162=real
 
 The `D3DTSS_TCI_SPHEREMAP` row reads `0x00757d00` where `0x00836900` is
 expected; the camera-space position, normal and reflection-vector rows
@@ -1798,7 +1856,7 @@ geometry evaluated with that formula gives the value read, and with
 same sign we do. A defect, on every leg of both Wines, issue #1161.
 
 ### visual.c/test_blit_format_conversion
-Sites: 29210=caps
+Sites: 29219=caps
 
 Intel legs only. Test 2 creates an R5G6B5 render-target texture as the
 `StretchRect` destination without asking `CheckDeviceFormat` first. On a
