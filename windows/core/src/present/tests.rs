@@ -350,7 +350,8 @@ fn an_interval_that_names_no_interval_is_refused() {
 fn a_lockable_back_buffer_is_refused_only_when_multisampled() {
     use mtld3d_types::{
         D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
-        D3DMULTISAMPLE_NONMASKABLE, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DSWAPEFFECT_DISCARD,
+        D3DMULTISAMPLE_NONMASKABLE, D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL,
+        D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DSWAPEFFECT_DISCARD,
     };
 
     use super::{present_flags_are_valid, present_params_are_valid};
@@ -380,8 +381,8 @@ fn a_lockable_back_buffer_is_refused_only_when_multisampled() {
         assert!(present_params_are_valid(&pp, true));
     }
     // Other flag bits beside the lockable one change nothing.
-    pp.flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER | 0x2;
+    pp.flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER | D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL;
     assert!(!present_flags_are_valid(&pp));
-    pp.flags = 0x2;
+    pp.flags = D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL;
     assert!(present_flags_are_valid(&pp));
 }

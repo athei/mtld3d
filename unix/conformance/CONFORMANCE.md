@@ -992,9 +992,13 @@ this document. The arm64 Wine's six keys were recorded locally on an Apple
 Silicon machine and moved by those five sites alone; the re-record's drop of
 the flaky test_wndproc 4471 and 4476 and its lower test_fetch4 15686 reads
 were not taken, as their clusters say. The fix is a check of the present
-parameters on the API thread that no Wine, translator or GPU takes part in,
-so the five sites were taken out of the x86_64 Wine's six keys and the two
-`@mac2` keys at the same time, for CI's runs to confirm.)
+parameters on the API thread, before any Wine, translator or GPU takes part
+and independent of the `intel.*` answers and `render.scale`, so the five
+sites were taken out of the x86_64 Wine's six keys and the two `@mac2` keys
+by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
+macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
+CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
+so those four stay unconfirmed until a local run under the x86_64 Wine.)
 (2026-10-24: since every size is served, smallest first, the mode
 `test_mode_change` leaves in the registry on the `@mac2` legs, where its
 restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
