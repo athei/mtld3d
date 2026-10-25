@@ -345,3 +345,44 @@ fn an_interval_that_names_no_interval_is_refused() {
     assert!(!present_params_are_valid(&pp, false));
     assert!(!present_params_are_valid(&pp, true));
 }
+
+#[test]
+fn a_lockable_back_buffer_is_refused_only_when_multisampled() {
+    use mtld3d_types::{
+        D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
+        D3DMULTISAMPLE_NONMASKABLE, D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL,
+        D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DSWAPEFFECT_DISCARD,
+    };
+
+    use super::{present_flags_are_valid, present_params_are_valid};
+    let mut pp = present_params(D3DSWAPEFFECT_DISCARD, 1);
+    for samples in [
+        D3DMULTISAMPLE_NONE,
+        D3DMULTISAMPLE_NONMASKABLE,
+        D3DMULTISAMPLE_2_SAMPLES,
+        D3DMULTISAMPLE_4_SAMPLES,
+    ] {
+        pp.multi_sample_type = samples;
+        pp.flags = 0;
+        assert!(present_flags_are_valid(&pp), "type {samples}, not lockable");
+    }
+    pp.flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+    pp.multi_sample_type = D3DMULTISAMPLE_NONE;
+    assert!(present_flags_are_valid(&pp), "lockable, single-sampled");
+    for samples in [
+        D3DMULTISAMPLE_NONMASKABLE,
+        D3DMULTISAMPLE_2_SAMPLES,
+        D3DMULTISAMPLE_4_SAMPLES,
+    ] {
+        pp.multi_sample_type = samples;
+        assert!(!present_flags_are_valid(&pp), "lockable, type {samples}");
+        // The swap-effect, count and interval rules do not read the flags.
+        assert!(present_params_are_valid(&pp, false));
+        assert!(present_params_are_valid(&pp, true));
+    }
+    // Other flag bits beside the lockable one change nothing.
+    pp.flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER | D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL;
+    assert!(!present_flags_are_valid(&pp));
+    pp.flags = D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL;
+    assert!(present_flags_are_valid(&pp));
+}

@@ -8,8 +8,8 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3DDEVTYPE_HAL, D3DDISPLAYMODEEX, D3DDISPLAYMODEFILTER, D3DPRESENT_PARAMETERS,
-    IDirect3D9ExVtbl, IDirect3DDevice9ExVtbl, LUID,
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DDEVTYPE_HAL, D3DDISPLAYMODEEX, D3DDISPLAYMODEFILTER,
+    D3DPRESENT_PARAMETERS, IDirect3D9ExVtbl, IDirect3DDevice9ExVtbl, LUID,
 };
 
 use super::{Factory, Harness, HarnessConfig};
@@ -226,6 +226,29 @@ impl Harness {
             ..HarnessConfig::default()
         };
         super::present_params(&cfg, self.hwnd)
+    }
+
+    /// [`Harness::create_device_hr`] through `IDirect3D9Ex::CreateDeviceEx`, with no display mode.
+    ///
+    /// # Panics
+    /// Panics on a plain harness, or if the back-buffer size does not fit a
+    /// window's `i32` extent.
+    pub fn create_device_ex_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        assert!(
+            self.factory != Factory::Plain,
+            "CreateDeviceEx needs an extended harness"
+        );
+        let d3d9 = self.d3d9;
+        Self::create_device_through(
+            pp,
+            |pp, device| {
+                // SAFETY: `d3d9` is the live interface `Direct3DCreate9Ex` made,
+                // checked above, and `device` is a writable out slot.
+                unsafe { create_device_ex(d3d9, D3DCREATE_HARDWARE_VERTEXPROCESSING, pp, device) }
+            },
+            |_| (),
+        )
+        .0
     }
 
     /// `ResetEx` with `pp` and an optional display mode.

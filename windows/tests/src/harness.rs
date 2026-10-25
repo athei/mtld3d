@@ -3543,25 +3543,47 @@ impl Harness {
         pp: &mut D3DPRESENT_PARAMETERS,
         observe: impl FnOnce(usize) -> R,
     ) -> (i32, R) {
+        let create = self.factory_vtbl().create_device;
+        Self::create_device_through(
+            pp,
+            |pp, device| {
+                // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device`
+                // are writable for the call and a null focus window is permitted.
+                unsafe {
+                    create(
+                        self.d3d9,
+                        0,
+                        D3DDEVTYPE_HAL,
+                        core::ptr::null_mut(),
+                        D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                        core::ptr::from_mut(pp).cast::<c_void>(),
+                        device,
+                    )
+                }
+            },
+            observe,
+        )
+    }
+
+    /// One device create of `pp` into a hidden window of its own, through `create`.
+    ///
+    /// `create` gets the parameters and the device out slot; the rest is
+    /// [`Self::create_device_observed`].
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    fn create_device_through<R>(
+        pp: &mut D3DPRESENT_PARAMETERS,
+        create: impl FnOnce(&mut D3DPRESENT_PARAMETERS, *mut *mut c_void) -> i32,
+        observe: impl FnOnce(usize) -> R,
+    ) -> (i32, R) {
         let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
         let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
         let hwnd =
             win32::create_styled_window(width, height, false, &win32::WindowStyle::Borderless);
         pp.device_window = hwnd;
         let mut device: *mut c_void = core::ptr::null_mut();
-        // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device` are
-        // writable for the call and a null focus window is permitted.
-        let hr = unsafe {
-            (self.factory_vtbl().create_device)(
-                self.d3d9,
-                0,
-                D3DDEVTYPE_HAL,
-                core::ptr::null_mut(),
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
-                core::ptr::from_mut(pp).cast::<c_void>(),
-                &raw mut device,
-            )
-        };
+        let hr = create(pp, &raw mut device);
         let observed = observe(hwnd);
         if !device.is_null() {
             // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.

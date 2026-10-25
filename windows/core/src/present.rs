@@ -5,9 +5,10 @@
 //! on top of it; the user's `present.maxFps` rides the same ceiling.
 
 use mtld3d_types::{
-    D3DPRESENT_BACK_BUFFERS_MAX, D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_DEFAULT,
-    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_COPY,
+    D3DMULTISAMPLE_NONE, D3DPRESENT_BACK_BUFFERS_MAX, D3DPRESENT_BACK_BUFFERS_MAX_EX,
+    D3DPRESENT_INTERVAL_DEFAULT, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
+    D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DSWAPEFFECT_COPY,
     D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIPEX,
 };
 
@@ -76,6 +77,22 @@ pub const fn present_params_are_valid(pp: &D3DPRESENT_PARAMETERS, extended: bool
             | D3DPRESENT_INTERVAL_FOUR
             | D3DPRESENT_INTERVAL_IMMEDIATE
     )
+}
+
+/// Validate the presentation flags against the back buffer's multisample type.
+///
+/// The `CreateDevice`, `CreateAdditionalSwapChain` and `Reset` contract on
+/// both kinds of device; `false` is the call's `D3DERR_INVALIDCALL`. A
+/// multisampled surface cannot be locked, so `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`
+/// together with any `MultiSampleType` but `D3DMULTISAMPLE_NONE`
+/// (`D3DMULTISAMPLE_NONMASKABLE` included) asks for a back buffer that cannot
+/// exist. A `Reset` checks this apart from [`present_params_are_valid`]: it is
+/// refused where the new swap chain is built, after a plain device's state
+/// returned to its defaults, so the device then needs another `Reset`.
+#[must_use]
+pub const fn present_flags_are_valid(pp: &D3DPRESENT_PARAMETERS) -> bool {
+    pp.flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER == 0
+        || pp.multi_sample_type == D3DMULTISAMPLE_NONE
 }
 
 #[must_use]

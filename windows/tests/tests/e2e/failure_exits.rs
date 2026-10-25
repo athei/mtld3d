@@ -4,16 +4,19 @@
 //! Metal with a descriptor it aborts on: a texture or surface past the extent
 //! the device reports, a lock rect whose offset overflows a 32-bit pointer, an
 //! additional swap chain with nowhere to go or present parameters the device
-//! refuses. It checks the `HRESULT`, then has
+//! refuses, a lockable back buffer that is also multisampled. It checks the
+//! `HRESULT`, then has
 //! the device clear, present and read a pixel back, so a refusal that left
 //! something half made, or let the request through to Metal, fails here.
 
 use mtld3d_tests::{Factory, Harness, HarnessConfig, Texture, TexturedVertex};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_BACK_BUFFERS_MAX, D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_IMMEDIATE,
-    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DSWAPEFFECT_COPY,
+    D3D_OK, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8,
+    D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES,
+    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_BACK_BUFFERS_MAX,
+    D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_PARAMETERS,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DSWAPEFFECT_COPY,
     D3DSWAPEFFECT_FLIPEX, D3DUSAGE_RENDERTARGET,
 };
 
@@ -308,4 +311,131 @@ fn an_additional_swap_chain_with_invalid_present_parameters_is_refused() {
         drop(chain);
         assert_device_draws(h, "additional swap chain parameters");
     }
+}
+
+/// A lockable back buffer that is also multisampled is refused by every create and `Reset`.
+///
+/// `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with `D3DMULTISAMPLE_4_SAMPLES` is
+/// `D3DERR_INVALIDCALL` from `CreateDevice` on a plain and an extended
+/// interface, from `CreateDeviceEx`, and from `CreateAdditionalSwapChain` on
+/// both kinds of device, which makes no chain and takes no device reference;
+/// the flag alone and the sample count alone each create. A plain device's
+/// `Reset` to a lockable 2x back buffer is refused and leaves
+/// `D3DERR_DEVICENOTRESET` until a `Reset` succeeds. An extended device's
+/// `Reset` and `ResetEx` are refused too and owe no `Reset`.
+#[test]
+fn a_lockable_multisampled_back_buffer_is_refused() {
+    let plain = Harness::new();
+    let extended = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        ..HarnessConfig::default()
+    });
+    for (h, is_extended) in [(&plain, false), (&extended, true)] {
+        let (width, height) = h.dims();
+        let valid = h.windowed_present_params(width, height);
+        let refused = D3DPRESENT_PARAMETERS {
+            flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+            multi_sample_type: D3DMULTISAMPLE_4_SAMPLES,
+            ..valid
+        };
+        let accepted = [
+            (
+                "lockable alone",
+                D3DPRESENT_PARAMETERS {
+                    flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+                    ..valid
+                },
+            ),
+            (
+                "4x alone",
+                D3DPRESENT_PARAMETERS {
+                    multi_sample_type: D3DMULTISAMPLE_4_SAMPLES,
+                    ..valid
+                },
+            ),
+        ];
+
+        let mut pp = refused;
+        assert_eq!(
+            h.create_device_hr(&mut pp),
+            D3DERR_INVALIDCALL,
+            "CreateDevice"
+        );
+        if is_extended {
+            let mut pp = refused;
+            assert_eq!(
+                h.create_device_ex_hr(&mut pp),
+                D3DERR_INVALIDCALL,
+                "CreateDeviceEx"
+            );
+        }
+        for (case, mut pp) in accepted {
+            assert_eq!(h.create_device_hr(&mut pp), D3D_OK, "CreateDevice, {case}");
+        }
+
+        let before = h.device_refcount();
+        let mut pp = refused;
+        let (hr, chain) = h.try_additional_swapchain(&mut pp);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "CreateAdditionalSwapChain");
+        assert!(chain.is_none(), "no chain is made");
+        assert_eq!(h.device_refcount(), before, "no device reference");
+        for (case, mut pp) in accepted {
+            let (hr, chain) = h.try_additional_swapchain(&mut pp);
+            assert_eq!(hr, D3D_OK, "CreateAdditionalSwapChain, {case}");
+            drop(chain);
+        }
+        assert_device_draws(h, "lockable multisampled creates");
+    }
+
+    let (width, height) = plain.dims();
+    let mut pp = D3DPRESENT_PARAMETERS {
+        flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        multi_sample_type: D3DMULTISAMPLE_2_SAMPLES,
+        ..plain.windowed_present_params(width, height)
+    };
+    assert_eq!(plain.reset_params(&mut pp), D3DERR_INVALIDCALL, "Reset");
+    assert_eq!(
+        plain.test_cooperative_level(),
+        D3DERR_DEVICENOTRESET,
+        "the refused Reset leaves a Reset owed"
+    );
+    pp.flags = 0;
+    assert_eq!(plain.reset_params(&mut pp), D3D_OK, "Reset to 2x alone");
+    assert_eq!(
+        plain.test_cooperative_level(),
+        D3D_OK,
+        "the Reset recovered"
+    );
+    pp.flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+    pp.multi_sample_type = D3DMULTISAMPLE_NONE;
+    assert_eq!(
+        plain.reset_params(&mut pp),
+        D3D_OK,
+        "Reset to lockable alone"
+    );
+    assert_device_draws(&plain, "after the Resets");
+
+    let (width, height) = extended.dims();
+    let mut pp = D3DPRESENT_PARAMETERS {
+        flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        multi_sample_type: D3DMULTISAMPLE_2_SAMPLES,
+        ..extended.windowed_present_params(width, height)
+    };
+    assert_eq!(
+        extended.reset_params(&mut pp),
+        D3DERR_INVALIDCALL,
+        "an extended Reset"
+    );
+    assert_eq!(
+        extended.reset_ex(&mut pp, None),
+        D3DERR_INVALIDCALL,
+        "ResetEx"
+    );
+    assert_eq!(
+        extended.test_cooperative_level(),
+        D3D_OK,
+        "an extended device owes no Reset"
+    );
+    assert_eq!(extended.present_ex(0), D3D_OK, "PresentEx after them");
+    assert_device_draws(&extended, "after the refused Resets");
 }

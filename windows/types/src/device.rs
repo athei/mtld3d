@@ -877,6 +877,7 @@ pub struct D3DCAPS9 {
 // D3DPRESENTFLAG_* bits for D3DPRESENT_PARAMETERS::flags. Only the
 // LOCKABLE_BACKBUFFER bit is honoured today (WoW portrait read-back path).
 pub const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER: u32 = 0x0000_0001;
+pub const D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL: u32 = 0x0000_0002;
 
 // D3DPRESENT_INTERVAL_* values of D3DPRESENT_PARAMETERS::PresentationInterval.
 // All but DEFAULT double as the bits of D3DCAPS9::PresentationIntervals; DEFAULT

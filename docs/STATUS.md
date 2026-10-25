@@ -159,7 +159,8 @@ unless its entry says otherwise.
   surface, as D3D9 does.
 - Additional swap chains: `CreateAdditionalSwapChain` checks the swap
   effect, the back-buffer count and the presentation interval as
-  `CreateDevice` and `Reset` do, for the kind of device it is called on, and
+  `CreateDevice` and `Reset` do, for the kind of device it is called on,
+  refuses a lockable back buffer that is also multisampled as they do, and
   its object carries its own present parameters, but its `GetBackBuffer`
   hands back a surface object of its own over the device's back-buffer
   texture and its `Present` presents the device frame into the device

@@ -978,11 +978,27 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-24: 7 `real`, 177 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 197 unique sites in all.
+`Sites:` tokens below on 2026-10-25: 2 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 192 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
+`Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
+multisampled back buffer, and a plain device's refused `Reset` leaves it
+needing another, so test_lockable_backbuffer 13133, 13136 and 13141 and
+test_swapchain_multisample_reset 13288 and 13290 pass and both clusters left
+this document. The arm64 Wine's six keys were recorded locally on an Apple
+Silicon machine and moved by those five sites alone; the re-record's drop of
+the flaky test_wndproc 4471 and 4476 and its lower test_fetch4 15686 reads
+were not taken, as their clusters say. The fix is a check of the present
+parameters on the API thread, before any Wine, translator or GPU takes part
+and independent of the `intel.*` answers and `render.scale`, so the five
+sites were taken out of the x86_64 Wine's six keys and the two `@mac2` keys
+by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
+macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
+CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
+so those four stay unconfirmed until a local run under the x86_64 Wine.)
 (2026-10-24: since every size is served, smallest first, the mode
 `test_mode_change` leaves in the registry on the `@mac2` legs, where its
 restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
@@ -1247,15 +1263,11 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-Three defects. Two were first observed by the Wine 11.19 tests:
-`D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` accepted with a multisampled
-back buffer (`device.c/test_lockable_backbuffer` and
-`device.c/test_swapchain_multisample_reset`, five sites, issue #1160), and
-the sign of the `D3DTSS_TCI_SPHEREMAP` denominator
-(`visual.c/test_generated_texcoords`, one site, issue #1161). The third was
-first counted by the Wine 11.20 tests: linear table fog with equal start and
-end fogs the whole primitive (`visual.c/fog_special_test`, one site, issue
-#1169).
+Two defects. One was first observed by the Wine 11.19 tests: the sign of the
+`D3DTSS_TCI_SPHEREMAP` denominator (`visual.c/test_generated_texcoords`, one
+site, issue #1161). The other was first counted by the Wine 11.20 tests:
+linear table fog with equal start and end fogs the whole primitive
+(`visual.c/fog_special_test`, one site, issue #1169).
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
@@ -1591,30 +1603,6 @@ incompatible with that design, which we keep. Site 12819 is the same pointer
 layout assertion across six cube faces and their mip levels. Cube staging is
 also one PageBox per subresource so a face or mip can rename independently.
 Per-subresource pixel data is correct.
-
-### device.c/test_lockable_backbuffer
-Sites: 13133=real 13136=real 13141=real
-
-`D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` together with a multisampled back buffer
-must be refused with `D3DERR_INVALIDCALL`, since a multisampled surface
-cannot be locked. 13133 asks `CreateAdditionalSwapChain` for it with four
-samples and 13141 `CreateDevice`; both read "Unexpected hr 0". 13136 follows
-from 13133: the swap chain that should not exist holds a device reference,
-so the release reads "Device has 1 references left". The present-parameter
-check every create and reset shares
-(`mtld3d_core::present::present_params_are_valid`) never reads `Flags`, where
-wined3d refuses the combination in `wined3d_swapchain_desc_validate_flags`.
-A defect, on every leg of both Wines, issue #1160.
-
-### device.c/test_swapchain_multisample_reset
-Sites: 13288=real 13290=real
-
-The `Reset` counterpart of `test_lockable_backbuffer`: 13288 resets a
-two-sample swap chain with `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` and expects
-`D3DERR_INVALIDCALL`, and 13290 expects the `D3DERR_DEVICENOTRESET` a
-rejected `Reset` latches; both read `S_OK`/`D3D_OK` because the `Reset`
-succeeds. The same missing check, so the same fix moves all five sites
-(issue #1160).
 
 ### device.c/test_cursor_clipping
 Sites: 14930=expected 14946=ceiling 14955=expected

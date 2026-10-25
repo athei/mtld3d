@@ -1932,6 +1932,15 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         );
         return D3DERR_INVALIDCALL;
     }
+    if !mtld3d_core::present::present_flags_are_valid(&pp) {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER with MultiSampleType {}, a \
+             multisampled back buffer cannot be locked",
+            pp.multi_sample_type,
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // An auto depth-stencil the depth answers refuse is refused here too,
     // before the window or the display mode moves. A format of 0 keeps
     // standing for no depth-stencil.
