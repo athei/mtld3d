@@ -9043,9 +9043,10 @@ impl FrameEncoder {
     ///
     /// They merge with the live-cache handles the caller already collected.
     /// Returns the held backings (both `PageBox` and `Arc<PageBox>`
-    /// variants), then `wait_for_gpu_idle`. The visibility pool is drained
-    /// after that wait, and the intake that finalizes the queries counting
-    /// into it runs between the two. A span the application left open is not
+    /// variants). It first waits for the GPU (`wait_for_gpu_idle`) and runs
+    /// the intake that finalizes the queries, which can queue free
+    /// visibility buffers for retention; then it drains the retention queue,
+    /// and the visibility pool last. A span the application left open is not
     /// finalized by either: the submit ahead of this cut it at its own
     /// boundary, and the next `begin_frame` reopens it against the fresh
     /// buffer, so the drain takes the buffers and leaves the open set. Does
@@ -9060,6 +9061,14 @@ impl FrameEncoder {
         textures: &mut Vec<u64>,
     ) -> HeldBackings {
         let mut held = HeldBackings::default();
+        self.wait_for_gpu_idle();
+        // Finalize before the pool goes: the wait has retired the frame that
+        // carried the last `Issue(END)`, and the drain below takes the slot
+        // arrays its counts are summed from. A query left `Pending` here is
+        // one the application still holds and can only ever read as `S_FALSE`.
+        // The intake queues the free visibility buffers past the pool's cap
+        // for retention, so it runs before the retention queue is drained.
+        self.intake_visibility();
         while let Some(entry) = self.pending_resource_retention.pop_front() {
             if entry.handle != 0 {
                 match entry.kind {
@@ -9094,12 +9103,10 @@ impl FrameEncoder {
         if let Some(page_box) = fan.backing {
             held.pageboxes.push(RetainedPages::Page(page_box));
         }
-        self.wait_for_gpu_idle();
-        // Finalize before the pool goes: the wait has retired the frame that
-        // carried the last `Issue(END)`, and the drain below takes the slot
-        // arrays its counts are summed from. A query left `Pending` here is
-        // one the application still holds and can only ever read as `S_FALSE`.
-        self.intake_visibility();
+        debug_assert!(
+            self.pending_resource_retention.is_empty(),
+            "nothing queues retention between the drain and the pool's"
+        );
         for vis_buf in self.visibility.drain_all_buffers() {
             let (page_box, handle, _seq) = vis_buf.into_parts();
             if !handle.is_null() {

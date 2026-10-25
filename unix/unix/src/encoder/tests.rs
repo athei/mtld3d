@@ -823,3 +823,75 @@ fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
     );
     drop(enc);
 }
+
+/// Visibility buffers the shutdown's own intake lets go of are destroyed by that shutdown.
+///
+/// Twenty frames retire a visibility buffer each and no intake has run yet,
+/// so the intake that finalizes the queries at shutdown frees them all and
+/// queues the four past the pool's cap of sixteen for retention. That
+/// intake runs before the retention queue is drained, so nothing is left in
+/// it and the retained-bytes gauge reads zero again.
+#[test]
+fn shutdown_destroys_the_visibility_buffers_its_intake_lets_go_of() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use mtld3d_core::{config::Mtld3dConfig, gpu_caps::GpuCaps, visibility::MIN_BUFFER_SLOTS};
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    // Nothing is submitted, so every frame's sequence (0) has retired.
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+
+    for _ in 0..20 {
+        let buf = enc
+            .provide_visibility_buffer(MIN_BUFFER_SLOTS)
+            .expect("a visibility buffer on the default device");
+        enc.visibility.install_first_buffer(buf);
+        enc.visibility.retire_frame_buffers(0);
+        enc.visibility.reset_frame();
+    }
+    assert!(enc.pending_resource_retention.is_empty());
+
+    enc.shutdown_cleanup();
+    assert!(
+        enc.pending_resource_retention.is_empty(),
+        "the buffers the intake let go of were destroyed with the rest"
+    );
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "shutdown takes back the bytes of the buffers it queued"
+    );
+    drop(enc);
+}

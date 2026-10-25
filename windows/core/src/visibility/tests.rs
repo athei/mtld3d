@@ -142,7 +142,7 @@ fn intake_sums_a_span_counted_up_to_the_last_slot_of_a_device_size_buffer() {
     late.end(1, 2);
     state.push_pending(1, late.clone(), (5_000, BUFFER_SLOTS_256K), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(early.get_u32(), 11);
     assert_eq!(late.get_u32(), 324, "every slot up to the last one");
 }
@@ -279,7 +279,7 @@ fn a_span_open_across_a_spill_sums_the_slots_of_both_buffers() {
     assert_eq!(retired_mut(&mut state, 1, 0).reserved, MIN_BUFFER_SLOTS);
     assert_eq!(retired_mut(&mut state, 1, 1).reserved, 2);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(closed.get_u32(), 5, "the span inside the first buffer");
     assert_eq!(spanning.status(), QueryStatus::Issued);
     assert_eq!(
@@ -509,13 +509,13 @@ fn state_intake_completed_respects_seq() {
     state.pool.retire(dummy_buf(10));
 
     // coherent_seq = 7: only c1 (seq 5) should publish.
-    state.intake_completed(7);
+    let _ = state.intake_completed(7);
     assert_eq!(c1.status(), QueryStatus::Issued);
     assert_eq!(c2.status(), QueryStatus::Pending);
     assert_eq!(state.pending.len(), 1);
 
     // coherent_seq = 10: c2 publishes.
-    state.intake_completed(10);
+    let _ = state.intake_completed(10);
     assert_eq!(c2.status(), QueryStatus::Issued);
     assert_eq!(state.pending.len(), 0);
 }
@@ -538,13 +538,13 @@ fn state_intake_adds_a_split_span_up_across_its_two_frames() {
     core.end(2, 1);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(
         core.status(),
         QueryStatus::Pending,
         "a span is not done while a later segment is outstanding"
     );
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 1_000);
 }
@@ -570,7 +570,7 @@ fn state_reissue_before_intake_discards_the_abandoned_span() {
     core.end(1, 2);
     state.push_pending(1, core.clone(), (1, 2), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 7);
 }
@@ -595,7 +595,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
     core.end(2, 2);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(
         core.status(),
         QueryStatus::Pending,
@@ -603,7 +603,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
     );
     assert_eq!(state.pending.len(), 1);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 7);
 }
@@ -624,7 +624,7 @@ fn state_intake_reads_an_empty_segment_without_a_buffer() {
     core.end(2, 1);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 55);
 }
@@ -639,7 +639,7 @@ fn state_intake_answers_permissively_when_a_counted_segments_buffer_is_gone() {
     // Nothing retired at seq 1: the slots the span counted into cannot be
     // read back.
     state.push_pending(1, core.clone(), (0, 2), true);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), u32::MAX);
 }
@@ -700,7 +700,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
 
     // The flush ahead of the drain, then the drain's own finalize.
     state.split_open_spans(1);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Pending, "END has not run yet");
     let drained = state.drain_all_buffers();
     assert_eq!(drained.len(), 1, "the frame's buffer leaves with the drain");
@@ -728,7 +728,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
     state.remove_active(&core);
     state.push_pending(2, core.clone(), (core.offset_begin(), 1), true);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
         core.get_u32(),
@@ -749,7 +749,7 @@ fn state_mark_exhausted_makes_every_open_span_uncounted() {
     assert!(state.exhausted_this_frame());
     core.end(1, state.draws_seen());
     state.push_pending(1, core.clone(), (0, 0), true);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
         core.get_u32(),
@@ -972,7 +972,7 @@ fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
     let second = core.mark_armed();
     assert_eq!(core.mark_end_requested(), second);
     assert_eq!(core.seq_end_loaded(), 0);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), super::QueryStatus::Pending);
     assert_eq!(core.get_u64(), 0);
     assert_eq!(core.seq_end_loaded(), 0);
@@ -982,7 +982,7 @@ fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
     write_slot(&mut replacement, 0, 7);
     state.pool.retire(replacement);
     state.push_pending(2, core.clone(), (0, 1), true);
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), super::QueryStatus::Issued);
     assert_eq!(core.get_u64(), 7);
     assert_eq!(core.seq_end_loaded(), 2);
@@ -1060,7 +1060,7 @@ fn state_a_span_begun_without_a_slot_splits_into_an_empty_segment() {
     starved.end(2, state.draws_seen());
     state.remove_active(&starved);
     state.push_pending(2, starved.clone(), (starved.offset_begin(), 0), true);
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(starved.status(), QueryStatus::Issued);
     assert_eq!(
         starved.get_u32(),

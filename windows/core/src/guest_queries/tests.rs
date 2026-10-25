@@ -109,7 +109,7 @@ fn reissue_preserves_pending_segment_generation_checks() {
     second.begin(1, 1, (1, 1), (1, 1), 1);
     second.end(1, 2);
     state.push_pending(1, Arc::clone(&second), (1, 2), true);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(original.status(), QueryStatus::Issued);
     assert_eq!(original.get_u32(), 7);
     drop(first);
@@ -132,14 +132,14 @@ fn api_reissue_rejects_delayed_native_result_before_new_begin() {
     let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     state.push_pending(1, Arc::clone(&native), (0, 0), true);
     let second = original.mark_armed();
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(original.status(), QueryStatus::Pending);
     assert_eq!(original.seq_end_loaded(), 0);
     assert_eq!(original.mark_end_requested(), second);
     native.begin_recorded(second, 2, 0, (1, 1), (1, 1), 0);
     native.end_recorded(second, 2, 0);
     state.push_pending(2, Arc::clone(&native), (0, 0), true);
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(original.status(), QueryStatus::Issued);
     assert_eq!(original.seq_end_loaded(), 2);
     drop(native);

@@ -953,6 +953,8 @@ impl VisibilityQueryState {
     /// list. Returns the free buffers the pool lets go of past its cap; the
     /// caller routes them through the same seq-gated destruction as the ones
     /// intake lets go of.
+    #[must_use = "a buffer let go of has to reach the seq-gated destruction, or its PageBox \
+                  drops under a live bytesNoCopy wrapper"]
     pub fn install_grown_buffer(
         &mut self,
         buf: RetiredVisibilityBuffer,
@@ -1200,6 +1202,8 @@ impl VisibilityQueryState {
     /// Panics if a segment is removed from `pending` at an index the loop
     /// above has already bounds-checked, which the `while i < len` guard
     /// makes unreachable.
+    #[must_use = "a buffer let go of has to reach the seq-gated destruction, or its PageBox \
+                  drops under a live bytesNoCopy wrapper"]
     pub fn intake_completed(&mut self, coherent_seq: u64) -> Vec<RetiredVisibilityBuffer> {
         // Fold first (reads retired buffers by seq), then release
         // pool entries. Order matters: release_up_to moves retired →
