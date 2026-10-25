@@ -978,14 +978,24 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-25: 1 `real`, 177 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 191 unique sites in all.
+`Sites:` tokens below on 2026-10-25: 0 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 190 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
 (2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
 `m = 2 * length(R + (0, 0, -1))`, so `test_generated_texcoords` 29162 left
-every key and its cluster left this document.)
+every key and its cluster left this document. Linear table fog with
+`D3DRS_FOGSTART` equal to `D3DRS_FOGEND` is a step at the end, a depth
+below it unfogged and one at or above it fully fogged, so
+`fog_special_test` 18390 left every key and its cluster went too; vertex
+fog with an equal start and end still fogs everything, which its cases 0 to
+3 check. The arm64 Wine's six Apple keys were recorded on an Apple Silicon
+machine. The x86_64 Wine's six Apple keys and the two `@mac2` keys lost the
+same two sites by hand, since neither the x86_64 Wine nor the Intel image
+ran here and the two Wines read these sites at the same counts; CI's
+`record_intel_baseline` dispatch with `intel_only` records the `@mac2`
+keys.)
 (2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
 `Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
 multisampled back buffer, and a plain device's refused `Reset` leaves it
@@ -1266,11 +1276,9 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-One defect, first counted by the Wine 11.20 tests: linear table fog with
-equal start and end fogs the whole primitive (`visual.c/fog_special_test`,
-one site, issue #1169).
+None: no failing site is `real` today.
 
-Every other failing site is a recorded decision (`expected`), a capability we
+Every failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
 reads lower on other hardware or flaps below it here (`ceiling`), or a known
 flap (`flaky`), each with its rationale in the
@@ -1764,25 +1772,6 @@ No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
 returns its source, the zero vector the test's hardware gives, so it passes.
 The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
 device encodes its own way (0x00808000; `def1` reads the same value there).
-
-### visual.c/fog_special_test
-Sites: 18390=real
-
-Linear table fog with `D3DRS_FOGSTART` equal to `D3DRS_FOGEND` (both 0.5)
-over a quad whose depth runs from 0 on the left to 1 on the right. D3D9
-leaves the coordinates below the end unfogged and fogs those above it, a
-step at the end, so the left probe expects the green vertex colour and the
-right one the red fog colour. The four table-fog cases (4 to 7: fixed
-function and shader vertex and pixel stages in every combination) read
-`0x00ff0000` on the left: the pixel stage's linear table fog
-(`windows/core/src/dxso/emit.rs`) answers a factor of 0, fully fogged,
-whenever the range is zero, so the whole quad takes the fog colour. The
-right probes and the vertex-fog cases 0 to 3, which fog everything, pass.
-Earlier builds of the tests marked this check `todo_wine`, which the runner
-does not count; the Wine 11.20 build wine-build ships drops the mark, since
-its wined3d gives the step, so the site is new with that build and not a
-change in mtld3d. A defect, read on every Apple key of both Wines, issue
-#1169.
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
 Sites: 5088=expected 5167=expected 6032=expected 18835=expected

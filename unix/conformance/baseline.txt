@@ -75,7 +75,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -215,7 +214,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -356,7 +354,6 @@
   visual.c:15686 count=15
   visual.c:15745 count=28
   visual.c:16481 count=2
-  visual.c:18390 count=4
   visual.c:18835 count=2
   visual.c:18838 count=2
   visual.c:18841 count=2
@@ -514,7 +511,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -656,7 +652,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -794,7 +789,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -935,7 +929,6 @@
   visual.c:15686 count=13
   visual.c:15745 count=28
   visual.c:16481 count=2
-  visual.c:18390 count=4
   visual.c:18835 count=2
   visual.c:18838 count=2
   visual.c:18841 count=2
@@ -1093,7 +1086,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1236,7 +1228,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1375,7 +1366,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1546,7 +1536,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1688,7 +1677,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1826,7 +1814,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1996,7 +1983,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1

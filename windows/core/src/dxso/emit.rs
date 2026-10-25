@@ -1513,9 +1513,11 @@ pub const fn fog_blend_active(variant: VariantKey) -> bool {
 /// encoder `setDepthBias` into the fragment `[[position]]` depth scaled to
 /// float-buffer ulps (2^exponent(z)-sized steps), which is neither the raw
 /// D3D bias nor absent. `precise::exp` keeps EXP/EXP2 inside the test's
-/// 48-ulp window regardless of the compiler's fast-math mode. LINEAR shares
-/// the VS path's zero-range rule: start == end is fully fogged (f = 0), and
-/// the signed denominator keeps reversed fog (start > end) working.
+/// 48-ulp window regardless of the compiler's fast-math mode. LINEAR with
+/// start == end is a step at the end: a depth below it is unfogged (f = 1)
+/// and a depth at or above it fully fogged (f = 0), where the VS path fogs
+/// every vertex. The signed denominator keeps reversed fog (start > end)
+/// working.
 pub fn write_fog_blend(out: &mut String, variant: VariantKey, target: &str) {
     if !fog_blend_active(variant) {
         return;
@@ -1550,7 +1552,7 @@ pub fn write_fog_blend(out: &mut String, variant: VariantKey, target: &str) {
                 );
                 w(
                     out,
-                    "    float fog_f = fog_range == 0.0 ? 0.0 : saturate((fog_data[1].y - fog_c) / fog_range);\n",
+                    "    float fog_f = fog_range == 0.0 ? (fog_c < fog_data[1].y ? 1.0 : 0.0) : saturate((fog_data[1].y - fog_c) / fog_range);\n",
                 );
             }
         }

@@ -1868,7 +1868,7 @@ fn table_fog_computes_per_pixel_factor() {
     );
     assert!(
         linear_z.contains(
-            "float fog_f = fog_range == 0.0 ? 0.0 : saturate((fog_data[1].y - fog_c) / fog_range);"
+            "float fog_f = fog_range == 0.0 ? (fog_c < fog_data[1].y ? 1.0 : 0.0) : saturate((fog_data[1].y - fog_c) / fog_range);"
         ),
         "{linear_z}"
     );
