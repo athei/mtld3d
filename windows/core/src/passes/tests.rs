@@ -6188,7 +6188,8 @@ fn a_multisampled_srgb_pass_attaches_and_resolves_through_the_twins() {
 ///
 /// Attaching the linear companion and resolving into the sRGB twin is a
 /// format mismatch Metal rejects, so the encode falls back to the pixel
-/// shader's OETF variant exactly as a target with no twin at all does.
+/// shader's OETF variant exactly as a twin-capable target whose view Metal
+/// declined does.
 #[test]
 fn a_multisampled_target_without_a_companion_twin_keeps_the_linear_attachment() {
     let mut s = fresh_multisampled();
