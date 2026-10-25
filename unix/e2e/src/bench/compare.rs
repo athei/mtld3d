@@ -1671,22 +1671,25 @@ pub fn time_step(name: &str, unit: &Unit) -> Option<f64> {
 /// The resolution a `noisy` count per frame is printed with, in counts; `None` for other metrics.
 ///
 /// A `perf.*_pf` count is a window's total over its frames, written to
-/// three places, so its step, 0.001, is one event per thousand frames. A
-/// rate of a few events per thousand frames moves by a whole step and by
-/// several percent with one event more or less, and five pairs that happen
-/// to agree leave a sigma near zero: `perf.faults_minor_pf` reads about
-/// 0.012 in the query benchmarks, and 0.012 against 0.013 on every pair is
-/// +8.33 % at a sigma of 0. So such a row's median difference has to exceed
-/// five steps as well, five events per thousand frames, the rule a `time`
-/// row's has ([`past_floor`]). Five steps of an event that costs 10 us is
-/// 50 ns a frame, half the step a benchmark's own frame time is printed
-/// with. The floor only reaches a rate under one event in six frames
-/// (0.167, where 3 % is five steps); above that the ratio decides alone.
-/// It covers every `noisy` count rate rather than the fault counts by name,
-/// since any event that rare (renames, compiles, waits) has the same step
-/// and the same one-event noise. A count gauge (`_count`) is a whole
-/// number, a peak rather than a rate, and a rate in bytes counts bytes, so
-/// neither has a step here.
+/// three places, so its step is 0.001 events per frame, one event per
+/// thousand frames. A rate of a few events per thousand frames is a few of
+/// those steps, so a difference of one step is several percent of it, and
+/// five pairs that happen to agree leave a sigma near zero:
+/// `perf.faults_minor_pf` reads about 0.012 in the query benchmarks, and
+/// 0.012 against 0.013 on every pair is +8.33 % at a sigma of 0. So such a
+/// row's median difference has to exceed five steps as well, five events
+/// per thousand frames, the rule a `time` row's has ([`past_floor`]). Five
+/// steps of an event that costs 10 us is 50 ns a frame, half the step a
+/// benchmark's own frame time is printed with. `past_floor` needs more than
+/// five whole steps, a difference of at least 0.0055, so the floor only
+/// reaches a rate under about 0.18 events per frame, where 3 % of the rate
+/// first exceeds that; above it the ratio decides alone. The floor is far
+/// below the one a zero base has, more than two events a frame
+/// ([`SPIKE_FLOOR`] in `judge_zero_base`). It covers every `noisy` count
+/// rate rather than the fault counts by name, since any event that rare
+/// (renames, compiles, waits) has the same step and the same one-step
+/// noise. A count gauge (`_count`) is a whole number, a peak rather than a
+/// rate, and a rate in bytes counts bytes, so neither has a step here.
 #[must_use]
 pub fn rate_step(name: &str, unit: &Unit) -> Option<f64> {
     let rate = name.starts_with(PERF_PREFIX) && name.ends_with(PER_FRAME_SUFFIX);

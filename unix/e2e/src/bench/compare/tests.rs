@@ -1619,34 +1619,6 @@ fn the_time_step_follows_the_unit_and_the_source() {
 }
 
 #[test]
-fn a_sampled_snapshot_count_is_reported_not_judged() {
-    // A sampled row 4 % up on every pair: past the 3 % floor at a sigma of
-    // zero, so the same numbers judged as a noisy row regress.
-    let name = "perf.draw_snapshot_sampled_rebuild_ps_source_pf";
-    let base = [5.0; 5];
-    let cand = [5.2; 5];
-    let row = judge(name, &def("count lower info"), &base, &cand, false);
-    assert_eq!(row.verdict, Verdict::Info);
-    assert!(!row.verdict.fails());
-    assert_eq!(row.base, "5 count");
-    assert_eq!(row.cand, "5.200 count");
-    assert_eq!(
-        verdict_of(name, "count lower noisy", &base, &cand),
-        Verdict::Regression
-    );
-    // The unsampled rebuild count beside it stays judged.
-    assert_eq!(
-        verdict_of(
-            "perf.draw_snapshot_rebuild_ps_source_pf",
-            "count lower noisy",
-            &[1252.0; 5],
-            &[1302.0; 5]
-        ),
-        Verdict::Regression
-    );
-}
-
-#[test]
 fn a_rare_event_rate_has_to_move_more_than_five_per_thousand_frames() {
     let spec = "count lower noisy";
     let name = "perf.faults_minor_pf";

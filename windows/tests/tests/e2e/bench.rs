@@ -2060,12 +2060,13 @@ pub const IDENTITY_ROWS: [f32; 16] = [
 ];
 
 /// How [`Metrics::perf`] records one `perf-kv` key.
-struct PerfRule {
+pub struct PerfRule {
     name: String,
     fold: Fold,
     unit: PerfUnit,
     decimals: usize,
-    class: Class,
+    /// How a comparison of two builds reads the metric.
+    pub class: Class,
 }
 
 /// How the values one key takes in several windows become one.
@@ -2127,7 +2128,7 @@ impl PerfFold {
 /// The metric one `perf-kv` key becomes, by its suffix; `None` for a key with no known suffix.
 ///
 /// [`Metrics::perf`] states the rules this applies.
-fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
+pub fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
     let fixed = matches!(work, FrameWork::Fixed);
     let rule = |name: String, fold, unit, decimals, class| {
         Some(PerfRule {
