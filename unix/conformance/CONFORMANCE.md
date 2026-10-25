@@ -214,6 +214,38 @@ with Metal API validation left on in `nslog` mode (it logs rather than aborting,
 so it cannot mask the failure counts) and with our logs and Wine's debug
 channels silenced.
 
+A subtest that reports a refused display-mode restore (`Failed to restore
+display modes`, which only `device.c/test_mode_change` prints) leaves the mode
+it wrote with `CDS_UPDATEREGISTRY` as the session's desktop, and every later
+process of the prefix would start from it. win32u keeps that state in
+volatile registry keys that a wineserver builds from the display when it
+starts, so the runner then starts the prefix's session again, in the steps the
+Makefile's prefix configuration ends with (`wineserver -k`, `wineserver -w`,
+`wineserver -p`, `wine wineboot`, then `wineserver -k0` to check that a
+server stayed), with the prefix and `WINEMSYNC` named for each, and the next
+subtest, the next run of a repeat or the next leg starts from the display's
+own mode. A mode-set could not do that: the display's own mode need not be
+one win32u lists (see `device.c/test_mode_change`). The restart holds the
+prefix's configure lock (`<prefix>/.mtld3d-configure.lock`, the flock
+`configure-test-prefix` holds while it ends and boots a server), asking for it
+again until its 120 s budget runs out, so a leg configuring the same prefix
+meanwhile waits instead of booting a second server; a lock it never gets
+leaves the session as it is. The runner's stderr and the raw log, ahead of
+its last line, say that it happened and how long it took, or why it did not
+or which step failed; a failed step fails nothing, since the next subtest's
+process starts a session of its own, and a step still running at the
+deadline is killed (the step itself, not what it started). A run that ends on
+a GPU hang restarts nothing, since the leg ends with it.
+
+Ending the server ends every process of the session, every other run in that
+prefix included, so this happens only where the restore was refused, which is
+on a display below 60 Hz (the condition is under `device.c/test_mode_change`):
+the Intel CI image's 30 Hz display, and as well a Mac driving an external
+display at 59.94 Hz or 50 Hz. On a display at 60 Hz or above the restore
+works and no run restarts anything. The tests of the same subtest that run
+after the refused restore still run on the mode it left; the runner cannot
+reach into a running subtest.
+
 The layer's validation *errors* are reported, deduplicated, as
 `metal-validation:` lines; its *warnings* are ignored. A warning is a
 performance hint, not misuse (a resource bound to an encoder no draw went on to
@@ -1021,6 +1053,23 @@ by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
 macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
 CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
 so those four stay unconfirmed until a local run under the x86_64 Wine.)
+(2026-10-25: the restore `test_mode_change` fails on the `@mac2` legs is
+refused by win32u, whose emulated mode list carries no mode at the Intel
+image's 30 Hz, and the runner now starts the prefix's session again after a
+subtest that reports such a refusal, so the subtests after `device` start
+from the display's 3840x2160 rather than from the 800x600 the test leaves
+behind. The `@mac2` device keys cannot move: 14930, 14955 and 15039 run in
+the `device` process after the refused restore, and they and the five
+restore sites wait on the Wine fix (issue #1183). The `visual`, `stateblock`
+and `d3d9ex` subtests of those legs now run on the display's own
+3840x2160 at 30 Hz, a desktop no recording has measured before: until #1177
+they ran on 3200x1800, where seven of the eleven `d3d9ex.c/test_wndproc`
+sites read 2, and since then on 800x600, where the test skipped its mode
+tests. CI's `record_intel_baseline` dispatch with `intel_only` on the
+branch records the two keys.
+PENDING RECORD: what the dispatch recorded per key goes here, the
+`d3d9ex.c/test_wndproc` sites and their counts, and every other site that
+moved in `visual`, `stateblock` and `d3d9ex`, with its cluster updated.)
 (2026-10-24: since every size is served, smallest first, the mode
 `test_mode_change` leaves in the registry on the `@mac2` legs, where its
 restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
@@ -1493,21 +1542,44 @@ mode and the test's own CDS calls pick a mode user32 accepts, on both Wines.
 5548/5550 (the back buffer must keep the size a fullscreen create asked for
 across an external mode change) pass because the back buffer honors the
 request and never follows the window. 5594/5614/5637/5672/5896 ("Failed to
-restore display modes") fire on the `@mac2` legs only, where the test's
-restore of the original display modes fails. Why it fails there is not
-established: the Intel CI image's display runs 3840x2160 at 30 Hz and user32
-lists 25 sizes for it, so it is not a single-mode display. Desktop mode
-switching is out of scope, so `expected`.
+restore display modes") fire on the `@mac2` legs only, where win32u refuses
+the modes the test hands back. The test saves each display's
+`ENUM_CURRENT_SETTINGS` mode and restores it with
+`ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)`, and win32u
+matches that mode, its refresh rate included, against the display's mode
+list (`find_display_mode` in `dlls/win32u/sysparams.c`). Under
+`EmulateModeset` the list is win32u's own: every size at 60 Hz, and the
+display's own rate as well only when it is above 60 (`get_virtual_modes`,
+the same in Wine 11.0 and 11.20). The Intel CI image's display runs
+3840x2160 at 30 Hz, so the saved mode is no mode of its list and every
+restore returns `DISP_CHANGE_BADMODE`; the layer's log there reads "host
+3840x2160@30Hz on a 3840x2160 display; 25 sizes settable of 75 enumerated
+modes", 25 sizes at three depths and one rate. The condition is the rate
+winemac reports, which it truncates to whole hertz and reads as 60 when the
+display gives none (`winemac.drv/display.c`): a rate from 2 to 59 is refused
+(59.94 reads 59), a rate of 60 matches the 60 Hz entries, a rate above 60 is
+listed, and `find_display_mode` ignores a requested rate of 1 or 0. So any
+display below 60 Hz refuses the restore, an external 50 Hz or 59.94 Hz one on
+an Apple Silicon Mac too; the displays the Apple keys were recorded on run
+at 60 Hz or above (a 120 Hz panel lists 60 and 120), and the restore passes
+on every Apple key. The device's
+own restores pass on that image too, since they apply the registry mode
+without a `DEVMODE`, which win32u does not match against the list. A Wine
+defect rather than ours, and desktop mode switching is out of scope, so
+`expected`. Listing the display's own rate below 60 Hz too, in wine-build's
+Wine, would let the restore pass and take these five sites and the three
+below that follow from them off the `@mac2` keys (issue #1183).
 
 A failed restore leaves the mode the test's own `CDS_UPDATEREGISTRY` calls
-wrote in the registry, and the persistent wineserver serves it as the desktop
-to every later test of the leg and to the later subtests. The test takes that
-mode from the served list, which is ordered smallest first: on the Intel
-image it is 800x600, the second size of at least 640x480 there. So the
-`@mac2` legs run the rest of the suite on a 4:3 desktop on a 16:9 display,
-which is what `test_cursor_clipping` 14930 and 14955 and
-`test_window_position` 15039 read, and why `d3d9ex.c/test_wndproc` skips its
-mode tests there.
+wrote in the registry, and the session serves it as the desktop to every
+later test of the subtest. The test takes that mode from the served list,
+which is ordered smallest first: on the Intel image it is 800x600, the
+second size of at least 640x480 there. So the `@mac2` legs run the rest of
+the `device` subtest on a 4:3 desktop on a 16:9 display, which is what
+`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15039 read.
+The runner starts the prefix's session again once the subtest has ended (see
+"The test binaries" under Running), so the later subtests start from the
+display's own mode.
 
 ### device.c/test_device_window_reset
 Sites: 5971=expected 5974=expected
@@ -1640,13 +1712,16 @@ on a display of another shape (a MacBook panel, the Intel image) and passes
 on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
 
 14930 and 14955 fire on the `@mac2` legs only. There the desktop is already
-800x600 when the test starts, the mode `test_mode_change` leaves in the
-registry when its restore fails (see that cluster), and win32u maps the
-clip with no fullscreen window the same way: on the Intel image's 3840x2160
+800x600 when the test starts, the mode `test_mode_change`, earlier in the
+same process, leaves in the registry when its restore fails (see that
+cluster; the runner's restart of the session comes after the process), and
+win32u maps the clip with no fullscreen window the same way: on the Intel
+image's 3840x2160
 display it reads "(-133,0)-(933,600)" against "(0,0)-(800,600)", before the
 create and again after the release. They read 1 on every run of the Intel
 image and appear on no Apple key, and they come from the same failed restore
-as the `test_mode_change` sites, so they are `expected` like those.
+as the `test_mode_change` sites, so they are `expected` like those and go
+with the Wine fix for that restore (issue #1183).
 
 ### device.c/test_window_position
 Sites: 15039=expected
@@ -1655,8 +1730,9 @@ The test creates a fullscreen device at the monitor's size, shrinks the
 window by one pixel on each axis, and after the second such resize expects
 the window to keep that rect once events are processed. It fires on the
 `@mac2` legs only, where the desktop is the 800x600 mode `test_mode_change`
-leaves behind (see that cluster), which win32u scales onto the 3840x2160
-display by 3.6 with bars at both sides: the window comes back from the event
+leaves behind earlier in the same process (see that cluster), which win32u
+scales onto the 3840x2160 display by 3.6 with bars at both sides: the
+window comes back from the event
 round trip one pixel lower, "(0,1)-(799,600)" for "(0,0)-(799,599)", the
 same size. The failure message prints the monitor rect, not the rect the
 test expects, so the log reads "Expect window rect (0,0)-(800,600)". The
@@ -1666,7 +1742,8 @@ That the pixel is lost rounding the window's frame through the 3.6 scale is
 conjecture. With a desktop of the display's shape it passes, as it did on
 the Intel image while the mode left behind was 3200x1800. It reads 1 on
 every run of the Intel image and comes from the same failed restore as the
-`test_mode_change` sites, so it is `expected` like those.
+`test_mode_change` sites, so it is `expected` like those and goes with the
+Wine fix for that restore (issue #1183).
 
 ### device.c/init_d3d9on12_modules
 Sites: 15104=ceiling
@@ -2072,11 +2149,14 @@ focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from
 `CheckDeviceState` after the focus loss, the occlusion decision above.
 
-None of these sites is measured on the `@mac2` legs. There the desktop is
-the 800x600 mode `device.c/test_mode_change` leaves behind, the served list
-holds no pair of other sizes the test's pick accepts, and the test skips its
-mode tests at 2838 ("Could not find adequate modes"), so the `@mac2` keys
-carry none of these entries.
+On the `@mac2` legs these sites went unmeasured while the d3d9ex subtest
+ran on the 800x600 desktop `device.c/test_mode_change` leaves behind there
+(see that cluster): on that desktop the served list holds no pair of other
+sizes the test's pick accepts, so the test skipped its mode tests at 2838
+("Could not find adequate modes"). The runner now starts the prefix's
+session again after that subtest, so d3d9ex runs on the display's own mode
+and the mode tests run; the `@mac2` counts are those of the dispatch the
+2026-10-25 note records.
 
 ### d3d9ex.c/test_wndproc_windowed
 Sites: 3331=expected 3345=expected 3349=expected 3356=expected 3399=expected
