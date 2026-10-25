@@ -231,12 +231,12 @@ prefix's configure lock (`<prefix>/.mtld3d-configure.lock`, the flock
 again while another run holds it until its 120 s budget runs out, so a leg
 configuring the same prefix meanwhile waits instead of booting a second
 server; a lock it never gets, or one the system refuses for another reason
-(named at once), leaves the session as it is. The runner's stderr and the raw log, ahead of
-its last line, say that it happened and how long it took, or why it did not
-or which step failed; a failed step fails nothing, since the next subtest's
-process starts a session of its own, and a step still running at the
-deadline is killed (the step itself, not what it started). A run that ends on
-a GPU hang restarts nothing, since the leg ends with it.
+(named at once), leaves the session as it is. The runner's stderr and the
+raw log, ahead of its last line, say that it happened and how long it took,
+or why it did not or which step failed; a failed step fails nothing, since
+the next subtest's process starts a session of its own, and a step still
+running at the deadline is killed (the step itself, not what it started). A
+run that ends on a GPU hang restarts nothing, since the leg ends with it.
 
 Ending the server ends every process of the session, every other run in that
 prefix included, so this happens only where the restore was refused, which is
@@ -1061,9 +1061,10 @@ so the `@mac2` subtests after `device` run on the display's own 3840x2160 at
 keys at the counts the other keys read (that cluster lists them). No other
 `@mac2` site moved. Recorded by the `record_intel_baseline` dispatch with
 `intel_only`, run 40166000744: `i686+intel@mac2` in attempt 1,
-`x86_64+intel@mac2` in attempt 2. Only the d3d9ex lines were taken; the
-artifacts predate the lockable back-buffer check above, and test_fetch4
-15686 keeps its higher pins.)
+`x86_64+intel@mac2` in attempt 2. Only the d3d9ex lines were taken: the
+artifacts predate the lockable back-buffer check (#1184) and the sphere-map
+and table-fog fixes (#1187), so they still carry device.c 13133 to 13290
+and visual.c 18390 and 29162. test_fetch4 15686 keeps its higher pins.)
 (2026-10-24: since every size is served, smallest first, the mode
 `test_mode_change` leaves in the registry on the `@mac2` legs, where its
 restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
@@ -1556,13 +1557,13 @@ listed, and `find_display_mode` ignores a requested rate of 1 or 0. So any
 display below 60 Hz refuses the restore, an external 50 Hz or 59.94 Hz one on
 an Apple Silicon Mac too; the displays the Apple keys were recorded on run
 at 60 Hz or above (a 120 Hz panel lists 60 and 120), and the restore passes
-on every Apple key. The device's
-own restores pass on that image too, since they apply the registry mode
-without a `DEVMODE`, which win32u does not match against the list. A Wine
-defect rather than ours, and desktop mode switching is out of scope, so
-`expected`. Listing the display's own rate below 60 Hz too, in wine-build's
-Wine, would let the restore pass and take these five sites and the three
-below that follow from them off the `@mac2` keys (issue #1183).
+on every Apple key. The device's own restores pass on that image too, since
+they apply the registry mode without a `DEVMODE`, which win32u does not
+match against the list. A Wine defect rather than ours, and desktop mode
+switching is out of scope, so `expected`. Listing the display's own rate
+below 60 Hz too, in wine-build's Wine, would let the restore pass and take
+these five sites and the three below that follow from them off the `@mac2`
+keys (issue #1183).
 
 A failed restore leaves the mode the test's own `CDS_UPDATEREGISTRY` calls
 wrote in the registry, and the session serves it as the desktop to every
@@ -1710,12 +1711,12 @@ on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
 same process, leaves in the registry when its restore fails (see that
 cluster; the runner's restart of the session comes after the process), and
 win32u maps the clip with no fullscreen window the same way: on the Intel
-image's 3840x2160
-display it reads "(-133,0)-(933,600)" against "(0,0)-(800,600)", before the
-create and again after the release. They read 1 on every run of the Intel
-image and appear on no Apple key, and they come from the same failed restore
-as the `test_mode_change` sites, so they are `expected` like those and go
-with the Wine fix for that restore (issue #1183).
+image's 3840x2160 display it reads "(-133,0)-(933,600)" against
+"(0,0)-(800,600)", before the create and again after the release. They read
+1 on every run of the Intel image and appear on no Apple key, and they come
+from the same failed restore as the `test_mode_change` sites, so they are
+`expected` like those and go with the Wine fix for that restore
+(issue #1183).
 
 ### device.c/test_window_position
 Sites: 15039=expected
@@ -1726,18 +1727,18 @@ the window to keep that rect once events are processed. It fires on the
 `@mac2` legs only, where the desktop is the 800x600 mode `test_mode_change`
 leaves behind earlier in the same process (see that cluster), which win32u
 scales onto the 3840x2160 display by 3.6 with bars at both sides: the
-window comes back from the event
-round trip one pixel lower, "(0,1)-(799,600)" for "(0,0)-(799,599)", the
-same size. The failure message prints the monitor rect, not the rect the
-test expects, so the log reads "Expect window rect (0,0)-(800,600)". The
-device sets no mode here, the request being the desktop's own size, and a
-window the layer re-covered the monitor with would read "(0,0)-(800,600)".
-That the pixel is lost rounding the window's frame through the 3.6 scale is
-conjecture. With a desktop of the display's shape it passes, as it did on
-the Intel image while the mode left behind was 3200x1800. It reads 1 on
-every run of the Intel image and comes from the same failed restore as the
-`test_mode_change` sites, so it is `expected` like those and goes with the
-Wine fix for that restore (issue #1183).
+window comes back from the event round trip one pixel lower,
+"(0,1)-(799,600)" for "(0,0)-(799,599)", the same size. The failure message
+prints the monitor rect, not the rect the test expects, so the log reads
+"Expect window rect (0,0)-(800,600)". The device sets no mode here, the
+request being the desktop's own size, and a window the layer re-covered the
+monitor with would read "(0,0)-(800,600)". That the pixel is lost rounding
+the window's frame through the 3.6 scale is conjecture. With a desktop of
+the display's shape it passes, as it did on the Intel image while the mode
+left behind was 3200x1800. It reads 1 on every run of the Intel image and
+comes from the same failed restore as the `test_mode_change` sites, so it is
+`expected` like those and goes with the Wine fix for that restore
+(issue #1183).
 
 ### device.c/init_d3d9on12_modules
 Sites: 15104=ceiling
