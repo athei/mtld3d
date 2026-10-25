@@ -1054,23 +1054,16 @@ by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
 macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
 CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
 so those four stay unconfirmed until a local run under the x86_64 Wine.)
-(2026-10-25: the restore `test_mode_change` fails on the `@mac2` legs is
-refused by win32u, whose emulated mode list carries no mode at the Intel
-image's 30 Hz, and the runner now starts the prefix's session again after a
-subtest that reports such a refusal, so the subtests after `device` start
-from the display's 3840x2160 rather than from the 800x600 the test leaves
-behind. The `@mac2` device keys cannot move: 14930, 14955 and 15039 run in
-the `device` process after the refused restore, and they and the five
-restore sites wait on the Wine fix (issue #1183). The `visual`, `stateblock`
-and `d3d9ex` subtests of those legs now run on the display's own
-3840x2160 at 30 Hz, a desktop no recording has measured before: until #1177
-they ran on 3200x1800, where seven of the eleven `d3d9ex.c/test_wndproc`
-sites read 2, and since then on 800x600, where the test skipped its mode
-tests. CI's `record_intel_baseline` dispatch with `intel_only` on the
-branch records the two keys.
-PENDING RECORD: what the dispatch recorded per key goes here, the
-`d3d9ex.c/test_wndproc` sites and their counts, and every other site that
-moved in `visual`, `stateblock` and `d3d9ex`, with its cluster updated.)
+(2026-10-25: the runner starts the prefix's session again after a subtest
+that reports a refused display-mode restore (see `device.c/test_mode_change`),
+so the `@mac2` subtests after `device` run on the display's own 3840x2160 at
+30 Hz. The eleven `d3d9ex.c/test_wndproc` sites joined both `@mac2` d3d9ex
+keys at the counts the other keys read (that cluster lists them). No other
+`@mac2` site moved. Recorded by the `record_intel_baseline` dispatch with
+`intel_only`, run 40166000744: `i686+intel@mac2` in attempt 1,
+`x86_64+intel@mac2` in attempt 2. Only the d3d9ex lines were taken; the
+artifacts predate the lockable back-buffer check above, and test_fetch4
+15686 keeps its higher pins.)
 (2026-10-24: since every size is served, smallest first, the mode
 `test_mode_change` leaves in the registry on the `@mac2` legs, where its
 restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
@@ -2150,14 +2143,17 @@ focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from
 `CheckDeviceState` after the focus loss, the occlusion decision above.
 
-On the `@mac2` legs these sites went unmeasured while the d3d9ex subtest
-ran on the 800x600 desktop `device.c/test_mode_change` leaves behind there
-(see that cluster): on that desktop the served list holds no pair of other
-sizes the test's pick accepts, so the test skipped its mode tests at 2838
-("Could not find adequate modes"). The runner now starts the prefix's
-session again after that subtest, so d3d9ex runs on the display's own mode
-and the mode tests run; the `@mac2` counts are those of the dispatch the
-2026-10-25 note records.
+On the `@mac2` legs d3d9ex runs on the display's own mode because the
+runner starts the prefix's session again after `device.c/test_mode_change`
+leaves 800x600 behind (see that cluster). On 800x600 the served list holds
+no pair of other sizes the test's pick accepts and the test skips its mode
+tests at 2838 ("Could not find adequate modes"). Every key, the `@mac2`
+ones included, reads:
+
+| Count | Sites |
+| --- | --- |
+| 2 | 2920, 2924, 2949, 2957, 3007, 3036, 3230 |
+| 1 | 3107, 3183, 3203, 3209 |
 
 ### d3d9ex.c/test_wndproc_windowed
 Sites: 3331=expected 3345=expected 3349=expected 3356=expected 3399=expected
