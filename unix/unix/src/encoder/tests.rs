@@ -878,8 +878,10 @@ fn a_draw_that_fills_the_visibility_buffer_leaves_no_pass_without_a_draw() {
         super::NativeSubmitSpawner,
     )
     .expect("an encoder on the default device");
-    // SAFETY: tests; opaque attachment values, never dereferenced since nothing is submitted.
-    let (color, depth) = unsafe { (MetalHandle::new(0x1000), MetalHandle::new(0x2000)) };
+    // SAFETY: tests; an opaque attachment value, never dereferenced since nothing is submitted.
+    let color = unsafe { MetalHandle::new(0x1000) };
+    // SAFETY: as above.
+    let depth = unsafe { MetalHandle::new(0x2000) };
     enc.pass_state.reset_frame(&FrameReset {
         backbuffer: color,
         backbuffer_srgb: MetalHandle::NULL,
