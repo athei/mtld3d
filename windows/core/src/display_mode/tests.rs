@@ -242,6 +242,46 @@ fn the_same_panel_with_retina_mode_off_serves_its_list_less_three_unscalable_siz
     assert_eq!(served.last(), Some(&(1728, 1117)));
 }
 
+/// The sizes the mac driver lists for a 2560x1664 panel on a 1470x956 desktop.
+///
+/// A driver that reports several modes gets no virtual sizes from win32u, so
+/// the list is the panel's own: its native size and the desktop sizes macOS
+/// offers it, of which seven fit on the desktop.
+const PANEL_HOST_SIZES: [(u32, u32); 8] = [
+    (2560, 1664),
+    (1470, 956),
+    (1470, 918),
+    (1280, 832),
+    (1280, 800),
+    (1024, 666),
+    (1024, 640),
+    (960, 600),
+];
+
+#[test]
+fn a_host_mode_list_serves_every_size_that_fits_on_the_desktop() {
+    // Every one of the seven sizes no larger than the desktop is served,
+    // 1280x800 among them, with no bound and under the 32 of the WoW
+    // profile alike; the native size is larger than the desktop and is not.
+    let expected = vec![
+        (960, 600),
+        (1024, 640),
+        (1024, 666),
+        (1280, 800),
+        (1280, 832),
+        (1470, 918),
+        (1470, 956),
+    ];
+    assert_eq!(served_at((1470, 956), &PANEL_HOST_SIZES, 96, 0), expected);
+    assert_eq!(served_at((1470, 956), &PANEL_HOST_SIZES, 96, 32), expected);
+    // The main module's `EnumDisplaySettings` walk reaches every listed
+    // position of a served size, 1280x800's included.
+    assert_eq!(
+        served_mode_indices(PANEL_HOST_SIZES, &expected),
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+}
+
 #[test]
 fn a_bound_keeps_the_largest_sizes_and_the_desktop() {
     // 32 is the size count a 32-button menu holds; at 96 dpi the display has
