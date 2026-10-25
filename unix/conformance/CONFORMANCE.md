@@ -990,12 +990,21 @@ every key and its cluster left this document. Linear table fog with
 below it unfogged and one at or above it fully fogged, so
 `fog_special_test` 18390 left every key and its cluster went too; vertex
 fog with an equal start and end still fogs everything, which its cases 0 to
-3 check. The arm64 Wine's six Apple keys were recorded on an Apple Silicon
-machine. The x86_64 Wine's six Apple keys and the two `@mac2` keys lost the
-same two sites by hand, since neither the x86_64 Wine nor the Intel image
-ran here and the two Wines read these sites at the same counts; CI's
-`record_intel_baseline` dispatch with `intel_only` records the `@mac2`
-keys.)
+3 check. The two sites were removed from all fourteen sections by hand.
+For the arm64 Wine's six Apple keys the edit was checked against a local
+re-record on an Apple Silicon machine, which read neither site and differed
+from the edit only in the header's tests build and in the flaky and ceiling
+pins, both kept as they were. On the x86_64 Wine no run was made here. CI
+confirms the plain `i686` and `x86_64` keys on macos-15, and the two
+`@mac2` keys are to be confirmed by CI's `record_intel_baseline` dispatch
+with `intel_only` before the change merges; no CI run reads `i686+intel`,
+`x86_64+intel`, `i686+scale` or `x86_64+scale`, which stay unconfirmed
+until a local x86_64-Wine run. Removing the sites there is still safe:
+both are fixed-function and pixel-stage MSL that `mtld3d-core` emits the
+same way under either Wine, the `intel.*` keys change neither the texgen,
+the fog nor the A8R8G8B8 back buffer both tests read, and the arm64 Wine's
+`+intel` and `+scale` re-records read both sites at zero, the fog probes
+included, ten pixels either side of the step.)
 (2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
 `Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
 multisampled back buffer, and a plain device's refused `Reset` leaves it
