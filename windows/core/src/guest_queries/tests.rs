@@ -9,7 +9,10 @@ use super::{GuestQueryDescriptor, GuestQueryLease, QueryLeaseCache};
 use crate::{
     encoder_value::WireValue,
     page_box::PageBox,
-    visibility::{QueryStatus, RetiredVisibilityBuffer, VisibilityQueryCore, VisibilityQueryState},
+    visibility::{
+        BUFFER_SLOTS_256K, QueryStatus, RetiredVisibilityBuffer, VisibilityQueryCore,
+        VisibilityQueryState,
+    },
 };
 
 fn descriptor(lease: &GuestQueryLease) -> GuestQueryDescriptor {
@@ -37,7 +40,7 @@ fn begin_and_end_share_native_arc_identity() {
     assert!(Arc::ptr_eq(&begin, &end));
     assert!(end_lease.completed());
     assert!(!begin_lease.completed());
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     state.push_active(&begin);
     state.remove_active(&end);
     assert_eq!(state.active_count(), 0);
@@ -92,12 +95,12 @@ fn reissue_preserves_pending_segment_generation_checks() {
     let mut cache = QueryLeaseCache::default();
     // SAFETY: first_lease retains the query mailbox until the final native reference drops.
     let first = unsafe { cache.adopt(first_lease.descriptor()) }.expect("first core");
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let mut backing = PageBox::new_zeroed(16);
-    backing.as_mut_slice()[..8].copy_from_slice(&100u64.to_le_bytes());
-    backing.as_mut_slice()[8..16].copy_from_slice(&7u64.to_le_bytes());
-    state.install_current_buffer(RetiredVisibilityBuffer::new(backing, MetalHandle::NULL, 0));
-    assert!(state.retire_current_buffer(1).is_none());
+    backing.as_mut_slice()[..8].copy_from_slice(&100u64.to_ne_bytes());
+    backing.as_mut_slice()[8..16].copy_from_slice(&7u64.to_ne_bytes());
+    state.install_first_buffer(RetiredVisibilityBuffer::new(backing, MetalHandle::NULL, 0));
+    assert!(state.retire_frame_buffers(1).is_empty());
     first.begin(1, 0, (1, 1), (1, 1), 0);
     first.end(1, 1);
     state.push_pending(1, Arc::clone(&first), (0, 1), true);
@@ -126,7 +129,7 @@ fn api_reissue_rejects_delayed_native_result_before_new_begin() {
     native.begin_recorded(first, 1, 0, (1, 1), (1, 1), 0);
     assert_eq!(original.mark_end_requested(), first);
     native.end_recorded(first, 1, 0);
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     state.push_pending(1, Arc::clone(&native), (0, 0), true);
     let second = original.mark_armed();
     state.intake_completed(1);

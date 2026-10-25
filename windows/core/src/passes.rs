@@ -927,6 +927,12 @@ pub struct Pass {
     /// set and keeps the `MTL_DEBUG_LAYER` validator from retaining
     /// per-pass tracking state for it.
     has_counting_visibility: bool,
+    /// Which of the frame's visibility buffers the pass's Counting modes name.
+    ///
+    /// Stamped when the pass opens from [`PassState`]'s current buffer, which
+    /// moves on only through [`PassState::break_for_visibility_buffer`], so
+    /// every visibility offset recorded into a pass is one of its buffer's.
+    visibility_buffer: u32,
     /// What the depth attachment is and what the pass's draws did with it.
     ///
     /// See [`PassDepthFlags`] for the bits.
@@ -1326,6 +1332,12 @@ impl Pass {
         self.has_counting_visibility
     }
 
+    /// Which of the frame's visibility buffers the submit path binds to this pass.
+    #[must_use]
+    pub const fn visibility_buffer(&self) -> u32 {
+        self.visibility_buffer
+    }
+
     #[must_use]
     pub const fn color_writes_observed(&self) -> bool {
         self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
@@ -1599,6 +1611,11 @@ pub struct FrameReset {
 pub struct PassState {
     passes: Vec<Pass>,
     current_pass_closed: bool,
+    /// The frame's visibility buffer that passes opened from now on count into.
+    ///
+    /// Zero at every frame start; [`Self::break_for_visibility_buffer`] moves
+    /// it on when the frame's queries fill a buffer.
+    visibility_buffer: u32,
 
     current_color_texture: MetalHandle<MTLTextureKind>,
     /// Multisampled companion of the bound render target 0, NULL for none.
@@ -1941,6 +1958,7 @@ impl PassState {
         Self {
             passes: Vec::with_capacity(4),
             current_pass_closed: true,
+            visibility_buffer: 0,
             current_color_texture: MetalHandle::NULL,
             current_color_msaa_texture: MetalHandle::NULL,
             current_color_msaa_srgb_texture: MetalHandle::NULL,
@@ -2052,6 +2070,7 @@ impl PassState {
         }
         self.upload_pass_end = 0;
         self.current_pass_closed = true;
+        self.visibility_buffer = 0;
         // No pass open → no viewport emitted yet; the next pass's open
         // reseeds this. (`set_viewport` only reads it inside an open pass.)
         self.last_emitted_viewport = None;
@@ -3866,6 +3885,7 @@ impl PassState {
             commands,
             leading_blits,
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: self.pass_depth_flags(),
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
@@ -4019,6 +4039,7 @@ impl PassState {
             commands: cmds,
             leading_blits,
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
@@ -4143,6 +4164,29 @@ impl PassState {
         }
     }
 
+    /// Close the current pass because the frame's visibility buffer is full.
+    ///
+    /// Passes opened after this count into the frame's next visibility
+    /// buffer: a Metal render pass counts into the one buffer its descriptor
+    /// names. Unlike [`Self::end_current_pass`] this keeps the render-target-0
+    /// decision, since the draw about to be recorded already made it for the
+    /// pass it opens. The pass opened next loads what this one stored, as
+    /// after any other break, and Rule J keeps the two apart.
+    pub fn break_for_visibility_buffer(&mut self) {
+        if !self.passes.is_empty() && !self.current_pass_closed {
+            self.current_pass_closed = true;
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                let idx = self.passes.len() - 1;
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-close idx={idx} caller=visibility_buffer_full buffer={}",
+                    self.visibility_buffer
+                );
+            }
+        }
+        self.visibility_buffer += 1;
+    }
+
     /// Materialize any pending clears as a standalone pass on the current attachments.
     ///
     /// D3D9 semantics: `Clear()` applies to whichever rt is bound at call
@@ -4220,6 +4264,7 @@ impl PassState {
             commands,
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: self.pass_depth_flags(),
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
@@ -5434,7 +5479,8 @@ impl PassState {
     /// load of every attachment between the halves. That split is what a
     /// render-target change undone before anything is drawn leaves, or an sRGB
     /// toggle undone the same way, or a borrowed binding put back. The second
-    /// pass joins the first when the join changes nothing D3D9 can see
+    /// pass joins the first when the join changes nothing D3D9 can see and
+    /// both count into the same visibility buffer, since a pass binds one
     /// (`merge_join` has the conditions): it has no leading blits and loads
     /// every attachment the first stores unresolved (a depth plane it discards
     /// on load may have any store before it), and the second samples none of
@@ -6443,7 +6489,8 @@ impl PassJoin {
 
 /// The join that fuses `next` into `prev` under Rule J, `None` when the two must stay apart.
 ///
-/// The passes stay apart unless they bind identical attachments, `next` has
+/// The passes stay apart unless they bind identical attachments and the same
+/// visibility buffer (a full one is what split them), `next` has
 /// no leading blits, every attachment carries over ([`color_carries_over`],
 /// [`depth_carries_over`]), and no sampler bind in `next` reads an
 /// attachment. Then every state of [`JOIN_STATES`] that `next` reads before
@@ -6458,6 +6505,7 @@ fn merge_join(
     frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> Option<PassJoin> {
     if !attachments_match(prev, next)
+        || prev.visibility_buffer != next.visibility_buffer
         || !next.leading_blits.is_empty()
         || !color_carries_over(prev, next)
         || !depth_carries_over(prev, next)

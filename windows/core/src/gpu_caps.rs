@@ -14,6 +14,8 @@
 
 use mtld3d_shared::mtl::DeviceCapsFlags;
 
+use crate::visibility::{BUFFER_SLOTS_64K, BUFFER_SLOTS_256K};
+
 /// The linear-texture row alignment a Mac2 (Intel/AMD) device reports for `BGRA8Unorm`.
 ///
 /// Apple-family devices report 16. `intel.linearAlign256` raises a smaller
@@ -67,6 +69,24 @@ impl GpuCaps {
     pub const fn resolve_needs_retire(self) -> bool {
         self.device_caps
             .contains(DeviceCapsFlags::RESOLVE_NEEDS_RETIRE)
+    }
+
+    /// How many slots one occlusion-query visibility buffer holds on this device.
+    ///
+    /// The most the device's largest visibility query offset addresses:
+    /// [`BUFFER_SLOTS_256K`] where it is 256 KB, [`BUFFER_SLOTS_64K`]
+    /// elsewhere. It bounds one buffer, not a frame, which continues in
+    /// another buffer once one is full.
+    #[must_use]
+    pub const fn visibility_buffer_slots(self) -> u32 {
+        if self
+            .device_caps
+            .contains(DeviceCapsFlags::VISIBILITY_OFFSET_256K)
+        {
+            BUFFER_SLOTS_256K
+        } else {
+            BUFFER_SLOTS_64K
+        }
     }
 
     /// Apply the `intel.managedMemory` and `intel.linearAlign256` answers over the device's.

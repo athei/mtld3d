@@ -12,11 +12,19 @@
 //! allocator's high-water mark, queues that segment, and reopens the span
 //! in the continuation frame. Each segment is summed against its own
 //! frame's buffer and folded into a running total the closing segment
-//! publishes. A span that could not be counted at any point (the slot
-//! budget ran out, or the buffer it counted into is gone) answers with the
-//! permissive `u32::MAX` rather than a count that reads as full occlusion,
-//! unless no draw was issued inside it at all: zero is then the exact
-//! answer rather than a guess.
+//! publishes.
+//!
+//! A frame has no slot limit. Its first buffer is sized from the slots
+//! recent frames reserved; a frame that fills it before the buffer reaches
+//! the most the device addresses replaces it with a larger one, which no
+//! GPU work has read yet since buffers are bound at submit; and a frame that
+//! fills a buffer of the device's size continues in another after a pass
+//! break, cutting every open span there as a submit does. A span that could
+//! not be counted at any point (a buffer it needed could not be allocated,
+//! or the buffer it counted into is gone) answers with the permissive
+//! `u32::MAX` rather than a count that reads as full occlusion, unless no
+//! draw was issued inside it at all: zero is then the exact answer rather
+//! than a guess.
 //!
 //! Split so this module holds only logic that needs no Metal handles:
 //! the slot allocator, the per-query state machine, the sum-across-span
@@ -36,26 +44,34 @@ use mtld3d_shared::{
 
 use crate::page_box::PageBox;
 
-/// The per-frame slot budget: 8192 u64 slots, a 64 KiB buffer, per submission.
-///
-/// A query takes a slot at BEGIN, one at END, and one for every pass it is
-/// open across, so a frame of sequential BEGIN/END pairs runs out after
-/// about 4000 of them. Engines that test every visible primitive's bounds
-/// issue hundreds to thousands per frame. The count is a chosen cap, not the
-/// device's limit: it keeps the last slot's offset within the smallest
-/// maximum visibility query offset Apple documents for any GPU family
-/// (65,528 bytes). The Apple GPUs this runs on (Apple7 and later) take
-/// 256 KB, and the limit of Intel and AMD Macs is not documented. A frame
-/// past the budget answers its overflowing queries from the uncounted path.
-pub const MAX_SLOTS: u32 = 8192;
-
 /// Byte size of a visibility result slot — Metal writes a u64 counter per slot.
 pub const SLOT_BYTES: u32 = 8;
 
-/// The smallest maximum visibility query offset Apple documents for a GPU family.
-const MAX_VISIBILITY_OFFSET: u32 = 65_528;
+/// Slots one visibility buffer holds on a GPU whose largest visibility query offset is 256 KB.
+///
+/// Apple's Metal feature set tables give that offset for the Apple7 family
+/// and later, the GPUs of Apple silicon Macs. The last slot's offset is
+/// 262,136 bytes.
+pub const BUFFER_SLOTS_256K: u32 = 32_768;
 
-const _: () = assert!((MAX_SLOTS - 1) * SLOT_BYTES <= MAX_VISIBILITY_OFFSET);
+/// Slots one visibility buffer holds on every other GPU.
+///
+/// 65,528 bytes is the smallest maximum visibility query offset the tables
+/// document (Apple2 to Apple6), and the tables give none for Intel and AMD
+/// Macs (Mac2), so those take the smaller buffer. The last slot's offset is
+/// 65,528 bytes.
+pub const BUFFER_SLOTS_64K: u32 = 8_192;
+
+/// The fewest slots a frame's first buffer holds: one 16 KiB page.
+///
+/// A buffer's backing is page-sized whatever it asks for, so a smaller one
+/// would cost the same memory.
+pub const MIN_BUFFER_SLOTS: u32 = 2_048;
+
+const _: () = assert!((BUFFER_SLOTS_256K - 1) * SLOT_BYTES < 256 * 1024);
+const _: () = assert!((BUFFER_SLOTS_64K - 1) * SLOT_BYTES <= 65_528);
+const _: () =
+    assert!(MIN_BUFFER_SLOTS as usize * SLOT_BYTES as usize == crate::page_box::PAGE_SIZE);
 
 /// Where a query sits in its lifecycle (begin → end → issued).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,8 +271,9 @@ impl VisibilityQueryCore {
 
     /// Record that part of this span was never counted.
     ///
-    /// Called when the frame's slot budget is spent or the buffer a segment
-    /// counted into is gone. The published result is then `u32::MAX` rather
+    /// Called when a visibility buffer the frame needed could not be
+    /// allocated or the buffer a segment counted into is gone. The published
+    /// result is then `u32::MAX` rather
     /// than the partial sum the slots that did exist add up to.
     pub fn mark_uncounted(&self) {
         self.mailbox().uncounted.store(1, Ordering::Release);
@@ -429,10 +446,6 @@ impl Drop for VisibilityQueryCore {
     }
 }
 
-/// Monotonic u64-slot allocator reset at each frame boundary.
-///
-/// Encapsulated inside `VisibilityQueryState` — the encoder reaches it
-/// via `VisibilityQueryState::bump_slot`.
 /// The pixel area of an extent, for the area ratio a count is rescaled by.
 const fn area((width, height): (u32, u32)) -> u64 {
     (width as u64) * (height as u64)
@@ -457,26 +470,27 @@ pub fn logical_samples(render_samples: u64, render_area: u64, logical_area: u64)
     u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
+/// Monotonic slot allocator over the frame's current visibility buffer.
+///
+/// Encapsulated inside `VisibilityQueryState`; the encoder reaches it via
+/// `VisibilityQueryState::bump_slot`. `capacity` is the current buffer's slot
+/// count, zero before the frame has a buffer.
 struct VisibilityOffsetAllocator {
     next: u32,
-    exhausted: bool,
+    capacity: u32,
 }
 
 impl VisibilityOffsetAllocator {
     const fn new() -> Self {
         Self {
             next: 0,
-            exhausted: false,
+            capacity: 0,
         }
     }
 
-    /// Bump to a fresh slot.
-    ///
-    /// Returns the newly-allocated index, or `None` if the frame's slot
-    /// budget is exhausted.
+    /// Bump to a fresh slot of the current buffer; `None` when it is full.
     const fn bump(&mut self) -> Option<u32> {
-        if self.next >= MAX_SLOTS {
-            self.exhausted = true;
+        if self.next >= self.capacity {
             return None;
         }
         let slot = self.next;
@@ -484,13 +498,31 @@ impl VisibilityOffsetAllocator {
         Some(slot)
     }
 
-    /// Called at `begin_frame`.
-    ///
-    /// Resets the counter so the next frame starts at slot 0.
-    const fn reset(&mut self) {
+    /// Point the allocator at a buffer of `capacity` slots, from slot 0.
+    const fn reset(&mut self, capacity: u32) {
         self.next = 0;
-        self.exhausted = false;
+        self.capacity = capacity;
     }
+}
+
+/// What the frame's current visibility buffer needs before it can hand out a slot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BufferNeed {
+    /// The current buffer has a free slot.
+    Ready,
+    /// The frame has no buffer yet: install one of at least this many slots.
+    First(u32),
+    /// The current buffer is full and smaller than the device allows: replace it.
+    ///
+    /// The replacement holds at least this many slots. No GPU work has read
+    /// the buffer yet, since a frame binds its buffers when it is submitted,
+    /// so the replacement takes over the slots already handed out.
+    Grow(u32),
+    /// The current buffer is full at the device's size: continue in another buffer.
+    ///
+    /// The next buffer holds at least this many slots, and the passes after
+    /// a pass break count into it.
+    Spill(u32),
 }
 
 /// Sum the u64 visibility counts of the half-open slot range `[begin, end)`.
@@ -522,6 +554,11 @@ pub struct RetiredVisibilityBuffer {
     ///
     /// Pool recycles it only once `coherent_seq >= release_seq`.
     release_seq: u64,
+    /// Which of its frame's buffers this was, in the order the frame filled them.
+    ///
+    /// A frame whose queries outgrow one buffer counts on in another; a
+    /// segment names the buffer it counted into by this and `release_seq`.
+    index: u32,
     /// Slots the frame that used this buffer reserved, from slot 0.
     ///
     /// Every slot the GPU can have written lies below it, since a Counting
@@ -534,9 +571,10 @@ impl RetiredVisibilityBuffer {
     /// Construct a retired buffer.
     ///
     /// `release_seq = 0` is valid and means "ready immediately" — used
-    /// for the freshly-allocated buffer installed on first BEGIN (its
-    /// real `release_seq` is stamped later, at submit time, by
-    /// `retire_current_buffer`).
+    /// for a freshly-allocated buffer installed into a frame (its real
+    /// `release_seq` and index are stamped later, at submit time, by
+    /// `retire_frame_buffers`). The backing is zeroed and a whole number of
+    /// slots long.
     #[must_use]
     pub const fn new(
         backing: PageBox,
@@ -547,8 +585,21 @@ impl RetiredVisibilityBuffer {
             backing,
             metal_handle,
             release_seq,
+            index: 0,
             reserved: 0,
         }
+    }
+
+    /// How many slots the buffer holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backing holds more than `u32::MAX` slots, which no
+    /// buffer the device takes does.
+    #[must_use]
+    pub fn slots(&self) -> u32 {
+        u32::try_from(self.backing.len() / SLOT_BYTES as usize)
+            .expect("a visibility buffer's slots fit u32")
     }
 
     /// Zero the slots the buffer's last frame reserved, before a new frame counts into it.
@@ -619,25 +670,47 @@ impl VisibilityBufferPool {
         }
     }
 
-    fn acquire(&mut self) -> Option<RetiredVisibilityBuffer> {
-        self.free.pop()
+    /// The smallest free buffer holding at least `slots`, `None` when no free buffer does.
+    fn acquire(&mut self, slots: u32) -> Option<RetiredVisibilityBuffer> {
+        let best = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.slots() >= slots)
+            .min_by_key(|(_, buf)| buf.slots())
+            .map(|(at, _)| at)?;
+        Some(self.free.swap_remove(best))
     }
 
     fn retire(&mut self, buf: RetiredVisibilityBuffer) -> Option<RetiredVisibilityBuffer> {
         self.retired.push(buf);
-        let total = self.retired.len() + self.free.len();
-        if total > self.cap {
-            // Prefer evicting free first; fall back to the oldest
-            // retired.
-            self.free.pop().or_else(|| {
-                if self.retired.is_empty() {
-                    None
-                } else {
-                    Some(self.retired.remove(0))
-                }
-            })
-        } else {
-            None
+        self.evict_over_cap()
+    }
+
+    /// Put back a buffer no GPU work has used, ready for reuse at once.
+    fn give_back(&mut self, buf: RetiredVisibilityBuffer) -> Option<RetiredVisibilityBuffer> {
+        self.free.push(buf);
+        self.evict_over_cap()
+    }
+
+    /// The buffer the pool lets go of when it holds more than its cap.
+    ///
+    /// The smallest free buffer goes first, since a frame that outgrew it
+    /// asks for larger ones; the oldest retired one only when nothing is free.
+    fn evict_over_cap(&mut self) -> Option<RetiredVisibilityBuffer> {
+        if self.retired.len() + self.free.len() <= self.cap {
+            return None;
+        }
+        let smallest = self
+            .free
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, buf)| buf.slots())
+            .map(|(at, _)| at);
+        match smallest {
+            Some(at) => Some(self.free.swap_remove(at)),
+            None if self.retired.is_empty() => None,
+            None => Some(self.retired.remove(0)),
         }
     }
 
@@ -652,13 +725,16 @@ impl VisibilityBufferPool {
         }
     }
 
-    /// Sum the slot range `span` of the retired buffer tagged `seq`; `None` without one.
+    /// Sum the slot range `span` of buffer `index` of the frame `seq`; `None` without one.
     ///
     /// The caller has seen `coherent_seq` reach `seq`, so the GPU has
     /// finished writing the buffer and CPU reads of its Shared backing
     /// observe the final counts.
-    fn sum_retired(&self, seq: u64, (begin, end): (u32, u32)) -> Option<u64> {
-        let buf = self.retired.iter().find(|b| b.release_seq == seq)?;
+    fn sum_retired(&self, seq: u64, index: u32, (begin, end): (u32, u32)) -> Option<u64> {
+        let buf = self
+            .retired
+            .iter()
+            .find(|b| b.release_seq == seq && b.index == index)?;
         Some(sum_slots(buf.backing().as_slice(), begin, end))
     }
 }
@@ -672,6 +748,8 @@ impl VisibilityBufferPool {
 /// already moved the core's own `offset_begin` on to the next segment.
 struct PendingSegment {
     submit_seq: u64,
+    /// Which of the frame's buffers the segment counted into.
+    buffer: u32,
     core: Arc<VisibilityQueryCore>,
     issue_generation: u64,
     span: (u32, u32),
@@ -684,9 +762,9 @@ struct PendingSegment {
 
 /// Composite encoder-side state for visibility queries.
 ///
-/// Lives on `FrameEncoder`: persistent across frames (pool, pending list)
-/// with per-frame pieces (allocator, `active_count`, current buffer) reset in
-/// `begin_frame`.
+/// Lives on `FrameEncoder`: persistent across frames (pool, pending list,
+/// the sizing history) with per-frame pieces (allocator, the frame's buffers)
+/// reset in `begin_frame`.
 pub struct VisibilityQueryState {
     allocator: VisibilityOffsetAllocator,
     pool: VisibilityBufferPool,
@@ -702,16 +780,25 @@ pub struct VisibilityQueryState {
     /// needs a Counting-mode arm and whether END emits Disabled or a
     /// fresh Counting slot.
     active: Vec<Arc<VisibilityQueryCore>>,
-    /// Visibility buffer reserved for the frame currently being encoded.
+    /// The visibility buffers of the frame being encoded, in the order it fills them.
     ///
-    /// `None` until the first BEGIN in a frame allocates. At submit time
-    /// the encoder moves this into the pool keyed by the frame's
-    /// `submit_seq`.
-    current_buffer: Option<RetiredVisibilityBuffer>,
-    /// `true` once any BEGIN this frame hit allocator exhaustion.
+    /// Empty until the frame reserves its first slot. The last one is the
+    /// one slots come from; the earlier ones filled up. At submit time the
+    /// encoder moves them all into the pool keyed by the frame's
+    /// `submit_seq` and their index here.
+    frame_buffers: Vec<RetiredVisibilityBuffer>,
+    /// The most slots one buffer may hold on this device.
+    buffer_slots: u32,
+    /// Slots recent submissions reserved, the largest of them decaying.
+    ///
+    /// A frame's first buffer is sized from it, so a workload that settled
+    /// at a size starts each frame in a buffer it fits.
+    peak_slots: u32,
+    /// `true` once a visibility buffer this frame needed could not be allocated.
     ///
     /// The encoder uses this to short-circuit subsequent commands and to
-    /// finalize overflowing queries with the safe `u32::MAX` fallback.
+    /// finalize the queries it left uncounted with the safe `u32::MAX`
+    /// fallback.
     exhausted_this_frame: bool,
     /// Draws the encoder has issued, counted from the first frame.
     ///
@@ -721,25 +808,26 @@ pub struct VisibilityQueryState {
 }
 
 impl VisibilityQueryState {
+    /// The state of a device whose visibility buffers hold at most `buffer_slots` slots.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(buffer_slots: u32) -> Self {
         Self {
             allocator: VisibilityOffsetAllocator::new(),
             // Cap at 16: sync_channel(1) + GPU in-flight gives at most
             // ~3 frames coexisting in the steady state, but a
             // `drawable_wait` hitch or a block on the encoder channel
             // can stack several more retirees before `intake_completed`
-            // drains them. At 64 KiB per buffer that is about 1 MiB of
-            // native memory: up to 16 pooled buffers plus the current one
-            // and evicted buffers awaiting retention. Eviction becomes a
-            // genuinely exceptional path rather than a predictable one on
-            // hitch frames. Evictions are still routed through the encoder's
+            // drains them. Eviction becomes a genuinely exceptional path
+            // rather than a predictable one on hitch frames. Evictions are
+            // still routed through the encoder's
             // `PendingBufferWrapperRetention` drain so the MTLBuffer
             // wrapper is destroyed before the `PageBox` drops.
             pool: VisibilityBufferPool::new(16),
             pending: VecDeque::new(),
             active: Vec::new(),
-            current_buffer: None,
+            frame_buffers: Vec::new(),
+            buffer_slots,
+            peak_slots: 0,
             exhausted_this_frame: false,
             draws_seen: 0,
         }
@@ -747,13 +835,13 @@ impl VisibilityQueryState {
 
     /// Reset per-frame fields.
     ///
-    /// Called on the encoder thread at `begin_frame` *after* the current
-    /// frame's buffer (if any) has been moved into retention via
-    /// `retire_current_buffer`. Does not touch the pool, the pending list
+    /// Called on the encoder thread at `begin_frame` *after* the previous
+    /// frame's buffers have been moved into retention via
+    /// `retire_frame_buffers`. Does not touch the pool, the pending list
     /// or the open spans; those drain separately, and a span open across
     /// the boundary is reopened by [`Self::resume_open_spans`].
     pub const fn reset_frame(&mut self) {
-        self.allocator.reset();
+        self.allocator.reset(0);
         self.exhausted_this_frame = false;
     }
 
@@ -776,50 +864,175 @@ impl VisibilityQueryState {
         self.draws_seen
     }
 
+    /// The most slots one buffer may hold on this device.
     #[must_use]
-    pub fn current_buffer_handle(&self) -> MetalHandle<MTLBufferKind> {
-        self.current_buffer
-            .as_ref()
+    pub const fn buffer_slots(&self) -> u32 {
+        self.buffer_slots
+    }
+
+    /// The handle of buffer `index` of the frame being encoded, null for one it has not used.
+    ///
+    /// A pass carries the index of the buffer its Counting modes name, and
+    /// the submit path binds that buffer to it.
+    #[must_use]
+    pub fn buffer_handle(&self, index: u32) -> MetalHandle<MTLBufferKind> {
+        self.frame_buffers
+            .get(index as usize)
             .map_or(MetalHandle::NULL, RetiredVisibilityBuffer::metal_handle)
     }
 
-    /// Install a buffer as this frame's visibility buffer.
+    /// How many slots a frame's first buffer is sized for.
     ///
-    /// Called on first Issue(BEGIN). Takes either a pool-acquired buffer
-    /// (via `try_acquire_reusable`) on which the caller has run
-    /// [`RetiredVisibilityBuffer::clear_reserved`], or a freshly allocated,
-    /// zeroed one.
-    pub fn install_current_buffer(&mut self, buf: RetiredVisibilityBuffer) {
-        debug_assert!(self.current_buffer.is_none());
-        self.current_buffer = Some(buf);
+    /// A quarter above the decayed peak of recent submissions, rounded up
+    /// to a power of two, at least [`MIN_BUFFER_SLOTS`] and at most what one
+    /// buffer may hold.
+    #[must_use]
+    pub const fn first_buffer_slots(&self) -> u32 {
+        let wanted = self.peak_slots.saturating_add(self.peak_slots / 4);
+        let rounded = match wanted.checked_next_power_of_two() {
+            Some(slots) => slots,
+            None => u32::MAX,
+        };
+        if rounded < MIN_BUFFER_SLOTS {
+            MIN_BUFFER_SLOTS
+        } else if rounded > self.buffer_slots {
+            self.buffer_slots
+        } else {
+            rounded
+        }
     }
 
-    /// Pool-backed acquire of a reusable visibility buffer.
-    ///
-    /// Its backing still holds the last frame's counter values: the caller
-    /// runs [`RetiredVisibilityBuffer::clear_reserved`] before counting into it.
-    pub fn try_acquire_reusable(&mut self) -> Option<RetiredVisibilityBuffer> {
-        self.pool.acquire()
+    /// What the frame needs before [`Self::bump_slot`] can hand out a slot.
+    #[must_use]
+    pub const fn buffer_need(&self) -> BufferNeed {
+        if self.frame_buffers.is_empty() {
+            BufferNeed::First(self.first_buffer_slots())
+        } else if self.allocator.next < self.allocator.capacity {
+            BufferNeed::Ready
+        } else if self.allocator.capacity < self.buffer_slots {
+            let doubled = self.allocator.capacity.saturating_mul(2);
+            BufferNeed::Grow(if doubled < self.buffer_slots {
+                doubled
+            } else {
+                self.buffer_slots
+            })
+        } else {
+            BufferNeed::Spill(self.buffer_slots)
+        }
     }
 
-    /// Move this frame's buffer into the pool's retired list.
+    /// A free buffer of at least `slots`, its last frame's slots zeroed; `None` when none is free.
+    pub fn try_acquire_reusable(&mut self, slots: u32) -> Option<RetiredVisibilityBuffer> {
+        let mut buf = self.pool.acquire(slots)?;
+        buf.clear_reserved();
+        Some(buf)
+    }
+
+    /// Install `buf` as the frame's first visibility buffer, for a [`BufferNeed::First`].
     ///
-    /// Tagged with `submit_seq` so `release_up_to` can free it for reuse
-    /// once the GPU retires the frame. Called from the encoder's submit
-    /// path.
+    /// `buf` is pool-acquired through [`Self::try_acquire_reusable`] or
+    /// freshly allocated and zeroed.
+    pub fn install_first_buffer(&mut self, buf: RetiredVisibilityBuffer) {
+        debug_assert!(self.frame_buffers.is_empty());
+        self.allocator.reset(buf.slots().min(self.buffer_slots));
+        self.frame_buffers.push(buf);
+    }
+
+    /// Replace the frame's full current buffer with the larger `buf`, for a [`BufferNeed::Grow`].
     ///
-    /// Returns the evicted entry (if any) when the pool exceeds its
-    /// cap. The caller **must** route it through the encoder's
-    /// seq-gated `PendingBufferWrapperRetention` drain — destroying
-    /// the `MTLBuffer` wrapper before the `PageBox` drops — otherwise
-    /// Metal's `bytesNoCopy` pointer outlives the PE allocation and
-    /// the GPU will write into freed snmalloc heap, corrupting
-    /// allocator metadata.
-    pub fn retire_current_buffer(&mut self, submit_seq: u64) -> Option<RetiredVisibilityBuffer> {
-        let mut buf = self.current_buffer.take()?;
-        buf.release_seq = submit_seq;
-        buf.reserved = self.allocator.next;
-        self.pool.retire(buf)
+    /// The slots handed out so far keep their offsets in `buf`, and the
+    /// replaced buffer, which no GPU work has read, goes back to the free
+    /// list. Returns a buffer the pool lets go of past its cap; the caller
+    /// routes it through the same seq-gated destruction as an eviction at
+    /// submit.
+    pub fn install_grown_buffer(
+        &mut self,
+        buf: RetiredVisibilityBuffer,
+    ) -> Option<RetiredVisibilityBuffer> {
+        let capacity = buf.slots().min(self.buffer_slots);
+        let replaced = self.frame_buffers.pop();
+        self.frame_buffers.push(buf);
+        self.allocator.capacity = capacity;
+        replaced.and_then(|old| self.pool.give_back(old))
+    }
+
+    /// Continue the frame in `buf` after its full current buffer, for a [`BufferNeed::Spill`].
+    ///
+    /// Every open span is cut at the end of the full buffer, like the cut a
+    /// submit makes, and reopened at slot 0 of `buf`, so its total adds the
+    /// slots of both. The caller ends the current pass, since a Metal render
+    /// pass counts into the one buffer its descriptor names.
+    pub fn spill_into(&mut self, submit_seq: u64, buf: RetiredVisibilityBuffer) {
+        let full = self.current_buffer_index();
+        let end = self.allocator.next;
+        for core in &self.active {
+            self.pending.push_back(PendingSegment {
+                submit_seq,
+                buffer: full,
+                core: core.clone(),
+                issue_generation: core.issue_generation(),
+                span: (core.offset_begin(), end),
+                closes_span: false,
+            });
+        }
+        if let Some(full) = self.frame_buffers.last_mut() {
+            full.reserved = end;
+        }
+        self.allocator.reset(buf.slots().min(self.buffer_slots));
+        self.frame_buffers.push(buf);
+        for core in &self.active {
+            core.resume(submit_seq, 0);
+        }
+    }
+
+    /// Index of the buffer slots come from now; 0 before the frame has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a frame holds more than `u32::MAX` buffers, which needs
+    /// more slots than any address space holds.
+    #[must_use]
+    pub fn current_buffer_index(&self) -> u32 {
+        u32::try_from(self.frame_buffers.len().saturating_sub(1))
+            .expect("a frame's buffer count fits u32")
+    }
+
+    /// Move every buffer of this frame into the pool's retired list.
+    ///
+    /// Each is tagged with `submit_seq` and its index in the frame, so
+    /// `release_up_to` can free it for reuse once the GPU retires the frame
+    /// and intake finds the buffer a segment counted into. Called from the
+    /// encoder's submit path. The slots the frame reserved feed the size of
+    /// the next frames' first buffer.
+    ///
+    /// Returns the entries the pool evicts past its cap. The caller **must**
+    /// route each through the encoder's seq-gated
+    /// `PendingBufferWrapperRetention` drain — destroying the `MTLBuffer`
+    /// wrapper before the `PageBox` drops — otherwise Metal's `bytesNoCopy`
+    /// pointer outlives the PE allocation and the GPU will write into freed
+    /// snmalloc heap, corrupting allocator metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a frame holds more than `u32::MAX` buffers, which needs
+    /// more slots than any address space holds.
+    pub fn retire_frame_buffers(&mut self, submit_seq: u64) -> Vec<RetiredVisibilityBuffer> {
+        let last = self.frame_buffers.len().saturating_sub(1);
+        let last_reserved = self.allocator.next;
+        let mut reserved_total: u32 = 0;
+        let mut evicted = Vec::new();
+        // Drained rather than taken, so the next frame reuses the capacity.
+        for (index, mut buf) in self.frame_buffers.drain(..).enumerate() {
+            if index == last {
+                buf.reserved = last_reserved;
+            }
+            reserved_total = reserved_total.saturating_add(buf.reserved);
+            buf.release_seq = submit_seq;
+            buf.index = u32::try_from(index).expect("a frame's buffer count fits u32");
+            evicted.extend(self.pool.retire(buf));
+        }
+        self.peak_slots = reserved_total.max(self.peak_slots - self.peak_slots / 32);
+        evicted
     }
 
     #[must_use]
@@ -827,7 +1040,7 @@ impl VisibilityQueryState {
         self.exhausted_this_frame
     }
 
-    /// Record that the frame's slot budget is spent.
+    /// Record that a visibility buffer the frame needed could not be allocated.
     ///
     /// Every span open at that point loses the rest of its count, so each
     /// one is marked uncounted: the alternative is publishing a partial
@@ -839,15 +1052,15 @@ impl VisibilityQueryState {
         }
     }
 
-    /// Encoder-side slot allocation.
+    /// Encoder-side slot allocation, from the current buffer.
     ///
-    /// Wraps the private allocator so the encoder never touches it
-    /// directly.
+    /// `None` when the current buffer is full or the frame has none; the
+    /// encoder asks [`Self::buffer_need`] first and provides one.
     pub const fn bump_slot(&mut self) -> Option<u32> {
         self.allocator.bump()
     }
 
-    /// The slot the next allocation would hand out: the frame's high-water mark.
+    /// The slot the next allocation would hand out: the current buffer's high-water mark.
     ///
     /// Where a span begun without a slot starts. Every slot below it was
     /// reserved before the span began, and once the frame is exhausted no slot
@@ -874,7 +1087,7 @@ impl VisibilityQueryState {
         self.active.retain(|c| !Arc::ptr_eq(c, core));
     }
 
-    /// Queue one segment of a span for the intake that follows its frame.
+    /// Queue one segment of a span, in the frame's current buffer, for the intake after its frame.
     ///
     /// `span` is the half-open slot range the segment counted into on the
     /// frame `submit_seq` names. `closes_span` marks the segment carrying
@@ -887,8 +1100,10 @@ impl VisibilityQueryState {
         closes_span: bool,
     ) {
         let issue_generation = core.issue_generation();
+        let buffer = self.current_buffer_index();
         self.pending.push_back(PendingSegment {
             submit_seq,
+            buffer,
             core,
             issue_generation,
             span,
@@ -898,15 +1113,17 @@ impl VisibilityQueryState {
 
     /// Cut every open span at a submit boundary.
     ///
-    /// The frame's slot array retires with the submit, so each open span
-    /// contributes the segment it has counted so far, ending at the
-    /// allocator's high-water mark. Called from the encoder's submit path,
-    /// after the last pass of the frame is closed.
+    /// The frame's buffers retire with the submit, so each open span
+    /// contributes the segment it has counted so far in the current buffer,
+    /// ending at the allocator's high-water mark. Called from the encoder's
+    /// submit path, after the last pass of the frame is closed.
     pub fn split_open_spans(&mut self, submit_seq: u64) {
         let end = self.allocator.next;
+        let buffer = self.current_buffer_index();
         for core in &self.active {
             self.pending.push_back(PendingSegment {
                 submit_seq,
+                buffer,
                 core: core.clone(),
                 issue_generation: core.issue_generation(),
                 span: (core.offset_begin(), end),
@@ -929,10 +1146,10 @@ impl VisibilityQueryState {
 
     /// Drain every owned `RetiredVisibilityBuffer`, leaving the queries alone.
     ///
-    /// Covers the current-frame slot plus the pool's retired and free lists.
-    /// Caller takes ownership of the returned vec; each entry's `into_parts`
-    /// yields the (`PageBox`, `metal_handle`, `release_seq`) triple the encoder
-    /// feeds through its destroy-then-drop ordering.
+    /// Covers the current frame's buffers plus the pool's retired and free
+    /// lists. Caller takes ownership of the returned vec; each entry's
+    /// `into_parts` yields the (`PageBox`, `metal_handle`, `release_seq`)
+    /// triple the encoder feeds through its destroy-then-drop ordering.
     ///
     /// The caller finalizes first, so every segment whose frame the GPU has
     /// retired is summed while the buffer it counted into is still here and
@@ -944,10 +1161,7 @@ impl VisibilityQueryState {
     /// permissively at the next intake, which cannot find the buffer it names:
     /// dropping it would leave its query `Pending` for the rest of the process.
     pub fn drain_all_buffers(&mut self) -> Vec<RetiredVisibilityBuffer> {
-        let mut all = Vec::new();
-        if let Some(cur) = self.current_buffer.take() {
-            all.push(cur);
-        }
+        let mut all = core::mem::take(&mut self.frame_buffers);
         all.append(&mut self.pool.retired);
         all.append(&mut self.pool.free);
         all
@@ -956,17 +1170,17 @@ impl VisibilityQueryState {
     /// Drain pending → finalize → release pool entries up to `coherent_seq`.
     ///
     /// Every queued segment whose frame has retired on the GPU is summed from
-    /// the retired visibility buffer matching its `submit_seq` and folded into
-    /// its query's running total; the segment carrying `Issue(END)` publishes
-    /// that total. An empty span sums to zero without consulting a buffer,
-    /// since a frame that reserved no slot for the query reserved no buffer
-    /// either. A non-empty span whose buffer cannot be found (retired and
-    /// evicted before intake ran, which the normal flow never produces)
-    /// leaves the whole span uncounted. A segment from a bracket abandoned by
-    /// a later BEGIN is skipped instead of being folded into that replacement
-    /// bracket. Its retired buffer still moves through the normal release path
-    /// once its seq has been reached, so abandoning a bracket changes no
-    /// storage lifetime.
+    /// the retired visibility buffer matching its `submit_seq` and buffer
+    /// index and folded into its query's running total; the segment carrying
+    /// `Issue(END)` publishes that total. An empty span sums to zero without
+    /// consulting a buffer, since a frame that reserved no slot for the query
+    /// reserved no buffer either. A non-empty span whose buffer cannot be
+    /// found (retired and evicted before intake ran, which the normal flow
+    /// never produces) leaves the whole span uncounted. A segment from a
+    /// bracket abandoned by a later BEGIN is skipped instead of being folded
+    /// into that replacement bracket. Its retired buffer still moves through
+    /// the normal release path once its seq has been reached, so abandoning a
+    /// bracket changes no storage lifetime.
     ///
     /// Each retired buffer's `PageBox` points at PE-allocated Shared storage
     /// wrapped by Metal. Once `coherent_seq >= release_seq` the GPU is done
@@ -995,7 +1209,10 @@ impl VisibilityQueryState {
             let (begin, end) = entry.span;
             let sum = if begin >= end {
                 0
-            } else if let Some(sum) = self.pool.sum_retired(entry.submit_seq, entry.span) {
+            } else if let Some(sum) =
+                self.pool
+                    .sum_retired(entry.submit_seq, entry.buffer, entry.span)
+            {
                 sum
             } else {
                 entry.core.mark_uncounted();
@@ -1007,12 +1224,6 @@ impl VisibilityQueryState {
             }
         }
         self.pool.release_up_to(coherent_seq);
-    }
-}
-
-impl Default for VisibilityQueryState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

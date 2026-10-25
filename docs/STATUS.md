@@ -191,13 +191,6 @@ unless its entry says otherwise.
   NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
-- Occlusion queries past the per-frame slot budget: 8192 visibility slots
-  per submission, a chosen cap that fits the smallest maximum visibility
-  query offset Apple documents. A query takes a slot at BEGIN, one at END
-  and one for each pass it stays open across, so this is about 4000
-  BEGIN/END pairs in a frame. A query open when the slots run out, or begun
-  after, that drew reads `u32::MAX`, fully visible, warned once; one that
-  drew nothing reads 0.
 - The fixed-function texture operations `D3DTOP_PREMODULATE`,
   `D3DTOP_MULTIPLYADD` and `D3DTOP_LERP`: absent from `TextureOpCaps`, and a
   stage that names one is warned once and runs as `D3DTOP_SELECTARG1`.
