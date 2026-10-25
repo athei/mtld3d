@@ -3029,9 +3029,8 @@ impl FrameEncoder {
         self.visibility.mark_exhausted();
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "visibility-query slots exhausted for this submission ({MAX_SLOTS}, the most a \
-             Metal visibility offset addresses on every GPU family): overflowing queries that \
-             drew report u32::MAX"
+            "visibility-query slot budget exhausted for this frame ({MAX_SLOTS} slots per \
+             submission): overflowing queries that drew report u32::MAX"
         );
     }
 

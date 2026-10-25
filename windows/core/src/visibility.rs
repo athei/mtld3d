@@ -36,21 +36,23 @@ use mtld3d_shared::{
 
 use crate::page_box::PageBox;
 
-/// Slots one submission can count into: 8192 u64 slots, a 64 KiB buffer.
+/// The per-frame slot budget: 8192 u64 slots, a 64 KiB buffer, per submission.
 ///
 /// A query takes a slot at BEGIN, one at END, and one for every pass it is
 /// open across, so a frame of sequential BEGIN/END pairs runs out after
 /// about 4000 of them. Engines that test every visible primitive's bounds
-/// issue hundreds to thousands per frame. The count is the most every Metal
-/// GPU family addresses: the visibility query offset reaches 65,528 bytes on
-/// the smallest (Apple2 to Apple6), which is slot 8191. A frame past it
-/// answers its overflowing queries from the uncounted path.
+/// issue hundreds to thousands per frame. The count is a chosen cap, not the
+/// device's limit: it keeps the last slot's offset within the smallest
+/// maximum visibility query offset Apple documents for any GPU family
+/// (65,528 bytes). The Apple GPUs this runs on (Apple7 and later) take
+/// 256 KB, and the limit of Intel and AMD Macs is not documented. A frame
+/// past the budget answers its overflowing queries from the uncounted path.
 pub const MAX_SLOTS: u32 = 8192;
 
 /// Byte size of a visibility result slot — Metal writes a u64 counter per slot.
 pub const SLOT_BYTES: u32 = 8;
 
-/// The largest visibility query offset every Metal GPU family accepts.
+/// The smallest maximum visibility query offset Apple documents for a GPU family.
 const MAX_VISIBILITY_OFFSET: u32 = 65_528;
 
 const _: () = assert!((MAX_SLOTS - 1) * SLOT_BYTES <= MAX_VISIBILITY_OFFSET);
@@ -727,10 +729,11 @@ impl VisibilityQueryState {
             // ~3 frames coexisting in the steady state, but a
             // `drawable_wait` hitch or a block on the encoder channel
             // can stack several more retirees before `intake_completed`
-            // drains them. At 64 KiB per buffer the 16-entry ceiling
-            // is 1 MiB of native memory, and eviction becomes a genuinely
-            // exceptional path rather than a predictable one on hitch
-            // frames. Evictions are still routed through the encoder's
+            // drains them. At 64 KiB per buffer that is about 1 MiB of
+            // native memory: up to 16 pooled buffers plus the current one
+            // and evicted buffers awaiting retention. Eviction becomes a
+            // genuinely exceptional path rather than a predictable one on
+            // hitch frames. Evictions are still routed through the encoder's
             // `PendingBufferWrapperRetention` drain so the MTLBuffer
             // wrapper is destroyed before the `PageBox` drops.
             pool: VisibilityBufferPool::new(16),
@@ -783,8 +786,9 @@ impl VisibilityQueryState {
     /// Install a buffer as this frame's visibility buffer.
     ///
     /// Called on first Issue(BEGIN). Takes either a pool-acquired buffer
-    /// (via `try_acquire_reusable`) or a freshly allocated one; the caller
-    /// has zero-initialized the backing before handing it in.
+    /// (via `try_acquire_reusable`) on which the caller has run
+    /// [`RetiredVisibilityBuffer::clear_reserved`], or a freshly allocated,
+    /// zeroed one.
     pub fn install_current_buffer(&mut self, buf: RetiredVisibilityBuffer) {
         debug_assert!(self.current_buffer.is_none());
         self.current_buffer = Some(buf);
@@ -792,8 +796,8 @@ impl VisibilityQueryState {
 
     /// Pool-backed acquire of a reusable visibility buffer.
     ///
-    /// Its backing still holds the last frame's counter values (caller
-    /// must zero).
+    /// Its backing still holds the last frame's counter values: the caller
+    /// runs [`RetiredVisibilityBuffer::clear_reserved`] before counting into it.
     pub fn try_acquire_reusable(&mut self) -> Option<RetiredVisibilityBuffer> {
         self.pool.acquire()
     }

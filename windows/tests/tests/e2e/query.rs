@@ -553,9 +553,9 @@ fn occlusion_queries_past_a_thousand_slots_count_what_they_drew() {
 
 #[test]
 fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
-    // The slots of one submission are finite (two per BEGIN/END pair plus
-    // one per pass the span crosses, up to the most a Metal visibility offset
-    // addresses). A query that gets no slot and did draw cannot be counted,
+    // The per-frame slot budget is finite (two slots per BEGIN/END pair plus
+    // one per pass the span crosses, 8192 per submission). A query that gets
+    // no slot and did draw cannot be counted,
     // and the answer for "unknown" is the permissive `u32::MAX`: reporting
     // the zero its empty span sums to would read as full occlusion and make
     // a title cull geometry it should draw. A query that drew nothing is not
