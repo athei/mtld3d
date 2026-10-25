@@ -3025,17 +3025,15 @@ impl PassState {
         if self.current_color_texture.is_null() {
             return false;
         }
-        let mut any_encodes = false;
-        if self.current_color_format.srgb_twin().is_some() {
-            if self.twin_of(self.current_color_texture).is_null()
+        let mut any_encodes = self.current_color_format.srgb_twin().is_some();
+        if any_encodes
+            && (self.twin_of(self.current_color_texture).is_null()
                 || !Self::companion_twin_present(
                     self.current_color_msaa_texture,
                     self.current_color_msaa_srgb_texture,
-                )
-            {
-                return false;
-            }
-            any_encodes = true;
+                ))
+        {
+            return false;
         }
         for (i, slot) in self.current_extra_color.iter().enumerate() {
             if self.current_extra_present_mask & (1 << i) == 0 || slot.format.srgb_twin().is_none()
