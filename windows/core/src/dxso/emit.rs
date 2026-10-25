@@ -59,18 +59,21 @@ bitflags::bitflags! {
         /// perspective-interpolated. Folded into the PS cache key so FLAT and
         /// GOURAUD draws get distinct libraries.
         const FLAT_SHADE = 1 << 1;
-        /// `D3DRS_SRGBWRITEENABLE != 0` on a colour target with no sRGB Metal view.
+        /// `D3DRS_SRGBWRITEENABLE != 0` on a target that takes the write through its linear view.
         ///
         /// When set, the PS applies the linear→sRGB OETF to the final colour
         /// rgb (alpha untouched) just before output, after
         /// fog/specular/alpha-test. This is the fallback path: where the
-        /// bound colour target has an sRGB twin the render pass attaches it
-        /// instead and the hardware encodes after the blender, which is what
-        /// D3D9 does; the encoder clears this flag for such a draw. It stays
-        /// set for a target whose format has no sRGB twin (e.g. R5G6B5),
-        /// where the encode can only happen in-shader and therefore lands
-        /// before the blender. Folded into the PS cache key so sRGB-write and
-        /// plain draws get distinct libraries.
+        /// bound colour target has an sRGB twin view the render pass attaches
+        /// it instead and the hardware encodes after the blender, which is
+        /// what D3D9 does; the encoder clears this flag for such a draw. A
+        /// target of a format without an sRGB twin (R5G6B5, the 16-bit and
+        /// float formats) takes no sRGB write in D3D9 and is written linear,
+        /// so the flag stays set only for a twin-capable target whose twin
+        /// view Metal declined, where the encode lands before the blender.
+        /// A programmable PS skips the targets bits 4..7 of
+        /// [`VariantKey::color_out_mask`] name. Folded into the PS cache key
+        /// so sRGB-write and plain draws get distinct libraries.
         const SRGB_WRITE = 1 << 2;
         /// `D3DRS_POINTSPRITEENABLE != 0` on a point-list draw.
         ///
@@ -209,7 +212,12 @@ pub struct VariantKey {
     /// a colour slot the pass leaves unbound, so the mask must match the
     /// pass exactly. Bit 0 is implied: the emitter ORs it in, so the derived
     /// `Default` (0) still means "render target 0 only" and the FF PS, which
-    /// writes one output, keys on the default. Part of the PS cache key.
+    /// writes one output, keys on the default.
+    ///
+    /// Bits 4..7 matter only under [`VariantFlags::SRGB_WRITE`]: bit `4 + i`
+    /// set ⇒ colour output `i` stays linear, its target's format taking no
+    /// sRGB write. Clear bits encode every exported output. Part of the PS
+    /// cache key.
     pub color_out_mask: u8,
     /// `D3DRS_MULTISAMPLEMASK` narrowed to the pass's sample count.
     ///
@@ -559,10 +567,11 @@ fn w(out: &mut String, s: &str) {
 
 /// Emit the linear→sRGB OETF helper for `D3DRS_SRGBWRITEENABLE`.
 ///
-/// Emitted only for a colour target with no sRGB Metal twin (`R5G6B5` and the
-/// float formats), where the RT stays at its plain pixel format and the encode
-/// can only happen in the pixel shader, on the final colour rgb (alpha is left
-/// linear). Per channel this is the standard sRGB transfer function:
+/// Emitted only for a colour target whose format takes the sRGB write but
+/// whose sRGB twin view Metal declined, where the RT stays at its plain pixel
+/// format and the encode can only happen in the pixel shader, on the final
+/// colour rgb (alpha is left linear). Per channel this is the standard sRGB
+/// transfer function:
 /// `c <= 0.0031308 ? 12.92*c : 1.055*c^(1/2.4) - 0.055`.
 /// `select(hi, lo, cond)` returns `cond ? lo : hi` per component; the `pow`
 /// domain is guarded with `max(c, 0)` so a negative lane never yields a NaN
@@ -1447,11 +1456,13 @@ fn emit_ps_function(
     write_fog_blend(out, variant, "oC0");
     // D3DRS_SRGBWRITEENABLE: in-shader linear→sRGB encode on the final colour,
     // after fog/specular/alpha-test, alpha left linear. See the helper doc.
-    // Every exported target is an sRGB-capable write under the same render
-    // state, so the encode applies to each of them.
+    // D3D9 encodes only the targets whose format takes an sRGB write; the
+    // encoder names the exported targets that stay linear in bits 4..7 of
+    // `color_out_mask`.
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
+        let linear_colors = variant.color_out_mask >> 4;
         for i in 0..4u32 {
-            if exported_colors & (1 << i) != 0 {
+            if exported_colors & !linear_colors & (1 << i) != 0 {
                 let _ = writeln!(out, "    oC{i}.rgb = mtld3d_linear_to_srgb(oC{i}.rgb);");
             }
         }

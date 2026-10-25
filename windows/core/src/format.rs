@@ -529,6 +529,19 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
         && (native_packed16 || !matches!(d3d_format, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
 }
 
+/// Whether `D3DRS_SRGBWRITEENABLE` encodes a render target of this format on this device.
+///
+/// D3D9 applies the sRGB write to the render-target formats with an sRGB
+/// counterpart and writes every other one linear. Here that is a format the
+/// device renders into whose Metal format has an sRGB twin, the view the pass
+/// attaches under the state.
+#[must_use]
+pub fn takes_srgb_write(d3d_format: u32, native_packed16: bool) -> bool {
+    is_render_target_format_device(d3d_format, native_packed16)
+        && map_d3d_format_device(d3d_format, native_packed16)
+            .is_some_and(|mapping| mapping.metal_pixel_format().srgb_twin().is_some())
+}
+
 /// The device-dependent half of a `CheckDeviceFormat` usage query.
 ///
 /// `D3DUSAGE_QUERY_FILTER` asks whether a format samples with linear
@@ -540,14 +553,15 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// members (R16F / G16R16F / A16B16G16R16F) filter on every family and stay
 /// advertised either way.
 ///
-/// `D3DUSAGE_QUERY_SRGBWRITE` asks whether the format encodes sRGB as it is
-/// written, which is a property of the render pass: the answer is the
-/// device's render-target answer for the format, whether or not the query
-/// also carries `D3DUSAGE_RENDERTARGET`. Every colour attachment encodes,
-/// through the sRGB twin view where the Metal format has one and through the
-/// pixel shader's OETF variant where it has not, so the twin table is the
-/// read side's question rather than this one. A format that is no colour
-/// attachment has nothing to encode into and answers no.
+/// `D3DUSAGE_QUERY_SRGBWRITE` asks whether `D3DRS_SRGBWRITEENABLE` encodes
+/// what is written into the format. It does for a render-target format of the
+/// device whose Metal format has an sRGB twin, the 8-bit four-channel
+/// formats, whether or not the query also carries `D3DUSAGE_RENDERTARGET`:
+/// the pass attaches the twin view, and the encode follows the blender. Every
+/// other render-target format (R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the
+/// float formats) is written linear under the state, as D3D9 writes it, and
+/// answers no, so the answer and the stored values agree. A format that is no
+/// colour attachment has nothing to encode into and answers no.
 ///
 /// `D3DUSAGE_QUERY_LEGACYBUMPMAP` asks whether the format can be the source
 /// texture of the fixed-function bump-environment operations, which
@@ -566,7 +580,7 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// target. Other usage policy stays with the caller; the float family is
 /// colour-renderable on both GPU families.
 #[must_use]
-pub const fn supports_usage_query(
+pub fn supports_usage_query(
     d3d_format: u32,
     usage: u32,
     float32_filtering: bool,
@@ -577,9 +591,7 @@ pub const fn supports_usage_query(
     {
         return false;
     }
-    if usage & D3DUSAGE_QUERY_SRGBWRITE != 0
-        && !is_render_target_format_device(d3d_format, native_packed16)
-    {
+    if usage & D3DUSAGE_QUERY_SRGBWRITE != 0 && !takes_srgb_write(d3d_format, native_packed16) {
         return false;
     }
     if usage & D3DUSAGE_QUERY_FILTER == 0 {

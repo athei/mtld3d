@@ -556,11 +556,20 @@ fn emit_draw_view(
         ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
     }
     // With sRGB attachment views bound, Metal applies the linear → sRGB OETF
-    // after the blender, which is the D3D9 order. The in-shader encode is the
-    // fallback for a colour target with no sRGB Metal view, and it must not
-    // run as well or the colour is encoded twice.
-    if enc.color_attachment_is_srgb() {
-        ps_variant.flags.remove(VariantFlags::SRGB_WRITE);
+    // after the blender, which is the D3D9 order, and must not be joined by
+    // the in-shader encode. That encode is the fallback for a target whose
+    // format takes the sRGB write but whose twin view Metal declined; a
+    // target of a format without a twin is written linear either way. The FF
+    // PS writes render target 0 alone. A programmable PS names the exported
+    // targets that stay linear in bits 4..7 of its colour mask.
+    if ps_variant.flags.contains(VariantFlags::SRGB_WRITE) {
+        let encode = enc.shader_srgb_encode_mask();
+        let exported = ps_variant.color_out_mask | 1;
+        if encode & exported == 0 {
+            ps_variant.flags.remove(VariantFlags::SRGB_WRITE);
+        } else if matches!(ps, PsSourceView::Programmable(_)) {
+            ps_variant.color_out_mask |= (exported & !encode) << 4;
+        }
     }
     // A fragment function declaring a depth output against a pass with no
     // depth attachment is a Metal pipeline error, so a programmable PS drops

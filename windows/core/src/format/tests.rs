@@ -1384,18 +1384,18 @@ fn ten_bit_formats_use_native_packed_storage_without_attachment_support() {
     }
 }
 
-/// The sRGB-write query is the render-target answer, for every format.
+/// The sRGB-write query answers yes for the render targets whose Metal format has an sRGB twin.
 ///
-/// The encode belongs to the render pass, and every colour attachment takes
-/// it: the pass binds the sRGB twin view where the Metal format has one and
-/// the pixel shader emits the OETF where it has not. So the answer tracks
-/// `is_render_target_format_device` across the whole table and on either
-/// device, with no format carrying a rule of its own, and it does not depend
-/// on the bits the query is combined with.
+/// D3D9 encodes those under `D3DRS_SRGBWRITEENABLE` and writes every other
+/// render target linear, so the answer is a render-target format of the
+/// device with a twin, across the whole table and on either device, and it
+/// does not depend on the bits the query is combined with.
 #[test]
 fn srgb_write_queries_follow_render_target_capability() {
     use mtld3d_types::{
-        D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R32F, D3DFMT_V8U8,
+        D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
+        D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_L8,
+        D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_V8U8, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
     };
 
     const COMBINED: [u32; 6] = [
@@ -1409,7 +1409,14 @@ fn srgb_write_queries_follow_render_target_capability() {
 
     for native_packed16 in [false, true] {
         for format in COLOUR_FORMATS {
-            let renderable = super::is_render_target_format_device(format, native_packed16);
+            let encodes = super::is_render_target_format_device(format, native_packed16)
+                && super::map_d3d_format_device(format, native_packed16)
+                    .is_some_and(|m| m.metal_pixel_format().srgb_twin().is_some());
+            assert_eq!(
+                super::takes_srgb_write(format, native_packed16),
+                encodes,
+                "format {format} packed16 {native_packed16}"
+            );
             for extra in COMBINED {
                 assert_eq!(
                     super::supports_usage_query(
@@ -1418,15 +1425,20 @@ fn srgb_write_queries_follow_render_target_capability() {
                         true,
                         native_packed16
                     ),
-                    renderable,
+                    encodes,
                     "format {format} extra {extra:#x} packed16 {native_packed16}"
                 );
             }
         }
-        // The two ends of the rule, named: a colour attachment answers yes
-        // whether or not its Metal format has an sRGB twin, and a sampled
-        // format answers no whether or not it has one.
-        for format in [D3DFMT_A8R8G8B8, D3DFMT_R32F] {
+        // The rule, named: the 8-bit four-channel render targets answer yes,
+        // every other render target answers no, and so does a sampled format
+        // whether or not it has a twin.
+        for format in [
+            D3DFMT_A8R8G8B8,
+            D3DFMT_X8R8G8B8,
+            D3DFMT_A8B8G8R8,
+            D3DFMT_X8B8G8R8,
+        ] {
             assert!(super::supports_usage_query(
                 format,
                 D3DUSAGE_QUERY_SRGBWRITE,
@@ -1434,29 +1446,30 @@ fn srgb_write_queries_follow_render_target_capability() {
                 native_packed16
             ));
         }
-        for format in [D3DFMT_DXT1, D3DFMT_L8, D3DFMT_V8U8] {
-            assert!(!super::supports_usage_query(
-                format,
-                D3DUSAGE_QUERY_SRGBWRITE,
-                true,
-                native_packed16
-            ));
+        for format in [
+            D3DFMT_R5G6B5,
+            D3DFMT_A1R5G5B5,
+            D3DFMT_G16R16,
+            D3DFMT_A16B16G16R16,
+            D3DFMT_R16F,
+            D3DFMT_A16B16G16R16F,
+            D3DFMT_R32F,
+            D3DFMT_A32B32G32R32F,
+            D3DFMT_DXT1,
+            D3DFMT_L8,
+            D3DFMT_V8U8,
+        ] {
+            assert!(
+                !super::supports_usage_query(
+                    format,
+                    D3DUSAGE_QUERY_SRGBWRITE,
+                    true,
+                    native_packed16
+                ),
+                "format {format} packed16 {native_packed16}"
+            );
         }
     }
-    // A device that widens the packed 16-bit formats renders into neither,
-    // so the encode goes with the render target.
-    assert!(super::supports_usage_query(
-        D3DFMT_R5G6B5,
-        D3DUSAGE_QUERY_SRGBWRITE,
-        true,
-        true
-    ));
-    assert!(!super::supports_usage_query(
-        D3DFMT_R5G6B5,
-        D3DUSAGE_QUERY_SRGBWRITE,
-        true,
-        false
-    ));
 }
 
 /// The legacy bump-map query answers yes for the signed `(du, dv)` formats alone.

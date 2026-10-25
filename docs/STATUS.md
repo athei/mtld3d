@@ -71,9 +71,12 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   RESZ readback.
 - Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
 - Anisotropic filtering, LOD bias, sRGB read on the formats whose Metal
-  counterpart has an sRGB twin and sRGB write into any render target (through
-  that twin where it exists, through the pixel shader otherwise, which is
-  what `D3DUSAGE_QUERY_SRGBWRITE` answers), alpha test, scissor,
+  counterpart has an sRGB twin and sRGB write into the render targets of
+  those formats (the 8-bit four-channel ones, through the twin view, after
+  the blender), which is what `D3DUSAGE_QUERY_SRGBWRITE` answers. Every other
+  render target, R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the float
+  formats, is written linear under `D3DRS_SRGBWRITEENABLE`, beside encoded
+  targets of the same pass too. Alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC

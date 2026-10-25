@@ -8,11 +8,14 @@
 
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface, TexturedVertex};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_R32F,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP,
-    D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, PrimitiveMiscCaps,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DERR_INVALIDCALL,
+    D3DERR_NOTAVAILABLE, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_A32B32G32R32F, D3DFMT_R32F,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_COLORWRITEENABLE1, D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND,
+    D3DRS_SRGBWRITEENABLE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, PrimitiveMiscCaps,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -700,11 +703,12 @@ fn a_clear_stays_ahead_of_a_pass_that_draws_into_its_target_as_an_extra() {
 
 #[test]
 fn larger_target_outside_the_pass_takes_one_srgb_encode_inside_the_viewport() {
-    // Target 0 is a 32x32 R32F with no sRGB view, so the clear is encoded
-    // before it is stored; slot 1 is a 64x64 A8R8G8B8 outside the pass, whose
-    // sRGB view encodes the value itself. Slot 1 must hold linear 0x80 encoded
-    // once (~0xBC, not ~0xDF), and only inside the 32x32 viewport: D3D9 clears
-    // the viewport intersected with each target, not the whole target.
+    // Target 0 is a 32x32 R32F, a format that takes no sRGB write, so the
+    // clear is stored linear; slot 1 is a 64x64 A8R8G8B8 outside the pass,
+    // whose sRGB view encodes the value itself. Slot 1 must hold linear 0x80
+    // encoded once (~0xBC, not ~0xDF), and only inside the 32x32 viewport:
+    // D3D9 clears the viewport intersected with each target, not the whole
+    // target.
     let h = Harness::new();
     let rt0 = h.create_texture(
         32,
@@ -760,6 +764,263 @@ fn larger_target_outside_the_pass_takes_one_srgb_encode_inside_the_viewport() {
         read_rt_pixel(&h, &rt1_surface, 48, 48),
         BLACK,
         "slot 1 outside the viewport keeps its contents",
+    );
+}
+
+/// `ps_3_0 { def c0, .5,.5,.5,1; def c1, .25,.5,.75,1; mov oC0, c0; mov oC1, c1; }`
+///
+/// Mid grey to render target 0 and a ramp to render target 1, the shape of a
+/// scene pass that stores colour in an 8-bit target and a depth value in a
+/// float one.
+#[rustfmt::skip]
+const PS_GREY_AND_RAMP: [u32; 20] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F00_0000, 0x3F00_0000, 0x3F00_0000, 0x3F80_0000, //   .5, .5, .5, 1
+    0x0500_0051, 0xA00F_0001,                           // def c1,
+    0x3E80_0000, 0x3F00_0000, 0x3F40_0000, 0x3F80_0000, //   .25, .5, .75, 1
+    0x0200_0001, 0x800F_0800, 0xA0E4_0000,              // mov oC0, c0
+    0x0200_0001, 0x800F_0801, 0xA0E4_0001,              // mov oC1, c1
+    0x0000_FFFF,                                        // end
+];
+
+/// D3DCOLOR channel 0x80 as the float a render target stores for it.
+const LINEAR_0X80: f32 = 128.0 / 255.0;
+
+/// Read one pixel of a DEFAULT-pool `A32B32G32R32F` render target as its four floats, red first.
+fn read_rt_rgba32f(h: &Harness, rt: &Surface<'_>, x: u32, y: u32) -> [f32; 4] {
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A32B32G32R32F,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(rt, &sysmem),
+        D3D_OK,
+        "GetRenderTargetData"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_words = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_words + x * 4) as usize;
+    let raw = locked.as_u32(idx + 4);
+    core::array::from_fn(|lane| f32::from_bits(raw[idx + lane]))
+}
+
+fn assert_rgba32f(actual: [f32; 4], expected: [f32; 4], what: &str) {
+    assert!(
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(a, e)| (a - e).abs() < 1.0e-3),
+        "{what}: expected {expected:?}, got {actual:?}"
+    );
+}
+
+/// An A8R8G8B8 target 0 and an A32B32G32R32F target 1, bound, with FF lighting off.
+fn srgb_and_float_targets(h: &Harness) -> (mtld3d_tests::Texture<'_>, mtld3d_tests::Texture<'_>) {
+    let rt0 = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt1 = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A32B32G32R32F,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(h.set_render_target(0, &rt0.surface_level(0)), D3D_OK);
+    assert_eq!(h.set_render_target(1, &rt1.surface_level(0)), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+    (rt0, rt1)
+}
+
+#[test]
+fn srgb_write_encodes_an_8bit_target_and_leaves_a_float_target_linear() {
+    // D3D9 applies D3DRS_SRGBWRITEENABLE to the formats that take an sRGB
+    // write only: the A8R8G8B8 target stores 0.5 encoded (~0xBC) while the
+    // float target beside it stores the ramp the shader wrote, unchanged.
+    // Encoding it as well turns 0.25 into ~0.54, which a depth-of-field pass
+    // reading the target back as depth sees as a far larger distance.
+    let h = Harness::new();
+    let (rt0, rt1) = srgb_and_float_targets(&h);
+    assert_eq!(h.clear_target(BLACK), D3D_OK, "clear both");
+    let ps = h.create_pixel_shader(&PS_GREY_AND_RAMP);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+        D3D_OK,
+        "draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), D3D_OK);
+    assert_color(
+        read_rt_pixel(&h, &rt0.surface_level(0), 32, 32),
+        0xFFBC_BCBC,
+        "the 8-bit target is encoded",
+    );
+    assert_rgba32f(
+        read_rt_rgba32f(&h, &rt1.surface_level(0), 32, 32),
+        [0.25, 0.5, 0.75, 1.0],
+        "the float target stays linear",
+    );
+    assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}
+
+#[test]
+fn srgb_write_clear_encodes_an_8bit_target_and_leaves_a_float_target_linear() {
+    // The clear colour follows the same per-target rule as a draw.
+    let h = Harness::new();
+    let (rt0, rt1) = srgb_and_float_targets(&h);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), D3D_OK);
+    assert_eq!(h.clear_target(0xFF80_8080), D3D_OK, "sRGB-write clear");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), D3D_OK);
+    assert_color(
+        read_rt_pixel(&h, &rt0.surface_level(0), 8, 8),
+        0xFFBC_BCBC,
+        "the 8-bit target is encoded",
+    );
+    assert_rgba32f(
+        read_rt_rgba32f(&h, &rt1.surface_level(0), 8, 8),
+        [LINEAR_0X80, LINEAR_0X80, LINEAR_0X80, 1.0],
+        "the float target stays linear",
+    );
+}
+
+/// `ps_3_0 { def c0, 1,1,1,.5; def c1, .25,.5,.75,.5; mov oC0, c0; mov oC1, c1; }`
+///
+/// Half-alpha white to render target 0 and the ramp at half alpha to render
+/// target 1, for the blended sRGB-write case.
+#[rustfmt::skip]
+const PS_HALF_WHITE_AND_RAMP: [u32; 20] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x3F80_0000, 0x3F80_0000, 0x3F00_0000, //   1, 1, 1, .5
+    0x0500_0051, 0xA00F_0001,                           // def c1,
+    0x3E80_0000, 0x3F00_0000, 0x3F40_0000, 0x3F00_0000, //   .25, .5, .75, .5
+    0x0200_0001, 0x800F_0800, 0xA0E4_0000,              // mov oC0, c0
+    0x0200_0001, 0x800F_0801, 0xA0E4_0001,              // mov oC1, c1
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn srgb_write_blends_an_8bit_target_in_linear_beside_a_float_target() {
+    // With D3DRS_SRGBWRITEENABLE the 8-bit target is decoded, blended in
+    // linear and encoded after the blender, while the float target beside it
+    // blends its stored values as they are. Over a stored 0x80 (linear
+    // 0.216), white at half alpha gives linear 0.608, stored as ~0xCD;
+    // encoding in the pixel shader before the blender instead blends 1.0
+    // against 0.502 and stores ~0xC0. The float target holds the linear blend
+    // of the ramp over 0.502. Alpha blends linear in both: 0.75.
+    let h = Harness::new();
+    let (rt0, rt1) = srgb_and_float_targets(&h);
+    assert_eq!(h.clear_target(0xFF80_8080), D3D_OK, "linear clear of both");
+    let ps = h.create_pixel_shader(&PS_HALF_WHITE_AND_RAMP);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+    for (state, value) in [
+        (D3DRS_ALPHABLENDENABLE, 1),
+        (D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+        (D3DRS_SRGBWRITEENABLE, 1),
+    ] {
+        assert_eq!(h.set_render_state(state, value), D3D_OK);
+    }
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+        D3D_OK,
+        "blended draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    for state in [D3DRS_ALPHABLENDENABLE, D3DRS_SRGBWRITEENABLE] {
+        assert_eq!(h.set_render_state(state, 0), D3D_OK);
+    }
+    assert_color(
+        read_rt_pixel(&h, &rt0.surface_level(0), 32, 32),
+        0xBFCD_CDCD,
+        "the 8-bit target blends in linear and is encoded afterwards",
+    );
+    let blend = |src: f32| 0.5f32.mul_add(src, 0.5 * LINEAR_0X80);
+    assert_rgba32f(
+        read_rt_rgba32f(&h, &rt1.surface_level(0), 32, 32),
+        [blend(0.25), blend(0.5), blend(0.75), 0.75],
+        "the float target blends its linear values",
+    );
+    assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}
+
+#[test]
+fn srgb_write_leaves_a_lone_float_target_linear_and_says_so() {
+    // A fixed-function draw and a clear into a float render target 0 under
+    // D3DRS_SRGBWRITEENABLE store the linear value, and the device answers
+    // D3DUSAGE_QUERY_SRGBWRITE no for the format: the answer and the stored
+    // value agree, as they do for an A8R8G8B8 target that answers yes and
+    // encodes.
+    let h = Harness::new();
+    for (format, answer) in [
+        (D3DFMT_A32B32G32R32F, D3DERR_NOTAVAILABLE),
+        (D3DFMT_A8R8G8B8, D3D_OK),
+    ] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                D3DRTYPE_TEXTURE,
+                format
+            ),
+            answer,
+            "QUERY_SRGBWRITE for {format}"
+        );
+    }
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A32B32G32R32F,
+        D3DPOOL_DEFAULT,
+    );
+    let surface = rt.surface_level(0);
+    assert_eq!(h.set_render_target(0, &surface), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.clear_texture(0), D3D_OK);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), D3D_OK);
+    assert_eq!(h.clear_target(0xFF80_8080), D3D_OK, "sRGB-write clear");
+    assert_rgba32f(
+        read_rt_rgba32f(&h, &surface, 8, 8),
+        [LINEAR_0X80, LINEAR_0X80, LINEAR_0X80, 1.0],
+        "the clear stays linear",
+    );
+    let grey = full_cover().map(|v| PosColorVertex {
+        color: 0xFF40_4040,
+        ..v
+    });
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &grey),
+        D3D_OK,
+        "fixed-function draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), D3D_OK);
+    let linear_0x40 = 64.0 / 255.0;
+    assert_rgba32f(
+        read_rt_rgba32f(&h, &surface, 32, 32),
+        [linear_0x40, linear_0x40, linear_0x40, 1.0],
+        "the draw stays linear",
     );
 }
 

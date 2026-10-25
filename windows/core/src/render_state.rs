@@ -137,8 +137,9 @@ pub const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_SRCBLENDALPHA
         | D3DRS_DESTBLENDALPHA
         // SRGBWRITEENABLE binds the colour attachment's sRGB twin view for
-        // the pass, so Metal encodes after the blender. A target with no
-        // sRGB Metal view falls back to the pixel-shader OETF variant
+        // the pass, so Metal encodes after the blender. A target whose format
+        // has no twin is written linear. One whose twin view Metal declined
+        // falls back to the pixel-shader OETF variant
         // (`VariantFlags::SRGB_WRITE`) with `Clear` converting its colour
         // through the same curve.
         | D3DRS_SRGBWRITEENABLE

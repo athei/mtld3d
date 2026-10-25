@@ -4918,6 +4918,49 @@ fn ps_oc1_with_depth_out_returns_every_member() {
     metal_compile_or_fail(&msl);
 }
 
+/// A target the colour mask's high nibble names keeps its output linear under the sRGB write.
+///
+/// The encoder sets bit `4 + i` for an exported target whose format takes no
+/// sRGB write, such as a float target the shader writes depth into: its value
+/// reaches the target unchanged while the other output is still encoded.
+#[test]
+fn srgb_write_leaves_the_outputs_the_high_nibble_names_linear() {
+    let ps = parse(&two_target_ps()).expect("ps parse");
+    for (linear, encoded, kept) in [(0b10, "oC0", "oC1"), (0b01, "oC1", "oC0")] {
+        let variant = VariantKey {
+            color_out_mask: 0b11 | linear << 4,
+            flags: VariantFlags::SRGB_WRITE,
+            ..VariantKey::default()
+        };
+        let msl = emit_ps_programmable(&ps, variant).expect("emit");
+        assert!(
+            msl.contains(&format!(
+                "{encoded}.rgb = mtld3d_linear_to_srgb({encoded}.rgb);"
+            )),
+            "{msl}"
+        );
+        assert!(
+            !msl.contains(&format!("{kept}.rgb = mtld3d_linear_to_srgb")),
+            "{msl}"
+        );
+        assert!(msl.contains(&format!("_ps_out.{kept} = {kept};")), "{msl}");
+        metal_compile_or_fail(&msl);
+    }
+    // Without the sRGB write the high nibble changes nothing.
+    let plain = VariantKey {
+        color_out_mask: 0b11,
+        ..VariantKey::default()
+    };
+    let named = VariantKey {
+        color_out_mask: 0b11 | 0b10 << 4,
+        ..VariantKey::default()
+    };
+    assert_eq!(
+        emit_ps_programmable(&ps, plain).expect("emit"),
+        emit_ps_programmable(&ps, named).expect("emit")
+    );
+}
+
 #[test]
 fn color_out_mask_bit0_is_implied_for_single_target_shaders() {
     // A present mask that names extra attachments the shader never writes

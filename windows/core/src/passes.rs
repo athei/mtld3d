@@ -1846,11 +1846,15 @@ pub struct PassState {
     /// Whether the next pass binds sRGB twin views of its colour attachments.
     ///
     /// True when `srgb_write_enabled` is set and every colour target the
-    /// pass attaches has a twin. Metal then converts linear → sRGB *after*
-    /// the blender, which is the D3D9 order the
-    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises. False leaves the
-    /// encode to the pixel shader's OETF variant, which runs before the
-    /// blender and is exact only for opaque draws.
+    /// pass attaches whose format has an sRGB twin has its twin view, at
+    /// least one target being such a format. Metal then converts linear →
+    /// sRGB *after* the blender, which is the D3D9 order the
+    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises, and a target of a
+    /// format without a twin (float, 16-bit and packed formats) is written
+    /// linear beside them, as D3D9 writes it. False with the state set
+    /// leaves the encode of the twin-capable targets to the pixel shader's
+    /// OETF variant, which runs before the blender and is exact only for
+    /// opaque draws ([`Self::shader_srgb_encode_mask`]).
     ///
     /// A change ends the current pass: the view is an attachment property,
     /// so draws on either side of the toggle cannot share one encoder.
@@ -2986,8 +2990,7 @@ impl PassState {
             self.current_extra_srgb[i] = self.twin_of(self.current_extra_color[i].texture);
         }
         self.pass_srgb_write = self.srgb_write_enabled && self.srgb_write_is_attachable();
-        if self.srgb_write_enabled && !self.pass_srgb_write && !self.current_color_texture.is_null()
-        {
+        if self.shader_srgb_encode_mask() & 1 != 0 {
             mtld3d_shared::log_once_info_by!(
                 target: crate::LOG_TARGET,
                 key: self.current_color_texture.raw(),
@@ -3008,27 +3011,71 @@ impl PassState {
             .unwrap_or(MetalHandle::NULL)
     }
 
-    /// Whether every colour target the next pass attaches has an sRGB twin.
+    /// Whether the next pass can bind an sRGB twin for every target that encodes.
     ///
-    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment only then:
-    /// one render pass has one set of views, so a target without a twin
-    /// would have to be written linear while its neighbours encode. The
-    /// all-or-nothing rule keeps a mixed set on the shader path.
+    /// D3D9 applies `D3DRS_SRGBWRITEENABLE` to the targets whose format takes
+    /// an sRGB write, the formats with an sRGB twin, and writes every other
+    /// target linear: the encode is a property of each attachment's view. So
+    /// a target of a format without a twin is attached linear beside twin
+    /// views and does not hold the pass back. A twin-capable target whose
+    /// view Metal declined keeps the whole set on the shader path, since the
+    /// pass would otherwise write it linear. False when no target encodes, so
+    /// toggling the state over targets that never encode ends no pass.
     fn srgb_write_is_attachable(&self) -> bool {
-        !self.current_color_texture.is_null()
-            && !self.twin_of(self.current_color_texture).is_null()
-            && Self::companion_twin_present(
-                self.current_color_msaa_texture,
-                self.current_color_msaa_srgb_texture,
-            )
-            && (0..3).all(|i| {
-                self.current_extra_present_mask & (1 << i) == 0
-                    || (!self.twin_of(self.current_extra_color[i].texture).is_null()
-                        && Self::companion_twin_present(
-                            self.current_extra_color[i].msaa_texture,
-                            self.current_extra_color[i].msaa_srgb_texture,
-                        ))
-            })
+        if self.current_color_texture.is_null() {
+            return false;
+        }
+        let mut any_encodes = self.current_color_format.srgb_twin().is_some();
+        if any_encodes
+            && (self.twin_of(self.current_color_texture).is_null()
+                || !Self::companion_twin_present(
+                    self.current_color_msaa_texture,
+                    self.current_color_msaa_srgb_texture,
+                ))
+        {
+            return false;
+        }
+        for (i, slot) in self.current_extra_color.iter().enumerate() {
+            if self.current_extra_present_mask & (1 << i) == 0 || slot.format.srgb_twin().is_none()
+            {
+                continue;
+            }
+            if self.twin_of(slot.texture).is_null()
+                || !Self::companion_twin_present(slot.msaa_texture, slot.msaa_srgb_texture)
+            {
+                return false;
+            }
+            any_encodes = true;
+        }
+        any_encodes
+    }
+
+    /// The colour outputs the pixel shader has to encode itself under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Bit 0 is render target 0 and bits 1..3 render targets 1..3. Zero while
+    /// the state is off and while the pass binds twin views
+    /// ([`Self::pass_srgb_write`]), where Metal encodes after the blender.
+    /// Otherwise it names the attached targets whose format takes an sRGB
+    /// write: those then reach the pass through their linear view, so the
+    /// shader's OETF variant has to encode them. A target of a format without
+    /// a twin is never named; it stays linear.
+    #[must_use]
+    pub fn shader_srgb_encode_mask(&self) -> u8 {
+        if !self.srgb_write_enabled || self.pass_srgb_write {
+            return 0;
+        }
+        let mut mask = u8::from(
+            !self.current_color_texture.is_null()
+                && self.current_color_format.srgb_twin().is_some(),
+        );
+        for i in 0..3 {
+            if self.current_extra_present_mask & (1 << i) != 0
+                && self.current_extra_color[i].format.srgb_twin().is_some()
+            {
+                mask |= 1 << (i + 1);
+            }
+        }
+        mask
     }
 
     /// Whether a multisampled companion, if there is one, has an sRGB twin.
