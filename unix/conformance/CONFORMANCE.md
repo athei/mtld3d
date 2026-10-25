@@ -978,11 +978,14 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-25: 2 `real`, 177 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 192 unique sites in all.
+`Sites:` tokens below on 2026-10-25: 1 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 191 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
+`m = 2 * length(R + (0, 0, -1))`, so `test_generated_texcoords` 29162 left
+every key and its cluster left this document.)
 (2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
 `Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
 multisampled back buffer, and a plain device's refused `Reset` leaves it
@@ -1263,11 +1266,9 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-Two defects. One was first observed by the Wine 11.19 tests: the sign of the
-`D3DTSS_TCI_SPHEREMAP` denominator (`visual.c/test_generated_texcoords`, one
-site, issue #1161). The other was first counted by the Wine 11.20 tests:
-linear table fog with equal start and end fogs the whole primitive
-(`visual.c/fog_special_test`, one site, issue #1169).
+One defect, first counted by the Wine 11.20 tests: linear table fog with
+equal start and end fogs the whole primitive (`visual.c/fog_special_test`,
+one site, issue #1169).
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
@@ -1894,17 +1895,6 @@ and on a device without the packed 16-bit formats R5G6B5 is no render target,
 so the answer is NOTAVAILABLE. That is the conformant answer for a device
 without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
-
-### visual.c/test_generated_texcoords
-Sites: 29162=real
-
-The `D3DTSS_TCI_SPHEREMAP` row reads `0x00757d00` where `0x00836900` is
-expected; the camera-space position, normal and reflection-vector rows
-pass. The fixed-function emitter (`windows/core/src/dxso/ff.rs`, the
-SPHEREMAP arm) divides by `m = 2 * length(R + (0, 0, 1))`; the test's
-geometry evaluated with that formula gives the value read, and with
-`R + (0, 0, -1)`, which wined3d emits, the value expected. DXVK uses the
-same sign we do. A defect, on every leg of both Wines, issue #1161.
 
 ### visual.c/test_blit_format_conversion
 Sites: 29219=caps

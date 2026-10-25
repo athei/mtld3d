@@ -1098,10 +1098,10 @@ const SPHERE_PROJ_AXIAL: [f32; 16] = [
 /// The quadrant with signs (`sx`, `sy`) carries the unit normal
 /// (0.576 `sx`, 0.168 `sy`, -0.8). With the eye-to-vertex direction
 /// E = (0, 0, 1): N.E = -0.8, R = E - 2 (N.E) N = E + 1.6 N
-/// = (0.9216 `sx`, 0.2688 `sy`, -0.28), R + (0, 0, 1) has length
-/// sqrt(0.84935 + 0.07225 + 0.5184) = 1.2, so m = 2.4 and
-/// (u, v) = (0.5 + 0.384 `sx`, 0.5 + 0.112 `sy`): 0.884 or 0.116 across,
-/// 0.612 or 0.388 down. The x and y components differ so that a swapped axis
+/// = (0.9216 `sx`, 0.2688 `sy`, -0.28), R + (0, 0, -1) has length
+/// sqrt(0.84935 + 0.07225 + 1.6384) = 1.6, so m = 3.2 and
+/// (u, v) = (0.5 + 0.288 `sx`, 0.5 + 0.084 `sy`): 0.788 or 0.212 across,
+/// 0.584 or 0.416 down. The x and y components differ so that a swapped axis
 /// moves the coordinate to another texel. E is off the axis by at most 0.01
 /// at the outer corners, which moves a coordinate by less than 0.006, and
 /// every pixel interpolates between vertices that all lie in one texel.
@@ -1181,9 +1181,9 @@ fn texgen_spheremap_texture_transform_applies_after_generation() {
     // COUNT2 multiplies the generated (u, v, 0, 1) by the stage matrix, here
     // u' = v + 0.25 and v' = u. The quarter offset rides on the fourth
     // component, which only a generated coordinate of dimension 3 pads to 1.
-    // Right-top: (0.612 + 0.25, 0.884) = (0.862, 0.884), texel (3, 3);
-    // right-bottom: (0.638, 0.884), texel (2, 3); left-top: (0.862, 0.116),
-    // texel (3, 0); left-bottom: (0.638, 0.116), texel (2, 0).
+    // Right-top: (0.584 + 0.25, 0.788) = (0.834, 0.788), texel (3, 3);
+    // right-bottom: (0.666, 0.788), texel (2, 3); left-top: (0.834, 0.212),
+    // texel (3, 0); left-bottom: (0.666, 0.212), texel (2, 0).
     #[rustfmt::skip]
     const SWAP_AND_SHIFT: [f32; 16] = [
         0.0,  1.0, 0.0, 0.0,
@@ -1210,9 +1210,10 @@ fn texgen_spheremap_without_normal_maps_the_view_direction() {
     // A vertex without a normal reads a zero normal, so R is the eye-to-vertex
     // direction E. The view moves the quad to (50, -50, 80) and the projection
     // moves it back: E = (5, -5, 8) / sqrt(114) = (0.4683, -0.4683, 0.7493),
-    // m = 2 sqrt(2 + 2 * 0.7493) = 3.7409, (u, v) = (0.6252, 0.3748), texel
-    // (2, 1) over the whole quad. The FVF has no texture coordinate, so a
-    // stage that fell back to its input reads texel (0, 0).
+    // m = 2 sqrt(2 - 2 * 0.7493) = 1.4162, (u, v) = (0.8306, 0.1694), texel
+    // (3, 0) over the whole quad, where a denominator of 2 |R + (0, 0, 1)|
+    // gives (0.6252, 0.3748), texel (2, 1). The FVF has no texture
+    // coordinate, so a stage that fell back to its input reads texel (0, 0).
     #[rustfmt::skip]
     const VIEW: [f32; 16] = [
         1.0,   0.0,  0.0,  0.0,
@@ -1238,9 +1239,75 @@ fn texgen_spheremap_without_normal_maps_the_view_direction() {
     for (x, y) in [(320, 240), (80, 60), (560, 420)] {
         assert_pixel_approx(
             h.read_pixel(x, y),
-            sphere_texel(2, 1),
+            sphere_texel(3, 0),
             2,
-            &format!("no normal: texel (2, 1) at ({x}, {y})"),
+            &format!("no normal: texel (3, 0) at ({x}, {y})"),
+        );
+    }
+}
+
+#[test]
+fn texgen_spheremap_coordinate_reaches_a_pixel_shader() {
+    // A `ps_1_1` shader writes the generated coordinate out as the colour
+    // (`texcoord t0; mov r0, t0`), so red and green read u and v. World and
+    // view each translate by (0.2, 0.2, 0) and the projection is the
+    // identity, so the triangle sits at z = 0.1 in eye space with the
+    // unnormalized normal (0.8, 0, 0.7) at every vertex. Each vertex gets
+    // R = reflect(normalize(posEye), N), m = 2 |R + (0, 0, -1)| and
+    // (u, v) = R.xy / m + 0.5, and the pixel interpolates the three: at the
+    // centre (0.514, 0.412), 0x836900, and at (240, 300) (0.527, 0.352),
+    // 0x865a00. A denominator of 2 |R + (0, 0, 1)| gives 0x757d00 and
+    // 0x787600. The generated w is not pinned, so the probes drop alpha.
+    #[rustfmt::skip]
+    const SHIFT: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.2, 0.2, 0.0, 1.0,
+    ];
+    const PS: &[u32] = &[
+        0xffff_0101, // ps_1_1
+        0x0000_0040, // texcoord t0
+        0xb00f_0000,
+        0x0000_0001, // mov r0, t0
+        0x800f_0000,
+        0xb0e4_0000,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    assert_eq!(h.set_transform(D3DTS_WORLD, &SHIFT), 0, "world");
+    assert_eq!(h.set_transform(D3DTS_VIEW, &SHIFT), 0, "view");
+    assert_eq!(h.set_transform(D3DTS_PROJECTION, &IDENTITY), 0, "proj");
+    let ps = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_SPHEREMAP),
+        0,
+        "SPHEREMAP"
+    );
+    let triangle = [(2.0, -2.0), (-2.0, -2.0), (0.0, 2.0)].map(|(x, y)| LitVertex {
+        x,
+        y,
+        z: 0.1,
+        nx: 0.8,
+        ny: 0.0,
+        nz: 0.7,
+    });
+    h.render_once(0xFFFF_FFFF, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 1, &triangle),
+            0,
+            "draw"
+        );
+    });
+    for ((x, y), expected) in [((320, 240), 0x0083_6900), ((240, 300), 0x0086_5a00)] {
+        assert_pixel_approx(
+            h.read_pixel(x, y) & 0x00FF_FFFF,
+            expected,
+            2,
+            &format!("sphere-map coordinate at ({x}, {y})"),
         );
     }
 }

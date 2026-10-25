@@ -1593,7 +1593,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             4 => {
                 // Sphere map of the reflection vector R = reflect(E, N), with
                 // E the unit eye-to-vertex direction:
-                // m = 2 * |R + (0, 0, 1)|, (u, v) = R.xy / m + 0.5. The
+                // m = 2 * |R + (0, 0, -1)|, (u, v) = R.xy / m + 0.5. The
                 // coordinate has dimension 3 like the other generated modes,
                 // so a texture transform multiplies (u, v, 0, 1). A vertex
                 // without a normal reads a zero normal, which leaves R = E.
@@ -1607,7 +1607,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                     out.push_str("        float3 R_tci = E_tci;\n");
                 }
                 out.push_str(
-                    "        float m_tci = 2.0 * length(R_tci + float3(0.0, 0.0, 1.0));\n",
+                    "        float m_tci = 2.0 * length(R_tci - float3(0.0, 0.0, 1.0));\n",
                 );
                 let _ = writeln!(
                     out,
