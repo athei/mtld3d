@@ -17,9 +17,11 @@
 //!   otherwise. An improvement is the mirror image. A `time` metric's median
 //!   difference must also exceed five steps of the resolution its value is
 //!   printed with ([`time_step`]), since a value of a few steps moves by tens
-//!   of percent when it crosses one. A metric whose base median is zero has
-//!   no ratio and is judged by its median difference against a small absolute
-//!   floor instead.
+//!   of percent when it crosses one. So must a `noisy` count per frame from
+//!   the `perf-kv` line (`perf.*_pf`), whose step is one event per thousand
+//!   frames ([`rate_step`]). A metric whose base median is zero has no ratio
+//!   and is judged by its median difference against a small absolute floor
+//!   instead.
 //! - `bytes`: the same with `T` at 3 % whatever the name, and the median
 //!   difference must also exceed 4 MiB, since a few percent of a small
 //!   footprint is allocator noise.
@@ -147,8 +149,14 @@ const US_STEP: f64 = 0.001;
 /// The step of a time in ns: `Value::Ns` prints one decimal.
 const NS_STEP: f64 = 0.1;
 
+/// The step of a `perf.*` count per frame: a `_total` over its frames is written to three places.
+const PERF_RATE_STEP: f64 = 0.001;
+
 /// The prefix of the metrics a benchmark copies from the layer's `perf-kv` line.
 const PERF_PREFIX: &str = "perf.";
+
+/// The suffix of a `perf.*` metric that is a window's `_total` over its frames.
+const PER_FRAME_SUFFIX: &str = "_pf";
 
 /// The meta keys every metrics file has to carry for the sanity checks.
 const REQUIRED_META: [&str; 5] = [
@@ -1544,9 +1552,12 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
             let mut improved = center < 1.0 - threshold && most(better, ratios.len());
             row.change = format!("{:+.2}%", (center - 1.0) * 100.0);
             row.noise = format!("sigma {:.2}%", sigma * 100.0);
-            if definition.class == Class::Time
-                && let Some(step) = time_step(name, &definition.unit)
-            {
+            let step = match definition.class {
+                Class::Time => time_step(name, &definition.unit),
+                Class::Noisy => rate_step(name, &definition.unit),
+                Class::Bytes | Class::Spikes | Class::Exact | Class::Info => None,
+            };
+            if let Some(step) = step {
                 let delta = median(&worse_by);
                 let past = past_floor(delta, step);
                 if (regressed || improved) && !past {
@@ -1655,6 +1666,34 @@ pub fn time_step(name: &str, unit: &Unit) -> Option<f64> {
         Unit::Ns => Some(NS_STEP),
         Unit::Count | Unit::Mib | Unit::Bytes | Unit::Ratio => None,
     }
+}
+
+/// The resolution a `noisy` count per frame is printed with, in counts; `None` for other metrics.
+///
+/// A `perf.*_pf` count is a window's total over its frames, written to
+/// three places, so its step is 0.001 events per frame, one event per
+/// thousand frames. A rate of a few events per thousand frames is a few of
+/// those steps, so a difference of one step is several percent of it, and
+/// five pairs that happen to agree leave a sigma near zero:
+/// `perf.faults_minor_pf` reads about 0.012 in the query benchmarks, and
+/// 0.012 against 0.013 on every pair is +8.33 % at a sigma of 0. So such a
+/// row's median difference has to exceed five steps as well, five events
+/// per thousand frames, the rule a `time` row's has ([`past_floor`]). Five
+/// steps of an event that costs 10 us is 50 ns a frame, half the step a
+/// benchmark's own frame time is printed with. `past_floor` needs more than
+/// five whole steps, a difference of at least 0.0055, so the floor only
+/// reaches a rate under about 0.18 events per frame, where 3 % of the rate
+/// first exceeds that; above it the ratio decides alone. The floor is far
+/// below the one a zero base has, more than two events a frame
+/// ([`SPIKE_FLOOR`] in `judge_zero_base`). It covers every `noisy` count
+/// rate rather than the fault counts by name, since any event that rare
+/// (renames, compiles, waits) has the same step and the same one-step
+/// noise. A count gauge (`_count`) is a whole number, a peak rather than a
+/// rate, and a rate in bytes counts bytes, so neither has a step here.
+#[must_use]
+pub fn rate_step(name: &str, unit: &Unit) -> Option<f64> {
+    let rate = name.starts_with(PERF_PREFIX) && name.ends_with(PER_FRAME_SUFFIX);
+    (*unit == Unit::Count && rate).then_some(PERF_RATE_STEP)
 }
 
 /// Whether the difference `delta` is more than five steps of `step`, counted in whole steps.

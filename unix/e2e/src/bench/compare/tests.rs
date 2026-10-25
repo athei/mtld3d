@@ -1619,6 +1619,67 @@ fn the_time_step_follows_the_unit_and_the_source() {
 }
 
 #[test]
+fn a_rare_event_rate_has_to_move_more_than_five_per_thousand_frames() {
+    let spec = "count lower noisy";
+    let name = "perf.faults_minor_pf";
+    // One fault in a thousand frames: +8.33 % at a sigma of zero.
+    let row = judge(name, &def(spec), &[0.012; 5], &[0.013; 5], false);
+    assert_eq!(row.verdict, Verdict::Neutral);
+    assert!(
+        row.change
+            .contains("(+0.001 count, within five steps of 0.001)"),
+        "{}",
+        row.change
+    );
+    assert_eq!(
+        verdict_of(name, spec, &[0.014; 5], &[0.015; 5]),
+        Verdict::Neutral
+    );
+    // Exactly five per thousand frames is within the floor.
+    assert_eq!(
+        verdict_of(name, spec, &[0.012; 5], &[0.017; 5]),
+        Verdict::Neutral
+    );
+    // Past it both ways.
+    assert_eq!(
+        verdict_of(name, spec, &[0.012; 5], &[0.020; 5]),
+        Verdict::Regression
+    );
+    assert_eq!(
+        verdict_of(name, spec, &[0.020; 5], &[0.012; 5]),
+        Verdict::Improvement
+    );
+    // A rate of whole events per frame is judged by its ratio as before.
+    assert_eq!(
+        verdict_of("perf.vbib_pool_miss_pf", spec, &[1.0; 5], &[1.04; 5]),
+        Verdict::Regression
+    );
+    // The floor follows the perf rate: a benchmark's own count and a rate in
+    // bytes keep the ratio alone.
+    assert_eq!(
+        verdict_of("polls.mean_pf", spec, &[0.012; 5], &[0.013; 5]),
+        Verdict::Regression
+    );
+    assert_eq!(
+        verdict_of(
+            "perf.vbib_rename_bytes_pf",
+            "bytes lower noisy",
+            &[0.012; 5],
+            &[0.013; 5]
+        ),
+        Verdict::Regression
+    );
+}
+
+#[test]
+fn the_rate_step_covers_only_perf_counts_per_frame() {
+    assert_eq!(rate_step("perf.faults_minor_pf", &Unit::Count), Some(0.001));
+    assert_eq!(rate_step("perf.vbib_rename_bytes_pf", &Unit::Bytes), None);
+    assert_eq!(rate_step("perf.cache_pipelines_count", &Unit::Count), None);
+    assert_eq!(rate_step("draws_pf", &Unit::Count), None);
+}
+
+#[test]
 fn window_lengths_that_round_to_one_second_count_as_one_length() {
     // A hitch stretched two windows of the base; older files wrote tenths.
     let fixture = Fixture::new("span-jitter");

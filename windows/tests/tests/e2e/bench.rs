@@ -256,6 +256,18 @@ const PROCESS_BYTES_KEYS: [&str; 4] = [
 /// environments some other way fail on this row.
 const CAPTURE_LAYER_KEY: &str = "metal_capture_layer_count";
 
+/// The prefix of the `perf-kv` counts of sampled draws, which [`perf_rule`] records as `info`.
+///
+/// `draw_snapshot_sampled_draws_total` and every
+/// `draw_snapshot_sampled_rebuild_<section>_total` count only the rebuilding
+/// draws the layer timed: one in 16 by a per-draw xorshift that carries over
+/// from frame to frame, in the timed frames a second xorshift picks, which
+/// the device seeds from the clock. Two runs of one workload therefore time
+/// different draws, and these counts move by several percent between runs
+/// of one build. The unsampled `draw_snapshot_rebuild_*_total` count every
+/// rebuilding draw and stay judged, so a change to the rebuilds still shows.
+const SAMPLED_SNAPSHOT_PREFIX: &str = "draw_snapshot_sampled_";
+
 /// The shader model of a programmable material.
 pub enum Model {
     /// `vs_2_0` with `ps_2_0`.
@@ -1697,9 +1709,12 @@ impl Metrics {
     ///   `info` over varying ones; a count that depends on how the CPU and
     ///   the GPU overlap (renames, copies, retention, pools, faults, slot
     ///   waits, compiles, command buffers, whose GPU time arrives with a
-    ///   later submit) is `noisy`. A window's count is divided by its frames
-    ///   because a window lasts two seconds, not a number of frames, so its
-    ///   totals grow with the frame rate.
+    ///   later submit) is `noisy`. The counts of the draws the section timers
+    ///   sample (`draw_snapshot_sampled_*_total`, [`SAMPLED_SNAPSHOT_PREFIX`])
+    ///   are `info`: which draws are sampled depends on the clock, and the
+    ///   unsampled rebuild counts beside them stay `noisy`. A window's count
+    ///   is divided by its frames because a window lasts two seconds, not a
+    ///   number of frames, so its totals grow with the frame rate.
     ///
     /// A key a window leaves out (`docs/ARCHITECTURE.md` names the ones that
     /// can be) is recorded only when every window read carries it, so each
@@ -2045,12 +2060,13 @@ pub const IDENTITY_ROWS: [f32; 16] = [
 ];
 
 /// How [`Metrics::perf`] records one `perf-kv` key.
-struct PerfRule {
+pub struct PerfRule {
     name: String,
     fold: Fold,
     unit: PerfUnit,
     decimals: usize,
-    class: Class,
+    /// How a comparison of two builds reads the metric.
+    pub class: Class,
 }
 
 /// How the values one key takes in several windows become one.
@@ -2112,7 +2128,7 @@ impl PerfFold {
 /// The metric one `perf-kv` key becomes, by its suffix; `None` for a key with no known suffix.
 ///
 /// [`Metrics::perf`] states the rules this applies.
-fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
+pub fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
     let fixed = matches!(work, FrameWork::Fixed);
     let rule = |name: String, fold, unit, decimals, class| {
         Some(PerfRule {
@@ -2172,10 +2188,14 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
     } else {
         PerfUnit::Count
     };
-    let class = match (structural(base), fixed) {
-        (true, true) => Class::Exact,
-        (true, false) => Class::Info,
-        (false, _) => Class::Noisy,
+    let class = if base.starts_with(SAMPLED_SNAPSHOT_PREFIX) {
+        Class::Info
+    } else {
+        match (structural(base), fixed) {
+            (true, true) => Class::Exact,
+            (true, false) => Class::Info,
+            (false, _) => Class::Noisy,
+        }
     };
     rule(format!("perf.{base}_pf"), Fold::PerFrame, unit, 3, class)
 }

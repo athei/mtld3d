@@ -299,6 +299,14 @@ removes the kept base worktrees. The metrics a benchmark writes include the
 layer's own counters, read from the `perf-kv` line of its perf windows as
 `perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
 calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
+The `perf.draw_snapshot_sampled_*` rows count only the draws the layer's
+section timers sampled, which the clock picks, so they are reported and not
+judged; the unsampled `perf.draw_snapshot_rebuild_*` rows beside them are.
+A noisy count per frame such as `perf.faults_minor_pf`, which reads about
+0.012 in the query benchmarks, fails only when its median also moves by more
+than five events per thousand frames (`rate_step` in
+`unix/e2e/src/bench/compare.rs`), since one more event in a thousand frames
+moves it by 8 %.
 
 `make bench` and `make bench-ab` run under the Wine `WINE_SDK` names and
 measure one build: `ARCH=i686`, the default, the i686 build under the i686
