@@ -823,3 +823,193 @@ fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
     );
     drop(enc);
 }
+
+/// A draw whose arm fills the visibility buffer opens its pass in the next buffer, with the clear.
+///
+/// A query is open, a draw has counted, and the frame's buffer is full at
+/// the device's size. A whole-target clear inside the open span ends the
+/// counting pass and waits as pending. The next draw's arm reserves its slot
+/// before its pass opens, so the full buffer ends nothing more and the pass
+/// the draw opens carries the clear in the next buffer: no pass without a
+/// draw sits between the two counting passes.
+#[test]
+fn a_draw_that_fills_the_visibility_buffer_leaves_no_pass_without_a_draw() {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use mtld3d_core::{
+        config::Mtld3dConfig,
+        gpu_caps::GpuCaps,
+        passes::{BackbufferContents, FrameReset},
+        render_scale::RenderScale,
+        visibility::{BufferNeed, VisibilityQueryCore},
+    };
+    use mtld3d_shared::{
+        Command, clock_calibration::ClockCalibration, mtl::PrimitiveType,
+        record_handle::DeviceRecordHandle,
+    };
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+    // SAFETY: tests; an opaque attachment value, never dereferenced since nothing is submitted.
+    let color = unsafe { MetalHandle::new(0x1000) };
+    // SAFETY: as above.
+    let depth = unsafe { MetalHandle::new(0x2000) };
+    enc.pass_state.reset_frame(&FrameReset {
+        backbuffer: color,
+        backbuffer_srgb: MetalHandle::NULL,
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: (640, 480),
+        backbuffer_format: PixelFormat::Bgra8Unorm,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth,
+        depth_size: (640, 480),
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    let draw = || Command::draw_primitives(PrimitiveType::Triangle, 0, 3);
+
+    let query = VisibilityQueryCore::new();
+    let generation = query.mark_armed();
+    enc.begin_visibility_query(&query, generation);
+    enc.begin_render_pass_if_needed();
+    enc.pass_state.emit_command(draw());
+    let full = BufferNeed::Spill(enc.visibility.buffer_slots());
+    while enc.visibility.buffer_need() != full {
+        enc.allocate_visibility_slot()
+            .expect("a slot of the frame's buffer");
+    }
+    let _ = enc.pass_state.clear_color(1, 2, 3, 4);
+    assert!(
+        enc.pass_state.pending_color_clear().is_some(),
+        "the clear waits"
+    );
+
+    enc.begin_render_pass_if_needed();
+    enc.pass_state.emit_command(draw());
+    enc.end_current_pass("test");
+
+    let passes = enc.pass_state.passes();
+    let draws: Vec<usize> = passes
+        .iter()
+        .map(|pass| pass.commands().iter().filter(|c| c.is_draw()).count())
+        .collect();
+    assert_eq!(draws, [1, 1], "no pass without a draw: {draws:?}");
+    assert_eq!(passes[0].visibility_buffer(), 0);
+    assert_eq!(
+        passes[1].visibility_buffer(),
+        1,
+        "the draw's pass counts into the next buffer"
+    );
+    assert!(passes[1].has_counting_visibility());
+    assert!(
+        matches!(
+            passes[1].color_load(),
+            mtld3d_core::passes::ColorLoad::Clear { .. }
+        ),
+        "the draw's pass carries the clear"
+    );
+    drop(enc);
+}
+
+/// Visibility buffers the shutdown's own intake lets go of are destroyed by that shutdown.
+///
+/// Twenty frames retire a visibility buffer each and no intake has run yet,
+/// so the intake that finalizes the queries at shutdown frees them all and
+/// queues the four past the pool's cap of sixteen for retention. That
+/// intake runs before the retention queue is drained, so nothing is left in
+/// it and the retained-bytes gauge reads zero again.
+#[test]
+fn shutdown_destroys_the_visibility_buffers_its_intake_lets_go_of() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use mtld3d_core::{config::Mtld3dConfig, gpu_caps::GpuCaps, visibility::MIN_BUFFER_SLOTS};
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    // Nothing is submitted, so every frame's sequence (0) has retired.
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+
+    for _ in 0..20 {
+        let buf = enc
+            .provide_visibility_buffer(MIN_BUFFER_SLOTS)
+            .expect("a visibility buffer on the default device");
+        enc.visibility.install_first_buffer(buf);
+        enc.visibility.retire_frame_buffers(0);
+        enc.visibility.reset_frame();
+    }
+    assert!(enc.pending_resource_retention.is_empty());
+
+    enc.shutdown_cleanup();
+    assert!(
+        enc.pending_resource_retention.is_empty(),
+        "the buffers the intake let go of were destroyed with the rest"
+    );
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "shutdown takes back the bytes of the buffers it queued"
+    );
+    drop(enc);
+}

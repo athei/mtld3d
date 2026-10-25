@@ -1,20 +1,28 @@
 //! Unit tests for the occlusion-query logic behind `IDirect3DQuery9`.
 //!
-//! Covers slot allocation (bump, reset, exhaustion), `sum_slots` over half-open and
-//! out-of-range spans, and the BEGIN/END/publish state machine with its `u32` clamp. The
+//! Covers slot allocation over the current buffer (bump, reset, a full buffer), `sum_slots`
+//! over half-open and out-of-range spans of a buffer's bytes, a span summed near the last slot
+//! of a buffer of the device's size, and the BEGIN/END/publish state machine with its `u32`
+//! clamp. The sizing cases pin the policy: a frame's first buffer is one page until recent
+//! submissions reserved more, then a quarter above their decayed peak rounded up to a power of
+//! two, never more than the device's buffer; a full buffer below that size grows in place and
+//! one at it spills into another, a span open across the spill summing the slots of both. The
 //! pool and state cases pin the lifetime rules: intake publishes only queries whose END frame
-//! has retired, reuse waits for `coherent_seq` to reach a buffer's `release_seq`, and an
-//! over-cap retire hands the evicted entry back. The segment cases pin what a span that
-//! outlives its submit does: it is cut at the boundary, reopened in the continuation, and
-//! the two sums add up, while a span that lost its slots reads `u32::MAX` unless it held
-//! no draw, where zero is exact. Reissuing before intake discards the pending segments of
-//! the abandoned bracket while keeping the replacement bracket's result.
+//! has retired, reuse waits for `coherent_seq` to reach a buffer's `release_seq`, hands out the
+//! smallest buffer that fits with its last frame's slots zeroed, retiring never evicts (a frame
+//! of more buffers than the pool keeps sums every one), and the intake hands back the free
+//! buffers past the cap, the smallest first. The segment cases pin what a span
+//! that outlives its submit does: it is cut at the boundary, reopened in the continuation, and
+//! the two sums add up, while a span that lost its slots reads `u32::MAX` unless it held no
+//! draw, where zero is exact. Reissuing before intake discards the pending segments of the
+//! abandoned bracket while keeping the replacement bracket's result.
 
 use mtld3d_shared::MetalHandle;
 
 use super::{
-    MAX_SLOTS, QueryStatus, RetiredVisibilityBuffer, VisibilityBufferPool,
-    VisibilityOffsetAllocator, VisibilityQueryCore, logical_samples, sum_slots,
+    BUFFER_SLOTS_256K, BufferNeed, MIN_BUFFER_SLOTS, QueryStatus, RetiredVisibilityBuffer,
+    SLOT_BYTES, VisibilityBufferPool, VisibilityOffsetAllocator, VisibilityQueryCore,
+    VisibilityQueryState, logical_samples, sum_slots,
 };
 use crate::page_box::PageBox;
 
@@ -24,46 +32,288 @@ fn dummy_buf(seq: u64) -> RetiredVisibilityBuffer {
     RetiredVisibilityBuffer::new(PageBox::new_zeroed(8192), handle, seq)
 }
 
+/// A zeroed test buffer of `slots` slots.
+fn buf_of(slots: u32) -> RetiredVisibilityBuffer {
+    // SAFETY: tests; opaque value never dereferenced.
+    let handle = unsafe { MetalHandle::new(0xDEAD_BEEF) };
+    RetiredVisibilityBuffer::new(
+        PageBox::new_zeroed((slots * SLOT_BYTES) as usize),
+        handle,
+        0,
+    )
+}
+
 /// Write a sample count into one slot of a test buffer, as the GPU would.
 fn write_slot(buf: &mut RetiredVisibilityBuffer, slot: usize, value: u64) {
-    let bytes = value.to_le_bytes();
-    buf.backing_mut().as_mut_slice()[slot * 8..slot * 8 + 8].copy_from_slice(&bytes);
+    let bytes = value.to_ne_bytes();
+    buf.backing.as_mut_slice()[slot * 8..slot * 8 + 8].copy_from_slice(&bytes);
+}
+
+/// Read one slot of a test buffer back.
+fn read_slot(buf: &RetiredVisibilityBuffer, slot: usize) -> u64 {
+    let bytes = &buf.backing.as_slice()[slot * 8..slot * 8 + 8];
+    u64::from_ne_bytes(bytes.try_into().expect("an 8-byte slot"))
+}
+
+/// Lay counters out as the bytes of a visibility buffer.
+fn slot_bytes(slots: &[u64]) -> Vec<u8> {
+    slots.iter().flat_map(|slot| slot.to_ne_bytes()).collect()
+}
+
+/// Run one submission that reserves `slots` slots in a first buffer of their size.
+fn submit_reserving(state: &mut VisibilityQueryState, seq: u64, slots: u32) {
+    let slots_wanted = slots.max(MIN_BUFFER_SLOTS);
+    let buf = state
+        .try_acquire_reusable(slots_wanted)
+        .unwrap_or_else(|| buf_of(slots_wanted));
+    state.install_first_buffer(buf);
+    for _ in 0..slots {
+        state.bump_slot().expect("the buffer holds the slots");
+    }
+    state.retire_frame_buffers(seq);
+    state.pool.release_up_to(seq);
+    state.reset_frame();
+}
+
+/// The retired buffer `index` of the frame `seq`.
+fn retired_mut(
+    state: &mut VisibilityQueryState,
+    seq: u64,
+    index: u32,
+) -> &mut RetiredVisibilityBuffer {
+    state
+        .pool
+        .retired
+        .iter_mut()
+        .find(|buf| buf.release_seq == seq && buf.index == index)
+        .expect("the frame's buffer")
 }
 
 #[test]
 fn sum_slots_single_span() {
-    let slots = [0u64, 42, 0, 0];
+    let slots = slot_bytes(&[0, 42, 0, 0]);
     assert_eq!(sum_slots(&slots, 1, 2), 42);
 }
 
 #[test]
 fn sum_slots_multi_span() {
-    let slots = [0u64, 10, 20, 30, 0];
+    let slots = slot_bytes(&[0, 10, 20, 30, 0]);
     assert_eq!(sum_slots(&slots, 1, 4), 60);
 }
 
 #[test]
 fn sum_slots_empty_range() {
-    let slots = [0u64; 8];
+    let slots = slot_bytes(&[0; 8]);
     assert_eq!(sum_slots(&slots, 5, 5), 0);
 }
 
 #[test]
 fn sum_slots_out_of_range_saturates() {
-    let slots = [1u64, 2, 3];
-    // end past buffer length saturates at slots.len().
+    let slots = slot_bytes(&[1, 2, 3]);
+    // end past buffer length saturates at the backing's last slot.
     assert_eq!(sum_slots(&slots, 0, 10), 6);
 }
 
 #[test]
 fn sum_slots_begin_past_end_returns_zero() {
-    let slots = [1u64, 2, 3];
+    let slots = slot_bytes(&[1, 2, 3]);
     assert_eq!(sum_slots(&slots, 2, 1), 0);
+}
+
+#[test]
+fn intake_sums_a_span_counted_up_to_the_last_slot_of_a_device_size_buffer() {
+    // An engine that tests each visible primitive's bounds runs well past a
+    // thousand slots in a frame; a query there sums its own slots like the
+    // first one does.
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    let early = VisibilityQueryCore::new();
+    let late = VisibilityQueryCore::new();
+    let mut buffer = buf_of(BUFFER_SLOTS_256K);
+    buffer.release_seq = 1;
+    write_slot(&mut buffer, 0, 11);
+    write_slot(&mut buffer, 5_000, 300);
+    write_slot(&mut buffer, 5_001, 20);
+    write_slot(&mut buffer, BUFFER_SLOTS_256K as usize - 1, 4);
+    state.pool.retire(buffer);
+    early.begin(1, 0, (640, 480), (640, 480), 0);
+    early.end(1, 1);
+    state.push_pending(1, early.clone(), (0, 1), true);
+    late.begin(1, 5_000, (640, 480), (640, 480), 1);
+    late.end(1, 2);
+    state.push_pending(1, late.clone(), (5_000, BUFFER_SLOTS_256K), true);
+
+    let _ = state.intake_completed(1);
+    assert_eq!(early.get_u32(), 11);
+    assert_eq!(late.get_u32(), 324, "every slot up to the last one");
+}
+
+#[test]
+fn reuse_zeroes_the_slots_the_last_frame_reserved() {
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    state.install_first_buffer(buf_of(MIN_BUFFER_SLOTS));
+    for _ in 0..3 {
+        state.bump_slot();
+    }
+    state.retire_frame_buffers(1);
+    // The GPU counted into the frame's slots before it retired.
+    let retired = retired_mut(&mut state, 1, 0);
+    assert_eq!(retired.reserved, 3);
+    write_slot(retired, 0, 7);
+    write_slot(retired, 2, 9);
+    state.pool.release_up_to(1);
+
+    let reused = state
+        .try_acquire_reusable(MIN_BUFFER_SLOTS)
+        .expect("released for reuse");
+    assert_eq!(read_slot(&reused, 0), 0);
+    assert_eq!(read_slot(&reused, 2), 0, "the last reserved slot");
+    assert_eq!(reused.reserved, 0);
+}
+
+#[test]
+fn a_first_buffer_is_one_page_until_submissions_reserve_more() {
+    let state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    assert_eq!(state.first_buffer_slots(), MIN_BUFFER_SLOTS);
+    assert_eq!(state.buffer_need(), BufferNeed::First(MIN_BUFFER_SLOTS));
+}
+
+#[test]
+fn a_first_buffer_follows_the_decayed_peak_with_headroom() {
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    submit_reserving(&mut state, 1, 3_000);
+    assert_eq!(
+        state.first_buffer_slots(),
+        4_096,
+        "a quarter above 3,000, rounded up to a power of two"
+    );
+    // A light frame does not shrink the next one at once.
+    submit_reserving(&mut state, 2, 10);
+    assert_eq!(state.first_buffer_slots(), 4_096);
+    // The peak decays by a thirty-second a submission, back to one page.
+    for seq in 3..200 {
+        submit_reserving(&mut state, seq, 10);
+    }
+    assert_eq!(state.first_buffer_slots(), MIN_BUFFER_SLOTS);
+}
+
+#[test]
+fn a_first_buffer_never_exceeds_the_device_size() {
+    let mut state = VisibilityQueryState::new(4_096);
+    state.peak_slots = 1_000_000;
+    assert_eq!(state.first_buffer_slots(), 4_096);
+    state.peak_slots = u32::MAX;
+    assert_eq!(state.first_buffer_slots(), 4_096);
+}
+
+#[test]
+fn a_full_buffer_below_the_device_size_grows_and_keeps_its_slots() {
+    let mut state = VisibilityQueryState::new(8_192);
+    state.install_first_buffer(buf_of(MIN_BUFFER_SLOTS));
+    for _ in 0..MIN_BUFFER_SLOTS {
+        state.bump_slot().expect("a slot");
+    }
+    assert_eq!(state.bump_slot(), None, "the first buffer is full");
+    assert_eq!(state.buffer_need(), BufferNeed::Grow(2 * MIN_BUFFER_SLOTS));
+    assert!(
+        state
+            .install_grown_buffer(buf_of(2 * MIN_BUFFER_SLOTS))
+            .is_empty()
+    );
+    assert_eq!(
+        state.bump_slot(),
+        Some(MIN_BUFFER_SLOTS),
+        "the larger buffer takes over the slots handed out"
+    );
+    assert_eq!(
+        state.current_buffer_index(),
+        0,
+        "still the frame's one buffer"
+    );
+    assert_eq!(
+        state.pool.free.len(),
+        1,
+        "the replaced buffer, never submitted, is free at once"
+    );
+}
+
+#[test]
+fn a_span_open_across_a_spill_sums_the_slots_of_both_buffers() {
+    let mut state = VisibilityQueryState::new(MIN_BUFFER_SLOTS);
+    state.install_first_buffer(buf_of(MIN_BUFFER_SLOTS));
+    let closed = VisibilityQueryCore::new();
+    let spanning = VisibilityQueryCore::new();
+    // A query that closes before the buffer fills.
+    let begin = state.bump_slot().expect("a slot");
+    closed.begin(1, begin, (640, 480), (640, 480), state.draws_seen());
+    state.note_draw();
+    let end = state.bump_slot().expect("a slot");
+    closed.end(1, state.draws_seen());
+    state.push_pending(1, closed.clone(), (begin, end), true);
+    // A query open while the buffer fills.
+    let begin = state.bump_slot().expect("a slot");
+    spanning.begin(1, begin, (640, 480), (640, 480), state.draws_seen());
+    state.push_active(&spanning);
+    state.note_draw();
+    while state.bump_slot().is_some() {}
+    assert_eq!(state.buffer_need(), BufferNeed::Spill(MIN_BUFFER_SLOTS));
+
+    state.spill_into(1, buf_of(MIN_BUFFER_SLOTS));
+    assert_eq!(state.current_buffer_index(), 1);
+    assert_eq!(
+        spanning.offset_begin(),
+        0,
+        "reopened at the next buffer's start"
+    );
+    state.note_draw();
+    let after = state.bump_slot().expect("a slot of the next buffer");
+    assert_eq!(after, 0);
+    let end = state.bump_slot().expect("a slot");
+    spanning.end(1, state.draws_seen());
+    state.remove_active(&spanning);
+    state.push_pending(1, spanning.clone(), (spanning.offset_begin(), end), true);
+
+    state.retire_frame_buffers(1);
+    write_slot(retired_mut(&mut state, 1, 0), 0, 5);
+    write_slot(retired_mut(&mut state, 1, 0), 7, 100);
+    write_slot(retired_mut(&mut state, 1, 1), 0, 23);
+    assert_eq!(retired_mut(&mut state, 1, 0).reserved, MIN_BUFFER_SLOTS);
+    assert_eq!(retired_mut(&mut state, 1, 1).reserved, 2);
+
+    let _ = state.intake_completed(1);
+    assert_eq!(closed.get_u32(), 5, "the span inside the first buffer");
+    assert_eq!(spanning.status(), QueryStatus::Issued);
+    assert_eq!(
+        spanning.get_u32(),
+        123,
+        "the span's slots in the full buffer and in the next one"
+    );
+}
+
+#[test]
+fn pool_hands_out_the_smallest_free_buffer_that_fits() {
+    let mut pool = VisibilityBufferPool::new(8);
+    for slots in [8_192, 2_048, 4_096] {
+        assert!(pool.give_back(buf_of(slots)).is_empty());
+    }
+    assert_eq!(pool.acquire(3_000).map(|buf| buf.slots()), Some(4_096));
+    assert_eq!(pool.acquire(10_000).map(|buf| buf.slots()), None);
+    assert_eq!(pool.acquire(1).map(|buf| buf.slots()), Some(2_048));
+}
+
+#[test]
+fn pool_over_cap_evicts_the_smallest_free_buffer_first() {
+    let mut pool = VisibilityBufferPool::new(2);
+    assert!(pool.give_back(buf_of(8_192)).is_empty());
+    assert!(pool.give_back(buf_of(2_048)).is_empty());
+    let evicted = pool.give_back(buf_of(4_096));
+    assert_eq!(evicted.len(), 1, "over the cap by one");
+    assert_eq!(evicted[0].slots(), 2_048);
 }
 
 #[test]
 fn allocator_bump_monotonic() {
     let mut a = VisibilityOffsetAllocator::new();
+    a.reset(8);
     assert_eq!(a.bump(), Some(0));
     assert_eq!(a.bump(), Some(1));
     assert_eq!(a.bump(), Some(2));
@@ -73,26 +323,26 @@ fn allocator_bump_monotonic() {
 #[test]
 fn allocator_reset_returns_used_and_restarts() {
     let mut a = VisibilityOffsetAllocator::new();
+    a.reset(8);
     a.bump();
     a.bump();
     a.bump();
     assert_eq!(a.next, 3);
-    a.reset();
+    a.reset(8);
     assert_eq!(a.next, 0);
     assert_eq!(a.bump(), Some(0));
 }
 
 #[test]
-fn allocator_exhaust_then_reset() {
+fn allocator_stops_at_its_buffer_and_has_none_before_one() {
     let mut a = VisibilityOffsetAllocator::new();
-    for _ in 0..MAX_SLOTS {
+    assert_eq!(a.bump(), None, "no buffer yet");
+    a.reset(MIN_BUFFER_SLOTS);
+    for _ in 0..MIN_BUFFER_SLOTS {
         assert!(a.bump().is_some());
     }
-    assert!(!a.exhausted);
     assert!(a.bump().is_none());
-    assert!(a.exhausted);
-    a.reset();
-    assert!(!a.exhausted);
+    a.reset(MIN_BUFFER_SLOTS);
     assert_eq!(a.bump(), Some(0));
 }
 
@@ -200,12 +450,14 @@ fn query_core_u32_clamp() {
 #[test]
 fn pool_retire_and_reuse() {
     let mut pool = VisibilityBufferPool::new(4);
-    assert!(pool.acquire().is_none());
-    assert!(pool.retire(dummy_buf(5)).is_none());
+    assert!(pool.acquire(1).is_none());
+    pool.retire(dummy_buf(5));
     // Not yet released.
-    assert!(pool.acquire().is_none());
+    assert!(pool.acquire(1).is_none());
     pool.release_up_to(5);
-    let reused = pool.acquire().expect("buffer should be free after release");
+    let reused = pool
+        .acquire(1)
+        .expect("buffer should be free after release");
     assert_eq!(reused.metal_handle().raw(), 0xDEAD_BEEF);
     assert_eq!(reused.release_seq, 5);
 }
@@ -223,19 +475,26 @@ fn pool_holds_in_flight_until_seq_catches_up() {
 }
 
 #[test]
-fn pool_free_cap_evicts_on_overfill() {
+fn pool_caps_the_free_list_and_never_the_retired_one() {
     let mut pool = VisibilityBufferPool::new(2);
-    assert!(pool.retire(dummy_buf(1)).is_none());
-    assert!(pool.retire(dummy_buf(2)).is_none());
-    // Third retiree pushes total to 3 > cap 2 → one eviction.
-    let evicted = pool.retire(dummy_buf(3));
-    assert!(evicted.is_some());
+    for seq in 1..=3 {
+        pool.retire(dummy_buf(seq));
+    }
+    assert_eq!(
+        pool.retired.len(),
+        3,
+        "a retired buffer still holds counts to read"
+    );
+    let evicted = pool.release_up_to(3);
+    assert_eq!(evicted.len(), 1, "three come free, two are kept");
+    assert_eq!(pool.free.len(), 2);
+    assert!(pool.retired.is_empty());
 }
 
 #[test]
 fn state_intake_completed_respects_seq() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let c1 = VisibilityQueryCore::new();
     let c2 = VisibilityQueryCore::new();
     c1.begin(5, 0, (640, 480), (640, 480), 0);
@@ -250,13 +509,13 @@ fn state_intake_completed_respects_seq() {
     state.pool.retire(dummy_buf(10));
 
     // coherent_seq = 7: only c1 (seq 5) should publish.
-    state.intake_completed(7);
+    let _ = state.intake_completed(7);
     assert_eq!(c1.status(), QueryStatus::Issued);
     assert_eq!(c2.status(), QueryStatus::Pending);
     assert_eq!(state.pending.len(), 1);
 
     // coherent_seq = 10: c2 publishes.
-    state.intake_completed(10);
+    let _ = state.intake_completed(10);
     assert_eq!(c2.status(), QueryStatus::Issued);
     assert_eq!(state.pending.len(), 0);
 }
@@ -264,7 +523,7 @@ fn state_intake_completed_respects_seq() {
 #[test]
 fn state_intake_adds_a_split_span_up_across_its_two_frames() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     core.begin(1, 0, (640, 480), (640, 480), 0);
     // Frame 1 counted slot 0, frame 2 slot 0 of its own buffer.
@@ -279,13 +538,13 @@ fn state_intake_adds_a_split_span_up_across_its_two_frames() {
     core.end(2, 1);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(
         core.status(),
         QueryStatus::Pending,
         "a span is not done while a later segment is outstanding"
     );
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 1_000);
 }
@@ -293,7 +552,7 @@ fn state_intake_adds_a_split_span_up_across_its_two_frames() {
 #[test]
 fn state_reissue_before_intake_discards_the_abandoned_span() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     let mut buffer = dummy_buf(1);
     write_slot(&mut buffer, 0, 100);
@@ -311,7 +570,7 @@ fn state_reissue_before_intake_discards_the_abandoned_span() {
     core.end(1, 2);
     state.push_pending(1, core.clone(), (1, 2), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 7);
 }
@@ -319,7 +578,7 @@ fn state_reissue_before_intake_discards_the_abandoned_span() {
 #[test]
 fn state_reissue_waits_for_the_replacement_segments_sequence() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
 
     let mut abandoned = dummy_buf(1);
@@ -336,7 +595,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
     core.end(2, 2);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(
         core.status(),
         QueryStatus::Pending,
@@ -344,7 +603,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
     );
     assert_eq!(state.pending.len(), 1);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 7);
 }
@@ -352,7 +611,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
 #[test]
 fn state_intake_reads_an_empty_segment_without_a_buffer() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     core.begin(1, 0, (640, 480), (640, 480), 0);
     // A continuation frame that drew nothing reserved no slot and so no
@@ -365,7 +624,7 @@ fn state_intake_reads_an_empty_segment_without_a_buffer() {
     core.end(2, 1);
     state.push_pending(2, core.clone(), (0, 1), true);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 55);
 }
@@ -373,14 +632,14 @@ fn state_intake_reads_an_empty_segment_without_a_buffer() {
 #[test]
 fn state_intake_answers_permissively_when_a_counted_segments_buffer_is_gone() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     core.begin(1, 0, (640, 480), (640, 480), 0);
     core.end(1, 1);
     // Nothing retired at seq 1: the slots the span counted into cannot be
     // read back.
     state.push_pending(1, core.clone(), (0, 2), true);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), u32::MAX);
 }
@@ -388,12 +647,13 @@ fn state_intake_answers_permissively_when_a_counted_segments_buffer_is_gone() {
 #[test]
 fn state_split_and_resume_close_and_reopen_every_open_span() {
     use super::VisibilityQueryState;
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     state.push_active(&core);
     // A second BEGIN on the same query leaves one entry.
     state.push_active(&core);
     assert_eq!(state.active_count(), 1);
+    state.allocator.reset(MIN_BUFFER_SLOTS);
     state.bump_slot();
     state.bump_slot();
     core.begin(1, 0, (640, 480), (640, 480), 0);
@@ -427,8 +687,9 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
     // the same cut a submit makes for a span the application left open. The
     // segment already counted has been summed by then, and the span itself
     // continues in the frame that follows, so the two halves still add up.
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
+    state.allocator.reset(MIN_BUFFER_SLOTS);
     state.bump_slot();
     core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
     state.push_active(&core);
@@ -439,7 +700,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
 
     // The flush ahead of the drain, then the drain's own finalize.
     state.split_open_spans(1);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Pending, "END has not run yet");
     let drained = state.drain_all_buffers();
     assert_eq!(drained.len(), 1, "the frame's buffer leaves with the drain");
@@ -457,6 +718,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
         0,
         "reopened against the fresh allocator"
     );
+    state.allocator.reset(MIN_BUFFER_SLOTS);
     state.bump_slot();
     state.note_draw();
     let mut second = dummy_buf(2);
@@ -466,7 +728,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
     state.remove_active(&core);
     state.push_pending(2, core.clone(), (core.offset_begin(), 1), true);
 
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
         core.get_u32(),
@@ -478,7 +740,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
 #[test]
 fn state_mark_exhausted_makes_every_open_span_uncounted() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let core = VisibilityQueryCore::new();
     core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
     state.push_active(&core);
@@ -487,7 +749,7 @@ fn state_mark_exhausted_makes_every_open_span_uncounted() {
     assert!(state.exhausted_this_frame());
     core.end(1, state.draws_seen());
     state.push_pending(1, core.clone(), (0, 0), true);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
         core.get_u32(),
@@ -499,7 +761,7 @@ fn state_mark_exhausted_makes_every_open_span_uncounted() {
 #[test]
 fn state_draw_counter_carries_across_a_frame_boundary() {
     use super::VisibilityQueryState;
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     state.note_draw();
     let core = VisibilityQueryCore::new();
     core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
@@ -520,49 +782,98 @@ fn state_draw_counter_carries_across_a_frame_boundary() {
 
 #[test]
 fn state_reset_frame_clears_per_frame_fields() {
-    use super::VisibilityQueryState;
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    state.install_first_buffer(dummy_buf(0));
     state.bump_slot();
-    state.install_current_buffer(dummy_buf(0));
     state.mark_exhausted();
-    assert_eq!(state.current_buffer_handle().raw(), 0xDEAD_BEEF);
+    assert_eq!(state.buffer_handle(0).raw(), 0xDEAD_BEEF);
     assert!(state.exhausted_this_frame());
     assert_eq!(state.allocator.next, 1);
 
-    // `retire_current_buffer` must run first — reset_frame does
-    // not touch the current buffer slot.
-    state.retire_current_buffer(42);
+    // `retire_frame_buffers` must run first: reset_frame does
+    // not touch the frame's buffers.
+    state.retire_frame_buffers(42);
     state.reset_frame();
-    assert!(state.current_buffer_handle().is_null());
+    assert!(state.buffer_handle(0).is_null());
     assert!(!state.exhausted_this_frame());
     assert_eq!(state.allocator.next, 0);
+    assert_eq!(state.buffer_need(), BufferNeed::First(MIN_BUFFER_SLOTS));
 }
 
 #[test]
-fn retire_current_buffer_returns_evicted_when_over_cap() {
-    use super::VisibilityQueryState;
+fn intake_hands_back_the_free_buffers_past_the_cap() {
     // Force a small cap by poking a fresh state's pool. The public
     // `new()` uses 16; we want the over-cap path in-test.
-    let mut state = VisibilityQueryState::new();
-    state.pool = super::VisibilityBufferPool::new(2);
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
+    state.pool = VisibilityBufferPool::new(2);
 
-    // Three frames with a visibility buffer each. Two fit, the
-    // third exceeds cap → the oldest is evicted and must be
-    // returned to the caller, not dropped in place.
-    state.install_current_buffer(dummy_buf(0));
-    assert!(state.retire_current_buffer(1).is_none());
-    state.install_current_buffer(dummy_buf(0));
-    assert!(state.retire_current_buffer(2).is_none());
-    state.install_current_buffer(dummy_buf(0));
-    let evicted = state
-        .retire_current_buffer(3)
-        .expect("over-cap retire must hand the evicted entry back");
-    // Evicted entry carries the oldest release_seq (the caller
-    // gates MTLBuffer destruction on coherent_seq >= this).
-    assert_eq!(evicted.release_seq(), 1);
-    let (_backing, handle, release_seq) = evicted.into_parts();
+    // Three frames with a visibility buffer each, all retired before the
+    // first intake: none is let go of while its frame is in flight.
+    for seq in 1..=3 {
+        state.install_first_buffer(dummy_buf(0));
+        state.retire_frame_buffers(seq);
+        state.reset_frame();
+    }
+    assert_eq!(state.pool.retired.len(), 3);
+    // Once all three are free, two stay and one must be handed back to
+    // the caller, not dropped in place.
+    let mut evicted = state.intake_completed(3);
+    assert_eq!(evicted.len(), 1, "the free list past its cap");
+    let evicted = evicted.pop().expect("one entry");
+    // The caller gates MTLBuffer destruction on coherent_seq >= this.
+    assert!(evicted.release_seq() <= 3);
+    let (_backing, handle, _release_seq) = evicted.into_parts();
     assert_eq!(handle.raw(), 0xDEAD_BEEF);
-    assert_eq!(release_seq, 1);
+    assert_eq!(state.pool.free.len(), 2);
+}
+
+#[test]
+fn a_frame_of_more_buffers_than_the_pool_keeps_sums_every_one() {
+    // 21 buffers in one frame, more than the 16 free buffers the pool
+    // keeps: every one is still there when intake reads the span open
+    // across all of them.
+    const BUFFERS: u32 = 21;
+    let mut state = VisibilityQueryState::new(MIN_BUFFER_SLOTS);
+    state.install_first_buffer(buf_of(MIN_BUFFER_SLOTS));
+    let spanning = VisibilityQueryCore::new();
+    let begin = state.bump_slot().expect("a slot");
+    spanning.begin(1, begin, (640, 480), (640, 480), state.draws_seen());
+    state.push_active(&spanning);
+    state.note_draw();
+    for _ in 1..BUFFERS {
+        while state.bump_slot().is_some() {}
+        assert_eq!(state.buffer_need(), BufferNeed::Spill(MIN_BUFFER_SLOTS));
+        state.spill_into(1, buf_of(MIN_BUFFER_SLOTS));
+    }
+    // The command whose allocation spilled counts at slot 0 of the last
+    // buffer, and END reserves the slot after it.
+    assert_eq!(state.bump_slot(), Some(0));
+    let end = state.bump_slot().expect("a slot of the last buffer");
+    spanning.end(1, state.draws_seen());
+    state.remove_active(&spanning);
+    state.push_pending(1, spanning.clone(), (spanning.offset_begin(), end), true);
+    state.retire_frame_buffers(1);
+    assert_eq!(
+        state.pool.retired.len(),
+        BUFFERS as usize,
+        "nothing evicted"
+    );
+
+    write_slot(retired_mut(&mut state, 1, 0), 0, 1);
+    write_slot(retired_mut(&mut state, 1, 10), 5, 4);
+    write_slot(retired_mut(&mut state, 1, BUFFERS - 1), 0, 2);
+    let evicted = state.intake_completed(1);
+    assert_eq!(spanning.status(), QueryStatus::Issued);
+    assert_eq!(
+        spanning.get_u32(),
+        7,
+        "the first, a middle and the last buffer"
+    );
+    assert_eq!(
+        evicted.len(),
+        BUFFERS as usize - 16,
+        "the free list keeps 16 once the frame retires"
+    );
 }
 
 const QUERIES: u32 = 100;
@@ -572,18 +883,18 @@ const TOTAL: u32 = QUERIES * (2 + PASS_BOUNDARIES);
 #[test]
 fn scaling_smoke_hundred_queries() {
     // 100 queries × (2 base slots + 5 pass-boundary bumps) = 700
-    // slots, still under MAX_SLOTS budget.
+    // slots, inside the first buffer.
     let mut a = VisibilityOffsetAllocator::new();
+    a.reset(MIN_BUFFER_SLOTS);
     for _ in 0..TOTAL {
         assert!(a.bump().is_some());
     }
     assert_eq!(a.next, TOTAL);
-    assert!(!a.exhausted);
 
     // Forge a slot array where each query contributes 10 visible
     // pixels split evenly across its slots.
     let total_usize = TOTAL as usize;
-    let slots: Vec<u64> = (0..total_usize).map(|_| 10).collect();
+    let slots = slot_bytes(&vec![10; total_usize]);
     let sum = sum_slots(&slots, 0, TOTAL);
     assert_eq!(
         u32::try_from(sum).expect("700 * 10 = 7000 fits u32"),
@@ -653,7 +964,7 @@ fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
     core.begin_recorded(first, 1, 0, (1, 1), (1, 1), 0);
     assert_eq!(core.mark_end_requested(), first);
     core.end_recorded(first, 1, 1);
-    let mut state = super::VisibilityQueryState::new();
+    let mut state = super::VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let mut buffer = dummy_buf(1);
     write_slot(&mut buffer, 0, 123);
     state.pool.retire(buffer);
@@ -661,7 +972,7 @@ fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
     let second = core.mark_armed();
     assert_eq!(core.mark_end_requested(), second);
     assert_eq!(core.seq_end_loaded(), 0);
-    state.intake_completed(1);
+    let _ = state.intake_completed(1);
     assert_eq!(core.status(), super::QueryStatus::Pending);
     assert_eq!(core.get_u64(), 0);
     assert_eq!(core.seq_end_loaded(), 0);
@@ -671,7 +982,7 @@ fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
     write_slot(&mut replacement, 0, 7);
     state.pool.retire(replacement);
     state.push_pending(2, core.clone(), (0, 1), true);
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(core.status(), super::QueryStatus::Issued);
     assert_eq!(core.get_u64(), 7);
     assert_eq!(core.seq_end_loaded(), 2);
@@ -724,10 +1035,12 @@ fn an_end_opens_an_empty_span_only_on_a_query_never_begun() {
 #[test]
 fn state_a_span_begun_without_a_slot_splits_into_an_empty_segment() {
     use super::{QueryStatus, VisibilityQueryState};
-    let mut state = VisibilityQueryState::new();
+    let mut state = VisibilityQueryState::new(BUFFER_SLOTS_256K);
     let mut buffer = dummy_buf(1);
     write_slot(&mut buffer, 0, 900);
-    // Another span counted into slot 0, then the budget ran out.
+    // Another span counted into slot 0, the buffer filled, and the larger
+    // one that would follow it could not be allocated.
+    state.allocator.reset(MIN_BUFFER_SLOTS);
     while state.bump_slot().is_some() {}
     state.mark_exhausted();
     let starved = VisibilityQueryCore::new();
@@ -747,7 +1060,7 @@ fn state_a_span_begun_without_a_slot_splits_into_an_empty_segment() {
     starved.end(2, state.draws_seen());
     state.remove_active(&starved);
     state.push_pending(2, starved.clone(), (starved.offset_begin(), 0), true);
-    state.intake_completed(2);
+    let _ = state.intake_completed(2);
     assert_eq!(starved.status(), QueryStatus::Issued);
     assert_eq!(
         starved.get_u32(),

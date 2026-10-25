@@ -468,61 +468,244 @@ fn occlusion_count_survives_a_flush_between_begin_and_end() {
     );
 }
 
-#[test]
-fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
-    // The per-frame slot budget is finite (two slots per BEGIN/END pair plus
-    // one per pass the span crosses). A query that gets no slot and did draw
-    // cannot be counted, and the answer for "unknown" is the permissive
-    // `u32::MAX`: reporting the zero its empty span sums to would read as
-    // full occlusion and make a title cull geometry it should draw. A query
-    // that drew nothing is not unknown at all, budget or no budget, and
-    // reports the zero it counted.
-    //
-    // The filler pair count is comfortably past the budget rather than
-    // exactly at it, so the span that follows is starved even if the budget
-    // grows; a budget that grew past this fails the test rather than quietly
-    // stopping to test the fallback.
-    const FILLERS: usize = 700;
+/// Draw the wall a query's draw can hide behind, after clearing colour and depth.
+fn clear_and_draw_wall(h: &Harness) {
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF00_0000, 1.0, 0),
+        0,
+        "clear colour and depth"
+    );
+    draw_full_frame_at(h, 0.5, "the wall");
+}
 
-    let h = Harness::with_config("query.flushImmediate=false");
+/// A harness with a depth buffer, set up for depth-tested counting draws.
+fn depth_tested_harness() -> Harness {
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "query.flushImmediate=false",
+        ..HarnessConfig::default()
+    });
+    arm_for_counting_draws(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "ZENABLE");
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0, "ZFUNC");
+    h
+}
+
+/// Count one query's draw behind the wall and another's in front of it.
+fn count_behind_and_in_front(h: &Harness, hidden: &Query<'_>, visible: &Query<'_>) {
+    assert_eq!(
+        hidden.issue(D3DISSUE_BEGIN),
+        0,
+        "Issue(BEGIN) behind the wall"
+    );
+    draw_full_frame_at(h, 0.9, "the draw behind the wall");
+    assert_eq!(hidden.issue(D3DISSUE_END), 0, "Issue(END) behind the wall");
+    assert_eq!(visible.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN) in front");
+    draw_full_frame_at(h, 0.1, "the draw in front of the wall");
+    assert_eq!(visible.issue(D3DISSUE_END), 0, "Issue(END) in front");
+}
+
+/// Assert what [`count_behind_and_in_front`] counted.
+fn assert_behind_and_in_front(hidden: &Query<'_>, visible: &Query<'_>, dims: (u32, u32)) {
+    assert_eq!(
+        occlusion_count(hidden, "the span behind the wall"),
+        0,
+        "a draw every sample of which fails the depth test counts no samples"
+    );
+    assert_full_frames(
+        occlusion_count(visible, "the span in front of the wall"),
+        1,
+        dims,
+        "a draw in front of the wall",
+    );
+}
+
+#[test]
+fn occlusion_queries_past_a_thousand_slots_count_what_they_drew() {
+    // An engine that tests the bounds of every visible primitive issues
+    // hundreds of queries a frame and then the few that decide how bright a
+    // light's halo or flare is drawn. Those late queries answer from the
+    // depth test like the first ones: one behind a wall counts nothing, one
+    // in front of it the whole frame. A query that answered fully visible
+    // here would draw its halo through the wall. 1,500 pairs take 3,000
+    // slots, more than a frame's first buffer holds, so the buffer grows
+    // under the slots already handed out.
+    const FILLERS: usize = 1_500;
+
+    let h = depth_tested_harness();
+    let dims = h.dims();
     let fillers: Vec<Query<'_>> = (0..FILLERS)
         .map(|_| {
             h.create_query(D3DQUERYTYPE_OCCLUSION)
                 .expect("OCCLUSION query should be supported")
         })
         .collect();
-    let Some(starved) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+    let Some(hidden) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
         panic!("OCCLUSION query should be supported");
     };
-    arm_for_counting_draws(&h);
+    let Some(visible) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
 
     assert!(h.pump(), "WM_QUIT");
     assert_eq!(h.begin_scene(), 0);
-    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    clear_and_draw_wall(&h);
     for q in &fillers {
         assert_eq!(q.issue(D3DISSUE_BEGIN), 0);
         assert_eq!(q.issue(D3DISSUE_END), 0);
     }
-    assert_eq!(starved.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
-    draw_full_frame(&h, "draw the starved span cannot count");
-    assert_eq!(starved.issue(D3DISSUE_END), 0, "Issue(END)");
+    count_behind_and_in_front(&h, &hidden, &visible);
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);
 
+    assert_behind_and_in_front(&hidden, &visible, dims);
     assert_eq!(
         occlusion_count(&fillers[0], "the first filler"),
         0,
-        "a query that got its slots and saw no draw counts no samples"
+        "a query that saw no draw counts no samples"
     );
     assert_eq!(
         occlusion_count(&fillers[FILLERS - 1], "the last filler"),
         0,
-        "a query past the budget that saw no draw still counts no samples"
+        "a query that saw no draw counts no samples"
+    );
+}
+
+/// Empty BEGIN/END pairs that fill more than one visibility buffer of any device's size.
+///
+/// Each pair takes two slots, so 17,000 pairs take 34,000: more than the
+/// 32,768 a buffer holds on an Apple7 or later GPU and four times the 8,192
+/// it holds elsewhere.
+const PAIRS_PAST_A_FULL_BUFFER: usize = 17_000;
+
+/// The name the workload child of `a_full_visibility_buffer_costs_one_pass_break` runs under.
+const SPILL_CHILD_NAME: &str = "occlusion-spill.exe";
+
+/// The log filter of that child: the visibility rows and the pass-break trace.
+const SPILL_LOG_FILTER: &str = "warn,mtld3d::unix::visibility=debug,mtld3d::d3d9::passes=trace";
+
+/// How long the child waits for its log to carry the rows of the frame it submitted.
+const SPILL_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One frame of queries that fills at least one visibility buffer, with a query open across.
+///
+/// `spanning` counts a draw before the fill and one after it, and the two
+/// queries behind and in front of the wall come after the fill. Each counted
+/// draw lies in front of every draw before it (the wall at 0.5, then 0.3,
+/// 0.1 and 0.05), since each writes its depth over the whole frame. Returns
+/// the slots the frame reserves: two per BEGIN/END pair, the passes after a
+/// full buffer arming none since their first command is a Counting mode.
+fn fill_a_visibility_buffer(
+    h: &Harness,
+    spanning: &Query<'_>,
+    filler: &Query<'_>,
+    behind_and_in_front: (&Query<'_>, &Query<'_>),
+) -> usize {
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    clear_and_draw_wall(h);
+    assert_eq!(spanning.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN) across");
+    draw_full_frame_at(h, 0.3, "the spanning query's draw before the fill");
+    for _ in 0..PAIRS_PAST_A_FULL_BUFFER {
+        assert_eq!(filler.issue(D3DISSUE_BEGIN), 0);
+        assert_eq!(filler.issue(D3DISSUE_END), 0);
+    }
+    count_behind_and_in_front(h, behind_and_in_front.0, behind_and_in_front.1);
+    draw_full_frame_at(h, 0.05, "the spanning query's draw after the fill");
+    assert_eq!(spanning.issue(D3DISSUE_END), 0, "Issue(END) across");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+    1 + 2 * PAIRS_PAST_A_FULL_BUFFER + 2 + 2 + 1
+}
+
+#[test]
+fn occlusion_queries_past_a_full_visibility_buffer_count_what_they_drew() {
+    // A frame has no slot limit. Once a buffer of the device's size is full
+    // the frame continues in another after a pass break, and a query open
+    // across the break counts every draw on both sides of it that passes the
+    // depth test: its own draw before the break in the first buffer, and the
+    // in-front query's draw and its own second draw in the next, three full
+    // frames in all. Queries begun in the later buffer answer from the depth
+    // test like any other.
+    let h = depth_tested_harness();
+    let dims = h.dims();
+    let query = || {
+        h.create_query(D3DQUERYTYPE_OCCLUSION)
+            .expect("OCCLUSION query should be supported")
+    };
+    let (spanning, filler, hidden, visible) = (query(), query(), query(), query());
+
+    fill_a_visibility_buffer(&h, &spanning, &filler, (&hidden, &visible));
+
+    assert_behind_and_in_front(&hidden, &visible, dims);
+    assert_full_frames(
+        occlusion_count(&spanning, "the span open across the full buffer"),
+        3,
+        dims,
+        "one passing draw before the break and two after it",
     );
     assert_eq!(
-        occlusion_count(&starved, "the starved span"),
-        u32::MAX,
-        "a query the frame had no slot left for, with a draw in it, reads fully visible"
+        occlusion_count(&filler, "the last filler"),
+        0,
+        "a query that saw no draw counts no samples"
+    );
+}
+
+#[test]
+fn a_full_visibility_buffer_costs_one_pass_break() {
+    if running_as(SPILL_CHILD_NAME) {
+        spill_workload();
+        return;
+    }
+    // The rows are counted from the log, so the workload runs alone in a log
+    // directory of its own.
+    run_in_private_log_child(
+        SPILL_CHILD_NAME,
+        "query::a_full_visibility_buffer_costs_one_pass_break",
+        SPILL_LOG_FILTER,
+    );
+}
+
+/// Fill visibility buffers in one frame and count the buffers it moved past and the breaks.
+///
+/// The frame moves past each full buffer once, and each time ends the pass
+/// open then, with the break's own trace row, and no other pass break.
+fn spill_workload() {
+    let h = depth_tested_harness();
+    let query = || {
+        h.create_query(D3DQUERYTYPE_OCCLUSION)
+            .expect("OCCLUSION query should be supported")
+    };
+    let (spanning, filler, hidden, visible) = (query(), query(), query(), query());
+    let slots = fill_a_visibility_buffer(&h, &spanning, &filler, (&hidden, &visible));
+    occlusion_count(&spanning, "the span open across the full buffer");
+
+    let deadline = std::time::Instant::now() + SPILL_LOG_WAIT;
+    let (spills, breaks) = loop {
+        let spills = logged_lines(" slots: continuing in buffer ");
+        let breaks = logged_lines("caller=visibility_buffer_full");
+        if (!spills.is_empty() && spills.len() == breaks.len())
+            || std::time::Instant::now() >= deadline
+        {
+            break (spills, breaks);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let buffer_slots: usize = spills
+        .first()
+        .and_then(|line| line.split(" full at ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .expect("a full-buffer row names the buffer's slots");
+    assert_eq!(
+        spills.len(),
+        (slots - 1) / buffer_slots,
+        "one row per buffer filled: {slots} slots in buffers of {buffer_slots}"
+    );
+    assert_eq!(
+        breaks.len(),
+        spills.len(),
+        "one pass break per full buffer: {breaks:?}"
     );
 }
 
@@ -592,68 +775,6 @@ fn a_second_end_keeps_the_count_of_the_first() {
         1,
         dims,
         "the span the first END closed",
-    );
-}
-
-#[test]
-fn a_span_begun_past_the_slot_budget_with_no_draw_counts_nothing() {
-    // A query begun once the frame's slots are spent counts into no slot. Cut
-    // by the frame boundary before its END, the part of the span in that
-    // frame covers none of the frame's slots: they were all reserved before
-    // it began, and the first of them holds a full frame another query
-    // counted. With no draw in the span, its exact answer is zero.
-    const FILLERS: usize = 600;
-
-    let h = Harness::with_config("query.flushImmediate=false");
-    let dims = h.dims();
-    let Some(counted) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
-        panic!("OCCLUSION query should be supported");
-    };
-    let fillers: Vec<Query<'_>> = (0..FILLERS)
-        .map(|_| {
-            h.create_query(D3DQUERYTYPE_OCCLUSION)
-                .expect("OCCLUSION query should be supported")
-        })
-        .collect();
-    let Some(starved) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
-        panic!("OCCLUSION query should be supported");
-    };
-    arm_for_counting_draws(&h);
-
-    assert!(h.pump(), "WM_QUIT");
-    assert_eq!(h.begin_scene(), 0);
-    assert_eq!(h.clear_target(0xFF00_0000), 0);
-    assert_eq!(counted.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
-    draw_full_frame(&h, "the draw the first slot counts");
-    assert_eq!(counted.issue(D3DISSUE_END), 0, "Issue(END)");
-    for q in &fillers {
-        assert_eq!(q.issue(D3DISSUE_BEGIN), 0);
-        assert_eq!(q.issue(D3DISSUE_END), 0);
-    }
-    assert_eq!(
-        starved.issue(D3DISSUE_BEGIN),
-        0,
-        "Issue(BEGIN) past the budget"
-    );
-    assert_eq!(h.end_scene(), 0);
-    assert_eq!(h.present(), 0);
-
-    assert_eq!(h.begin_scene(), 0);
-    assert_eq!(h.clear_target(0xFF00_0000), 0);
-    assert_eq!(starved.issue(D3DISSUE_END), 0, "Issue(END)");
-    assert_eq!(h.end_scene(), 0);
-    assert_eq!(h.present(), 0);
-
-    assert_full_frames(
-        occlusion_count(&counted, "the counted span"),
-        1,
-        dims,
-        "a quad covering the frame",
-    );
-    assert_eq!(
-        occlusion_count(&starved, "the starved span"),
-        0,
-        "a span with no draw in it counts nothing, whatever slot it began at"
     );
 }
 

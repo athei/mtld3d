@@ -788,6 +788,13 @@ bitflags! {
         /// waits for the last submitted command buffer before it copies
         /// out of a resolve target when this is set.
         const RESOLVE_NEEDS_RETIRE = 1 << 6;
+        /// The device takes a visibility query offset up to 256 KB.
+        ///
+        /// Apple's Metal feature set tables give that maximum for the Apple7
+        /// family and later; they give 65,528 bytes for Apple2 to Apple6 and
+        /// none for Mac2, which therefore keep the smaller buffer. Sizes one
+        /// occlusion-query visibility buffer.
+        const VISIBILITY_OFFSET_256K = 1 << 7;
     }
 }
 

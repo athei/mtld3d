@@ -1048,6 +1048,75 @@ fn pass_break_clears_flag_for_new_pass() {
     assert!(!s.passes()[1].has_counting_visibility());
 }
 
+/// Record two counting passes on one target, split by `split`, and join what Rule J joins.
+fn counting_halves(split: fn(&mut PassState)) -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(
+        tex(0x3000),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_visibility_result_mode(
+        VisibilityResultMode::Counting,
+        0,
+    ));
+    s.emit_command(dummy_draw());
+    split(&mut s);
+    s.emit_command(Command::set_visibility_result_mode(
+        VisibilityResultMode::Counting,
+        8,
+    ));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+    s.merge_adjacent_identical_passes();
+    s
+}
+
+#[test]
+fn rule_j_joins_two_counting_halves_of_one_visibility_buffer() {
+    let s = counting_halves(|s| s.end_current_pass("test"));
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].visibility_buffer(), 0);
+}
+
+#[test]
+fn a_full_visibility_buffer_keeps_the_passes_on_either_side_apart() {
+    // Each half binds its own buffer, which one Metal pass cannot.
+    let s = counting_halves(PassState::break_for_visibility_buffer);
+    assert_eq!(s.passes().len(), 2, "two buffers, two passes");
+    assert_eq!(s.passes()[0].visibility_buffer(), 0);
+    assert_eq!(s.passes()[1].visibility_buffer(), 1);
+    assert!(s.passes()[1].has_counting_visibility());
+}
+
+#[test]
+fn a_full_visibility_buffer_keeps_the_render_target_0_decision() {
+    // The draw that fills the buffer already left render target 0 out of
+    // the pass it records into, which is the one the break opens.
+    let mut s = fresh();
+    s.set_rt0_dropped(true);
+    s.ensure_pass_open();
+    s.break_for_visibility_buffer();
+    assert!(s.rt0_dropped(), "the decision outlives the break");
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 2);
+    assert!(s.passes()[1].color_texture().is_null());
+    assert_eq!(s.passes()[1].visibility_buffer(), 1);
+}
+
+#[test]
+fn a_new_frame_counts_into_its_first_visibility_buffer() {
+    let mut s = fresh();
+    s.break_for_visibility_buffer();
+    reset_test_frame(&mut s);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].visibility_buffer(), 0);
+}
+
 // ── LastBoundCache ──
 
 #[test]

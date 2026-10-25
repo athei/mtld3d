@@ -113,6 +113,10 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
         DeviceCapsFlags::RESOLVE_NEEDS_RETIRE,
         resolve_needs_retire(&device),
     );
+    caps.set(
+        DeviceCapsFlags::VISIBILITY_OFFSET_256K,
+        device.supportsFamily(MTLGPUFamily::Apple7),
+    );
     Some((name, registry_id, caps))
 }
 
