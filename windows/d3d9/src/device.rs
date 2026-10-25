@@ -5008,6 +5008,15 @@ extern "system" fn device_create_additional_swap_chain(
         );
         return D3DERR_INVALIDCALL;
     }
+    if !mtld3d_core::present::present_flags_are_valid(&pp) {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER with \
+             MultiSampleType {}, a multisampled back buffer cannot be locked → INVALIDCALL",
+            pp.multi_sample_type,
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // Resolve a zero-dimension windowed request against the target window's
     // client rect (the device window when device_window is NULL), and clamp a
     // zero back-buffer count to one — then report both back to the caller.
@@ -5260,6 +5269,21 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
                 "rejected, {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still \
                  referenced"
             ),
+            ResetFailureEffect::Unchanged,
+        );
+        return reject_reset(dev);
+    }
+    // A lockable back buffer cannot be multisampled. D3D9 refuses that where
+    // it builds the new swap chain, past the point where a plain device's
+    // state went back to its defaults, so unlike the malformed parameters
+    // above it leaves a plain device needing a `Reset`; an extended device
+    // answers it without changing anything.
+    if !mtld3d_core::present::present_flags_are_valid(&pp) {
+        log_failed_reset(
+            dev,
+            &log,
+            &pp,
+            format_args!("rejected, a lockable back buffer cannot be multisampled"),
             ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
