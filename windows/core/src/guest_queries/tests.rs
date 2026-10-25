@@ -100,7 +100,7 @@ fn reissue_preserves_pending_segment_generation_checks() {
     backing.as_mut_slice()[..8].copy_from_slice(&100u64.to_ne_bytes());
     backing.as_mut_slice()[8..16].copy_from_slice(&7u64.to_ne_bytes());
     state.install_first_buffer(RetiredVisibilityBuffer::new(backing, MetalHandle::NULL, 0));
-    assert!(state.retire_frame_buffers(1).is_empty());
+    state.retire_frame_buffers(1);
     first.begin(1, 0, (1, 1), (1, 1), 0);
     first.end(1, 1);
     state.push_pending(1, Arc::clone(&first), (0, 1), true);

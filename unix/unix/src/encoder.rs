@@ -1518,8 +1518,9 @@ impl RetainedPages {
 ///    `get_or_create_staging_buffer` and at an emitted upload that
 ///    releases its level's staging: `Buffer` + handle, `page_box = None`,
 ///    the slot's keepalive in `staging_arc`.
-/// 4. Visibility-buffer pool over-cap eviction (`submit` path, via
-///    `VisibilityQueryState::retire_current_buffer`): `Buffer` +
+/// 4. Visibility-buffer free-list trim (the intake path, via
+///    `VisibilityQueryState::intake_completed`, and buffer growth, via
+///    `VisibilityQueryState::install_grown_buffer`): `Buffer` +
 ///    handle + `page_box`, `seq = release_seq` of the evicted buffer.
 ///    `newBufferWithBytesNoCopy:` over the evicted `PageBox`; drain must
 ///    destroy the wrapper before the backing drops.
@@ -2468,7 +2469,8 @@ impl FrameEncoder {
 
     /// Finalize visibility queries whose Issue(END) frame has retired on the GPU.
     ///
-    /// Then release retired buffers back into the pool's free list.
+    /// Then release retired buffers back into the pool's free list, and
+    /// route the free buffers past its cap to destruction.
     /// Delegates to `VisibilityQueryState::intake_completed` for the
     /// sum + pool release. Called from `begin_frame` each frame, plus
     /// on-demand via the `IntakeVisibility` message when an app polls
@@ -2483,7 +2485,9 @@ impl FrameEncoder {
             // live.
             unsafe { SharedCounter::new(self.coherent_seq_ptr) }.load(Ordering::Acquire)
         };
-        self.visibility.intake_completed(coherent);
+        for evicted in self.visibility.intake_completed(coherent) {
+            self.retain_evicted_visibility_buffer(evicted);
+        }
     }
 
     /// Cross-field adapter for `EncoderPerfState::log_frame_summary`.
@@ -2818,7 +2822,7 @@ impl FrameEncoder {
                 true
             }),
             BufferNeed::Grow(slots) => self.provide_visibility_buffer(slots).is_some_and(|buf| {
-                if let Some(evicted) = self.visibility.install_grown_buffer(buf) {
+                for evicted in self.visibility.install_grown_buffer(buf) {
                     self.retain_evicted_visibility_buffer(evicted);
                 }
                 true
@@ -2864,7 +2868,7 @@ impl FrameEncoder {
         );
     }
 
-    /// Arm the current pass for the occlusion queries counting across it.
+    /// Reserve the slot that arms the draw's pass for the occlusion queries counting across it.
     ///
     /// A Metal render encoder starts with visibility counting off, so a pass
     /// opened between `Issue(BEGIN)` and `Issue(END)` counts nothing until a
@@ -2872,26 +2876,22 @@ impl FrameEncoder {
     /// `D3DRS_SRGBWRITEENABLE` toggle, a render-target change, a `Clear`
     /// under a counting pass) opens one. This is the draw-site arm, so the
     /// synthetic quad a `Clear` emits into a fresh pass stays outside the
-    /// count while every game draw after it is inside it.
-    fn arm_visibility_on_current_pass(&mut self) {
+    /// count while every game draw after it is inside it. `None` when no
+    /// query is open, when the open pass already counts, or when the frame
+    /// is exhausted.
+    ///
+    /// Asked before the draw's pass opens: a closed pass answers that it
+    /// does not count, which is what the pass about to open starts with, so
+    /// the answer is the same as after. A full buffer then ends the open
+    /// pass here, before the draw opens its own in the next buffer, rather
+    /// than after a pass that would carry only the pending clears.
+    fn reserve_draw_visibility_slot(&mut self) -> Option<u32> {
         if self.visibility.active_count() == 0
             || self.pass_state.current_pass_has_counting_visibility()
         {
-            return;
+            return None;
         }
-        let Some(slot) = self.allocate_visibility_slot() else {
-            return;
-        };
-        // A full buffer ends the pass in the allocation above, and the
-        // Counting mode then opens the next one, whose encoder holds none of
-        // the draw's bindings yet.
-        let passes_before = self.pass_state.passes().len();
-        self.pass_state
-            .emit_command(Command::set_visibility_result_mode(
-                VisibilityResultMode::Counting,
-                slot * SLOT_BYTES,
-            ));
-        self.reset_last_bound_if_pass_opened(passes_before);
+        self.allocate_visibility_slot()
     }
 
     /// Arm a visibility query.
@@ -3099,9 +3099,9 @@ impl FrameEncoder {
     /// `PageBox` drops, once GPU work on its `release_seq` has retired.
     fn retain_evicted_visibility_buffer(&mut self, evicted: RetiredVisibilityBuffer) {
         let (page_box, mtl_buffer, release_seq) = evicted.into_parts();
-        mtld3d_shared::log_once_warn!(
+        mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "visibility buffer pool over cap — evicting an entry (seq={release_seq}); routing \
+            "visibility buffer pool: more free buffers than it keeps, releasing one (seq={release_seq}) \
              through pending_resource_retention so DestroyBuffer fires before the PageBox drops"
         );
         self.perf.bump_vbib_retained_add(page_box.len());
@@ -5471,6 +5471,9 @@ impl FrameEncoder {
     /// `last_bound` so the per-draw dedup in `emit_draw` re-emits the full
     /// state on the first draw of the new Metal render encoder.
     pub fn begin_render_pass_if_needed(&mut self) {
+        // The slot comes first, since a full visibility buffer ends the
+        // open pass while reserving it.
+        let arm_slot = self.reserve_draw_visibility_slot();
         let passes_before = self.pass_state.passes().len();
         self.pass_state.ensure_pass_open();
         self.reset_last_bound_if_pass_opened(passes_before);
@@ -5478,7 +5481,13 @@ impl FrameEncoder {
         // the open occlusion spans: a span holding no draw answers zero
         // exactly, even where its slots went missing.
         self.visibility.note_draw();
-        self.arm_visibility_on_current_pass();
+        if let Some(slot) = arm_slot {
+            self.pass_state
+                .emit_command(Command::set_visibility_result_mode(
+                    VisibilityResultMode::Counting,
+                    slot * SLOT_BYTES,
+                ));
+        }
     }
 
     /// Record that the draw being emitted read `[offset, offset + size)` from VB/IB `id`.
@@ -10565,15 +10574,10 @@ fn log_cascade_frame_summary(enc: &mut FrameEncoder) {
 /// The list is keyed by `submit_seq` and each buffer's index in the frame.
 /// A buffer becomes reusable once the GPU retires the frame (`coherent_seq`
 /// catches up), which both releases it *and* unblocks `intake_completed` so
-/// pending segments matched against this seq can be summed.
-///
-/// Every entry the pool evicts past its cap goes through
-/// `retain_evicted_visibility_buffer`, so the drain path destroys the
-/// `MTLBuffer` wrapper before the `PageBox` drops.
+/// pending segments matched against this seq can be summed. Retiring evicts
+/// nothing; the intake caps the free list once buffers come free.
 fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
-    for evicted in enc.visibility.retire_frame_buffers(submit_seq) {
-        enc.retain_evicted_visibility_buffer(evicted);
-    }
+    enc.visibility.retire_frame_buffers(submit_seq);
 }
 
 /// Move this frame's blit-source read guards into the pending queue.
