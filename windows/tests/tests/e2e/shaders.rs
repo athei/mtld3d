@@ -19,6 +19,8 @@ use mtld3d_types::{
     D3DTOP_SELECTARG1, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVERTEXELEMENT9,
 };
 
+use super::device::{run_in_private_log_child, running_as};
+
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
 const VS_BC: [u32; 8] = [
     0xFFFE_0200,
@@ -206,14 +208,40 @@ fn user_shader_constant_drives_color() {
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
 }
 
+/// The name the workload child of the first-draw replay test runs under.
+const FIRST_DRAW_REPLAY_CHILD_NAME: &str = "pipeline-cache-first-draw.exe";
+
 #[test]
 fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
+    if running_as(FIRST_DRAW_REPLAY_CHILD_NAME) {
+        first_draw_replay_workload();
+        return;
+    }
+    // The layer keeps its cache beside the executable, so the workload runs
+    // in a copy alone in a directory of its own: no other test's process or
+    // device can open that file, and the child has exited, with every handle
+    // it held closed, before the directory and the cache in it are removed.
+    run_in_private_log_child(
+        FIRST_DRAW_REPLAY_CHILD_NAME,
+        "shaders::pipeline_cache_replays_before_the_first_draw_on_a_new_device",
+        "warn",
+    );
+}
+
+/// Record a pipeline cache on one device, then replay it before a second device's first draw.
+///
+/// The cache starts absent beside the private executable, so the first
+/// device compiles live and records what it built.
+fn first_draw_replay_workload() {
     let cache = std::env::current_exe()
         .expect("resolve test executable")
         .parent()
         .expect("test executable has a parent")
         .join("mtld3d_shaders.bin");
-    remove_cache_files(&cache);
+    assert!(
+        !cache.exists(),
+        "the private directory starts without a cache"
+    );
 
     let first = Harness::with_config("shaderCache.enable=true");
     {
@@ -356,23 +384,6 @@ fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
             3,
             "new state appends one pipeline recipe"
         );
-    }
-
-    remove_cache_files(&cache);
-}
-
-fn remove_cache_files(cache: &std::path::Path) {
-    remove_cache_file(cache);
-    let mut lock_name = cache.as_os_str().to_owned();
-    lock_name.push(".lock");
-    remove_cache_file(std::path::Path::new(&lock_name));
-}
-
-fn remove_cache_file(path: &std::path::Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("remove {}: {error}", path.display()),
     }
 }
 
