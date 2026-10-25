@@ -407,6 +407,66 @@ fn table_fog_exponential_factor_is_computed_per_pixel() {
 }
 
 #[test]
+fn linear_table_fog_with_equal_start_and_end_steps_at_the_end() {
+    // FOGSTART and FOGEND are both 0.5 over a quad whose depth runs from 0 on
+    // the left to 1 on the right. Linear table fog leaves the depth below the
+    // end unfogged and fully fogs the depth above it, on the fixed-function
+    // and the shader path alike, so the left probe (depth 0.25) keeps the
+    // vertex colour and the right one (depth 0.75) takes the fog colour.
+    // Vertex fog with the same range fogs the whole quad.
+    let corners = [
+        (-1.0, 1.0, 0.0),
+        (-1.0, -1.0, 0.0),
+        (1.0, 1.0, 1.0),
+        (1.0, -1.0, 1.0),
+    ];
+    let fixed = corners.map(|(x, y, z)| PosColorVertex {
+        x,
+        y,
+        z,
+        color: RED,
+    });
+    let shaded = corners.map(|(x, y, z)| Position4Vertex {
+        position: [x, y, z, 1.0],
+        color: RED,
+    });
+    let probe = |h: &Harness, draw_quad: &dyn Fn(&Harness)| {
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.clear_target(BLACK), 0);
+        draw_quad(h);
+        assert_eq!(h.end_scene(), 0);
+        (h.read_pixel(32, 64), h.read_pixel(96, 64))
+    };
+    let h = harness();
+    let target = h.create_render_target(128, 128, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &target), 0);
+    set(&h, D3DRS_FOGSTART, 0.5_f32.to_bits());
+    set(&h, D3DRS_FOGEND, 0.5_f32.to_bits());
+
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    let (left, right) = probe(&h, &|h| draw(h, &fixed));
+    assert_pixel_approx(left, RED, 1, "fixed function, table fog, below the end");
+    assert_pixel_approx(right, GREEN, 1, "fixed function, table fog, above the end");
+
+    let vertex_shader = h.create_vertex_shader(VS2);
+    let pixel_shader = h.create_pixel_shader(&pixel_shader_code(2));
+    assert_eq!(h.set_vertex_shader(&vertex_shader), 0);
+    assert_eq!(h.set_pixel_shader(&pixel_shader), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZW | D3DFVF_DIFFUSE), 0);
+    let (left, right) = probe(&h, &|h| draw(h, &shaded));
+    assert_pixel_approx(left, RED, 1, "shaders, table fog, below the end");
+    assert_pixel_approx(right, GREEN, 1, "shaders, table fog, above the end");
+
+    assert_eq!(h.clear_vertex_shader(), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    set(&h, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+    let (left, right) = probe(&h, &|h| draw(h, &fixed));
+    assert_pixel_approx(left, GREEN, 1, "vertex fog, below the end");
+    assert_pixel_approx(right, GREEN, 1, "vertex fog, above the end");
+}
+
+#[test]
 fn multiply_transform_projection_between_draws_of_one_frame_moves_the_fog_source() {
     // The identity projection is orthographic, so linear table fog reads the
     // pixel depth: 0.5 fogs to 0.875 of the vertex colour. Multiplying in a

@@ -1868,7 +1868,7 @@ fn table_fog_computes_per_pixel_factor() {
     );
     assert!(
         linear_z.contains(
-            "float fog_f = fog_range == 0.0 ? 0.0 : saturate((fog_data[1].y - fog_c) / fog_range);"
+            "float fog_f = fog_range == 0.0 ? (fog_c < fog_data[1].y ? 1.0 : 0.0) : saturate((fog_data[1].y - fog_c) / fog_range);"
         ),
         "{linear_z}"
     );
@@ -2501,7 +2501,7 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
 fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     // D3DTSS_TEXCOORDINDEX = 0x40000 (TCI_SPHEREMAP). With lighting off the
     // pre-scan hoists both eye-space locals, and the stage emits
-    // R = reflect(normalize(posEye), n), m = 2 * |R + (0, 0, 1)| and the
+    // R = reflect(normalize(posEye), n), m = 2 * |R + (0, 0, -1)| and the
     // coordinate (R.x / m + 0.5, R.y / m + 0.5, 0, 0). The normal is the one
     // lighting reads, through the D3D9 normal matrix and not renormalized
     // while NORMALIZENORMALS is clear.
@@ -2518,7 +2518,7 @@ fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     for line in [
         "        float3 E_tci = normalize(posEye);\n",
         "        float3 R_tci = reflect(E_tci, n);\n",
-        "        float m_tci = 2.0 * length(R_tci + float3(0.0, 0.0, 1.0));\n",
+        "        float m_tci = 2.0 * length(R_tci - float3(0.0, 0.0, 1.0));\n",
         "        raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);\n",
         "    out.texcoord0 = raw0;\n",
     ] {

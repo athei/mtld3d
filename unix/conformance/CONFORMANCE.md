@@ -978,11 +978,33 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-25: 2 `real`, 177 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 192 unique sites in all.
+`Sites:` tokens below on 2026-10-25: 0 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 190 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
+`m = 2 * length(R + (0, 0, -1))`, so `test_generated_texcoords` 29162 left
+every key and its cluster left this document. Linear table fog with
+`D3DRS_FOGSTART` equal to `D3DRS_FOGEND` is a step at the end, a depth
+below it unfogged and one at or above it fully fogged, so
+`fog_special_test` 18390 left every key and its cluster went too; vertex
+fog with an equal start and end still fogs everything, which its cases 0 to
+3 check. The two sites were removed from all fourteen sections by hand.
+For the arm64 Wine's six Apple keys the edit was checked against a local
+re-record on an Apple Silicon machine, which read neither site and differed
+from the edit only in the header's tests build and in the flaky and ceiling
+pins, both kept as they were. On the x86_64 Wine no run was made here. CI
+confirms the plain `i686` and `x86_64` keys on macos-15, and the two
+`@mac2` keys are to be confirmed by CI's `record_intel_baseline` dispatch
+with `intel_only` before the change merges; no CI run reads `i686+intel`,
+`x86_64+intel`, `i686+scale` or `x86_64+scale`, which stay unconfirmed
+until a local x86_64-Wine run. Removing the sites there is still safe:
+both are fixed-function and pixel-stage MSL that `mtld3d-core` emits the
+same way under either Wine, the `intel.*` keys change neither the texgen,
+the fog nor the A8R8G8B8 back buffer both tests read, and the arm64 Wine's
+`+intel` and `+scale` re-records read both sites at zero, the fog probes
+included, ten pixels either side of the step.)
 (2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
 `Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
 multisampled back buffer, and a plain device's refused `Reset` leaves it
@@ -1263,13 +1285,9 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-Two defects. One was first observed by the Wine 11.19 tests: the sign of the
-`D3DTSS_TCI_SPHEREMAP` denominator (`visual.c/test_generated_texcoords`, one
-site, issue #1161). The other was first counted by the Wine 11.20 tests:
-linear table fog with equal start and end fogs the whole primitive
-(`visual.c/fog_special_test`, one site, issue #1169).
+None: no failing site is `real` today.
 
-Every other failing site is a recorded decision (`expected`), a capability we
+Every failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
 reads lower on other hardware or flaps below it here (`ceiling`), or a known
 flap (`flaky`), each with its rationale in the
@@ -1764,25 +1782,6 @@ returns its source, the zero vector the test's hardware gives, so it passes.
 The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
 device encodes its own way (0x00808000; `def1` reads the same value there).
 
-### visual.c/fog_special_test
-Sites: 18390=real
-
-Linear table fog with `D3DRS_FOGSTART` equal to `D3DRS_FOGEND` (both 0.5)
-over a quad whose depth runs from 0 on the left to 1 on the right. D3D9
-leaves the coordinates below the end unfogged and fogs those above it, a
-step at the end, so the left probe expects the green vertex colour and the
-right one the red fog colour. The four table-fog cases (4 to 7: fixed
-function and shader vertex and pixel stages in every combination) read
-`0x00ff0000` on the left: the pixel stage's linear table fog
-(`windows/core/src/dxso/emit.rs`) answers a factor of 0, fully fogged,
-whenever the range is zero, so the whole quad takes the fog colour. The
-right probes and the vertex-fog cases 0 to 3, which fog everything, pass.
-Earlier builds of the tests marked this check `todo_wine`, which the runner
-does not count; the Wine 11.20 build wine-build ships drops the mark, since
-its wined3d gives the step, so the site is new with that build and not a
-change in mtld3d. A defect, read on every Apple key of both Wines, issue
-#1169.
-
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
 Sites: 5088=expected 5167=expected 6032=expected 18835=expected
 Sites: 18838=expected 18841=expected 18844=expected 20750=expected
@@ -1894,17 +1893,6 @@ and on a device without the packed 16-bit formats R5G6B5 is no render target,
 so the answer is NOTAVAILABLE. That is the conformant answer for a device
 without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
-
-### visual.c/test_generated_texcoords
-Sites: 29162=real
-
-The `D3DTSS_TCI_SPHEREMAP` row reads `0x00757d00` where `0x00836900` is
-expected; the camera-space position, normal and reflection-vector rows
-pass. The fixed-function emitter (`windows/core/src/dxso/ff.rs`, the
-SPHEREMAP arm) divides by `m = 2 * length(R + (0, 0, 1))`; the test's
-geometry evaluated with that formula gives the value read, and with
-`R + (0, 0, -1)`, which wined3d emits, the value expected. DXVK uses the
-same sign we do. A defect, on every leg of both Wines, issue #1161.
 
 ### visual.c/test_blit_format_conversion
 Sites: 29219=caps

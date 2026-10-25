@@ -75,7 +75,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -87,7 +86,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:27950 count=2
-  visual.c:29162 count=1
 [i686/stateblock] crash=0
 [i686/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -216,7 +214,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -229,7 +226,6 @@
   visual.c:27598 count=5
   visual.c:27950 count=2
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [i686+intel/stateblock] crash=0
 [i686+intel/d3d9ex] crash=0
@@ -358,7 +354,6 @@
   visual.c:15686 count=15
   visual.c:15745 count=28
   visual.c:16481 count=2
-  visual.c:18390 count=4
   visual.c:18835 count=2
   visual.c:18838 count=2
   visual.c:18841 count=2
@@ -372,7 +367,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [i686+intel@mac2/stateblock] crash=0
 [i686+intel@mac2/d3d9ex] crash=0
@@ -517,7 +511,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -532,7 +525,6 @@
   visual.c:27950 count=2
   visual.c:28161 count=2
   visual.c:28185 count=2
-  visual.c:29162 count=1
 [i686+scale/stateblock] crash=0
 [i686+scale/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -660,7 +652,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -672,7 +663,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:27950 count=2
-  visual.c:29162 count=1
 [x86_64/stateblock] crash=0
 [x86_64/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -799,7 +789,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -812,7 +801,6 @@
   visual.c:27598 count=5
   visual.c:27950 count=2
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [x86_64+intel/stateblock] crash=0
 [x86_64+intel/d3d9ex] crash=0
@@ -941,7 +929,6 @@
   visual.c:15686 count=13
   visual.c:15745 count=28
   visual.c:16481 count=2
-  visual.c:18390 count=4
   visual.c:18835 count=2
   visual.c:18838 count=2
   visual.c:18841 count=2
@@ -955,7 +942,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [x86_64+intel@mac2/stateblock] crash=0
 [x86_64+intel@mac2/d3d9ex] crash=0
@@ -1100,7 +1086,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1115,7 +1100,6 @@
   visual.c:27950 count=2
   visual.c:28161 count=2
   visual.c:28185 count=2
-  visual.c:29162 count=1
 [x86_64+scale/stateblock] crash=0
 [x86_64+scale/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -1244,7 +1228,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1256,7 +1239,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:27950 count=2
-  visual.c:29162 count=1
 [i686-arm64/stateblock] crash=0
 [i686-arm64/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -1384,7 +1366,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=17
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1397,7 +1378,6 @@
   visual.c:27598 count=5
   visual.c:27950 count=2
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [i686-arm64+intel/stateblock] crash=0
 [i686-arm64+intel/d3d9ex] crash=0
@@ -1556,7 +1536,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1571,7 +1550,6 @@
   visual.c:27950 count=2
   visual.c:28161 count=2
   visual.c:28185 count=2
-  visual.c:29162 count=1
 [i686-arm64+scale/stateblock] crash=0
 [i686-arm64+scale/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -1699,7 +1677,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1711,7 +1688,6 @@
   visual.c:25196 count=1
   visual.c:27598 count=5
   visual.c:27950 count=2
-  visual.c:29162 count=1
 [arm64x/stateblock] crash=0
 [arm64x/d3d9ex] crash=0
   d3d9ex.c:775 count=1
@@ -1838,7 +1814,6 @@
   visual.c:5452 count=1
   visual.c:15686 count=15
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -1851,7 +1826,6 @@
   visual.c:27598 count=5
   visual.c:27950 count=2
   visual.c:28072 count=1
-  visual.c:29162 count=1
   visual.c:29219 count=1
 [arm64x+intel/stateblock] crash=0
 [arm64x+intel/d3d9ex] crash=0
@@ -2009,7 +1983,6 @@
   visual.c:16177 count=4
   visual.c:16179 count=4
   visual.c:16481 count=1
-  visual.c:18390 count=4
   visual.c:20928 count=1
   visual.c:20931 count=1
   visual.c:21007 count=1
@@ -2024,7 +1997,6 @@
   visual.c:27950 count=2
   visual.c:28161 count=2
   visual.c:28185 count=2
-  visual.c:29162 count=1
 [arm64x+scale/stateblock] crash=0
 [arm64x+scale/d3d9ex] crash=0
   d3d9ex.c:775 count=1
