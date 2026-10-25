@@ -1399,6 +1399,13 @@ endef
 # ends however it ends, so a leg killed mid-configure leaves no stale lock. And
 # the sub-make configures nothing when the prefix is already configured, which
 # it is from the first leg of a checkout on.
+#
+# The conformance runner takes the same lock (flock(2), which is what `lockf`
+# holds) when it ends and boots the prefix's server itself: after a subtest
+# that reports a display-mode restore win32u refused, which leaves that mode
+# as the session's desktop (unix/conformance/CONFORMANCE.md, "The test
+# binaries"). The lock keeps a configure from booting a second server beside
+# it, but the restart still ends the session for every run in this prefix.
 configure-test-prefix:
 	[ -x '$(WINE_LOADER)' ] || { echo "$(WINE_LOADER) is no Wine loader; WINE_SDK names the Wine the test, conformance and benchmark legs run under" >&2; exit 2; }
 	mkdir -p $(TEST_PREFIX)

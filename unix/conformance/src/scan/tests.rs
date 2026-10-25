@@ -5,9 +5,30 @@
 //! real failures, and a panic keeps its location and message. Crash detection
 //! gets its own cases: a signal kill, a host-side abort with no failures and a
 //! missing end-of-run summary all count, but a marker quoted in a failure does not.
+//! A refused display-mode restore is recognised by its failure message alone,
+//! and only as a failure: the same words in a todo line or a trace are not one.
 
-use super::parse_subtest_output;
+use super::{parse_subtest_output, reports_failed_mode_restore};
 use crate::model::Site;
+
+#[test]
+fn a_refused_mode_restore_is_recognised_by_its_failure_line() {
+    assert!(reports_failed_mode_restore(
+        "device.c:5593: Test succeeded inside todo block: x.\n\
+         device.c:5594: Test failed: Failed to restore display modes.\n"
+    ));
+    assert!(
+        reports_failed_mode_restore(
+            "device.c:5611: Test failed: Failed to restore display modes.\n"
+        ),
+        "another line number is the same failure"
+    );
+    assert!(!reports_failed_mode_restore(
+        "device.c:5594: Test marked todo: Failed to restore display modes.\n\
+         device.c:5505: Test failed: Failed to change display mode, ret 0xfffffffe.\n\
+         device: 10 tests executed (0 marked as todo, 1 failures), 0 skipped.\n"
+    ));
+}
 
 fn site(file: &str, line: u32) -> Site {
     Site {

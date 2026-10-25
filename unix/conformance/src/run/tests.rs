@@ -21,6 +21,17 @@
 //! holds after the subtest is gone must not park the run: the collection ends
 //! at its grace with what arrived, and the raw log says it was cut short.
 //!
+//! A subtest that reports a refused display-mode restore has to be followed
+//! by a new session of its prefix, in the Makefile's order (end the server,
+//! wait for it, start a persistent one, boot, check one stayed), with the
+//! prefix and `WINEMSYNC` named, the raw log saying so and still ending in how
+//! the process ended. A subtest that reports none restarts nothing, nor does a
+//! run that ends on a GPU hang. A configure lock `lockf` holds leaves the
+//! session alone; only a holder makes the lock be asked for again, and any
+//! other lock error is named at once. A step that fails is reported without
+//! failing the run, and one still running at the restart's deadline is killed
+//! rather than waited for.
+//!
 //! Which server to sample is decided on a process table and a working
 //! directory, so the decision is tested on both rather than on the machine's
 //! own processes: a name alone must never pick another checkout's server, and
@@ -29,13 +40,15 @@
 
 use std::{
     fs,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use super::{
-    DEFAULT_TIMEOUT, Launch, cwd_is_server_dir, is_gpu_hang_line, normalize_numbers, run_subtest,
-    server_dir_for, validation_errors, validation_gate_failed, wineserver_pids,
+    DEFAULT_TIMEOUT, Launch, PREFIX_LOCK_FILE, Wineserver, cwd_is_server_dir, is_gpu_hang_line,
+    normalize_numbers, restart_session, retry_lock, run_subtest, server_dir_for, validation_errors,
+    validation_gate_failed, wineserver_pids,
 };
 use crate::model::{Arch, Gpu, Leg, Subtest, Variant};
 
@@ -438,4 +451,272 @@ fn nothing_is_kept_and_no_log_dir_is_named_without_a_raw_dir() {
     let dir = exe.parent().expect("script dir").to_path_buf();
     run_subtest(&launch(exe), LEG, Subtest::Device, None).expect("spawn sh");
     assert!(!dir.join("i686-device.log").exists());
+}
+
+/// The failure line `test_mode_change` prints for a refused restore.
+const REFUSED_RESTORE: &str = "device.c:5594: Test failed: Failed to restore display modes.";
+
+/// An executable script `name` in `dir`, standing in for a Wine tool.
+fn tool(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, body).expect("tool");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// A kept spawn whose Wine and wineserver log every call they get to a file.
+///
+/// The loader runs the subtest script through `/bin/sh` and records a
+/// `wineboot`; the server records its one argument, writes the prefix and
+/// `WINEMSYNC` it was handed to `env.txt` beside it, and exits with
+/// `server_exit`. The prefix is the script's directory, where the configure
+/// lock then lives too. Returns the spawn and the file the calls go to.
+fn launch_restartable(exe: PathBuf, server_exit: u8) -> (Launch, PathBuf) {
+    let dir = exe.parent().expect("script dir").to_path_buf();
+    let calls = dir.join("calls.txt");
+    let _ = fs::remove_file(&calls);
+    let env = dir.join("env.txt");
+    let wine = tool(
+        &dir,
+        "wine",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = wineboot ]; then echo wineboot >> '{}'; exit 0; fi\nexec \
+             /bin/sh \"$@\"\n",
+            calls.display()
+        ),
+    );
+    let server = tool(
+        &dir,
+        "wineserver",
+        &format!(
+            "#!/bin/sh\necho \"wineserver $1\" >> '{}'\necho \"$WINEPREFIX $WINEMSYNC\" > \
+             '{}'\nexit {server_exit}\n",
+            calls.display(),
+            env.display()
+        ),
+    );
+    let launch = Launch {
+        wine,
+        wineserver: Some(Wineserver {
+            exe: server,
+            prefix: dir,
+        }),
+        ..launch_kept(exe)
+    };
+    (launch, calls)
+}
+
+#[test]
+fn a_refused_mode_restore_starts_the_session_again() {
+    let exe = script(
+        "mode-restore",
+        &format!("echo '{REFUSED_RESTORE}'\necho '{SUMMARY}'\n"),
+    );
+    let (launch, calls) = launch_restartable(exe, 0);
+    let dir = launch.raw_dir.clone().expect("kept");
+    let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn the script");
+    assert!(!run.result.crash, "the restart is no part of the verdict");
+    assert_eq!(run.result.sites.values().sum::<u32>(), 1);
+
+    let calls = fs::read_to_string(&calls).expect("the session was restarted");
+    assert_eq!(
+        calls, "wineserver -k\nwineserver -w\nwineserver -p\nwineboot\nwineserver -k0\n",
+        "the Makefile's order: end, wait, start a persistent server, boot, check it stayed"
+    );
+    let env = fs::read_to_string(dir.join("env.txt")).expect("the server wrote its environment");
+    assert_eq!(
+        env.trim_end(),
+        format!("{} 1", dir.display()),
+        "the tools are told the prefix and the subtests' WINEMSYNC"
+    );
+    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    assert!(
+        raw.contains("[conformance] the subtest could not restore the display modes it changed, so the prefix's wineserver session was started again"),
+        "{raw}"
+    );
+    assert!(
+        raw.trim_end()
+            .ends_with("[conformance] subtest exited: code 0"),
+        "the raw log still ends in how the process ended: {raw}"
+    );
+}
+
+#[test]
+fn a_subtest_that_restored_its_modes_restarts_nothing() {
+    let exe = script(
+        "mode-kept",
+        &format!("echo 'device.c:5505: Test failed: x'\necho '{SUMMARY}'\n"),
+    );
+    let (launch, calls) = launch_restartable(exe, 0);
+    run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn the script");
+    assert!(
+        !calls.exists(),
+        "a session nothing changed was restarted: {:?}",
+        fs::read_to_string(&calls)
+    );
+}
+
+#[test]
+fn a_failed_restart_is_reported_and_the_run_goes_on() {
+    let exe = script(
+        "mode-restart-fails",
+        &format!("echo '{REFUSED_RESTORE}'\necho '{SUMMARY}'\n"),
+    );
+    let (launch, calls) = launch_restartable(exe, 3);
+    let dir = launch.raw_dir.clone().expect("kept");
+    let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn the script");
+    assert!(!run.result.crash);
+
+    let calls = fs::read_to_string(&calls).expect("the restart was tried");
+    assert_eq!(
+        calls, "wineserver -k\nwineserver -w\nwineserver -p\n",
+        "an end that finds no server is no failure; a start that fails stops before the boot"
+    );
+    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    assert!(
+        raw.contains("restarting the prefix's wineserver session failed: `")
+            && raw.contains("wineserver -p` ended with exit status: 3"),
+        "{raw}"
+    );
+}
+
+#[test]
+fn a_run_ending_on_a_gpu_hang_restarts_nothing() {
+    let exe = script(
+        "mode-restore-hang",
+        &format!("echo '{REFUSED_RESTORE}'\necho '{DRIVER_HANG}' >&2\necho '{SUMMARY}'\n"),
+    );
+    let (launch, calls) = launch_restartable(exe, 0);
+    let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn the script");
+    assert!(run.gpu_hang);
+    assert!(
+        !calls.exists(),
+        "a leg that ends on the hang was restarted: {:?}",
+        fs::read_to_string(&calls)
+    );
+}
+
+#[test]
+fn a_held_configure_lock_leaves_the_session_alone() {
+    let exe = script(
+        "mode-restore-locked",
+        &format!("echo '{REFUSED_RESTORE}'\necho '{SUMMARY}'\n"),
+    );
+    let (launch, calls) = launch_restartable(exe, 0);
+    let prefix = launch.wineserver.as_ref().expect("named").prefix.clone();
+    // The holder is `lockf`, the tool the Makefile's configure holds the
+    // lock with, so the test pins that the two locks see each other. Its
+    // command outlives the restart's one-second budget and ends by itself
+    // soon after, since a kill of `lockf` does not reach it.
+    let ready = prefix.join("lock-held");
+    let _ = fs::remove_file(&ready);
+    let mut holder = std::process::Command::new("lockf")
+        .arg("-k")
+        .arg(prefix.join(PREFIX_LOCK_FILE))
+        .args(["/bin/sh", "-c", "touch \"$0\"; exec sleep 4"])
+        .arg(&ready)
+        .spawn()
+        .expect("lockf");
+    let waited = Instant::now();
+    while !ready.exists() {
+        assert!(waited.elapsed() < PROMPT, "lockf never took the lock");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let started = Instant::now();
+    let note = restart_session(&launch, Duration::from_secs(1));
+    let elapsed = started.elapsed();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        note.contains("configure lock") && note.contains("was not restarted"),
+        "{note}"
+    );
+    assert!(elapsed < PROMPT, "took {elapsed:?} for a one-second budget");
+    assert!(
+        !calls.exists(),
+        "a step ran without the lock: {:?}",
+        fs::read_to_string(&calls)
+    );
+}
+
+#[test]
+fn only_another_holder_makes_the_lock_ask_again() {
+    let mut asked = 0;
+    let granted = retry_lock(
+        || {
+            asked += 1;
+            if asked < 3 {
+                Err(fs::TryLockError::WouldBlock)
+            } else {
+                Ok(())
+            }
+        },
+        Instant::now() + PROMPT,
+        Duration::from_millis(1),
+    );
+    assert_eq!(granted, Ok(()));
+    assert_eq!(
+        asked, 3,
+        "a held lock is asked for again until it is granted"
+    );
+
+    let mut asked = 0;
+    let refused = retry_lock(
+        || {
+            asked += 1;
+            Err(fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                libc::EBADF,
+            )))
+        },
+        Instant::now() + PROMPT,
+        Duration::from_millis(1),
+    );
+    assert_eq!(asked, 1, "an error other than a holder is not asked again");
+    let why = refused.expect_err("the error is reported");
+    assert!(
+        why.starts_with("could not be locked: ") && why.contains("Bad file descriptor"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_step_still_running_at_the_deadline_is_killed() {
+    let exe = script("mode-restore-stuck", &format!("echo '{SUMMARY}'\n"));
+    let dir = exe.parent().expect("script dir").to_path_buf();
+    let server = tool(&dir, "wineserver", "#!/bin/sh\nexec sleep 30\n");
+    let launch = Launch {
+        wineserver: Some(Wineserver {
+            exe: server,
+            prefix: dir,
+        }),
+        ..launch(exe)
+    };
+    let started = Instant::now();
+    let note = restart_session(&launch, Duration::from_secs(1));
+    let elapsed = started.elapsed();
+    assert!(
+        note.contains("-k` was still running at the end of the restart's 1s budget and was killed"),
+        "{note}"
+    );
+    assert!(
+        elapsed < PROMPT,
+        "took {elapsed:?}: the step was waited for, not killed"
+    );
+}
+
+#[test]
+fn without_a_wineserver_the_run_says_the_mode_stays() {
+    let exe = script(
+        "mode-no-server",
+        &format!("echo '{REFUSED_RESTORE}'\necho '{SUMMARY}'\n"),
+    );
+    let launch = launch_kept(exe);
+    let dir = launch.raw_dir.clone().expect("kept");
+    run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
+    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    assert!(
+        raw.contains("the runner was given no wineserver to restart"),
+        "{raw}"
+    );
 }

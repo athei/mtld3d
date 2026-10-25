@@ -7,7 +7,9 @@
 //! so whoever invokes the runner owns where a Wine install keeps its loader and
 //! its test binaries. The one thing it knows of a running Wine is how a
 //! wineserver names the directory of the prefix it serves, which is what tells
-//! one prefix's server from another's (see [`server_dir_for`]).
+//! one prefix's server from another's (see [`server_dir_for`]), and the one
+//! thing it does to one is start the prefix's session again after a subtest
+//! that left the display modes changed (see [`restart_session`]).
 
 use std::{
     collections::BTreeSet,
@@ -71,6 +73,16 @@ const SAMPLE_SECONDS: &str = "2";
 /// wait after the process is gone is at most twice this.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// How long starting the prefix's session again may take, lock and steps together.
+///
+/// The wait for the prefix's configure lock counts against it. The end of the
+/// old server is immediate, and the boot of the new one is what costs: the
+/// Makefile's boot of a configured prefix on the Intel CI image (`wineserver
+/// -p`, then `wineboot`) took 15 s. A step still running past this is killed
+/// and the run says the restart failed. The caller passes it to
+/// [`restart_session`].
+const SESSION_RESTART_BUDGET: Duration = Duration::from_secs(120);
+
 /// The driver's codes for a hung GPU, as Metal prints them to stderr.
 ///
 /// The first names the command buffer that hung the GPU, the second every
@@ -129,7 +141,9 @@ pub struct Launch {
     /// The wineserver to sample beside a subtest that runs out of budget.
     ///
     /// `None` keeps the process sample alone, and the wineserver sample says
-    /// the caller named no server rather than going missing.
+    /// the caller named no server rather than going missing. It is also the
+    /// server [`restart_session`] ends and starts again; with `None` a session
+    /// left in another display mode stays in it, and the run says so.
     pub wineserver: Option<Wineserver>,
 }
 
@@ -230,7 +244,16 @@ pub fn wine_version(wine: &Path) -> String {
 /// pipes hold is bounded too ([`DRAIN_GRACE`]), the subtest is judged on what
 /// arrived before that, and the raw log says so when the collection was cut
 /// short. The wineserver the caller booted for the whole run is in the
-/// caller's group and is never touched.
+/// caller's group and no kill reaches it; only the restart below ends it.
+///
+/// A subtest whose output says it could not restore the display modes it
+/// changed has left its own mode as the session's desktop, which every later
+/// process of the prefix would start from. The prefix's session is started
+/// again before this returns ([`restart_session`]), so whatever runs next, the
+/// next subtest, the next run of a repeat or the next leg, starts from the
+/// display's own mode. The raw log says so ahead of the line that says how
+/// the process ended. A run that ends on a GPU hang restarts nothing, since
+/// the leg ends with it.
 ///
 /// A process still running at `launch.timeout` is sampled before its group is
 /// killed, and so is the wineserver of its prefix when the caller named one.
@@ -348,6 +371,12 @@ pub fn run_subtest(
     combined.push_str(&String::from_utf8_lossy(&stderr.bytes));
     if !stdout.complete || !stderr.complete {
         report_cut_short(leg, subtest, &mut combined);
+    }
+    // A leg a GPU hang ends has nothing after it to start from the right mode.
+    if !gpu_hang && scan::reports_failed_mode_restore(&combined) {
+        let note = restart_session(launch, SESSION_RESTART_BUDGET);
+        eprintln!("  [{leg}/{subtest}] {note}");
+        let _ = write!(combined, "\n[conformance] {note}\n");
     }
     if let Some(samples) = &timed_out {
         let _ = write!(
@@ -761,6 +790,196 @@ fn drain_stderr_on_thread(
 /// Whether a stderr line is the driver reporting a hung GPU.
 fn is_gpu_hang_line(line: &str) -> bool {
     GPU_HANG_MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// Start the prefix's wineserver session again, and say how that went.
+///
+/// win32u keeps a session's display state (the current and the registry mode
+/// of every display, and the mode list) in volatile registry keys, which a
+/// server builds afresh from the display when it starts and drops when it
+/// ends. So a new session is the one way back to the state the leg started
+/// in: a mode-set cannot do it, since the display's own mode need not be one
+/// win32u lists. Under `EmulateModeset` win32u lists every size at 60 Hz and
+/// the display's own rate only above 60, and winemac reports that rate
+/// truncated to whole hertz, so on a display below 60 Hz (a 59.94 Hz monitor
+/// reads 59, the Intel CI image's display 30) the current mode is no listed
+/// one and the test's restore of it is refused. A display at 60 Hz matches
+/// the 60 Hz entries, and one above lists its own rate.
+///
+/// The steps are the ones the Makefile ends its prefix configuration with:
+/// end the server, wait for it to go, start a persistent one, boot the prefix
+/// in it, and check that a server is left running. They run under the lock
+/// that configuration holds while it ends and boots a server (see
+/// [`PREFIX_LOCK_FILE`]), so a leg configuring the same prefix meanwhile
+/// waits rather than booting a second server beside this one. The lock is
+/// asked for again until `budget` runs out, and the run says so when it was
+/// never obtained. Ending the server still ends every process of the session,
+/// any other run's in that prefix included, which is why only a subtest that
+/// reported a refused restore leads here; on a display where the restore
+/// works nothing is restarted. A step that fails is reported and the run goes
+/// on: a session that could not be started is started by the next subtest's
+/// own process.
+fn restart_session(launch: &Launch, budget: Duration) -> String {
+    const WHY: &str = "the subtest could not restore the display modes it changed";
+    let Some(server) = &launch.wineserver else {
+        return format!(
+            "{WHY}, and the runner was given no wineserver to restart, so what runs next in the \
+             prefix starts from the mode it left"
+        );
+    };
+    let started = Instant::now();
+    let deadline = started + budget;
+    let lock_path = server.prefix.join(PREFIX_LOCK_FILE);
+    // Held to the end of this function: the lock goes with the descriptor.
+    let _lock = match lock_prefix(&lock_path, deadline) {
+        Ok(lock) => lock,
+        Err(why) => {
+            return format!(
+                "{WHY}, and the prefix's configure lock {} {why}, so the session was not \
+                 restarted and what runs next starts from the mode it left",
+                lock_path.display()
+            );
+        }
+    };
+    // `-k` and `-w` find nothing to end when no server runs, which is no
+    // failure here; what matters is that the new one starts, boots and stays.
+    let steps: [(&Path, &str, bool); 5] = [
+        (server.exe.as_path(), "-k", false),
+        (server.exe.as_path(), "-w", false),
+        (server.exe.as_path(), "-p", true),
+        (launch.wine.as_path(), "wineboot", true),
+        (server.exe.as_path(), "-k0", true),
+    ];
+    for (tool, arg, must_succeed) in steps {
+        match run_tool(tool, arg, &server.prefix, deadline, budget) {
+            Ok(status) if status.success() || !must_succeed => {}
+            Ok(status) => {
+                return format!(
+                    "{WHY}; restarting the prefix's wineserver session failed: `{} {arg}` ended \
+                     with {status}",
+                    tool.display()
+                );
+            }
+            Err(why) => {
+                return format!(
+                    "{WHY}; restarting the prefix's wineserver session failed: `{} {arg}` {why}",
+                    tool.display()
+                );
+            }
+        }
+    }
+    format!(
+        "{WHY}, so the prefix's wineserver session was started again in {}s and what runs next \
+         starts from the display's own mode",
+        started.elapsed().as_secs()
+    )
+}
+
+/// The prefix's configure lock, as the Makefile names it under the prefix.
+///
+/// `configure-test-prefix` holds an exclusive flock(2) on this file (through
+/// `lockf`, whose locks are flock locks) while it ends and boots the prefix's
+/// server; the Makefile's `TEST_PREFIX_LOCK` is the same path.
+const PREFIX_LOCK_FILE: &str = ".mtld3d-configure.lock";
+
+/// How often a held configure lock is asked for again.
+const LOCK_RETRY: Duration = Duration::from_millis(100);
+
+/// Take the exclusive flock on `path`, asking again until `deadline`.
+///
+/// The file is created when it does not exist yet, as `lockf -k` does.
+/// `File::try_lock` is flock(2) with `LOCK_NB` on macOS, the same lock
+/// `lockf` holds. The lock is released when the returned file is dropped. The
+/// descriptor is close-on-exec, so the persistent server and the residents
+/// the restart starts never inherit it and the lock ends with the restart.
+///
+/// # Errors
+///
+/// Returns why the lock was not obtained: the file could not be opened,
+/// another holder kept it until `deadline`, or the lock call failed for a
+/// reason other than a holder ([`retry_lock`]).
+fn lock_prefix(path: &Path, deadline: Instant) -> Result<fs::File, String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("could not be opened: {e}"))?;
+    retry_lock(|| file.try_lock(), deadline, LOCK_RETRY)?;
+    Ok(file)
+}
+
+/// Ask `try_lock` for the lock until it is granted or `deadline` passes.
+///
+/// Only `WouldBlock`, another holder, is worth asking again; any other
+/// error ends the wait at once and is named, since asking again would only
+/// repeat it for the rest of the budget.
+///
+/// # Errors
+///
+/// Returns why the lock was not obtained.
+fn retry_lock(
+    mut try_lock: impl FnMut() -> Result<(), fs::TryLockError>,
+    deadline: Instant,
+    retry: Duration,
+) -> Result<(), String> {
+    loop {
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => return Err(format!("could not be locked: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("stayed held by another run until the restart's budget ran out".to_owned());
+        }
+        thread::sleep(retry);
+    }
+}
+
+/// Run one step of [`restart_session`] with its output discarded, until `deadline`.
+///
+/// No stream is inherited: the persistent server and the residents
+/// `wineboot` leaves behind outlive the step, and a pipe they inherited would
+/// stay open for as long as they run. The prefix is named explicitly, as is
+/// the synchronization the subtests run under (`WINEMSYNC`), so the server
+/// started here is the one the next subtest attaches to; the boot also gets
+/// the subtest's debug and DLL-override settings, so it installs nothing and
+/// prints nothing. A step still running at `deadline` is killed, the step
+/// itself and not what it started, and `budget` is only named in the reason.
+fn run_tool(
+    tool: &Path,
+    arg: &str,
+    prefix: &Path,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<ExitStatus, String> {
+    let mut child = Command::new(tool)
+        .arg(arg)
+        .env("WINEPREFIX", prefix)
+        .env("WINEMSYNC", "1")
+        .env("WINEDEBUG", "-all")
+        .env("WINEDLLOVERRIDES", HEADLESS_DLL_OVERRIDES)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not be started: {e}"))?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "was still running at the end of the restart's {}s budget and was killed",
+                    budget.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("could not be waited for: {e}")),
+        }
+    }
 }
 
 /// SIGKILL the child's process group: the child and everything it forked.

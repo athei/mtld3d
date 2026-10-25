@@ -62,6 +62,25 @@ const PANIC_MARKER: &str = "panicked at";
 /// baseline.
 const SUMMARY_MARKER: &str = " tests executed (";
 
+/// The failure `device.c/test_mode_change` reports for a refused mode restore.
+///
+/// win32u refused the display modes the test saved at its start and tried
+/// to put back. The test writes a mode of its own into the registry with
+/// `CDS_UPDATEREGISTRY` between its restores, so a refused restore leaves that
+/// mode as the session's desktop for every later process of the prefix.
+const FAILED_MODE_RESTORE: &str = ": Test failed: Failed to restore display modes.";
+
+/// Whether a subtest's output says it left display modes it could not restore.
+///
+/// Matched on the message rather than on its sites, so it holds when the
+/// tests' line numbers move.
+#[must_use]
+pub fn reports_failed_mode_restore(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.contains(FAILED_MODE_RESTORE))
+}
+
 /// Scan combined stdout+stderr for failing sites and a crash bit.
 ///
 /// `signaled` is set when the spawned process died by a fatal signal — a
