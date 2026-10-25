@@ -26,9 +26,11 @@
 //! wait for it, start a persistent one, boot, check one stayed), with the
 //! prefix and `WINEMSYNC` named, the raw log saying so and still ending in how
 //! the process ended. A subtest that reports none restarts nothing, nor does a
-//! run that ends on a GPU hang; a held configure lock leaves the session
-//! alone; a step that fails is reported without failing the run, and one still
-//! running at the restart's deadline is killed rather than waited for.
+//! run that ends on a GPU hang. A configure lock `lockf` holds leaves the
+//! session alone; only a holder makes the lock be asked for again, and any
+//! other lock error is named at once. A step that fails is reported without
+//! failing the run, and one still running at the restart's deadline is killed
+//! rather than waited for.
 //!
 //! Which server to sample is decided on a process table and a working
 //! directory, so the decision is tested on both rather than on the machine's
@@ -38,14 +40,14 @@
 
 use std::{
     fs,
-    os::{fd::AsRawFd as _, unix::fs::PermissionsExt as _},
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use super::{
     DEFAULT_TIMEOUT, Launch, PREFIX_LOCK_FILE, Wineserver, cwd_is_server_dir, is_gpu_hang_line,
-    normalize_numbers, restart_session, run_subtest, server_dir_for, validation_errors,
+    normalize_numbers, restart_session, retry_lock, run_subtest, server_dir_for, validation_errors,
     validation_gate_failed, wineserver_pids,
 };
 use crate::model::{Arch, Gpu, Leg, Subtest, Variant};
@@ -602,20 +604,30 @@ fn a_held_configure_lock_leaves_the_session_alone() {
     );
     let (launch, calls) = launch_restartable(exe, 0);
     let prefix = launch.wineserver.as_ref().expect("named").prefix.clone();
-    let held = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(prefix.join(PREFIX_LOCK_FILE))
-        .expect("lock file");
-    // SAFETY: flock(2) on a descriptor this test owns; it touches no memory.
-    let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(locked, 0, "the test takes the lock first");
+    // The holder is `lockf`, the tool the Makefile's configure holds the
+    // lock with, so the test pins that the two locks see each other. Its
+    // command outlives the restart's one-second budget and ends by itself
+    // soon after, since a kill of `lockf` does not reach it.
+    let ready = prefix.join("lock-held");
+    let _ = fs::remove_file(&ready);
+    let mut holder = std::process::Command::new("lockf")
+        .arg("-k")
+        .arg(prefix.join(PREFIX_LOCK_FILE))
+        .args(["/bin/sh", "-c", "touch \"$0\"; exec sleep 4"])
+        .arg(&ready)
+        .spawn()
+        .expect("lockf");
+    let waited = Instant::now();
+    while !ready.exists() {
+        assert!(waited.elapsed() < PROMPT, "lockf never took the lock");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let started = Instant::now();
     let note = restart_session(&launch, Duration::from_secs(1));
     let elapsed = started.elapsed();
-    drop(held);
+    let _ = holder.kill();
+    let _ = holder.wait();
     assert!(
         note.contains("configure lock") && note.contains("was not restarted"),
         "{note}"
@@ -625,6 +637,46 @@ fn a_held_configure_lock_leaves_the_session_alone() {
         !calls.exists(),
         "a step ran without the lock: {:?}",
         fs::read_to_string(&calls)
+    );
+}
+
+#[test]
+fn only_another_holder_makes_the_lock_ask_again() {
+    let mut asked = 0;
+    let granted = retry_lock(
+        || {
+            asked += 1;
+            if asked < 3 {
+                Err(fs::TryLockError::WouldBlock)
+            } else {
+                Ok(())
+            }
+        },
+        Instant::now() + PROMPT,
+        Duration::from_millis(1),
+    );
+    assert_eq!(granted, Ok(()));
+    assert_eq!(
+        asked, 3,
+        "a held lock is asked for again until it is granted"
+    );
+
+    let mut asked = 0;
+    let refused = retry_lock(
+        || {
+            asked += 1;
+            Err(fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                libc::EBADF,
+            )))
+        },
+        Instant::now() + PROMPT,
+        Duration::from_millis(1),
+    );
+    assert_eq!(asked, 1, "an error other than a holder is not asked again");
+    let why = refused.expect_err("the error is reported");
+    assert!(
+        why.starts_with("could not be locked: ") && why.contains("Bad file descriptor"),
+        "{why}"
     );
 }
 

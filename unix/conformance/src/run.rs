@@ -16,12 +16,9 @@ use std::{
     fmt::Write as _,
     fs,
     io::{BufRead, BufReader, Read},
-    os::{
-        fd::AsRawFd as _,
-        unix::{
-            fs::MetadataExt as _,
-            process::{CommandExt, ExitStatusExt},
-        },
+    os::unix::{
+        fs::MetadataExt as _,
+        process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -890,15 +887,17 @@ const LOCK_RETRY: Duration = Duration::from_millis(100);
 
 /// Take the exclusive flock on `path`, asking again until `deadline`.
 ///
-/// The file is created when it does not exist yet, as `lockf -k` does. The
-/// lock is released when the returned file is dropped. The descriptor is
-/// close-on-exec, so the persistent server and the residents the restart
-/// starts never inherit it and the lock ends with the restart.
+/// The file is created when it does not exist yet, as `lockf -k` does.
+/// `File::try_lock` is flock(2) with `LOCK_NB` on macOS, the same lock
+/// `lockf` holds. The lock is released when the returned file is dropped. The
+/// descriptor is close-on-exec, so the persistent server and the residents
+/// the restart starts never inherit it and the lock ends with the restart.
 ///
 /// # Errors
 ///
-/// Returns why the lock was not obtained: the file could not be opened, or
-/// another holder kept it until `deadline`.
+/// Returns why the lock was not obtained: the file could not be opened,
+/// another holder kept it until `deadline`, or the lock call failed for a
+/// reason other than a holder ([`retry_lock`]).
 fn lock_prefix(path: &Path, deadline: Instant) -> Result<fs::File, String> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -907,16 +906,34 @@ fn lock_prefix(path: &Path, deadline: Instant) -> Result<fs::File, String> {
         .truncate(false)
         .open(path)
         .map_err(|e| format!("could not be opened: {e}"))?;
+    retry_lock(|| file.try_lock(), deadline, LOCK_RETRY)?;
+    Ok(file)
+}
+
+/// Ask `try_lock` for the lock until it is granted or `deadline` passes.
+///
+/// Only `WouldBlock`, another holder, is worth asking again; any other
+/// error ends the wait at once and is named, since asking again would only
+/// repeat it for the rest of the budget.
+///
+/// # Errors
+///
+/// Returns why the lock was not obtained.
+fn retry_lock(
+    mut try_lock: impl FnMut() -> Result<(), fs::TryLockError>,
+    deadline: Instant,
+    retry: Duration,
+) -> Result<(), String> {
     loop {
-        // SAFETY: flock(2) on a descriptor this function owns; it touches no
-        // memory of ours.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => return Err(format!("could not be locked: {e}")),
         }
         if Instant::now() >= deadline {
             return Err("stayed held by another run until the restart's budget ran out".to_owned());
         }
-        thread::sleep(LOCK_RETRY);
+        thread::sleep(retry);
     }
 }
 

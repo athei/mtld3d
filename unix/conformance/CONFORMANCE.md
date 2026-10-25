@@ -228,9 +228,10 @@ own mode. A mode-set could not do that: the display's own mode need not be
 one win32u lists (see `device.c/test_mode_change`). The restart holds the
 prefix's configure lock (`<prefix>/.mtld3d-configure.lock`, the flock
 `configure-test-prefix` holds while it ends and boots a server), asking for it
-again until its 120 s budget runs out, so a leg configuring the same prefix
-meanwhile waits instead of booting a second server; a lock it never gets
-leaves the session as it is. The runner's stderr and the raw log, ahead of
+again while another run holds it until its 120 s budget runs out, so a leg
+configuring the same prefix meanwhile waits instead of booting a second
+server; a lock it never gets, or one the system refuses for another reason
+(named at once), leaves the session as it is. The runner's stderr and the raw log, ahead of
 its last line, say that it happened and how long it took, or why it did not
 or which step failed; a failed step fails nothing, since the next subtest's
 process starts a session of its own, and a step still running at the
