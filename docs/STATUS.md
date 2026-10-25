@@ -191,6 +191,12 @@ unless its entry says otherwise.
   NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- Occlusion queries past the 8192 visibility slots one submission counts
+  into, the most a Metal visibility offset addresses on every GPU family.
+  A query takes a slot at BEGIN, one at END and one for each pass it stays
+  open across, so this is about 4000 BEGIN/END pairs in a frame. A query
+  that draws after the slots run out reads `u32::MAX`, fully visible, warned
+  once; one that draws nothing reads 0.
 - The fixed-function texture operations `D3DTOP_PREMODULATE`,
   `D3DTOP_MULTIPLYADD` and `D3DTOP_LERP`: absent from `TextureOpCaps`, and a
   stage that names one is warned once and runs as `D3DTOP_SELECTARG1`.

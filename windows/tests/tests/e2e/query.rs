@@ -44,6 +44,14 @@ const fn full_frame_quad(z: f32) -> [PosColorVertex; 6] {
 /// The quad every counting draw that has no depth buffer under it uses.
 const FULL_FRAME_QUAD: [PosColorVertex; 6] = full_frame_quad(0.5);
 
+/// Empty BEGIN/END pairs that use up every visibility slot one submission has.
+///
+/// Each pair takes two of the 8192 slots, so this many leave none for the
+/// query issued after them, with room to spare: a limit that grew past it
+/// fails the tests that rely on it rather than quietly no longer testing the
+/// fallback.
+const PAIRS_PAST_THE_SLOT_LIMIT: usize = 4_200;
+
 const fn quad_vertex(x: f32, y: f32, z: f32) -> PosColorVertex {
     PosColorVertex {
         x,
@@ -469,20 +477,90 @@ fn occlusion_count_survives_a_flush_between_begin_and_end() {
 }
 
 #[test]
-fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
-    // The per-frame slot budget is finite (two slots per BEGIN/END pair plus
-    // one per pass the span crosses). A query that gets no slot and did draw
-    // cannot be counted, and the answer for "unknown" is the permissive
-    // `u32::MAX`: reporting the zero its empty span sums to would read as
-    // full occlusion and make a title cull geometry it should draw. A query
-    // that drew nothing is not unknown at all, budget or no budget, and
-    // reports the zero it counted.
-    //
-    // The filler pair count is comfortably past the budget rather than
-    // exactly at it, so the span that follows is starved even if the budget
-    // grows; a budget that grew past this fails the test rather than quietly
-    // stopping to test the fallback.
+fn occlusion_queries_past_a_thousand_slots_count_what_they_drew() {
+    // An engine that tests the bounds of every visible primitive issues
+    // hundreds of queries a frame and then the few that decide how bright a
+    // light's halo or flare is drawn. Those late queries answer from the
+    // depth test like the first ones: one behind a wall counts nothing, one
+    // in front of it the whole frame. A query that answered fully visible
+    // here would draw its halo through the wall.
     const FILLERS: usize = 700;
+
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "query.flushImmediate=false",
+        ..HarnessConfig::default()
+    });
+    let dims = h.dims();
+    let fillers: Vec<Query<'_>> = (0..FILLERS)
+        .map(|_| {
+            h.create_query(D3DQUERYTYPE_OCCLUSION)
+                .expect("OCCLUSION query should be supported")
+        })
+        .collect();
+    let Some(hidden) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    let Some(visible) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "ZENABLE");
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0, "ZFUNC");
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF00_0000, 1.0, 0),
+        0,
+        "clear colour and depth"
+    );
+    draw_full_frame_at(&h, 0.5, "the wall");
+    for q in &fillers {
+        assert_eq!(q.issue(D3DISSUE_BEGIN), 0);
+        assert_eq!(q.issue(D3DISSUE_END), 0);
+    }
+    assert_eq!(
+        hidden.issue(D3DISSUE_BEGIN),
+        0,
+        "Issue(BEGIN) behind the wall"
+    );
+    draw_full_frame_at(&h, 0.9, "the draw behind the wall");
+    assert_eq!(hidden.issue(D3DISSUE_END), 0, "Issue(END) behind the wall");
+    assert_eq!(visible.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN) in front");
+    draw_full_frame_at(&h, 0.1, "the draw in front of the wall");
+    assert_eq!(visible.issue(D3DISSUE_END), 0, "Issue(END) in front");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        occlusion_count(&hidden, "the span behind the wall"),
+        0,
+        "a draw every sample of which fails the depth test counts no samples"
+    );
+    assert_full_frames(
+        occlusion_count(&visible, "the span in front of the wall"),
+        1,
+        dims,
+        "a draw in front of the wall",
+    );
+    assert_eq!(
+        occlusion_count(&fillers[FILLERS - 1], "the last filler"),
+        0,
+        "a query that saw no draw counts no samples"
+    );
+}
+
+#[test]
+fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
+    // The slots of one submission are finite (two per BEGIN/END pair plus
+    // one per pass the span crosses, up to the most a Metal visibility offset
+    // addresses). A query that gets no slot and did draw cannot be counted,
+    // and the answer for "unknown" is the permissive `u32::MAX`: reporting
+    // the zero its empty span sums to would read as full occlusion and make
+    // a title cull geometry it should draw. A query that drew nothing is not
+    // unknown at all, budget or no budget, and reports the zero it counted.
+    const FILLERS: usize = PAIRS_PAST_THE_SLOT_LIMIT;
 
     let h = Harness::with_config("query.flushImmediate=false");
     let fillers: Vec<Query<'_>> = (0..FILLERS)
@@ -602,7 +680,7 @@ fn a_span_begun_past_the_slot_budget_with_no_draw_counts_nothing() {
     // frame covers none of the frame's slots: they were all reserved before
     // it began, and the first of them holds a full frame another query
     // counted. With no draw in the span, its exact answer is zero.
-    const FILLERS: usize = 600;
+    const FILLERS: usize = PAIRS_PAST_THE_SLOT_LIMIT;
 
     let h = Harness::with_config("query.flushImmediate=false");
     let dims = h.dims();

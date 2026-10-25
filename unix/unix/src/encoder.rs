@@ -2925,9 +2925,7 @@ impl FrameEncoder {
         }
         // Pool-acquired buffer first — reuses a PageBox + Metal wrapper.
         if let Some(mut reused) = self.visibility.try_acquire_reusable() {
-            // Zero the backing so prior-frame counter values don't
-            // leak into slots the GPU didn't touch this frame.
-            zero_page_box(reused.backing_mut());
+            reused.clear_reserved();
             self.visibility.install_current_buffer(reused);
             return true;
         }
@@ -3031,8 +3029,9 @@ impl FrameEncoder {
         self.visibility.mark_exhausted();
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "visibility-query slot budget exhausted for this frame: \
-             overflowing queries that drew report u32::MAX"
+            "visibility-query slots exhausted for this submission ({MAX_SLOTS}, the most a \
+             Metal visibility offset addresses on every GPU family): overflowing queries that \
+             drew report u32::MAX"
         );
     }
 
@@ -10524,16 +10523,6 @@ fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
 /// encode + commit path, whichever thread runs it.
 fn retire_blit_reads(enc: &mut FrameEncoder, submit_seq: u64) {
     enc.blit_retention.queue(&mut enc.perf, submit_seq);
-}
-
-/// Zero the full backing of a `PageBox`.
-///
-/// Called when a visibility buffer is pulled off the pool for reuse —
-/// Metal only writes u64 counters to slots it touches under Counting mode,
-/// so stale values in slots we bump but the GPU never enters Counting for
-/// would leak across frames without this.
-fn zero_page_box(backing: &mut PageBox) {
-    backing.as_mut_slice().fill(0);
 }
 
 // ── Shader disk cache helpers ──

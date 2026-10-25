@@ -1,7 +1,9 @@
 //! Unit tests for the occlusion-query logic behind `IDirect3DQuery9`.
 //!
 //! Covers slot allocation (bump, reset, exhaustion), `sum_slots` over half-open and
-//! out-of-range spans, and the BEGIN/END/publish state machine with its `u32` clamp. The
+//! out-of-range spans of a buffer's bytes, a span summed near the last slot, reuse zeroing
+//! the prefix the last frame reserved, and the BEGIN/END/publish state machine with its
+//! `u32` clamp. The
 //! pool and state cases pin the lifetime rules: intake publishes only queries whose END frame
 //! has retired, reuse waits for `coherent_seq` to reach a buffer's `release_seq`, and an
 //! over-cap retire hands the evicted entry back. The segment cases pin what a span that
@@ -13,7 +15,7 @@
 use mtld3d_shared::MetalHandle;
 
 use super::{
-    MAX_SLOTS, QueryStatus, RetiredVisibilityBuffer, VisibilityBufferPool,
+    MAX_SLOTS, QueryStatus, RetiredVisibilityBuffer, SLOT_BYTES, VisibilityBufferPool,
     VisibilityOffsetAllocator, VisibilityQueryCore, logical_samples, sum_slots,
 };
 use crate::page_box::PageBox;
@@ -24,41 +26,113 @@ fn dummy_buf(seq: u64) -> RetiredVisibilityBuffer {
     RetiredVisibilityBuffer::new(PageBox::new_zeroed(8192), handle, seq)
 }
 
+/// A test buffer of the size the encoder allocates, every slot addressable.
+fn full_size_buf(seq: u64) -> RetiredVisibilityBuffer {
+    // SAFETY: tests; opaque value never dereferenced.
+    let handle = unsafe { MetalHandle::new(0xDEAD_BEEF) };
+    RetiredVisibilityBuffer::new(
+        PageBox::new_zeroed((MAX_SLOTS * SLOT_BYTES) as usize),
+        handle,
+        seq,
+    )
+}
+
 /// Write a sample count into one slot of a test buffer, as the GPU would.
 fn write_slot(buf: &mut RetiredVisibilityBuffer, slot: usize, value: u64) {
-    let bytes = value.to_le_bytes();
-    buf.backing_mut().as_mut_slice()[slot * 8..slot * 8 + 8].copy_from_slice(&bytes);
+    let bytes = value.to_ne_bytes();
+    buf.backing.as_mut_slice()[slot * 8..slot * 8 + 8].copy_from_slice(&bytes);
+}
+
+/// Read one slot of a test buffer back.
+fn read_slot(buf: &RetiredVisibilityBuffer, slot: usize) -> u64 {
+    let bytes = &buf.backing.as_slice()[slot * 8..slot * 8 + 8];
+    u64::from_ne_bytes(bytes.try_into().expect("an 8-byte slot"))
+}
+
+/// Lay counters out as the bytes of a visibility buffer.
+fn slot_bytes(slots: &[u64]) -> Vec<u8> {
+    slots.iter().flat_map(|slot| slot.to_ne_bytes()).collect()
 }
 
 #[test]
 fn sum_slots_single_span() {
-    let slots = [0u64, 42, 0, 0];
+    let slots = slot_bytes(&[0, 42, 0, 0]);
     assert_eq!(sum_slots(&slots, 1, 2), 42);
 }
 
 #[test]
 fn sum_slots_multi_span() {
-    let slots = [0u64, 10, 20, 30, 0];
+    let slots = slot_bytes(&[0, 10, 20, 30, 0]);
     assert_eq!(sum_slots(&slots, 1, 4), 60);
 }
 
 #[test]
 fn sum_slots_empty_range() {
-    let slots = [0u64; 8];
+    let slots = slot_bytes(&[0; 8]);
     assert_eq!(sum_slots(&slots, 5, 5), 0);
 }
 
 #[test]
 fn sum_slots_out_of_range_saturates() {
-    let slots = [1u64, 2, 3];
-    // end past buffer length saturates at slots.len().
+    let slots = slot_bytes(&[1, 2, 3]);
+    // end past buffer length saturates at the backing's last slot.
     assert_eq!(sum_slots(&slots, 0, 10), 6);
 }
 
 #[test]
 fn sum_slots_begin_past_end_returns_zero() {
-    let slots = [1u64, 2, 3];
+    let slots = slot_bytes(&[1, 2, 3]);
     assert_eq!(sum_slots(&slots, 2, 1), 0);
+}
+
+#[test]
+fn intake_sums_a_span_counted_past_a_thousand_slots() {
+    use super::VisibilityQueryState;
+    // An engine that tests each visible primitive's bounds runs well past a
+    // thousand slots in a frame; a query there sums its own slots like the
+    // first one does.
+    let mut state = VisibilityQueryState::new();
+    let early = VisibilityQueryCore::new();
+    let late = VisibilityQueryCore::new();
+    let mut buffer = full_size_buf(1);
+    write_slot(&mut buffer, 0, 11);
+    write_slot(&mut buffer, 5_000, 300);
+    write_slot(&mut buffer, 5_001, 20);
+    write_slot(&mut buffer, MAX_SLOTS as usize - 1, 4);
+    state.pool.retire(buffer);
+    early.begin(1, 0, (640, 480), (640, 480), 0);
+    early.end(1, 1);
+    state.push_pending(1, early.clone(), (0, 1), true);
+    late.begin(1, 5_000, (640, 480), (640, 480), 1);
+    late.end(1, 2);
+    state.push_pending(1, late.clone(), (5_000, MAX_SLOTS), true);
+
+    state.intake_completed(1);
+    assert_eq!(early.get_u32(), 11);
+    assert_eq!(late.get_u32(), 324, "every slot up to the last one");
+}
+
+#[test]
+fn reuse_zeroes_the_slots_the_last_frame_reserved() {
+    use super::VisibilityQueryState;
+    let mut state = VisibilityQueryState::new();
+    state.install_current_buffer(full_size_buf(0));
+    for _ in 0..3 {
+        state.bump_slot();
+    }
+    state.retire_current_buffer(1);
+    // The GPU counted into the frame's slots before it retired.
+    let retired = state.pool.retired.last_mut().expect("the frame's buffer");
+    assert_eq!(retired.reserved, 3);
+    write_slot(retired, 0, 7);
+    write_slot(retired, 2, 9);
+    state.pool.release_up_to(1);
+
+    let mut reused = state.try_acquire_reusable().expect("released for reuse");
+    reused.clear_reserved();
+    assert_eq!(read_slot(&reused, 0), 0);
+    assert_eq!(read_slot(&reused, 2), 0, "the last reserved slot");
+    assert_eq!(reused.reserved, 0);
 }
 
 #[test]
@@ -583,7 +657,7 @@ fn scaling_smoke_hundred_queries() {
     // Forge a slot array where each query contributes 10 visible
     // pixels split evenly across its slots.
     let total_usize = TOTAL as usize;
-    let slots: Vec<u64> = (0..total_usize).map(|_| 10).collect();
+    let slots = slot_bytes(&vec![10; total_usize]);
     let sum = sum_slots(&slots, 0, TOTAL);
     assert_eq!(
         u32::try_from(sum).expect("700 * 10 = 7000 fits u32"),

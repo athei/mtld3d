@@ -36,15 +36,24 @@ use mtld3d_shared::{
 
 use crate::page_box::PageBox;
 
-/// 1024 u64 slots = 8 KiB.
+/// Slots one submission can count into: 8192 u64 slots, a 64 KiB buffer.
 ///
-/// Covers every realistic D3D9 occlusion workload (heavy-occlusion
-/// titles issue ≤64 queries/frame; with a typical 4–6 passes per frame
-/// the worst-case slot use is N*(2+P) ≈ 450 for 64 queries).
-pub const MAX_SLOTS: u32 = 1024;
+/// A query takes a slot at BEGIN, one at END, and one for every pass it is
+/// open across, so a frame of sequential BEGIN/END pairs runs out after
+/// about 4000 of them. Engines that test every visible primitive's bounds
+/// issue hundreds to thousands per frame. The count is the most every Metal
+/// GPU family addresses: the visibility query offset reaches 65,528 bytes on
+/// the smallest (Apple2 to Apple6), which is slot 8191. A frame past it
+/// answers its overflowing queries from the uncounted path.
+pub const MAX_SLOTS: u32 = 8192;
 
 /// Byte size of a visibility result slot — Metal writes a u64 counter per slot.
 pub const SLOT_BYTES: u32 = 8;
+
+/// The largest visibility query offset every Metal GPU family accepts.
+const MAX_VISIBILITY_OFFSET: u32 = 65_528;
+
+const _: () = assert!((MAX_SLOTS - 1) * SLOT_BYTES <= MAX_VISIBILITY_OFFSET);
 
 /// Where a query sits in its lifecycle (begin → end → issued).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,19 +491,24 @@ impl VisibilityOffsetAllocator {
     }
 }
 
-/// Sum u64 visibility counts across a BEGIN→END span.
+/// Sum the u64 visibility counts of the half-open slot range `[begin, end)`.
 ///
-/// `slots` is the shared-storage buffer readable once `coherent_seq` has
-/// caught up to the frame containing END. The span is half-open:
-/// `[begin, end)`.
-fn sum_slots(slots: &[u64], begin: u32, end: u32) -> u64 {
+/// `bytes` is a visibility buffer's backing, readable once `coherent_seq` has
+/// caught up to the frame that counted into it. Only the range is read, in
+/// place: the cost of a segment is its own slots, not the buffer's size. A
+/// range past the backing stops at its end. Metal writes each counter in the
+/// host's byte order.
+fn sum_slots(bytes: &[u8], begin: u32, end: u32) -> u64 {
+    let slot = SLOT_BYTES as usize;
     let begin = begin as usize;
-    let end = end as usize;
-    let end = end.min(slots.len());
+    let end = (end as usize).min(bytes.len() / slot);
     if begin >= end {
         return 0;
     }
-    slots[begin..end].iter().sum()
+    bytes[begin * slot..end * slot]
+        .chunks_exact(slot)
+        .map(|counter| u64::from_ne_bytes(counter.try_into().expect("an 8-byte chunk")))
+        .sum()
 }
 
 /// A retired visibility buffer awaiting GPU completion.
@@ -506,6 +520,12 @@ pub struct RetiredVisibilityBuffer {
     ///
     /// Pool recycles it only once `coherent_seq >= release_seq`.
     release_seq: u64,
+    /// Slots the frame that used this buffer reserved, from slot 0.
+    ///
+    /// Every slot the GPU can have written lies below it, since a Counting
+    /// mode is only ever set at a reserved slot, so reuse zeroes this prefix
+    /// and leaves the rest, still zero, alone.
+    reserved: u32,
 }
 
 impl RetiredVisibilityBuffer {
@@ -525,12 +545,23 @@ impl RetiredVisibilityBuffer {
             backing,
             metal_handle,
             release_seq,
+            reserved: 0,
         }
     }
 
-    /// Mutable backing so the encoder can zero the region on reuse.
-    pub const fn backing_mut(&mut self) -> &mut PageBox {
-        &mut self.backing
+    /// Zero the slots the buffer's last frame reserved, before a new frame counts into it.
+    ///
+    /// Metal only writes the slots a Counting mode names, so a slot reserved
+    /// and never counted would otherwise carry the last frame's count into
+    /// the sum of this one. The backing is zeroed when it is allocated, and
+    /// no frame writes past the slots it reserved, so the prefix is all that
+    /// can hold a stale count.
+    pub fn clear_reserved(&mut self) {
+        let bytes = (self.reserved * SLOT_BYTES) as usize;
+        let slice = self.backing.as_mut_slice();
+        let end = bytes.min(slice.len());
+        slice[..end].fill(0);
+        self.reserved = 0;
     }
 
     const fn metal_handle(&self) -> MetalHandle<MTLBufferKind> {
@@ -619,33 +650,14 @@ impl VisibilityBufferPool {
         }
     }
 
-    /// Read back the slot array of the retired buffer tagged `seq`.
+    /// Sum the slot range `span` of the retired buffer tagged `seq`; `None` without one.
     ///
-    /// SAFETY: caller guarantees the buffer's GPU work has completed
-    /// (`coherent_seq` >= `release_seq`), so CPU reads of the Shared
-    /// backing observe the final counter writes. Backing is allocated
-    /// via `PageBox::new_uninit_with_align(SLOT_BYTES * MAX_SLOTS)` which
-    /// returns an 8-aligned page-mapped region — but clippy can't see
-    /// that, so we use `read_unaligned` per slot to make alignment a
-    /// non-question at the cast.
-    fn retired_backing_for(&self, seq: u64) -> Option<Vec<u64>> {
-        let buf = self
-            .retired
-            .iter()
-            .find(|b| b.release_seq == seq)?
-            .backing();
-        let ptr = buf.as_ptr();
-        let slots: Vec<u64> = (0..MAX_SLOTS as usize)
-            .map(|i| {
-                // SAFETY: `ptr + i * 8` stays within the visibility buffer
-                // (size = MAX_SLOTS * 8 bytes).
-                let byte_ptr = unsafe { ptr.add(i * 8) };
-                // SAFETY: read_unaligned is the correct primitive for
-                // byte-addressed access to a `u64` slot.
-                unsafe { core::ptr::read_unaligned(byte_ptr.cast::<u64>()) }
-            })
-            .collect();
-        Some(slots)
+    /// The caller has seen `coherent_seq` reach `seq`, so the GPU has
+    /// finished writing the buffer and CPU reads of its Shared backing
+    /// observe the final counts.
+    fn sum_retired(&self, seq: u64, (begin, end): (u32, u32)) -> Option<u64> {
+        let buf = self.retired.iter().find(|b| b.release_seq == seq)?;
+        Some(sum_slots(buf.backing().as_slice(), begin, end))
     }
 }
 
@@ -715,8 +727,8 @@ impl VisibilityQueryState {
             // ~3 frames coexisting in the steady state, but a
             // `drawable_wait` hitch or a block on the encoder channel
             // can stack several more retirees before `intake_completed`
-            // drains them. At 8 KiB per buffer the 16-entry ceiling
-            // is 128 KiB — cheap — and eviction becomes a genuinely
+            // drains them. At 64 KiB per buffer the 16-entry ceiling
+            // is 1 MiB of native memory, and eviction becomes a genuinely
             // exceptional path rather than a predictable one on hitch
             // frames. Evictions are still routed through the encoder's
             // `PendingBufferWrapperRetention` drain so the MTLBuffer
@@ -800,10 +812,10 @@ impl VisibilityQueryState {
     /// the GPU will write into freed snmalloc heap, corrupting
     /// allocator metadata.
     pub fn retire_current_buffer(&mut self, submit_seq: u64) -> Option<RetiredVisibilityBuffer> {
-        let buf = self.current_buffer.take()?;
-        let (backing, handle, _) = buf.into_parts();
-        let retired = RetiredVisibilityBuffer::new(backing, handle, submit_seq);
-        self.pool.retire(retired)
+        let mut buf = self.current_buffer.take()?;
+        buf.release_seq = submit_seq;
+        buf.reserved = self.allocator.next;
+        self.pool.retire(buf)
     }
 
     #[must_use]
@@ -979,8 +991,8 @@ impl VisibilityQueryState {
             let (begin, end) = entry.span;
             let sum = if begin >= end {
                 0
-            } else if let Some(slots) = self.pool.retired_backing_for(entry.submit_seq) {
-                sum_slots(&slots, begin, end)
+            } else if let Some(sum) = self.pool.sum_retired(entry.submit_seq, entry.span) {
+                sum
             } else {
                 entry.core.mark_uncounted();
                 0
