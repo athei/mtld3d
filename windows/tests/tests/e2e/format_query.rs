@@ -121,13 +121,14 @@ fn dynamic_usage_in_the_default_pool_is_accepted() {
     }
 }
 
-/// The sRGB-write query answers the render-target question, for every format.
+/// The sRGB-write query answers yes for the 8-bit four-channel render targets alone.
 ///
-/// The encode belongs to the render pass, so a format that can be a colour
-/// attachment takes it and one that cannot has nothing to encode into. The
-/// expected answer is read from the device's own `D3DUSAGE_RENDERTARGET`
-/// answer rather than spelled out, so the case holds on a GPU family without
-/// the native packed 16-bit formats too.
+/// D3D9 encodes those under `D3DRS_SRGBWRITEENABLE` and writes every other
+/// render target linear (R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the
+/// floats), so a format answers yes when the device renders into it and it
+/// is one of the four, and no otherwise. The render-target half is read from
+/// the device's own `D3DUSAGE_RENDERTARGET` answer, so the case holds on a GPU
+/// family without the native packed 16-bit formats too.
 #[test]
 fn srgb_write_queries_answer_the_render_target_question() {
     let h = Harness::factory_only();
@@ -138,7 +139,11 @@ fn srgb_write_queries_answer_the_render_target_question() {
             D3DRTYPE_TEXTURE,
             format,
         ) == D3D_OK;
-        let expected = if renderable {
+        let encodes = matches!(
+            format,
+            D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_A8B8G8R8 | D3DFMT_X8B8G8R8
+        );
+        let expected = if renderable && encodes {
             D3D_OK
         } else {
             D3DERR_NOTAVAILABLE
@@ -167,11 +172,11 @@ fn srgb_write_queries_answer_the_render_target_question() {
 
 /// The sRGB read and the sRGB write questions are answered separately.
 ///
-/// They were one question while the write answer came off the twin table.
 /// DXT1 has the twin view its `D3DSAMP_SRGBTEXTURE` decode needs and is no
-/// colour attachment; R32F is a colour attachment whose Metal format has no
-/// twin, so its write encodes in the pixel shader and its read has nothing
-/// to decode with. Each answers yes to one of the two.
+/// colour attachment, so it answers yes to the read alone. R32F, A16B16G16R16F
+/// and G16R16 are colour attachments whose Metal format has no twin: the
+/// write stores them linear and the read has nothing to decode with, so they
+/// answer no to both. A8R8G8B8 answers yes to both.
 #[test]
 fn srgb_read_and_write_queries_are_independent() {
     let h = Harness::factory_only();
@@ -190,7 +195,8 @@ fn srgb_read_and_write_queries_are_independent() {
     }
     for format in [D3DFMT_R32F, D3DFMT_A16B16G16R16F, D3DFMT_G16R16] {
         assert_eq!(check(D3DUSAGE_QUERY_SRGBREAD, format), D3DERR_NOTAVAILABLE);
-        assert_eq!(check(D3DUSAGE_QUERY_SRGBWRITE, format), D3D_OK);
+        assert_eq!(check(D3DUSAGE_QUERY_SRGBWRITE, format), D3DERR_NOTAVAILABLE);
+        assert_eq!(check(D3DUSAGE_RENDERTARGET, format), D3D_OK);
     }
     // The pair an engine probes together before it commits to a
     // gamma-correct pipeline still answers both halves.
