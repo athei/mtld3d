@@ -160,8 +160,8 @@ impl PixelFormat {
     /// one; `D3DSAMP_SRGBTEXTURE=1` selects it as the sampled view, and
     /// `D3DRS_SRGBWRITEENABLE=1` attaches it as the render pass's colour
     /// attachment so the hardware encodes after the blender. A colour target
-    /// whose format returns `None` here keeps the pixel-shader OETF variant,
-    /// which encodes before the blender.
+    /// whose format returns `None` here takes no sRGB write and is written
+    /// linear under the state, as D3D9 writes such a format.
     ///
     /// Returning `None` means the linear format is the only thing mtld3d
     /// supports — callers fall back to the linear view with a once-per-id

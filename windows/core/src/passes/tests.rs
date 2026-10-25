@@ -5408,15 +5408,140 @@ fn srgb_write_without_a_twin_keeps_the_linear_attachment() {
     s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.set_srgb_write_enabled(true);
     assert!(!s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0b1);
     assert_eq!(s.current_color_format(), RT_FORMAT);
     s.ensure_pass_open();
     assert_eq!(s.passes()[0].color_attachment_texture(), base);
 }
 
-/// One extra target without a twin keeps the whole attachment set linear.
+fn extra_slot(texture: MetalHandle<MTLTextureKind>, format: PixelFormat) -> ExtraColorSlot {
+    ExtraColorSlot {
+        texture,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        sample_count: 1,
+        subresource: 0,
+        size: (256, 256),
+        logical_size: (256, 256),
+        format,
+        scale: RenderScale::IDENTITY,
+        has_alpha: true,
+    }
+}
+
+/// A float target beside an sRGB-capable one is attached linear while the other encodes.
 ///
-/// A render pass binds one set of views: a target that cannot encode would
-/// otherwise be written linear while its neighbours encode.
+/// D3D9 applies `D3DRS_SRGBWRITEENABLE` to the formats that take an sRGB
+/// write only. The pass binds render target 0's twin, so Metal encodes it
+/// after the blender, and binds the float target's own view, so what the
+/// shader writes there (a depth value, say) is stored unchanged. Neither
+/// output is left to the pixel shader.
+#[test]
+fn a_float_extra_target_stays_linear_beside_an_encoded_target_0() {
+    let mut s = fresh();
+    let base = tex(0x7F70);
+    let twin = tex(0x7F71);
+    let float = tex(0x7F72);
+    s.register_srgb_twin(twin, base);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(extra_slot(float, PixelFormat::Rgba32Float)));
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0);
+    assert_eq!(s.current_color_format(), PixelFormat::Bgra8UnormSrgb);
+    assert_eq!(
+        s.extra_color_attachments().formats[0],
+        PixelFormat::Rgba32Float
+    );
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), twin);
+    assert_eq!(pass.extra_color()[0].attachment_texture(), float);
+}
+
+/// The roles swapped: a float target 0 stays linear while render target 1 encodes.
+#[test]
+fn a_float_target_0_stays_linear_beside_an_encoded_extra_target() {
+    let mut s = fresh();
+    let float = tex(0x7F80);
+    let extra = tex(0x7F81);
+    let extra_twin = tex(0x7F82);
+    s.register_srgb_twin(extra_twin, extra);
+    s.set_color_render_target(
+        float,
+        256,
+        256,
+        PixelFormat::Rgba32Float,
+        RenderScale::IDENTITY,
+    );
+    s.set_extra_color_render_target(1, Some(extra_slot(extra, RT_FORMAT)));
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0);
+    assert_eq!(s.current_color_format(), PixelFormat::Rgba32Float);
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), float);
+    assert_eq!(pass.extra_color()[0].attachment_texture(), extra_twin);
+}
+
+/// A pass of targets that take no sRGB write binds no twin and asks the shader for nothing.
+///
+/// Toggling the state over such a pass changes no view, so it ends no pass.
+#[test]
+fn targets_without_an_srgb_format_ignore_srgb_write() {
+    let mut s = fresh();
+    let float = tex(0x7F90);
+    let half = tex(0x7F91);
+    s.set_color_render_target(
+        float,
+        256,
+        256,
+        PixelFormat::Rgba32Float,
+        RenderScale::IDENTITY,
+    );
+    s.set_extra_color_render_target(1, Some(extra_slot(half, PixelFormat::Rgba16Float)));
+    s.set_srgb_write_enabled(true);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    assert!(!s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0);
+    s.set_srgb_write_enabled(false);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    s.set_srgb_write_enabled(true);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 1, "no view changed, so no pass ended");
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), float);
+    assert_eq!(pass.extra_color()[0].attachment_texture(), half);
+}
+
+/// With a declined twin on the shader path, only the twin-capable targets are encoded there.
+///
+/// Render target 0's twin view is missing, so the pass binds every target
+/// linear and the pixel shader encodes; the float target beside it is still
+/// written linear.
+#[test]
+fn the_shader_path_encodes_only_targets_that_take_the_srgb_write() {
+    let mut s = fresh();
+    let base = tex(0x7FA0);
+    let float = tex(0x7FA1);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(extra_slot(float, PixelFormat::Rgba32Float)));
+    s.set_srgb_write_enabled(true);
+    assert!(!s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0b01);
+    s.set_srgb_write_enabled(false);
+    assert_eq!(s.shader_srgb_encode_mask(), 0);
+}
+
+/// An extra target whose twin view is missing keeps the whole attachment set linear.
+///
+/// Its format takes the sRGB write, so a pass binding twins for its
+/// neighbours would write it linear; the set stays on the shader path, which
+/// encodes both outputs.
 #[test]
 fn an_extra_target_without_a_twin_keeps_the_whole_set_linear() {
     let mut s = fresh();
@@ -5442,11 +5567,13 @@ fn an_extra_target_without_a_twin_keeps_the_whole_set_linear() {
     );
     s.set_srgb_write_enabled(true);
     assert!(!s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0b11);
 
     // Give the extra a twin of its own and the whole set can encode.
     let extra_twin = tex(0x7F43);
     s.register_srgb_twin(extra_twin, extra);
     assert!(s.pass_srgb_write());
+    assert_eq!(s.shader_srgb_encode_mask(), 0);
     s.ensure_pass_open();
     let pass = &s.passes()[0];
     assert_eq!(pass.color_attachment_texture(), twin);

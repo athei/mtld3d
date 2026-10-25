@@ -155,10 +155,10 @@ fn texture_usage(
 /// forbids rendering through a channel swizzle.
 ///
 /// 0 means either that the format has no sRGB counterpart or that Metal
-/// declined the view. The PE side treats both alike: a target without a twin
-/// has `D3DRS_SRGBWRITEENABLE` applied in the pixel shader, ahead of the
-/// blender, so the second case is a fidelity loss, not a failure, and is
-/// warned about once here.
+/// declined the view. A format without a counterpart takes no sRGB write and
+/// is written linear under `D3DRS_SRGBWRITEENABLE`. A declined view has the
+/// state applied in the pixel shader, ahead of the blender, so that case is
+/// a fidelity loss, not a failure, and is warned about once here.
 fn srgb_twin_view(
     texture: &ProtocolObject<dyn MTLTexture>,
     format: PixelFormat,

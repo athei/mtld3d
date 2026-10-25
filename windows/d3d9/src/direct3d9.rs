@@ -562,10 +562,9 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // the PE-side `PixelFormat::srgb_twin()` table in `unix/shared/src/mtl.rs`
 // — drives the answer `CheckDeviceFormat` returns for
 // `D3DUSAGE_QUERY_SRGBREAD`. Adding a new linear/sRGB pair to `PixelFormat`
-// requires extending this list too. The write side is not this question: a
-// colour target without a twin encodes through the pixel shader's OETF
-// variant instead, so `D3DUSAGE_QUERY_SRGBWRITE` follows render-target
-// capability (`mtld3d_core::format::supports_usage_query`).
+// requires extending this list too. The write side asks the same twin of the
+// render-target formats alone (`mtld3d_core::format::takes_srgb_write`), so
+// a sampled-only format with a twin, such as DXT1, answers no there.
 //
 // `R8G8B8` belongs here even though it is widened on upload: its backing is
 // `Bgra8Unorm` on every device, so the eager twin view exists and the decode
@@ -1388,8 +1387,8 @@ extern "system" fn d3d9_check_device_format(
     // format samples with linear filtering, a per-format device answer
     // rather than the device-wide `D3DPTFILTERCAPS` bits `GetDeviceCaps`
     // reports, and only the single-precision float family depends on the
-    // device), D3DUSAGE_QUERY_SRGBWRITE (the render-target answer, the
-    // encode being a property of the pass) and D3DUSAGE_QUERY_LEGACYBUMPMAP
+    // device), D3DUSAGE_QUERY_SRGBWRITE (a render-target format with an sRGB
+    // twin, the formats the write encodes) and D3DUSAGE_QUERY_LEGACYBUMPMAP
     // (the signed formats a bump-environment stage reads its displacement
     // from).
     if !mtld3d_core::format::supports_usage_query(

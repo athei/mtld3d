@@ -3643,13 +3643,15 @@ impl FrameEncoder {
         self.pass_state.rt0_dropped()
     }
 
-    /// Whether the pass binds sRGB views, so the hardware encodes post-blend.
+    /// The colour outputs the pixel shader encodes itself under `D3DRS_SRGBWRITEENABLE`.
     ///
-    /// Read at draw time: when it is set the pixel shader must NOT also
-    /// apply the OETF, or the colour is encoded twice.
+    /// See `PassState::shader_srgb_encode_mask`. Read at draw time: zero
+    /// while the pass binds sRGB views, where the hardware encodes post-blend
+    /// and a shader encode would apply the curve twice, and for every target
+    /// of a format without an sRGB twin, which D3D9 writes linear.
     #[must_use]
-    pub const fn color_attachment_is_srgb(&self) -> bool {
-        self.pass_state.pass_srgb_write()
+    pub fn shader_srgb_encode_mask(&self) -> u8 {
+        self.pass_state.shader_srgb_encode_mask()
     }
 
     /// Sample count of the currently bound color RT, 1 when single-sampled.
@@ -3891,9 +3893,13 @@ impl FrameEncoder {
     /// The clear colour as the bound attachment needs it stored.
     ///
     /// A pass that binds sRGB views takes the linear value and lets Metal
-    /// encode it, exactly as it encodes a draw's blended output. A target
-    /// with no sRGB view is written raw, so the curve is applied here: the
-    /// same encode the pixel-shader OETF variant performs for a draw.
+    /// encode it, exactly as it encodes a draw's blended output, and a target
+    /// of a format without an sRGB twin stores it linear, as D3D9 does. Only
+    /// a render target 0 that takes the sRGB write through its linear view
+    /// (Metal declined its twin) gets the curve here: the same encode the
+    /// pixel-shader OETF variant performs for a draw. The one value serves
+    /// every target the pass attaches, so in such a pass a target beside it
+    /// follows render target 0's rule.
     fn resolved_clear_rgba(
         &self,
         r: u32,
@@ -3902,7 +3908,7 @@ impl FrameEncoder {
         a: u32,
         srgb_write: bool,
     ) -> (u32, u32, u32, u32) {
-        if !srgb_write || self.pass_state.pass_srgb_write() {
+        if !srgb_write || self.pass_state.shader_srgb_encode_mask() & 1 == 0 {
             return (r, g, b, a);
         }
         let encoded = mtld3d_core::convert::linear_to_srgb_rgba([
