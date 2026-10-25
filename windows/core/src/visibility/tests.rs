@@ -853,7 +853,11 @@ fn a_frame_of_more_buffers_than_the_pool_keeps_sums_every_one() {
     state.remove_active(&spanning);
     state.push_pending(1, spanning.clone(), (spanning.offset_begin(), end), true);
     state.retire_frame_buffers(1);
-    assert_eq!(state.pool.retired.len(), BUFFERS as usize, "nothing evicted");
+    assert_eq!(
+        state.pool.retired.len(),
+        BUFFERS as usize,
+        "nothing evicted"
+    );
 
     write_slot(retired_mut(&mut state, 1, 0), 0, 1);
     write_slot(retired_mut(&mut state, 1, 10), 5, 4);
