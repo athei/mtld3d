@@ -149,15 +149,16 @@ lets the x87sidecar binary work without any entitlements.
 
 **Builtin** — for a Wine installation you own (your own build, an app-bundled
 Wine, a package install). Simplest to operate: no registry override, no
-per-game files, and every d3d9 application in that Wine tree uses mtld3d.
-The costs: it modifies the installation, so a Wine update or reinstall wipes
-it (re-copy afterwards), and other d3d9 applications can no longer reach the
-stock implementation. Not possible on CrossOver — `CrossOver.app` is replaced
-wholesale on every update.
+per-prefix `d3d9.dll`, and every d3d9 application in that Wine tree uses
+mtld3d. The costs: it modifies the installation, so a Wine update or reinstall
+wipes it (re-copy afterwards), and other d3d9 applications can no longer reach
+the stock implementation. Not possible on CrossOver: `CrossOver.app` is
+replaced wholesale on every update.
 
 **Native override** — required on CrossOver, and the right choice on stock
-Wine when the stock d3d9 should keep serving other applications. The costs: a
-registry override per prefix plus a `d3d9.dll` copy per game (or per prefix).
+Wine when the stock d3d9 should keep serving other prefixes. The costs: a
+registry override plus a `d3d9.dll` copy per prefix. The prefix copy covers
+every application of its arch in the prefix.
 
 ## Stock Wine, builtin route
 
@@ -225,12 +226,21 @@ cp prefix-markers/system32-arm64/mtld3d.dll "$WINEPREFIX/drive_c/windows/system3
 # x86_64 Wine, or a bundle without system32-arm64, the AMD64 stub instead:
 #cp prefix-markers/system32/mtld3d.dll      "$WINEPREFIX/drive_c/windows/system32/"
 
-# Native d3d9.dll next to the game executable: pick the game's arch, and for
-# a 64-bit game the build whose mtld3d.dll went in above.
-cp native/i386-windows/d3d9.dll "/path/to/MyGame/"      # 32-bit game
-#cp native/aarch64-windows/d3d9.dll "/path/to/MyGame/"  # 64-bit game, arm64 Wine
-#cp native/x86_64-windows/d3d9.dll "/path/to/MyGame/"   # 64-bit game, x86_64 Wine,
-#                                                       # or arm64 Wine without aarch64-windows
+# Native d3d9.dll into the prefix's system directory, never the game folder:
+# syswow64 for a 32-bit game, system32 for a 64-bit game. Back up the existing
+# copies first; -n keeps the first backup when this runs again. Pick the
+# game's arch, or both for games of both, and for a 64-bit game the build
+# whose mtld3d.dll went in above.
+WIN="$WINEPREFIX/drive_c/windows"
+cp -n "$WIN/system32/d3d9.dll" "$WIN/system32/d3d9.dll.orig" || true
+cp -n "$WIN/syswow64/d3d9.dll" "$WIN/syswow64/d3d9.dll.orig" || true
+cp native/i386-windows/d3d9.dll "$WIN/syswow64/"      # 32-bit game
+#cp native/aarch64-windows/d3d9.dll "$WIN/system32/"  # 64-bit game, arm64 Wine
+#cp native/x86_64-windows/d3d9.dll "$WIN/system32/"   # 64-bit game, x86_64 Wine,
+#                                                     # or arm64 Wine without aarch64-windows
+
+# A game-folder copy would win over the prefix copy.
+rm -f "/path/to/MyGame/d3d9.dll"
 
 # Optional: runtime configuration next to the game executable.
 cp mtld3d.conf "/path/to/MyGame/"
@@ -239,11 +249,18 @@ cp mtld3d.conf "/path/to/MyGame/"
 wine reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
 ```
 
-Instead of the game directory, the native `d3d9.dll` can go into the prefix —
-`drive_c/windows/syswow64/` for 32-bit games, `drive_c/windows/system32/` for
-64-bit — where it covers every application in the prefix. A game-directory
-copy wins when both exist. The prefix copy survives wineboot prefix updates,
-which only replace placeholder files, never real PEs.
+The native `d3d9.dll` goes into the prefix's system directory because Steam's
+overlay looks d3d9 up at its system path, and Wine matches that path only
+against a module loaded from there. The prefix copy covers every application
+of its arch in the prefix, and it survives wineboot prefix updates, which only
+replace placeholder files, never real PEs.
+
+With the `d3d9=native` override set, a process of the other arch finds only
+the placeholder, which `native` refuses, so d3d9 fails to load in it. A prefix
+that runs both 32-bit and 64-bit d3d9 games needs both copies.
+
+Upgrading mtld3d means re-copying `d3d9.dll` into the prefix and repeating the
+copies into `T`, all from one build.
 
 In a wine-build Wine the native `d3d9.dll` reaches the builtin `mtld3d.dll`
 only in a process whose builtin search includes the tree `T`: the Wine's
@@ -258,28 +275,27 @@ gives another d3d9 (a per-game rule) does not search `T`, finds no
 A 64-bit game on an arm64 Wine runs as an ARM64EC process, so the route
 takes the ARM64X builds for its 64-bit half: the builtin `mtld3d.dll` from
 `wine/aarch64-windows/` in the tree's `aarch64-windows`, and the unmarked
-`d3d9.dll` from `native/aarch64-windows/` next to the game or in the
-prefix's `drive_c/windows/system32/`, with the tree's builtin `d3d9.dll`
-replaced from `wine/aarch64-windows/` as above. The game then runs both as
-native code. A bundle without the `aarch64-windows` entries, one built
-against an x86_64 Wine, serves the same route with its x86_64 builds
-instead: the pair from `wine/x86_64-windows/` in the tree's
-`aarch64-windows` and the `d3d9.dll` from `native/x86_64-windows/`, all
-translated. The files in the tree and the native `d3d9.dll` come from one
-build either way. A 32-bit game takes the i386 files, as on an x86_64 Wine.
-The 64-bit prefix marker is the hybrid one from `system32-arm64/`, which an
-x64 process accepts as it does the AMD64 one and a native ARM64 process
-accepts too; a bundle without it leaves the AMD64 one from `system32/`, which
-serves x64 programs only. On a wine-build arm64 Wine the `mtld3d.dll` goes
-into `lib/wine/d3d9/mtld3d` (the `T` above), never over the placeholders in
-its default `lib/wine/aarch64-windows`.
+`d3d9.dll` from `native/aarch64-windows/` in the prefix's
+`drive_c/windows/system32/`, with the tree's builtin `d3d9.dll` replaced from
+`wine/aarch64-windows/` as above. The game then runs both as native code. A
+bundle without the `aarch64-windows` entries, one built against an x86_64
+Wine, serves the same route with its x86_64 builds instead: the pair from
+`wine/x86_64-windows/` in the tree's `aarch64-windows` and the `d3d9.dll` from
+`native/x86_64-windows/`, all translated. The files in the tree and the native
+`d3d9.dll` come from one build either way. A 32-bit game takes the i386 files,
+as on an x86_64 Wine. The 64-bit prefix marker is the hybrid one from
+`system32-arm64/`, which an x64 process accepts as it does the AMD64 one and a
+native ARM64 process accepts too; a bundle without it leaves the AMD64 one
+from `system32/`, which serves x64 programs only. On a wine-build arm64 Wine
+the `mtld3d.dll` goes into `lib/wine/d3d9/mtld3d` (the `T` above), never over
+the placeholders in its default `lib/wine/aarch64-windows`.
 
 ## CrossOver
 
 The setup is self-contained in the bottle and survives CrossOver updates:
-`d3d9.dll` is loaded as a *native* DLL from the game directory via a DLL
-override, and the `mtld3d.dll` / `mtld3d.so` builtin pair is supplied through
-the bottle's DLL search path. Nothing is written into `CrossOver.app`.
+`d3d9.dll` is loaded as a *native* DLL from the bottle's system directory via
+a DLL override, and the `mtld3d.dll` / `mtld3d.so` builtin pair is supplied
+through the bottle's DLL search path. Nothing is written into `CrossOver.app`.
 
 ```sh
 tar -xf mtld3d.tar.xz
@@ -290,16 +306,25 @@ GAME_DIR="$BOTTLE/drive_c/Program Files/MyGame"   # dir holding the game .exe
 # The builtins (both PE arches + the unix side), kept inside the bottle.
 # (The builtin-marked d3d9.dll comes along but is inert here — a marked PE
 # on the search path can never shadow CrossOver's own builtin.)
-cp -R wine "$BOTTLE/mtld3d"
+cp -R wine/. "$BOTTLE/mtld3d"
 
 # Prefix markers so Wine resolves the custom builtin name (Wine looks
 # builtin names up in the prefix's system dirs, not on the search path).
 cp prefix-markers/syswow64/mtld3d.dll "$BOTTLE/drive_c/windows/syswow64/"
 cp prefix-markers/system32/mtld3d.dll "$BOTTLE/drive_c/windows/system32/"
 
-# Native d3d9.dll next to the game executable — pick the game's arch.
-cp native/i386-windows/d3d9.dll "$GAME_DIR/"     # 32-bit game
-#cp native/x86_64-windows/d3d9.dll "$GAME_DIR/"  # 64-bit game
+# Native d3d9.dll into the bottle's system directory, never the game folder:
+# syswow64 for a 32-bit game, system32 for a 64-bit game. Back up the existing
+# copies first; -n keeps the first backup when this runs again. Pick the
+# game's arch, or both for games of both.
+WIN="$BOTTLE/drive_c/windows"
+cp -n "$WIN/system32/d3d9.dll" "$WIN/system32/d3d9.dll.orig" || true
+cp -n "$WIN/syswow64/d3d9.dll" "$WIN/syswow64/d3d9.dll.orig" || true
+cp native/i386-windows/d3d9.dll "$WIN/syswow64/"     # 32-bit game
+#cp native/x86_64-windows/d3d9.dll "$WIN/system32/"  # 64-bit game
+
+# A game-folder copy would win over the bottle's copy.
+rm -f "$GAME_DIR/d3d9.dll"
 
 # Optional: runtime configuration next to the game executable.
 cp mtld3d.conf "$GAME_DIR/"
@@ -309,9 +334,11 @@ CX_WINE="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
 "$CX_WINE" --bottle MyBottle reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
 ```
 
-The native `d3d9.dll` can alternatively go into the bottle's
-`drive_c/windows/syswow64/` (32-bit) or `system32/` (64-bit) to cover every
-application in the bottle, as described in the stock-Wine section above.
+The copy goes there for Steam's overlay, as the stock-Wine section explains,
+and covers every application of its arch in the bottle. A bottle that runs
+both 32-bit and 64-bit d3d9 games needs both copies: with the override set, a
+process of the other arch finds only the placeholder and d3d9 fails to load
+in it.
 
 Finally, add the `mtld3d` directory to the bottle's DLL search path in
 `$BOTTLE/cxbottle.conf` (create the `[Wine]` section if it doesn't exist):
@@ -346,7 +373,9 @@ Notes:
   `[EnvironmentVariables]` in the same `cxbottle.conf`.
 - **CrossOver updates** replace `CrossOver.app` but not bottles, so this
   setup persists. If a version upgrade migrates the bottle and refreshes
-  `drive_c/windows`, re-copy the two prefix markers.
+  `drive_c/windows`, re-copy the two prefix markers and `d3d9.dll`.
+- **mtld3d upgrades**: re-copy `d3d9.dll` into the bottle's system directory
+  along with `$BOTTLE/mtld3d`, so all of it comes from one build.
 
 ## Configuration and logging
 
@@ -400,9 +429,9 @@ Check, in order:
   the usual cause: `d3d9.dll` imports `mtld3d.dll`, so a missing marker makes
   `d3d9.dll` itself unloadable.
 - For the native-override route, `d3d9` is set to `native` under
-  `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` next to the game came
-  from `native/`, not from `wine/`. A builtin-marked PE never executes its own
-  bytes.
+  `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` in the prefix's
+  `syswow64` (32-bit game) or `system32` (64-bit game) came from `native/`,
+  not from `wine/`. A builtin-marked PE never executes its own bytes.
 - The unix side is installed for the arch of the Wine build, not of the game.
 - On an ARM64 Wine, or on macOS older than 15.4, use 0.6.0 or newer. Earlier
   releases carry BMI instructions that neither `xtajit` nor pre-15.4 Rosetta
@@ -411,6 +440,12 @@ Check, in order:
 The game's own `Logs/gx.log` is not useful here: the crash happens before that
 file is opened, so it is empty either way. An empty `Loaded Modules` section in
 the report only means the game directory has no usable `dbghelp.dll`.
+
+**The Steam overlay does nothing.** The tell is no `GameOverlay: started` line
+for the game in `Steam/logs/console_log.txt`, because `gameoverlayui.exe` or
+`gameoverlayui64.exe` never starts. On the native-override route, put
+`d3d9.dll` in the prefix's `syswow64` (32-bit game) or `system32` (64-bit
+game) and leave no copy in the game folder.
 
 ## Fullscreen
 
