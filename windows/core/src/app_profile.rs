@@ -60,6 +60,31 @@ static PROFILES: &[AppProfile] = &[
         original_filename: Some("Halo2.exe"),
         settings: "buffer.ignoreLockBounds=true",
     },
+    // The Elder Scrolls IV: Oblivion.
+    //
+    // Its renderer takes its shader level from the prefix of the adapter's
+    // `Driver` string. Without an `ati` or `nv` prefix it stays on the basic
+    // 2.0 level whatever the caps say, and the Video menu greys Shadow
+    // Filtering and Shadows on Grass below the level `nv` reaches. The prefix
+    // needs the caps as well: `nv` reaches that level only when
+    // `PS20Caps.NumInstructionSlots` is above 96, and the game counts the
+    // slots as 96 when `PS20Caps.NumTemps` is under 32. The layer reports 512
+    // and 32, so a caps change past either threshold greys both options again.
+    //
+    // The identity is NVIDIA's because `nv` is the only prefix that keeps
+    // refraction under multisampling, which this profile therefore turns on.
+    // Each identity runs a multi-GPU probe. The `nv` one calls `NvCplGetDataInt`
+    // in `NVCPL.dll` and has no effect when the DLL is absent. The `ati` one
+    // calls `AtiQueryMgpuCount`, which goes through `ExtEscape`, in the
+    // `ATIMGPUD.dll` the game ships, so it always runs.
+    AppProfile {
+        name: "oblivion",
+        exe: "Oblivion.exe",
+        company: Some("Bethesda Softworks"),
+        product: Some("TES4: Oblivion"),
+        original_filename: None,
+        settings: "adapter.spoof=nvidia",
+    },
     // World of Warcraft, the 1.12 and 3.3.5 clients alike.
     //
     // Both poll `GetData(D3DGETDATA_FLUSH)` after every loading-screen upload

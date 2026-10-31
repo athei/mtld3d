@@ -26,6 +26,7 @@ the reason for each one.
 | NosTale | Plays, 32-bit, windowed and DPI-unaware |
 | Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
+| The Elder Scrolls IV: Oblivion | Options work with the `oblivion` profile, 32-bit; hangs after a save loads, with or without the profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |

@@ -8,6 +8,13 @@ const GTA_IV: [(&str, &str); 3] = [
     ("OriginalFilename", "GTAIV.exe"),
 ];
 
+/// The three fields read out of the shipped `Oblivion.exe`.
+const OBLIVION: [(&str, &str); 3] = [
+    ("CompanyName", "Bethesda Softworks"),
+    ("ProductName", "TES4: Oblivion"),
+    ("OriginalFilename", "Oblivion.exe"),
+];
+
 /// Encode string entries the way a real `VS_VERSIONINFO` holds them.
 ///
 /// Each entry is preceded by its three header words (`wLength`,
@@ -50,6 +57,30 @@ fn the_gta_iv_profile_matches_the_real_binarys_resource() {
     // The name is matched case-insensitively: a launcher may spell it either way.
     let shouting = AppIdentity::new("gtaiv.exe".to_owned(), Some(&blob(&GTA_IV)));
     assert_eq!(lookup(&shouting).map(AppProfile::name), Some("gta-iv"));
+}
+
+#[test]
+fn the_oblivion_profile_matches_the_real_binarys_resource() {
+    let id = AppIdentity::new("Oblivion.exe".to_owned(), Some(&blob(&OBLIVION)));
+    assert_eq!(lookup(&id).map(AppProfile::name), Some("oblivion"));
+    // The name is matched case-insensitively: a launcher may spell it either way.
+    let shouting = AppIdentity::new("OBLIVION.EXE".to_owned(), Some(&blob(&OBLIVION)));
+    assert_eq!(lookup(&shouting).map(AppProfile::name), Some("oblivion"));
+    // A same-named binary from anyone else must not pick it up.
+    let impostor = AppIdentity::new("Oblivion.exe".to_owned(), None);
+    assert!(lookup(&impostor).is_none());
+}
+
+#[test]
+fn the_oblivion_profile_needs_both_its_company_and_its_product() {
+    for (company, product) in [
+        ("Somebody Else", "TES4: Oblivion"),
+        ("Bethesda Softworks", "Somebody Else's Game"),
+    ] {
+        let other = blob(&[("CompanyName", company), ("ProductName", product)]);
+        let id = AppIdentity::new("Oblivion.exe".to_owned(), Some(&other));
+        assert!(lookup(&id).is_none(), "{company}, {product}");
+    }
 }
 
 #[test]
@@ -184,6 +215,19 @@ fn the_gta_iv_profile_resolves_to_the_options_it_names() {
     assert!(!cfg.df_formats);
     assert!(!cfg.query_flush_immediate);
     assert!(cfg.depth_alias_same_size);
+}
+
+#[test]
+fn the_oblivion_profile_resolves_to_the_nvidia_identity() {
+    let id = AppIdentity::new("Oblivion.exe".to_owned(), Some(&blob(&OBLIVION)));
+    let profile = lookup(&id).expect("the profile matches its own fixture");
+    // A typo in the settings string would keep the stock `Driver` string, and
+    // the game would stay at the level that greys its two shadow options.
+    assert_eq!(parse(None, "", None).adapter_spoof, AdapterSpoof::None);
+    assert_eq!(
+        parse(Some(profile), "", None).adapter_spoof,
+        AdapterSpoof::Nvidia
+    );
 }
 
 /// A profile that sets two unrelated options, for the precedence cases.
