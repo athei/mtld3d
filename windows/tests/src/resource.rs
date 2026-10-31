@@ -109,6 +109,23 @@ impl SwapChain<'_> {
         unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(self.ptr) }
     }
 
+    /// `Present` of the whole back buffer through this swap chain.
+    #[must_use]
+    pub fn present(&self) -> i32 {
+        // SAFETY: live swapchain; null rectangles and region present the whole
+        // back buffer, into the swap chain's own window.
+        unsafe {
+            (self.vtbl().present)(
+                self.ptr,
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+            )
+        }
+    }
+
     /// Read the front buffer, or probe a null destination with `None`.
     pub fn front_buffer_data(&self, dst: Option<&Surface<'_>>) -> i32 {
         let ptr = dst.map_or(core::ptr::null_mut(), Surface::as_ptr);

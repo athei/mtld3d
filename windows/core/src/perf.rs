@@ -2586,6 +2586,8 @@ pub struct TaskFaults {
 /// annotate which pass renders to the backbuffer vs off-screen.
 pub struct FrameSummaryContext {
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// What the frame shows: `backbuffer_handle`, or an additional swap chain's texture.
+    pub present_texture: MetalHandle<MTLTextureKind>,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     pub backbuffer_width: u32,
     pub backbuffer_height: u32,
@@ -3334,11 +3336,11 @@ impl EncoderPerfState {
 
             let expected_final_bb = passes
                 .last()
-                .is_some_and(|p| p.color_texture() == ctx.backbuffer_handle);
+                .is_some_and(|p| p.color_texture() == ctx.present_texture);
             trace!(
                 target: PASSES_TARGET,
                 "  present_texture={pt:#x} bb={bb:#x} {size} expected_final_bb_pass={check}",
-                pt = ctx.backbuffer_handle,
+                pt = ctx.present_texture,
                 bb = ctx.backbuffer_handle,
                 size = format_args!("{}x{}", ctx.backbuffer_width, ctx.backbuffer_height),
                 check = if expected_final_bb { "yes" } else { "NO" },

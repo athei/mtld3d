@@ -1733,8 +1733,10 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 ///   present-params struct (the conformance `stateblock` device, additional
 ///   swap chains) never forwards a 0-dimension texture descriptor to Metal.
 ///
-/// A window whose client rect cannot be read leaves the request untouched; a
-/// dimension still zero afterwards is rejected by the caller.
+/// A window whose client rect cannot be read leaves the request untouched. A
+/// dimension still zero afterwards is the caller's to answer: `CreateDevice`
+/// and `Reset` reject it, and `CreateAdditionalSwapChain` makes it
+/// `EMPTY_CLIENT_BACK_BUFFER_EXTENT`.
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
     if pp.windowed == 0 {
         crate::fullscreen::warn_if_dpi_scaled(hwnd as *mut c_void);

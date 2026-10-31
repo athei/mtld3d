@@ -165,8 +165,8 @@ struct Inner {
 ///
 /// Owns a retain on the texture it presents and on the layer, as wire
 /// handles rather than `Retained` objects so the state stays `Send` without
-/// asserting it. The texture is the back buffer until a snapshot retargets
-/// the packet at a slot.
+/// asserting it. The texture is the frame's present texture, the back buffer or
+/// an additional swap chain's, until a snapshot retargets the packet at a slot.
 pub struct PresentPacket {
     seq: u64,
     source: MetalHandle<MTLTextureKind>,

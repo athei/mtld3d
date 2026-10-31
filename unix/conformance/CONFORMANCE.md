@@ -654,8 +654,9 @@ record. A knob, where one makes sense, is named with its default.
   `BackBufferCount` above one, D3D9 keeps a chain of back buffers that
   `Present` rotates, and `GetBackBuffer` hands back a distinct surface for
   each index. Here every index of a swap chain, the implicit one included,
-  hands back the same surface object over the one texture the device
-  presents from, so a game that writes one index sees it in all of them, and
+  hands back the same surface object over one texture (the device's back
+  buffer for the implicit chain, the chain's own for an additional one), so a
+  game that writes one index sees it in all of them, and
   a `StretchRect` that stretches between two indices is refused with
   `D3DERR_INVALIDCALL` as a stretch inside one surface, where D3D9 copies it.
   A chain of real buffers would cost a texture per index and a rotation at

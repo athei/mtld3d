@@ -75,11 +75,12 @@ pub struct SystemMemoryDst {
 ///
 /// Implicit surfaces are cached on `DeviceInner`, created with refcount 0,
 /// forward their refcount to the device on the 0↔1 boundary, are never freed
-/// when their refcount reaches 0 (destroyed only at device teardown), and
+/// when their refcount reaches 0 (destroyed only at their owner's teardown), and
 /// resolve their Metal handle + dimensions **live** from the device every call
 /// — so a backbuffer/depth texture recreated by a window resize
 /// (`DeviceInner::apply_auto_resize`) or `Reset` is never observed through a
-/// freed handle.
+/// freed handle. [`Self::SwapChainBackbuffer`] shares the counting alone: its
+/// swap chain caches and destroys it, and it keeps its own handles and size.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImplicitKind {
     /// Ordinary surface: normal refcount-1 lifecycle, snapshot fields.
@@ -93,6 +94,11 @@ pub enum ImplicitKind {
     /// Resolves depth handle + dims + format from the device's current
     /// depth-stencil.
     DepthStencil,
+    /// The back buffer of an additional swap chain, which owns it.
+    ///
+    /// Lives as the other two do, but its size and textures are the swap
+    /// chain's own, so they are the stored fields rather than the device's.
+    SwapChainBackbuffer,
 }
 
 /// Resource-wide `LockRect`/`GetDC` mutual-exclusion state.
@@ -330,20 +336,6 @@ impl Direct3DSurface9 {
     /// [`ImplicitKind`]). `container` is the implicit swapchain wrapper
     /// `GetContainer` returns.
     pub fn new_implicit_backbuffer(device_inner: *mut DeviceInner, container: u64) -> Self {
-        Self::backbuffer(device_inner, container, SurfaceFlags::empty())
-    }
-
-    /// The back buffer of an additional swap chain, which pins that swap chain while referenced.
-    ///
-    /// Shaped like [`Self::new_implicit_backbuffer`]: the swap chain caches it
-    /// and frees it with itself, and it resolves its colour handle live from
-    /// the device. `swap_chain` is the `Direct3DSwapChain9` wrapper that is its
-    /// `GetContainer` and that it pins (see [`SurfaceFlags::PINS_SWAP_CHAIN`]).
-    pub fn new_swap_chain_backbuffer(device_inner: *mut DeviceInner, swap_chain: u64) -> Self {
-        Self::backbuffer(device_inner, swap_chain, SurfaceFlags::PINS_SWAP_CHAIN)
-    }
-
-    fn backbuffer(device_inner: *mut DeviceInner, container: u64, flags: SurfaceFlags) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
             parent_texture: core::ptr::null_mut(),
@@ -365,7 +357,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
-            flags,
+            flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -379,6 +371,26 @@ impl Direct3DSurface9 {
             private_refcount: 0,
             inner,
         }
+    }
+
+    /// The back buffer of an additional swap chain, which pins that swap chain while referenced.
+    ///
+    /// Counted like [`Self::new_implicit_backbuffer`]: the swap chain caches it
+    /// and frees it with itself. Its textures and size are the ones `init`
+    /// describes, a standalone colour target's, which it retires as one when
+    /// it is freed. `swap_chain` is the `Direct3DSwapChain9` wrapper that is
+    /// its `GetContainer` and that it pins (see
+    /// [`SurfaceFlags::PINS_SWAP_CHAIN`]).
+    pub fn new_swap_chain_backbuffer(init: &ColorTargetCreateInfo, swap_chain: u64) -> Self {
+        let mut surface = Self::new_color_target(init);
+        surface.refcount = 0;
+        // SAFETY: `surface.inner` is the live `SurfaceInner` `new_color_target`
+        // just made, and nothing else references it yet.
+        let inner = unsafe { &mut *surface.inner };
+        inner.flags = SurfaceFlags::PINS_SWAP_CHAIN;
+        inner.implicit_kind = ImplicitKind::SwapChainBackbuffer;
+        inner.container = swap_chain;
+        surface
     }
 
     /// The device's implicit depth-stencil (`GetDepthStencilSurface`).
@@ -1226,7 +1238,8 @@ struct SurfaceInner {
     /// `None` for an ordinary app-owned surface.
     ///
     /// `Backbuffer`/`DepthStencil` for the device's implicit (device-owned)
-    /// surfaces — see [`ImplicitKind`].
+    /// surfaces, `SwapChainBackbuffer` for an additional swap chain's back
+    /// buffer — see [`ImplicitKind`].
     implicit_kind: ImplicitKind,
     /// The implicit COM object `GetContainer` queries.
     ///
@@ -1350,6 +1363,17 @@ impl SurfaceInner {
 }
 
 impl SurfaceInner {
+    /// Whether this surface is the device's own, with a size and format the device holds.
+    ///
+    /// The implicit back buffer and depth stencil. An additional swap chain's
+    /// back buffer is implicit in its lifetime alone, and keeps its own.
+    const fn follows_device(&self) -> bool {
+        matches!(
+            self.implicit_kind,
+            ImplicitKind::Backbuffer | ImplicitKind::DepthStencil
+        ) && !self.device_inner.is_null()
+    }
+
     /// Live Metal color handle.
     ///
     /// The device's current backbuffer for an implicit `Backbuffer` surface,
@@ -1397,7 +1421,7 @@ impl SurfaceInner {
     /// Both implicit surfaces take the swap chain's, which is the only
     /// configuration `CreateDevice` and `Reset` ever give them.
     fn live_multi_sample(&self) -> SurfaceMultiSample {
-        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+        if self.follows_device() {
             // SAFETY: `device_inner` is the live owning device (see above).
             let dev = unsafe { &*self.device_inner };
             return SurfaceMultiSample {
@@ -1428,7 +1452,7 @@ impl SurfaceInner {
     /// (backbuffer and auto depth-stencil share the device dimensions), else
     /// the stored snapshot.
     fn live_width(&self) -> u32 {
-        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+        if self.follows_device() {
             // SAFETY: `device_inner` is the live owning device (see above).
             unsafe { (*self.device_inner).backbuffer_width() }
         } else {
@@ -1438,7 +1462,7 @@ impl SurfaceInner {
 
     /// Live surface height — counterpart to [`Self::live_width`].
     fn live_height(&self) -> u32 {
-        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+        if self.follows_device() {
             // SAFETY: `device_inner` is the live owning device (see above).
             unsafe { (*self.device_inner).backbuffer_height() }
         } else {
@@ -1452,7 +1476,7 @@ impl SurfaceInner {
     /// texture the device recreates at that scale on a `Reset` or a window
     /// resize), else the stored snapshot.
     fn live_render_scale(&self) -> RenderScale {
-        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+        if self.follows_device() {
             // SAFETY: `device_inner` is the live owning device (see above).
             unsafe { (*self.device_inner).render_scale() }
         } else {
@@ -1465,7 +1489,7 @@ impl SurfaceInner {
     /// Implicit surfaces follow the device across Reset, including a change
     /// between A8 and X8 that keeps the same BGRA8 backbuffer storage.
     fn live_format(&self) -> u32 {
-        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+        if self.follows_device() {
             // SAFETY: `device_inner` is the live owning device (see above).
             let device = unsafe { &*self.device_inner };
             if self.implicit_kind == ImplicitKind::DepthStencil {
@@ -1597,15 +1621,19 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
         // free an ordinary surface and, through the device release it
         // forwards, tear down a device whose binding was this surface's other
         // reference; a release past zero is not the last reference.
-        let swap_chain = {
+        let (swap_chain, device) = {
             // SAFETY: live wrapper per the thunk; the borrow ends before the engine call.
             let obj = unsafe { &*this.cast::<Direct3DSurface9>() };
-            if obj.refcount == 1 && obj.private_refcount == 0 {
-                obj.pinned_swap_chain()
+            if obj.refcount == 1 && obj.private_refcount == 0 && obj.pinned_swap_chain() != 0 {
+                (obj.pinned_swap_chain(), obj.inner().device_wrapper())
             } else {
-                0
+                (0, core::ptr::null_mut())
             }
         };
+        // The unpin below can retire this surface's textures through the device
+        // the engine's forwarded release can tear down, so the device is kept
+        // until the unpin is done. No-op without a swap chain to unpin.
+        crate::device::device_wrapper_add_ref(device);
         // SAFETY: a standalone/implicit surface — the central engine finalizes it
         // (or forwards the device release for a device-owned implicit surface).
         let rc = unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
@@ -1615,6 +1643,7 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
             // chain and this surface with it, so it comes last.
             unsafe { crate::swapchain::unpin_for_backbuffer(swap_chain) };
         }
+        crate::device::device_wrapper_release(device);
         return rc;
     }
     // A texture sub-surface: drop our own refcount and free the surface Box once
@@ -1664,13 +1693,14 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
     // `Box::into_raw(SurfaceInner)` from `Self::new` and no other
     // reference can survive.
     let inner = unsafe { Box::from_raw(inner_ptr) };
-    // A device-owned implicit surface must reach this point ONLY via
-    // `finalize_implicit_surface` at device teardown (which clears `implicit_kind`
-    // first). Any other path here with a live `implicit_kind` is a gating bug
-    // that would free a surface the device still hands out — fail loudly.
+    // An implicit surface must reach this point ONLY via
+    // `finalize_implicit_surface` at its owner's teardown (which clears
+    // `implicit_kind` first). Any other path here with a live `implicit_kind` is
+    // a gating bug that would free a surface its owner still hands out — fail
+    // loudly.
     debug_assert!(
         inner.implicit_kind == ImplicitKind::None,
-        "device-owned implicit surface finalized outside device teardown"
+        "implicit surface finalized outside its owner's teardown"
     );
     // Same invariant for a container-cached sub-surface: only
     // `finalize_cached_surface` (from `finalize_texture`) may bring one here, and
@@ -1763,32 +1793,35 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
     drop(unsafe { Box::from_raw(this) });
 }
 
-/// Finalize a device-owned implicit surface at device teardown.
+/// Finalize an implicit surface at its owner's teardown.
 ///
 /// Drop its `SurfaceInner` — which releases any registered `D3DSPD_IUNKNOWN`
 /// private-data object via `PrivateDataStore` — and free the wrapper shell.
-/// Device-owned implicit surfaces are never finalized by `surface_release`
-/// (they outlive the app's `Release`), so this is the single finalize site,
-/// called once from `device_release` per cached surface.
+/// Implicit surfaces are never finalized by `surface_release` (they outlive
+/// the app's `Release`), so this is the single finalize site, called once
+/// from `device_release` per cached surface and from `finalize_swapchain`
+/// for an additional swap chain's back buffer, which also retires its
+/// textures here through the device, so the device has to outlive the call.
 ///
 /// # Safety
 /// `ptr` must be `0` or a live `*mut Direct3DSurface9` produced by
-/// `new_implicit_backbuffer`/`new_implicit_depth_stencil`; after this returns the
-/// pointer is dangling and must not be used again.
+/// `new_implicit_backbuffer`, `new_implicit_depth_stencil` or
+/// `new_swap_chain_backbuffer`; after this returns the pointer is dangling and
+/// must not be used again.
 pub unsafe fn finalize_implicit_surface(ptr: u64) {
     if ptr == 0 {
         return;
     }
     let surf = ptr as *mut Direct3DSurface9;
-    // Mark this surface as no longer device-owned before finalizing: teardown is
-    // the one legitimate finalize of an implicit surface, so clearing the kind
-    // lets `finalize_surface`'s invariant assert catch every OTHER path.
+    // Mark this surface as no longer implicit before finalizing: its owner's
+    // teardown is the one legitimate finalize of an implicit surface, so clearing
+    // the kind lets `finalize_surface`'s invariant assert catch every OTHER path.
     // SAFETY: `surf` is the live cached implicit surface wrapper.
     let inner_ptr = unsafe { (*surf).inner };
     // SAFETY: `inner_ptr` is its valid `SurfaceInner` for the duration of teardown.
     unsafe { (*inner_ptr).implicit_kind = ImplicitKind::None };
-    // SAFETY: the caller guarantees `ptr` is a live device-owned implicit
-    // surface wrapper; access is exclusive (D3D9 objects are single-threaded,
+    // SAFETY: the caller guarantees `ptr` is a live implicit surface wrapper
+    // whose owner is tearing down; access is exclusive (D3D9 objects are single-threaded,
     // or serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`),
     // so nothing else references it at teardown.
     unsafe { finalize_surface(surf) };
@@ -2113,7 +2146,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
     }
     fn finalizes_on_zero(&self) -> bool {
         // Implicit surfaces are never freed by `Release` — they are destroyed
-        // only at device teardown (see `ImplicitKind`), and neither is a
+        // only at their owner's teardown (see `ImplicitKind`), and neither is a
         // container-cached sub-surface, freed by its texture's finalize.
         self.inner().implicit_kind == ImplicitKind::None && !self.container_cached()
     }

@@ -13,7 +13,7 @@ use mtld3d_types::{
 
 use super::{
     DisplaySync, LayerPacing, display_sync_for, effective_max_fps, interval_divisor,
-    layer_pacing_for, queued_pacing,
+    intervals_pace_alike, layer_pacing_for, queued_pacing,
 };
 
 const fn pacing(display_sync: bool, max_fps: u32) -> LayerPacing {
@@ -21,6 +21,31 @@ const fn pacing(display_sync: bool, max_fps: u32) -> LayerPacing {
         display_sync,
         max_fps,
     }
+}
+
+#[test]
+fn intervals_pace_alike_when_the_layer_could_not_tell_them_apart() {
+    assert!(intervals_pace_alike(
+        D3DPRESENT_INTERVAL_DEFAULT,
+        D3DPRESENT_INTERVAL_ONE
+    ));
+    assert!(intervals_pace_alike(D3DPRESENT_INTERVAL_ONE, 0x1234));
+    assert!(intervals_pace_alike(
+        D3DPRESENT_INTERVAL_TWO,
+        D3DPRESENT_INTERVAL_TWO
+    ));
+    assert!(!intervals_pace_alike(
+        D3DPRESENT_INTERVAL_DEFAULT,
+        D3DPRESENT_INTERVAL_IMMEDIATE
+    ));
+    assert!(!intervals_pace_alike(
+        D3DPRESENT_INTERVAL_ONE,
+        D3DPRESENT_INTERVAL_TWO
+    ));
+    assert!(!intervals_pace_alike(
+        D3DPRESENT_INTERVAL_THREE,
+        D3DPRESENT_INTERVAL_FOUR
+    ));
 }
 
 #[test]

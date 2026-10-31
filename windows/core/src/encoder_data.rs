@@ -1053,6 +1053,10 @@ pub struct FrameData {
     pub backbuffer_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
     /// Sample count the frame's back buffer and default depth surface carry.
     pub backbuffer_sample_count: u8,
+    /// The texture a presenting frame shows, NULL for `backbuffer_handle`.
+    ///
+    /// An additional swap chain's `Present` names its own back buffer here.
+    pub present_texture: MetalHandle<MTLTextureKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
@@ -1228,6 +1232,7 @@ impl FrameData {
             backbuffer_msaa_handle: init.backbuffer_msaa_handle,
             backbuffer_msaa_srgb_handle: init.backbuffer_msaa_srgb_handle,
             backbuffer_sample_count: init.backbuffer_sample_count,
+            present_texture: MetalHandle::NULL,
             layer_handle: init.layer_handle,
             view_handle: init.view_handle,
             backbuffer_width: init.backbuffer_width,

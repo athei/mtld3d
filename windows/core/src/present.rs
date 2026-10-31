@@ -12,6 +12,9 @@ use mtld3d_types::{
     D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIPEX,
 };
 
+/// The side of an additional swap chain whose request and window both leave it zero.
+pub const EMPTY_CLIENT_BACK_BUFFER_EXTENT: u32 = 8;
+
 /// Result of mapping a `D3DPRESENT_INTERVAL_*` to the vsync request.
 ///
 /// `Fallthrough` carries the same boolean as a supported choice but
@@ -121,6 +124,16 @@ pub const fn interval_divisor(interval: u32) -> u32 {
         D3DPRESENT_INTERVAL_FOUR => 4,
         _ => 1,
     }
+}
+
+/// Whether two intervals ask the layer for the same pacing.
+///
+/// `DEFAULT` and `ONE` do, as does a pattern that names no interval, which runs
+/// at display rate.
+#[must_use]
+pub const fn intervals_pace_alike(a: u32, b: u32) -> bool {
+    display_sync_for(a).enabled() == display_sync_for(b).enabled()
+        && interval_divisor(a) == interval_divisor(b)
 }
 
 /// The frame-rate ceiling in Hz for `interval` on a `refresh_hz` mode, `0` for none.
