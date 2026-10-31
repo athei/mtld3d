@@ -48,6 +48,32 @@ fn header_borrows_the_original_arena_payload() {
     }
 }
 
+/// Seal `frame` and read back the texture its present shows.
+fn sealed_present_texture(mut frame: FrameData) -> u64 {
+    let recorder = FrameRecorder::new();
+    let mut metadata = MetadataStorage::new();
+    metadata.seal(&mut frame, &recorder).unwrap();
+    // SAFETY: frame and recorder retain the initialized header and its only optional payload.
+    let bytes = unsafe { metadata.as_bytes() };
+    // SAFETY: the retained frame contains the initialized canonical header.
+    let view = unsafe { FrameView::from_bytes(bytes) }.unwrap();
+    view.present_texture().raw()
+}
+
+#[test]
+fn a_frame_presents_its_back_buffer_unless_it_names_another_texture() {
+    let mut frame = frame();
+    // SAFETY: opaque test values; no Metal object is dereferenced.
+    frame.backbuffer_handle = unsafe { MetalHandle::new(0x1000) };
+    assert_eq!(sealed_present_texture(frame), 0x1000, "the back buffer");
+    let mut frame = self::frame();
+    // SAFETY: opaque test values; no Metal object is dereferenced.
+    frame.backbuffer_handle = unsafe { MetalHandle::new(0x1000) };
+    // SAFETY: opaque test values; no Metal object is dereferenced.
+    frame.present_texture = unsafe { MetalHandle::new(0x2000) };
+    assert_eq!(sealed_present_texture(frame), 0x2000, "the named texture");
+}
+
 #[test]
 fn warmup_capture_is_already_a_command_before_frame_sealing() {
     let mut frame = frame();

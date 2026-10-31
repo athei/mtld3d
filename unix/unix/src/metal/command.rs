@@ -710,10 +710,12 @@ fn encode_frame(
     ctx.planes.end_submission(&ctx.stamp);
 
     // Presentation: what the presenter needs once this frame's render work
-    // has committed. The layer and the back buffer are retained here from the
-    // addresses the PE side keeps valid until it has drained the submit thread
-    // and waited for presentation to go idle, which every path that retires
-    // them does first; the packet owns the retains from here on.
+    // has committed. The layer and the present texture are retained here from
+    // the addresses the PE side keeps valid until it has drained the submit
+    // thread and waited for presentation to go idle, which every path that
+    // retires the layer or the back buffer does first; an additional swap
+    // chain's texture retires behind the submissions that name it, this one
+    // included. The packet owns the retains from here on.
     let mut packet = if params.present_layer.is_null() {
         None
     } else {
@@ -991,9 +993,11 @@ pub fn encode_present(
         // know its presents reached `nextDrawable` rather than being skipped.
         debug!(
             target: PRESENT_LOG_TARGET,
-            "present: drawable acquired on window {:#x} for seq={}",
+            "present: drawable acquired on window {:#x} for seq={} from {}x{}",
             attachment.map_or(0, |att| att.hwnd()),
             args.seq,
+            geometry.src.0,
+            geometry.src.1,
         );
         register_presented_probe(drawable, args.record, args.seq, args.drawable_wait_ns);
     }

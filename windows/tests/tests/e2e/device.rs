@@ -2047,7 +2047,7 @@ pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
 }
 
 /// [`await_logged_lines`] with a bound of the caller's.
-fn await_logged_lines_within(needle: &str, expected: usize, bound: Duration) -> Vec<String> {
+pub fn await_logged_lines_within(needle: &str, expected: usize, bound: Duration) -> Vec<String> {
     let deadline = std::time::Instant::now() + bound;
     loop {
         let logged = logged_lines(needle);

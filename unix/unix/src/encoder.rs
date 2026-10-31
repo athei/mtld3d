@@ -10012,6 +10012,7 @@ const fn frame_summary_ctx(owner: &NativeFrame) -> FrameSummaryContext {
     let frame = owner.view();
     FrameSummaryContext {
         backbuffer_handle: frame.backbuffer_handle(),
+        present_texture: frame.present_texture(),
         depth_texture: frame.depth_texture(),
         backbuffer_width: frame.header().backbuffer_width,
         backbuffer_height: frame.header().backbuffer_height,
@@ -10076,7 +10077,7 @@ fn submit_sync(enc: &mut FrameEncoder, frame: NativeFrame) {
             target: LOG_TARGET,
             "encoder: SubmitFrame failed (status={status:#x}, passes={}, present_tex={:#x})",
             payload.descriptors.len(),
-            frame.view().backbuffer_handle(),
+            frame.view().present_texture(),
         );
     }
     let ctx = frame_summary_ctx(&frame);
@@ -10208,7 +10209,7 @@ fn finalize_submit(
         present_texture: if no_present {
             MetalHandle::NULL
         } else {
-            frame.backbuffer_handle()
+            frame.present_texture()
         },
         present_view: if no_present {
             MetalHandle::NULL

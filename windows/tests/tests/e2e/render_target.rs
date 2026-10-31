@@ -34,7 +34,7 @@ const MAGENTA: u32 = 0xFFFF_00FF;
 const FRESH: u32 = 0x0000_0000;
 
 /// `left`/`top`/`right`/`bottom` in surface coordinates.
-const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
+pub const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
     D3DRECT { x1, y1, x2, y2 }
 }
 
@@ -1223,11 +1223,12 @@ fn stretch_rect_refuses_a_stretch_inside_one_surface() {
     );
     assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
 
-    // An additional swap chain's back buffer aliases the device's texture here
-    // but is another surface to the application, so a stretch from it into the
-    // device's back buffer is accepted and lands as one between two surfaces.
+    // An additional swap chain's back buffer is another surface, with a texture
+    // of its own, so a stretch from it into the device's back buffer is
+    // accepted and lands as one between two surfaces.
     let extra = h.additional_swapchain();
     let extra_bb = extra.back_buffer();
+    assert_eq!(h.color_fill_hr(&extra_bb, BLUE), D3D_OK, "fill the chain");
     assert_eq!(
         h.stretch_rect_regions(
             &extra_bb,
@@ -1239,7 +1240,7 @@ fn stretch_rect_refuses_a_stretch_inside_one_surface() {
         D3D_OK,
         "a stretch from an additional swap chain's back buffer into the device's",
     );
-    assert_eq!(h.read_pixel(320, 192), RED, "the stretched block landed");
+    assert_eq!(h.read_pixel(320, 192), BLUE, "the stretched block landed");
 
     let texture = h.create_texture(
         64,

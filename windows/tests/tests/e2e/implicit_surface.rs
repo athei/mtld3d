@@ -474,7 +474,7 @@ fn implicit_depth_stencil_is_cached() {
 ///
 /// The two words fill 32 bits, which go through `i32` because an i686 lparam
 /// has no more: a height past 32767 sets its sign bit there.
-fn client_size(width: u16, height: u16) -> isize {
+pub fn client_size(width: u16, height: u16) -> isize {
     let words = (u32::from(height) << 16) | u32::from(width);
     isize::try_from(words.cast_signed()).expect("an i32 fits an lparam")
 }

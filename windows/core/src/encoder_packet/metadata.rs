@@ -115,6 +115,7 @@ impl MetadataStorage {
             render_scale_percent: frame.render_scale.percent(),
             backbuffer_sample_count: u32::from(frame.backbuffer_sample_count),
             backbuffer_contents: frame.backbuffer_contents as u32,
+            present_texture: frame.present_texture.raw(),
             ..FrameMetadata::default()
         };
         let target = frame.scratch.alloc_uninit::<FrameMetadata>();
@@ -341,6 +342,21 @@ impl<'a> FrameView<'a> {
     ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
         // SAFETY: the matched producer supplies the live handle with its declared object kind.
         unsafe { mtld3d_shared::MetalHandle::new(self.header.backbuffer_msaa_srgb_handle) }
+    }
+    /// The texture this frame shows if it presents: the back buffer unless it names another.
+    #[must_use]
+    pub const fn present_texture(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        let named = self.header.present_texture;
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe {
+            mtld3d_shared::MetalHandle::new(if named == 0 {
+                self.header.backbuffer_handle
+            } else {
+                named
+            })
+        }
     }
     #[must_use]
     pub const fn layer_handle(

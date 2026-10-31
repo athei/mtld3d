@@ -30,6 +30,8 @@ pub struct FrameMetadata {
     pub backbuffer_sample_count: u32,
     pub backbuffer_contents: u32,
     pub reserved: u32,
+    /// The texture a presenting frame shows, 0 for `backbuffer_handle`.
+    pub present_texture: u64,
 }
 
 const _: () = {
@@ -38,7 +40,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ArrayRef, address) == 0);
     assert!(core::mem::offset_of!(ArrayRef, count) == 8);
     assert!(core::mem::offset_of!(ArrayRef, reserved) == 12);
-    assert!(size_of::<FrameMetadata>() == 112);
+    assert!(size_of::<FrameMetadata>() == 120);
     assert!(align_of::<FrameMetadata>() == 8);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_handle) == 0);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_srgb_handle) == 8);
@@ -57,4 +59,5 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_sample_count) == 100);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_contents) == 104);
     assert!(core::mem::offset_of!(FrameMetadata, reserved) == 108);
+    assert!(core::mem::offset_of!(FrameMetadata, present_texture) == 112);
 };

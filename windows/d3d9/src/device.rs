@@ -356,6 +356,14 @@ bitflags::bitflags! {
         /// nothing and owes nothing, so this is what quiets its retries; the
         /// next success clears it and says so at info.
         const RESET_FAILURE_LOGGED = 1 << 6;
+        /// Set once the application has made an additional swap chain, and never cleared.
+        ///
+        /// Such an application sizes its chains to its windows itself, and may
+        /// drive the device from a thread that is not the window's, so a
+        /// `WM_SIZE` leaves the implicit back buffer alone. One that arrives
+        /// before the first chain still resizes it, off the API lock like any
+        /// other (`ARCHITECTURE.md`, "Application multithreading").
+        const MADE_SWAP_CHAIN = 1 << 7;
     }
 }
 
@@ -2137,6 +2145,14 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
+        self.present_texture(MetalHandle::NULL)
+    }
+
+    /// [`Self::present`] showing `texture` in place of the back buffer, unless it is NULL.
+    ///
+    /// The texture rides the outgoing frame alone, so a `Present` that returns
+    /// early leaves nothing behind for the next one.
+    pub fn present_texture(&mut self, texture: MetalHandle<MTLTextureKind>) -> i32 {
         if let Err(hr) = self.encoder.status() {
             self.discard_unsendable_frame();
             return hr;
@@ -2158,7 +2174,8 @@ impl DeviceInner {
         }
         self.apply_upload_answers();
         let new_frame = self.fresh_frame();
-        let (frame, seq) = self.stamp_and_swap(new_frame, false);
+        let (mut frame, seq) = self.stamp_and_swap(new_frame, false);
+        frame.present_texture = texture;
 
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
@@ -3216,8 +3233,11 @@ impl DeviceInner {
     /// states / textures / bindings must survive.
     /// No-op when dims already match, and for a fullscreen device: its
     /// logical size is the mode the game requested, decoupled from the
-    /// window, and only a `Reset` may change it. Caller drives this from
-    /// the cursor subclass wndproc on the API thread; encoder is paused
+    /// window, and only a `Reset` may change it. Likewise for a device whose
+    /// application made an additional swap chain, see
+    /// [`DeviceFlags::MADE_SWAP_CHAIN`]. Caller drives this from the cursor
+    /// subclass wndproc on the window's thread, which is the API thread
+    /// unless the application draws from another one; encoder is paused
     /// inside `flush_current_frame_blocking` for the destroy/create
     /// span so no in-flight cmdbuf references the freed handles.
     pub fn apply_auto_resize(&mut self, new_width: u32, new_height: u32) {
@@ -3237,6 +3257,15 @@ impl DeviceInner {
                 target: LOG_TARGET,
                 "WM_SIZE ({new_width}x{new_height}) on a fullscreen device ignored; the back \
                  buffer keeps the requested {}x{}",
+                self.backbuffer_width, self.backbuffer_height,
+            );
+            return;
+        }
+        if self.flags.contains(DeviceFlags::MADE_SWAP_CHAIN) {
+            debug!(
+                target: LOG_TARGET,
+                "WM_SIZE ({new_width}x{new_height}) on a device with additional swap chains \
+                 ignored; the back buffer keeps its {}x{}",
                 self.backbuffer_width, self.backbuffer_height,
             );
             return;
@@ -5026,22 +5055,86 @@ extern "system" fn device_create_additional_swap_chain(
         dev.window()
     };
     crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
+    // A window with no client area leaves a zero here.
+    if pp.back_buffer_width == 0 {
+        pp.back_buffer_width = mtld3d_core::present::EMPTY_CLIENT_BACK_BUFFER_EXTENT;
+    }
+    if pp.back_buffer_height == 0 {
+        pp.back_buffer_height = mtld3d_core::present::EMPTY_CLIENT_BACK_BUFFER_EXTENT;
+    }
     if pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
+    // The chain's back buffer is a colour target of its own, in the storage
+    // the implicit one uses: it reports A8R8G8B8 when asked for that and
+    // X8R8G8B8 for every other format, warned as `CreateDevice` warns.
+    crate::direct3d9::warn_unsupported_backbuffer_format(pp.back_buffer_format);
+    let format = mtld3d_core::format::backbuffer_surface_format(pp.back_buffer_format);
+    let multi_sample = match resolve_surface_multi_sample(
+        pp.multi_sample_type,
+        pp.multi_sample_quality,
+        format,
+        "CreateAdditionalSwapChain",
+    ) {
+        Ok(ms) => ms,
+        Err(hr) => return hr,
+    };
+    let staging = if pp.flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER == 0 {
+        None
+    } else {
+        let bytes = lockable_staging_bytes(pp.back_buffer_width, pp.back_buffer_height, format);
+        let Some(staging) = PageBox::try_new_zeroed(bytes) else {
+            return refuse_unallocatable_staging("CreateAdditionalSwapChain", swap_chain);
+        };
+        Some(staging)
+    };
+    let Some(target) = allocate_color_target(
+        dev.device_handle,
+        obj.inner_ptr(),
+        &ColorTargetSpec {
+            width: pp.back_buffer_width,
+            height: pp.back_buffer_height,
+            format,
+            usage: D3DUSAGE_RENDERTARGET,
+            multi_sample,
+        },
+        dev.config().expand_packed16,
+    ) else {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain({}x{}, format={format}) → INVALIDCALL (no \
+             renderable Metal color mapping or allocation failed)",
+            pp.back_buffer_width, pp.back_buffer_height,
+        );
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: `present_params` is the non-null pointer the request was read from, writable
     // per the ABI; alignment is not assumed.
     unsafe { report_resolved_geometry(present_params, &pp) };
     // The stored copy resolves hDeviceWindow so GetPresentParameters reports the
     // real target window even when the caller passed NULL.
     pp.device_window = target_window;
+    debug!(
+        target: LOG_TARGET,
+        "CreateAdditionalSwapChain: {}x{} format={} count={} swap_effect={} flags={:#x} \
+         window={target_window:#x}, device back buffer {}x{} window={:#x}",
+        pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format, pp.back_buffer_count,
+        pp.swap_effect, pp.flags, dev.backbuffer_width, dev.backbuffer_height, dev.window(),
+    );
     let sc = crate::swapchain::Direct3DSwapChain9::new(obj.inner_ptr(), pp);
-    // SAFETY: vtable out-param; `swap_chain` is *mut *mut c_void per the ABI.
     let sc_ptr = Box::into_raw(Box::new(sc));
+    let mut back_buffer = Direct3DSurface9::new_swap_chain_backbuffer(&target, sc_ptr as u64);
+    if let Some(staging) = staging {
+        back_buffer.set_lockable_staging(staging);
+    }
+    // SAFETY: `sc_ptr` is the live swap chain just made, referenced by nothing
+    // else yet, and takes ownership of the back buffer.
+    unsafe { (*sc_ptr).set_back_buffer(Box::into_raw(Box::new(back_buffer)) as u64) };
     // SAFETY: `sc_ptr` is a freshly created, live additional swapchain at
     // refcount 1.
     unsafe { crate::com_ref::com_register_child(sc_ptr) };
+    dev.flags.insert(DeviceFlags::MADE_SWAP_CHAIN);
     // SAFETY: vtable out-param; `swap_chain` is *mut *mut c_void per the ABI.
     unsafe { OutPtr::write_opt(swap_chain, sc_ptr.cast::<c_void>()) };
     D3D_OK
@@ -7650,6 +7743,12 @@ struct ColorTargetSpec {
     multi_sample: SurfaceMultiSample,
 }
 
+/// The bytes of a lockable colour surface's CPU staging, 0 for a format with no CPU byte size.
+fn lockable_staging_bytes(width: u32, height: u32, format: u32) -> usize {
+    let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
+    (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
+}
+
 /// Create a persistent render-target-capable color `MTLTexture` and wrap it as a surface.
 ///
 /// The wrapper is a standalone `Direct3DSurface9`, mirroring the depth path.
@@ -7665,6 +7764,24 @@ fn create_color_target_surface(
     spec: &ColorTargetSpec,
     expand_packed16: bool,
 ) -> Option<*mut Direct3DSurface9> {
+    let target = allocate_color_target(device_handle, device_inner, spec, expand_packed16)?;
+    let surf_ptr = Box::into_raw(Box::new(Direct3DSurface9::new_color_target(&target)));
+    // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
+    // surface at refcount 1.
+    unsafe { crate::com_ref::com_register_child(surf_ptr) };
+    Some(surf_ptr)
+}
+
+/// Allocate the Metal textures of one standalone colour surface and charge them to the device.
+///
+/// What [`create_color_target_surface`] wraps, and what an additional swap
+/// chain's back buffer is made of. `None` as that function says.
+fn allocate_color_target(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    device_inner: *mut DeviceInner,
+    spec: &ColorTargetSpec,
+    expand_packed16: bool,
+) -> Option<ColorTargetCreateInfo> {
     let &ColorTargetSpec {
         width,
         height,
@@ -7748,19 +7865,6 @@ fn create_color_target_surface(
     if unix_call(&mut params) != 0 || params.texture_handle.is_null() {
         return None;
     }
-    let surf = Direct3DSurface9::new_color_target(&ColorTargetCreateInfo {
-        device_inner,
-        metal_color_handle: params.texture_handle,
-        metal_color_srgb_handle: params.srgb_texture_handle,
-        metal_msaa_handle: params.msaa_texture_handle,
-        metal_msaa_srgb_handle: params.msaa_srgb_texture_handle,
-        width,
-        height,
-        format,
-        usage,
-        render_scale: scale,
-        multi_sample,
-    });
     // The surface owns DEFAULT-pool Metal textures no `TextureInner` covers,
     // so charge them here; `finalize_surface`'s colour retire arm refunds
     // them. Above one sample that is the single-sample texture plus the
@@ -7777,11 +7881,19 @@ fn create_color_target_surface(
         mtld3d_core::format::StandaloneSurfaceKind::ColorTarget,
         scale,
     );
-    let surf_ptr = Box::into_raw(Box::new(surf));
-    // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
-    // surface at refcount 1.
-    unsafe { crate::com_ref::com_register_child(surf_ptr) };
-    Some(surf_ptr)
+    Some(ColorTargetCreateInfo {
+        device_inner,
+        metal_color_handle: params.texture_handle,
+        metal_color_srgb_handle: params.srgb_texture_handle,
+        metal_msaa_handle: params.msaa_texture_handle,
+        metal_msaa_srgb_handle: params.msaa_srgb_texture_handle,
+        width,
+        height,
+        format,
+        usage,
+        render_scale: scale,
+        multi_sample,
+    })
 }
 
 extern "system" fn device_create_render_target(
@@ -7854,8 +7966,7 @@ extern "system" fn device_create_render_target(
     let staging_bytes = if lockable == 0 {
         0
     } else {
-        let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
-        (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
+        lockable_staging_bytes(width, height, format)
     };
     // Zero-initialise the staging (defence-in-depth): a `LockRect` before any
     // render, or any path that skips the read-back fill, reads defined bytes
