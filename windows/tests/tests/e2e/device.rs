@@ -86,6 +86,26 @@ fn adapter_basics() {
     assert_eq!(mode.format, D3DFMT_X8R8G8B8, "display mode format");
 }
 
+/// Oblivion compares the head of `Driver` case-insensitively.
+///
+/// It takes its shader level from that prefix, so each spoofed string has to
+/// keep starting with `nv` or `ati`.
+#[test]
+fn a_spoofed_adapter_reports_its_vendors_driver_prefix() {
+    let spoofs: [(&str, &[u8]); 2] = [
+        ("adapter.spoof=nvidia", b"nv"),
+        ("adapter.spoof=amd", b"ati"),
+    ];
+    for (entries, prefix) in spoofs {
+        let id = Harness::factory_only_with_config(entries).adapter_identifier();
+        assert!(
+            id.driver[..prefix.len()].eq_ignore_ascii_case(prefix),
+            "{entries}: driver string {:?}",
+            &id.driver[..prefix.len()]
+        );
+    }
+}
+
 #[test]
 fn adapter_mode_enumeration() {
     let h = Harness::factory_only();
