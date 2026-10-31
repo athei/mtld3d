@@ -451,8 +451,8 @@ uncommitted changes against the commit they sit on) and shows how far the
 machine moves the numbers by itself; run it when a verdict looks surprising.
 
 Run `make bench-ab BASE=origin/main` with the default `BENCH_SET=wow` before
-merging a change to the render, encoder, submit or shader path, and put the
-summary line in the pull request's verification. The `wow` set is the two
+merging a change that can reasonably be expected to change performance, and put
+the summary line in the pull request's verification. The `wow` set is the two
 World of Warcraft frames, the EVENT-query throttle under the game's settings
 and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
 texture-streaming benchmarks at the game's rates. A leg's round is one
