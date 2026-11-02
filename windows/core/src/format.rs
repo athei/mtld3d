@@ -493,6 +493,10 @@ pub const fn is_render_target_format(d3d_format: u32) -> bool {
             | D3DFMT_X8B8G8R8
             | D3DFMT_R5G6B5
             | D3DFMT_A1R5G5B5
+            // L8 has a direct, renderable R8Unorm backing. Sampling retains
+            // the existing L8 RRR1 view swizzle, so attachment writes need
+            // no format conversion.
+            | D3DFMT_L8
             | D3DFMT_G16R16
             | D3DFMT_A16B16G16R16
             | D3DFMT_R16F
