@@ -37,8 +37,8 @@ Two commands, both green before you commit:
   clippy legs again, and the host-native unit tests that `make test` runs, on
   a `PERF=1` build (`clippy-perf` and `test-unit-perf`), since no other gate
   compiles the perf telemetry or the tests behind `cfg(perf_tracking)`, and
-  the native ones once more with `cfg(standalone)` (`clippy-standalone` and
-  `test-unit-standalone`), the build with the unix side linked into `d3d9`
+  the same legs once more with `cfg(native_d3d9)` (`clippy-native-d3d9` and
+  `test-unit-native-d3d9`), the build with the unix side linked into `d3d9`
   and no Wine, which nothing else compiles until `d3d9` builds for the host. Only
   the check legs deny warnings, so a plain `cargo clippy` in an editor reports
   without failing. Each audit finding names the section of
@@ -641,9 +641,9 @@ both unix `.so` builds, the e2e test binaries of every leg, the e2e and
 conformance runners for both host arches), which serves the legs of both
 Wines, and another runs formatting and audit first, then documentation,
 Clippy (the ARM64X halves included) and unit tests, with the `PERF=1` and
-`cfg(standalone)` Clippy and unit-test legs of `make check`, as steps of one job. Production bundles
-are built by the release job only, also on macos-26 in the arm64 mode, so
-they carry the ARM64X pair beside the x86 builds.
+`cfg(native_d3d9)` Clippy and unit-test legs of `make check`, as steps of one
+job. Production bundles are built by the release job only, also on macos-26 in
+the arm64 mode, so they carry the ARM64X pair beside the x86 builds.
 Every run on `main` has its own concurrency group so pending runs survive
 later pushes and every commit keeps its CI result. PR updates cancel the
 superseded run. The test machines carry no toolchain: they install the stage

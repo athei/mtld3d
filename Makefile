@@ -585,8 +585,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 # The arch suffix is the target's own spelling, i686 / x86_64 for PE and
 # x64 / arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
 # suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
-# `test-unit-perf`. A `-standalone` suffix runs them again with
-# `cfg(standalone)`: `clippy-standalone`, `test-unit-standalone`.
+# `test-unit-perf`. A `-native-d3d9` suffix runs them again with
+# `cfg(native_d3d9)`: `clippy-native-d3d9`, `test-unit-native-d3d9`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
@@ -605,7 +605,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-arm64x conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-arm64x conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
-	clippy-native clippy-perf test-unit-perf clippy-standalone test-unit-standalone audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
+	clippy-native clippy-perf test-unit-perf clippy-native-d3d9 test-unit-native-d3d9 audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -2391,18 +2391,19 @@ clippy-perf:
 test-unit-perf:
 	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= test-unit
 
-# `cfg(standalone)` is the build that links the unix side into `d3d9` itself,
-# with no Wine: `mtld3d-core` and `mtld3d-unix` read it from MTLD3D_STANDALONE
+# `cfg(native_d3d9)` is the build that links the unix side into `d3d9` itself,
+# with no Wine: `mtld3d-core` and `mtld3d-unix` read it from MTLD3D_NATIVE_D3D9
 # in their build scripts, as they read MTLD3D_PERF. Wine's `mtld3d.so` and
 # that build share a target, so the target cannot tell them apart. Until
 # `d3d9` builds for the host, these two are what compiles the cfg's side of
-# both crates: `clippy-standalone` the native leg, `test-unit-standalone` the
-# host unit tests, each in its own `target/standalone` for the reason above.
-clippy-standalone:
-	MTLD3D_STANDALONE=1 CARGO_TARGET_DIR=target/standalone $(MAKE) clippy-native
+# both crates: `clippy-native-d3d9` the `clippy-native` leg,
+# `test-unit-native-d3d9` the host unit tests, each in its own
+# `target/native-d3d9` for the reason above.
+clippy-native-d3d9:
+	MTLD3D_NATIVE_D3D9=1 CARGO_TARGET_DIR=target/native-d3d9 $(MAKE) clippy-native
 
-test-unit-standalone:
-	MTLD3D_STANDALONE=1 CARGO_TARGET_DIR=target/standalone $(MAKE) test-unit
+test-unit-native-d3d9:
+	MTLD3D_NATIVE_D3D9=1 CARGO_TARGET_DIR=target/native-d3d9 $(MAKE) test-unit
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
@@ -2438,21 +2439,21 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# PERF=1 and standalone clippy legs and unit tests, the conventions audit, the Makefile
-# regressions, and the doc build. fmt-check first (fast, fails early on drift);
-# clippy reuses the targets above; audit and the Makefile regressions are fast;
-# doc stays last. Each leg is also its own target, so CI's check job runs each
-# as a step of its own instead of this sequence.
+# PERF=1 and `cfg(native_d3d9)` clippy legs and unit tests, the conventions
+# audit, the Makefile regressions, and the doc build. fmt-check first (fast,
+# fails early on drift); clippy reuses the targets above; audit and the Makefile
+# regressions are fast; doc stays last. Each leg is also its own target, so CI's
+# check job runs each as a step of its own instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
 	$(MAKE) clippy-perf
-	$(MAKE) clippy-standalone
+	$(MAKE) clippy-native-d3d9
 	$(MAKE) audit
 	$(MAKE) test-isolation
 	$(MAKE) test-e2e-discovery
 	$(MAKE) test-unit-perf
-	$(MAKE) test-unit-standalone
+	$(MAKE) test-unit-native-d3d9
 	$(MAKE) doc
 
 clean:

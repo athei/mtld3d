@@ -26,10 +26,10 @@ mod translation;
 /// `InitLogger` from its own `DllMain` before any other call.
 const LOG_TARGET: &str = "mtld3d::unix";
 
-#[cfg_attr(not(standalone), unsafe(export_name = "__wine_unix_call_funcs"))]
+#[cfg_attr(not(native_d3d9), unsafe(export_name = "__wine_unix_call_funcs"))]
 pub static WINE_UNIX_CALL_FUNCS: [UnixCallFn; Thunks::COUNT] = DISPATCH_TABLE;
 
-#[cfg_attr(not(standalone), unsafe(export_name = "__wine_unix_call_wow64_funcs"))]
+#[cfg_attr(not(native_d3d9), unsafe(export_name = "__wine_unix_call_wow64_funcs"))]
 pub static WINE_UNIX_CALL_WOW64_FUNCS: [UnixCallFn; Thunks::COUNT] = DISPATCH_TABLE;
 
 type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -37,7 +37,7 @@ type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
 /// Every thunk's handler, at the index of its code.
 ///
 /// Wine's dispatcher reaches it through the two tables above, which
-/// `mtld3d.so` exports under the names Wine looks up. A `standalone` build
+/// `mtld3d.so` exports under the names Wine looks up. A `native_d3d9` build
 /// exports neither, and `d3d9` indexes this table itself.
 pub const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
 
