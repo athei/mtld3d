@@ -535,7 +535,7 @@ fn the_render_target_family_holds_the_formats_a_colour_attachment_accepts() {
     }
     // The swizzled pair reads through a channel correction a render write
     // cannot undo, R8G8B8 has no Metal counterpart and is widened on upload,
-    // and the compressed formats no D3D9 device rendered into stay out.
+    // compressed formats and A8 (whose Metal backing is not renderable) stay out.
     for fmt in [
         D3DFMT_X1R5G5B5,
         D3DFMT_A4R4G4B4,

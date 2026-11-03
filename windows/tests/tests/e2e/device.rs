@@ -728,6 +728,11 @@ fn check_format_conversion() {
         D3DERR_NOTAVAILABLE,
         "RGB -> L8 is not a conversion target",
     );
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_L8, D3DFMT_X8R8G8B8),
+        D3DERR_NOTAVAILABLE,
+        "L8 -> RGB is not advertised as a conversion",
+    );
     // A format converts to itself, L8 included.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_L8, D3DFMT_L8),
@@ -843,7 +848,7 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             }
         }
 
-        // Every destination the device renders into, and no other.
+        // Every renderable destination except L8, which only converts to itself.
         let mut converted = 0;
         for target in [
             D3DFMT_A8R8G8B8,
@@ -867,7 +872,8 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             D3DFMT_YUY2,
             D3DFMT_UYVY,
         ] {
-            let renders = check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, target) == D3D_OK;
+            let renders = target != D3DFMT_L8
+                && check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, target) == D3D_OK;
             converted += u32::from(renders);
             assert_eq!(
                 h.check_device_format_conversion(format, target),

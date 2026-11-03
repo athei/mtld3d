@@ -254,6 +254,11 @@ fn identical_same_surface_rects_are_a_no_op() {
 
 #[test]
 fn blit_decode_follows_the_source_format() {
+    assert!(matches!(
+        blit_decode(mtld3d_types::D3DFMT_L8),
+        BlitDecode::Luminance
+    ));
+    assert_eq!(BlitDecode::Luminance.uniform().to_bits(), 6.0f32.to_bits());
     assert!(matches!(blit_decode(D3DFMT_YUY2), BlitDecode::Yuy2));
     assert!(matches!(blit_decode(D3DFMT_UYVY), BlitDecode::Uyvy));
     for format in [

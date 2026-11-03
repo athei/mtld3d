@@ -1806,7 +1806,7 @@ the same Rule B depth-store elision as z_range_test.
 ### visual.c/pixelshader_blending_test
 Sites: 12006=expected
 
-Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
+Renders into a one- or two-channel texture (L8, G16R16, R16F, G16R16F, R32F,
 G32R32F) with blending on, then samples it and expects absent channels to
 read as 1.0. Render targets now keep separate attachment and sampling views,
 including both linear and sRGB roles for X8 formats. Native Apple GPUs apply

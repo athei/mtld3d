@@ -32,7 +32,7 @@ use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DDISPLAYMODEEX,
     D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8,
     D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
-    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
     D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
     D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
     D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
@@ -420,10 +420,11 @@ const fn is_present_compatible(src: u32, dst: u32) -> bool {
 
 /// Formats `StretchRect` can read as the source of a format conversion.
 ///
-/// The render-quad path samples any colour format the device can render and
+/// The render-quad path samples colour formats the device can render and
 /// decodes the packed 4:2:2 (`YUY2` / `UYVY`) and planar 4:2:0 (`YV12` /
 /// `NV12`) YUV formats in its fragment function; the offscreen-plain CPU
-/// converter covers the YUV members too.
+/// converter covers the YUV members too. L8 is excluded by the conversion
+/// query below, even though the blit path can decode it.
 const fn is_conversion_source(fmt: u32) -> bool {
     mtld3d_core::format::is_render_target_format(fmt)
         || mtld3d_core::stretch_rect::is_packed_yuv(fmt)
@@ -437,12 +438,16 @@ const fn is_conversion_source(fmt: u32) -> bool {
 /// ([`is_conversion_source`] — a pure predicate, since sources are sampled on
 /// every device) and the destination a colour format this device renders into
 /// (`is_render_target_format_on_device` — the render-quad writes into it).
+/// L8 is restricted to identity conversion despite being renderable.
 /// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
 /// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
 /// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
 fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> bool {
     if src == dst {
         return true;
+    }
+    if src == D3DFMT_L8 || dst == D3DFMT_L8 {
+        return false;
     }
     is_conversion_source(src) && is_render_target_format_on_device(dst, expand_packed16)
 }
