@@ -419,7 +419,7 @@ fn luminance_render_target_draws_reads_back_and_samples() {
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
     let mut quad = fullscreen_quad();
     for vertex in &mut quad {
-        vertex.color = 0xff808080;
+        vertex.color = 0xff80_8080;
     }
     assert_eq!(h.begin_scene(), 0);
     assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
