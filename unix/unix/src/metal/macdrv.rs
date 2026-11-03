@@ -21,9 +21,12 @@ use objc2_app_kit::{NSView, NSWindow};
 use objc2_core_foundation::CGRect;
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
-use super::layer::{
-    DisplayCaps, LayerAttachRequest, PresentPacing, bounded_cast, min_present_duration,
-    natural_drawable_size, pack_pacing, sync_drawable_size, unpack_pacing,
+use super::{
+    bounded_cast,
+    layer::{
+        DisplayCaps, LayerAttachRequest, PresentPacing, min_present_duration,
+        natural_drawable_size, pack_pacing, sync_drawable_size, unpack_pacing,
+    },
 };
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 

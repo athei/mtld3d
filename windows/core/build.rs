@@ -9,6 +9,11 @@ fn main() {
     if std::env::var("MTLD3D_PERF").is_ok_and(|v| !v.is_empty() && v != "0") {
         println!("cargo:rustc-cfg=perf_tracking");
     }
+    println!("cargo::rustc-check-cfg=cfg(standalone)");
+    println!("cargo:rerun-if-env-changed=MTLD3D_STANDALONE");
+    if std::env::var("MTLD3D_STANDALONE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        println!("cargo:rustc-cfg=standalone");
+    }
 }
 
 // Paths and lengths delimit the hash input, independent of checkout path and target.

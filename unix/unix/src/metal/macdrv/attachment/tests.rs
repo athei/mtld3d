@@ -42,7 +42,7 @@ use super::{
 };
 use crate::metal::{
     command::PresentGeometry,
-    macdrv::{PresentPacing, pack_pacing},
+    layer::{PresentPacing, pack_pacing},
 };
 
 fn latches(

@@ -9,6 +9,8 @@
 use log::debug;
 use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
 
+use super::bounded_cast;
+
 /// Present-throttle request resolved PE-side.
 ///
 /// The guest's vsync ask (`D3DPRESENT_PARAMETERS::PresentationInterval`
@@ -98,14 +100,14 @@ pub struct LayerAttachRequest {
     pub cursor_kick_sink_ptr: u64,
     /// Where a client surface present request is written on the PE side, `0` = nowhere.
     pub client_surface_request_sink_ptr: u64,
-    /// `cursor.software`, resolved here against the layer mode attach picks.
+    /// `cursor.software`, resolved by attach against the layer mode it picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
 
 /// What attach answers the PE side about the display and the cursor.
 #[derive(Clone, Copy)]
 pub struct DisplayCaps {
-    /// The Wine layer's `contentsScale` rounded + clamped to `[1, 8]`: 2 in retina mode, else 1.
+    /// The layer's `contentsScale` rounded + clamped to `[1, 8]`: 2 in retina mode, else 1.
     pub backing_scale: u32,
     /// Whether the device draws its cursor through the overlay window.
     ///
@@ -121,61 +123,6 @@ pub fn host_seconds_to_ns(secs: f64) -> u64 {
     bounded_cast::f64_to_u64_saturating(secs * 1e9)
 }
 
-/// Numeric casts where the cast lints fire but the bounds are established by the caller.
-///
-/// Grouping them under one mod-level allow collapses what would otherwise be
-/// four per-site allows into one. Each fn is the raw cast; callers document
-/// the bound that justifies it.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-pub mod bounded_cast {
-    /// Saturating `f64 → u32`.
-    ///
-    /// NaN/negative → 0, ≥ `u32::MAX` → `u32::MAX`; all other inputs land in
-    /// `(0.0, u32::MAX)` where the cast is exact.
-    pub fn f64_to_u32_saturating(v: f64) -> u32 {
-        if !v.is_finite() || v <= 0.0 {
-            return 0;
-        }
-        if v >= f64::from(u32::MAX) {
-            return u32::MAX;
-        }
-        v as u32
-    }
-
-    /// Saturating `f64 → u64`.
-    ///
-    /// NaN/negative → 0, ≥ `u64::MAX` → `u64::MAX`; all other inputs land in
-    /// `(0.0, u64::MAX)` where the cast is exact to f64 precision.
-    pub fn f64_to_u64_saturating(v: f64) -> u64 {
-        if !v.is_finite() || v <= 0.0 {
-            return 0;
-        }
-        if v >= u64::MAX as f64 {
-            return u64::MAX;
-        }
-        v as u64
-    }
-
-    /// `f64 → f32` narrowing.
-    ///
-    /// Caller establishes the bound where mantissa loss is acceptable.
-    pub const fn f64_to_f32(v: f64) -> f32 {
-        v as f32
-    }
-
-    /// `i32 → f32` narrowing.
-    ///
-    /// Caller establishes `|v|` is well inside the f32 mantissa (< 2^24) so
-    /// the cast is exact.
-    pub const fn i32_to_f32(v: i32) -> f32 {
-        v as f32
-    }
-}
-
 /// The drawable size the layer's own geometry asks for: `bounds × contentsScale`.
 ///
 /// `(0, 0)` while the view has no frame yet, which the callers treat as "no
@@ -189,7 +136,7 @@ pub fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u
     )
 }
 
-/// Point `drawableSize` at the layer's own backing store, and say whether it moved.
+/// Point `drawableSize` at the layer's own backing store.
 ///
 /// `CAMetalLayer` documents `drawableSize` as defaulting to `bounds ×
 /// contentsScale`, but it captures that once and does **not** follow the
@@ -239,3 +186,6 @@ pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     layer.setDrawableSize(CGSize { width, height });
     CATransaction::commit();
 }
+
+#[cfg(test)]
+mod tests;

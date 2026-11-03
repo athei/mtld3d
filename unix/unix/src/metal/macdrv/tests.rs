@@ -1,11 +1,4 @@
-//! Unit tests for the present-throttle duration and the layer-mode decision.
-//!
-//! `min_present_duration` folds the guest's vsync request and the user's
-//! `present.maxFps` ceiling into the minimum seconds handed to
-//! `presentDrawable:afterMinimumDuration:`. Bit-exact assertions pin every
-//! combination of the two inputs: the lower of the two rates wins, an
-//! unknown panel rate still honours the user cap, and only IMMEDIATE with
-//! no cap resolves to `0.0` for an unthrottled free run.
+//! Unit tests for the layer-mode decision.
 //!
 //! `layer_mode_for` and `layer_mode_change` decide which `CAMetalLayer`
 //! configuration a screen asks for and whether the applied one has to be
@@ -84,11 +77,11 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use super::{
     KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
-    PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
-    first_null_required_entry, layer_mode_change, layer_mode_for, min_present_duration,
-    min_present_duration_change, pack_pacing, pick_orphan, rect_covers, run_through_wine,
-    screen_params_filter_step, unpack_pacing,
+    ScreenParamsFilterStep, backing_scale_change, backing_scale_from, first_null_required_entry,
+    layer_mode_change, layer_mode_for, min_present_duration_change, pick_orphan, rect_covers,
+    run_through_wine, screen_params_filter_step,
 };
+use crate::metal::layer::{PresentPacing, min_present_duration};
 
 /// A rectangle at `x`, `y` of `width` by `height` points.
 const fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
@@ -129,63 +122,6 @@ fn a_view_that_leaves_part_of_the_frame_uncovered_does_not_cover_it() {
         !rect_covers(rect(0.0, 0.0, 1512.0, 981.5), frame),
         "one Retina pixel at the top edge"
     );
-}
-
-#[test]
-fn vsync_only_paces_at_panel_rate() {
-    let pacing = PresentPacing {
-        vsync_requested: true,
-        max_fps: 0,
-    };
-    let d = min_present_duration(120.0, &pacing);
-    assert_eq!(d.to_bits(), (1.0_f64 / 120.0).to_bits());
-}
-
-#[test]
-fn cap_only_bounds_the_free_run() {
-    let pacing = PresentPacing {
-        vsync_requested: false,
-        max_fps: 30,
-    };
-    let d = min_present_duration(120.0, &pacing);
-    assert_eq!(d.to_bits(), (1.0_f64 / 30.0).to_bits());
-}
-
-#[test]
-fn lower_rate_wins_when_both_active() {
-    let below_panel = PresentPacing {
-        vsync_requested: true,
-        max_fps: 60,
-    };
-    let d = min_present_duration(120.0, &below_panel);
-    assert_eq!(d.to_bits(), (1.0_f64 / 60.0).to_bits());
-
-    let above_panel = PresentPacing {
-        vsync_requested: true,
-        max_fps: 240,
-    };
-    let d = min_present_duration(120.0, &above_panel);
-    assert_eq!(d.to_bits(), (1.0_f64 / 120.0).to_bits());
-}
-
-#[test]
-fn immediate_and_uncapped_free_runs() {
-    let pacing = PresentPacing {
-        vsync_requested: false,
-        max_fps: 0,
-    };
-    let d = min_present_duration(120.0, &pacing);
-    assert_eq!(d.to_bits(), 0.0_f64.to_bits());
-}
-
-#[test]
-fn unknown_panel_rate_still_honours_the_cap() {
-    let pacing = PresentPacing {
-        vsync_requested: true,
-        max_fps: 60,
-    };
-    let d = min_present_duration(0.0, &pacing);
-    assert_eq!(d.to_bits(), (1.0_f64 / 60.0).to_bits());
 }
 
 #[test]
@@ -244,30 +180,6 @@ fn a_brightness_change_alone_does_not_reconfigure() {
     // therefore keep the HDR layer.
     assert_eq!(layer_mode_change(LayerMode::Hdr, 16.0, true), None);
     assert_eq!(layer_mode_change(LayerMode::Hdr, 16.0, true), None);
-}
-
-#[test]
-fn pacing_survives_the_round_trip_through_one_word() {
-    for (vsync_requested, max_fps) in [(true, 0), (false, 0), (true, 60), (false, 240)] {
-        let packed = pack_pacing(&PresentPacing {
-            vsync_requested,
-            max_fps,
-        });
-        let back = unpack_pacing(packed);
-        assert_eq!(back.vsync_requested, vsync_requested);
-        assert_eq!(back.max_fps, max_fps);
-    }
-}
-
-#[test]
-fn the_widest_cap_survives_the_round_trip() {
-    let packed = pack_pacing(&PresentPacing {
-        vsync_requested: true,
-        max_fps: u32::MAX,
-    });
-    let back = unpack_pacing(packed);
-    assert!(back.vsync_requested);
-    assert_eq!(back.max_fps, u32::MAX);
 }
 
 #[test]

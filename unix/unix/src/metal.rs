@@ -1,4 +1,10 @@
 mod blit;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+mod bounded_cast;
 mod buffer;
 mod capture;
 mod clear_quad;
