@@ -21,5 +21,8 @@ snmalloc-rs = { workspace = true }
 xbr = { workspace = true }
 xxhash-rust = { workspace = true }
 
+[target.'cfg(not(windows))'.dependencies]
+mtld3d-unix = { workspace = true }
+
 [lints]
 workspace = true

@@ -171,7 +171,7 @@ jobs:
   check:
     if: ${{ !inputs.probe_only && !inputs.intel_only && github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -217,12 +217,18 @@ jobs:
       - name: clippy-perf
         if: ${{ !cancelled() }}
         run: make clippy-perf
+      - name: clippy-native-d3d
+        if: ${{ !cancelled() }}
+        run: make clippy-native-d3d
       - name: test-unit
         if: ${{ !cancelled() }}
         run: make test-unit
       - name: test-unit-perf
         if: ${{ !cancelled() }}
         run: make test-unit-perf
+      - name: test-unit-native-d3d
+        if: ${{ !cancelled() }}
+        run: make test-unit-native-d3d
 
   # The end-to-end suite: the staged test binaries, run by the pinned Wine
   # against a Metal device, one leg per image and PE arch. The image's Wine

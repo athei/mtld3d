@@ -68,8 +68,8 @@ unix/unix/src/metal/command.rs BlitSite Clone,Copy
 unix/unix/src/metal/command.rs CopyRejectReason Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/command.rs PresentGeometry Clone,Copy,PartialEq,Eq
 unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
+unix/unix/src/metal/layer.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
-unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerMode Clone,Copy,Debug,PartialEq,Eq
 unix/unix/src/metal/macdrv/attachment.rs AttachFlags Clone,Copy,Debug,Default,PartialEq,Eq

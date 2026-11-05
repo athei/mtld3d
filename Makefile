@@ -585,7 +585,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 # The arch suffix is the target's own spelling, i686 / x86_64 for PE and
 # x64 / arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
 # suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
-# `test-unit-perf`.
+# `test-unit-perf`. A `-native-d3d` suffix runs them again with
+# `cfg(native_d3d)`: `clippy-native-d3d`, `test-unit-native-d3d`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
@@ -604,7 +605,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-arm64x conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-arm64x conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
-	clippy-native clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
+	clippy-native clippy-perf test-unit-perf clippy-native-d3d test-unit-native-d3d audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -788,13 +789,15 @@ windows-arm64x:
 # stamps the inner DWARF file after the input's basename and lldb looks it up
 # by that name — renaming the bundle afterwards produces one lldb won't find.
 unix-x64:
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_x64) \
+		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
 	cp -c $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
 	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_x64)/mtld3d.so
 
 unix-arm64:
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_arm64) \
+		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
 	cp -c $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
@@ -2388,6 +2391,18 @@ clippy-perf:
 test-unit-perf:
 	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= test-unit
 
+# The `clippy-native` and `test-unit` legs again with `cfg(native_d3d)`, the
+# build that links the unix side into `d3d9` without Wine; nothing else compiles
+# it until `d3d9` builds for the host. That build shares a target with Wine's
+# `mtld3d.so`, so the cfg comes from MTLD3D_NATIVE_D3D, read by the build
+# scripts of `mtld3d-core` and `mtld3d-unix`. The legs get their own target dir
+# for the reason `target/perf` does.
+clippy-native-d3d:
+	MTLD3D_NATIVE_D3D=1 CARGO_TARGET_DIR=target/native-d3d $(MAKE) PERF=0 clippy-native
+
+test-unit-native-d3d:
+	MTLD3D_NATIVE_D3D=1 CARGO_TARGET_DIR=target/native-d3d $(MAKE) PERF=0 test-unit
+
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
 # set of files. See docs/CONVENTIONS.md § Mechanical audit.
@@ -2422,19 +2437,21 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# PERF=1 clippy legs and unit tests, the conventions audit, the Makefile
-# regressions, and the doc build. fmt-check first (fast, fails early on drift);
-# clippy reuses the targets above; audit and the Makefile regressions are fast;
-# doc stays last. Each leg is also its own target, so CI's check job runs each
-# as a step of its own instead of this sequence.
+# PERF=1 and `cfg(native_d3d)` clippy legs and unit tests, the conventions
+# audit, the Makefile regressions, and the doc build. fmt-check first (fast,
+# fails early on drift); clippy reuses the targets above; audit and the Makefile
+# regressions are fast; doc stays last. Each leg is also its own target, so CI's
+# check job runs each as a step of its own instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
 	$(MAKE) clippy-perf
+	$(MAKE) clippy-native-d3d
 	$(MAKE) audit
 	$(MAKE) test-isolation
 	$(MAKE) test-e2e-discovery
 	$(MAKE) test-unit-perf
+	$(MAKE) test-unit-native-d3d
 	$(MAKE) doc
 
 clean:

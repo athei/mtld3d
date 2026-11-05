@@ -18,6 +18,7 @@ homepage = "https://github.com/athei/mtld3d"
 mtld3d-core = { path = "core" }
 mtld3d-shared = { path = "../unix/shared" }
 mtld3d-types = { path = "types" }
+mtld3d-unix = { path = "../unix/unix" }
 bitflags = "2"
 log = "0.4"
 objc2 = "0.6"

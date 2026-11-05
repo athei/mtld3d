@@ -174,7 +174,7 @@ fn register_presented_probe(
             // SAFETY: Metal invokes the block with the presented drawable;
             // the pointer is valid for the handler's duration.
             let d = unsafe { d_ptr.as_ref() };
-            let now_ns = super::macdrv::host_seconds_to_ns(d.presentedTime());
+            let now_ns = super::layer::host_seconds_to_ns(d.presentedTime());
             if now_ns == 0 {
                 // Never presented (drawable dropped): leave the chain alone.
                 return;

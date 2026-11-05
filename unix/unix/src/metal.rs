@@ -1,4 +1,10 @@
 mod blit;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+mod bounded_cast;
 mod buffer;
 mod capture;
 mod clear_quad;
@@ -9,6 +15,7 @@ mod frame_signal;
 mod gamma;
 mod gpu_time;
 pub mod handle;
+mod layer;
 mod macdrv;
 mod null_texture;
 mod pipeline;
@@ -31,10 +38,10 @@ pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_r
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
 pub use frame_signal::{FrameSignal, FrameWait, PACED_PRESENT_CAP};
 pub use gamma::set_gamma_ramp;
+pub use layer::{LayerAttachRequest, PresentPacing};
 pub use macdrv::{
-    LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
-    detach_metal_layer, present_client_surface, retire_metal_view, set_cursor_overlay,
-    set_display_sync_enabled,
+    attach_metal_layer, declare_latency_critical_activity, detach_metal_layer,
+    present_client_surface, retire_metal_view, set_cursor_overlay, set_display_sync_enabled,
 };
 pub use mtld3d_shared::perf::init_tracking_enabled;
 pub use pipeline::{create_render_pipeline, destroy_render_pipeline};
