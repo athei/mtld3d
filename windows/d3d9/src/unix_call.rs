@@ -3,8 +3,6 @@ use core::ffi::c_void;
 use mtld3d_shared::Thunk;
 #[cfg(perf_tracking)]
 use mtld3d_shared::encoder_protocol::EncoderSubmitMode;
-#[cfg(not(windows))]
-use mtld3d_unix::DISPATCH_TABLE;
 
 #[cfg(windows)]
 #[link(name = "mtld3d", kind = "raw-dylib")]
@@ -20,8 +18,8 @@ pub fn unix_call<T: Thunk>(params: &mut T) -> i32 {
     );
     let args = std::ptr::from_mut::<T>(params).cast::<c_void>();
     // SAFETY: `params` is a live `&mut T` and `T::CODE` is the matching
-    // thunk discriminant for `T`; the unix-side dispatcher casts back to
-    // `*mut T` using the same code.
+    // thunk discriminant for `T`; the handler at `T::CODE` casts `args` back
+    // to `*mut T`.
     let status = unsafe {
         #[cfg(windows)]
         {
@@ -29,7 +27,8 @@ pub fn unix_call<T: Thunk>(params: &mut T) -> i32 {
         }
         #[cfg(not(windows))]
         {
-            DISPATCH_TABLE[usize::try_from(T::CODE).expect("a u32 thunk code fits usize")](args)
+            mtld3d_unix::DISPATCH_TABLE
+                [usize::try_from(T::CODE).expect("a u32 thunk code fits usize")](args)
         }
     };
     mtld3d_shared::crumb!(

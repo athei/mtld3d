@@ -6,10 +6,10 @@ fn main() {
     if std::env::var("MTLD3D_PERF").is_ok_and(|value| !value.is_empty() && value != "0") {
         println!("cargo:rustc-cfg=perf_tracking");
     }
-    println!("cargo::rustc-check-cfg=cfg(native_d3d9)");
-    println!("cargo:rerun-if-env-changed=MTLD3D_NATIVE_D3D9");
-    if std::env::var("MTLD3D_NATIVE_D3D9").is_ok_and(|v| !v.is_empty() && v != "0") {
-        println!("cargo:rustc-cfg=native_d3d9");
+    println!("cargo::rustc-check-cfg=cfg(native_d3d)");
+    println!("cargo:rerun-if-env-changed=MTLD3D_NATIVE_D3D");
+    if std::env::var("MTLD3D_NATIVE_D3D").is_ok_and(|v| !v.is_empty() && v != "0") {
+        println!("cargo:rustc-cfg=native_d3d");
     }
     println!("cargo::rustc-check-cfg=cfg(mtld3d_crumb)");
     println!("cargo:rerun-if-env-changed=MTLD3D_CRUMB");

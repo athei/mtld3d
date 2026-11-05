@@ -1,10 +1,7 @@
-//! The `CAMetalLayer` a device presents into, apart from how it is obtained.
+//! The `CAMetalLayer` code that does not depend on how the layer was obtained.
 //!
-//! The attach request and its answer, the present pacing a layer is held to,
-//! the host-time conversion of a presented drawable, and the drawable size
-//! that follows the layer's own geometry. None of it depends on Wine or
-//! `AppKit`; `macdrv` obtains the layer from the metal view Wine creates in the
-//! window's client area.
+//! It holds the attach request and answer, present pacing, host-time
+//! conversion and drawable sizing. None of it depends on Wine or `AppKit`.
 
 use log::debug;
 use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};

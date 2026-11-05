@@ -37,9 +37,8 @@ Two commands, both green before you commit:
   clippy legs again, and the host-native unit tests that `make test` runs, on
   a `PERF=1` build (`clippy-perf` and `test-unit-perf`), since no other gate
   compiles the perf telemetry or the tests behind `cfg(perf_tracking)`, and
-  the same legs once more with `cfg(native_d3d9)` (`clippy-native-d3d9` and
-  `test-unit-native-d3d9`), the build with the unix side linked into `d3d9`
-  and no Wine, which nothing else compiles until `d3d9` builds for the host. Only
+  the native clippy leg and the unit tests once more with `cfg(native_d3d)`
+  (`clippy-native-d3d` and `test-unit-native-d3d`). Only
   the check legs deny warnings, so a plain `cargo clippy` in an editor reports
   without failing. Each audit finding names the section of
   `docs/CONVENTIONS.md` behind it; read that section rather than
@@ -641,7 +640,7 @@ both unix `.so` builds, the e2e test binaries of every leg, the e2e and
 conformance runners for both host arches), which serves the legs of both
 Wines, and another runs formatting and audit first, then documentation,
 Clippy (the ARM64X halves included) and unit tests, with the `PERF=1` and
-`cfg(native_d3d9)` Clippy and unit-test legs of `make check`, as steps of one
+`cfg(native_d3d)` Clippy and unit-test legs of `make check`, as steps of one
 job. Production bundles are built by the release job only, also on macos-26 in
 the arm64 mode, so they carry the ARM64X pair beside the x86 builds.
 Every run on `main` has its own concurrency group so pending runs survive

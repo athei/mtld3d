@@ -203,11 +203,9 @@ first `make check` in a checkout builds it from scratch, which takes a few
 minutes and about 5.6 GB of disk (3.3 GB under `windows`, 2.3 GB under
 `unix`). The Makefile says which legs it runs beside `clippy-perf`.
 
-`make check` lints and unit-tests a `cfg(native_d3d9)` build the same way, in
-`target/native-d3d9`: `MTLD3D_NATIVE_D3D9=1` makes the build scripts of
-`mtld3d-core` and `mtld3d-unix` set the cfg for the build that links the unix
-side into `d3d9`, without Wine. The Makefile says why beside
-`clippy-native-d3d9`.
+`make check` lints and unit-tests a `cfg(native_d3d)` build the same way, in
+`target/native-d3d`. `MTLD3D_NATIVE_D3D=1` sets the cfg; the Makefile says
+why beside `clippy-native-d3d`.
 
 The test legs run with Apple's Metal validation layer on and the Metal HUD
 off; the Makefile says why beside `MTL_HUD_ENABLED`. Setting
