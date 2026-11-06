@@ -126,182 +126,182 @@ impl FrameRecorder {
                 data,
             } => self.record_ff_vs_constants(scratch, start_row, rows, data),
             Op::SetViewport(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::SetVertexSampler(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::SetVertexTexture(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::BindDepth(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::BindColor(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::GenerateMipmapsOrdered(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UnbindExtraColor(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::DestroyTexture(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::DestroyBuffer(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::NoteColorRead(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ResolveDepthSurface(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::StretchBlit(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ColorFill(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::CarryDepth(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ClearColor(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ClearColorRects(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ClearDepthStencilRects(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ClearDepthStencil(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ResolveDynamicDepth(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ResolveDepthTexture(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::AdoptProgram(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::RetireColor(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::RetireDepth(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UploadColor(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UploadResampled(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UpdateColorRegion(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::GenerateMipmaps(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::SetDumpDraw(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ReadColorHandle(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ReadTextureHandle(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ReadTextureColorHandle(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::ReadDeviceBuffer(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::BeginVisibility(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::EndVisibility(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UploadTexture(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }
             Op::UploadTextureAndMips(value) => {
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, native_d3d)))]
                 let value = *value;
                 self.record_typed(scratch, value)
             }

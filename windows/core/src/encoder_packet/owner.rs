@@ -84,7 +84,7 @@ impl FramePacket {
     /// by an earlier native frame, so the returned owner must survive until native quiescence.
     pub fn new(mut frame: FrameData) -> Result<Self, (WireError, Box<Self>)> {
         let mut recorder = frame.recorder.take().unwrap_or_default();
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, native_d3d)))]
         for op in core::mem::take(&mut frame.ops) {
             recorder.record(&mut frame.scratch, op);
         }

@@ -813,152 +813,152 @@ pub enum Op {
     /// Issue a draw using the current snapshot.
     Draw(DrawOp),
     SetViewport(
-        #[cfg(windows)] SetViewportOp,
-        #[cfg(not(windows))] Box<SetViewportOp>,
+        #[cfg(any(windows, native_d3d))] SetViewportOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<SetViewportOp>,
     ),
     SetVertexSampler(
-        #[cfg(windows)] SetVertexSamplerOp,
-        #[cfg(not(windows))] Box<SetVertexSamplerOp>,
+        #[cfg(any(windows, native_d3d))] SetVertexSamplerOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<SetVertexSamplerOp>,
     ),
     SetVertexTexture(
-        #[cfg(windows)] SetVertexTextureOp,
-        #[cfg(not(windows))] Box<SetVertexTextureOp>,
+        #[cfg(any(windows, native_d3d))] SetVertexTextureOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<SetVertexTextureOp>,
     ),
     BindDepth(
-        #[cfg(windows)] BindDepthOp,
-        #[cfg(not(windows))] Box<BindDepthOp>,
+        #[cfg(any(windows, native_d3d))] BindDepthOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<BindDepthOp>,
     ),
     BindColor(
-        #[cfg(windows)] BindColorOp,
-        #[cfg(not(windows))] Box<BindColorOp>,
+        #[cfg(any(windows, native_d3d))] BindColorOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<BindColorOp>,
     ),
     GenerateMipmapsOrdered(
-        #[cfg(windows)] GenerateMipmapsOrderedOp,
-        #[cfg(not(windows))] Box<GenerateMipmapsOrderedOp>,
+        #[cfg(any(windows, native_d3d))] GenerateMipmapsOrderedOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<GenerateMipmapsOrderedOp>,
     ),
     UnbindExtraColor(
-        #[cfg(windows)] UnbindExtraColorOp,
-        #[cfg(not(windows))] Box<UnbindExtraColorOp>,
+        #[cfg(any(windows, native_d3d))] UnbindExtraColorOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UnbindExtraColorOp>,
     ),
     DestroyTexture(
-        #[cfg(windows)] DestroyTextureOp,
-        #[cfg(not(windows))] Box<DestroyTextureOp>,
+        #[cfg(any(windows, native_d3d))] DestroyTextureOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<DestroyTextureOp>,
     ),
     DestroyBuffer(
-        #[cfg(windows)] DestroyBufferOp,
-        #[cfg(not(windows))] Box<DestroyBufferOp>,
+        #[cfg(any(windows, native_d3d))] DestroyBufferOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<DestroyBufferOp>,
     ),
     ReadColorHandle(
-        #[cfg(windows)] ReadColorHandleOp,
-        #[cfg(not(windows))] Box<ReadColorHandleOp>,
+        #[cfg(any(windows, native_d3d))] ReadColorHandleOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ReadColorHandleOp>,
     ),
     NoteColorRead(
-        #[cfg(windows)] NoteColorReadOp,
-        #[cfg(not(windows))] Box<NoteColorReadOp>,
+        #[cfg(any(windows, native_d3d))] NoteColorReadOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<NoteColorReadOp>,
     ),
     ResolveDepthSurface(
-        #[cfg(windows)] ResolveDepthSurfaceOp,
-        #[cfg(not(windows))] Box<ResolveDepthSurfaceOp>,
+        #[cfg(any(windows, native_d3d))] ResolveDepthSurfaceOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ResolveDepthSurfaceOp>,
     ),
     StretchBlit(
-        #[cfg(windows)] StretchBlitOp,
-        #[cfg(not(windows))] Box<StretchBlitOp>,
+        #[cfg(any(windows, native_d3d))] StretchBlitOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<StretchBlitOp>,
     ),
     ColorFill(
-        #[cfg(windows)] ColorFillOp,
-        #[cfg(not(windows))] Box<ColorFillOp>,
+        #[cfg(any(windows, native_d3d))] ColorFillOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ColorFillOp>,
     ),
     CarryDepth(
-        #[cfg(windows)] CarryDepthOp,
-        #[cfg(not(windows))] Box<CarryDepthOp>,
+        #[cfg(any(windows, native_d3d))] CarryDepthOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<CarryDepthOp>,
     ),
     ClearColor(
-        #[cfg(windows)] ClearColorOp,
-        #[cfg(not(windows))] Box<ClearColorOp>,
+        #[cfg(any(windows, native_d3d))] ClearColorOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ClearColorOp>,
     ),
     ClearColorRects(
-        #[cfg(windows)] ClearColorRectsOp,
-        #[cfg(not(windows))] Box<ClearColorRectsOp>,
+        #[cfg(any(windows, native_d3d))] ClearColorRectsOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ClearColorRectsOp>,
     ),
     ClearDepthStencilRects(
-        #[cfg(windows)] ClearDepthStencilRectsOp,
-        #[cfg(not(windows))] Box<ClearDepthStencilRectsOp>,
+        #[cfg(any(windows, native_d3d))] ClearDepthStencilRectsOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ClearDepthStencilRectsOp>,
     ),
     ClearDepthStencil(
-        #[cfg(windows)] ClearDepthStencilOp,
-        #[cfg(not(windows))] Box<ClearDepthStencilOp>,
+        #[cfg(any(windows, native_d3d))] ClearDepthStencilOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ClearDepthStencilOp>,
     ),
     ResolveDynamicDepth(
-        #[cfg(windows)] ResolveDynamicDepthOp,
-        #[cfg(not(windows))] Box<ResolveDynamicDepthOp>,
+        #[cfg(any(windows, native_d3d))] ResolveDynamicDepthOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ResolveDynamicDepthOp>,
     ),
     ResolveDepthTexture(
-        #[cfg(windows)] ResolveDepthTextureOp,
-        #[cfg(not(windows))] Box<ResolveDepthTextureOp>,
+        #[cfg(any(windows, native_d3d))] ResolveDepthTextureOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ResolveDepthTextureOp>,
     ),
     ReadDeviceBuffer(
-        #[cfg(windows)] ReadDeviceBufferOp,
-        #[cfg(not(windows))] Box<ReadDeviceBufferOp>,
+        #[cfg(any(windows, native_d3d))] ReadDeviceBufferOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ReadDeviceBufferOp>,
     ),
     RegisterProgram(
-        #[cfg(windows)] RegisterProgramOp,
-        #[cfg(not(windows))] Box<RegisterProgramOp>,
+        #[cfg(any(windows, native_d3d))] RegisterProgramOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<RegisterProgramOp>,
     ),
     AdoptProgram(
-        #[cfg(windows)] AdoptProgramOp,
-        #[cfg(not(windows))] Box<AdoptProgramOp>,
+        #[cfg(any(windows, native_d3d))] AdoptProgramOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<AdoptProgramOp>,
     ),
     BeginVisibility(
-        #[cfg(windows)] BeginVisibilityOp,
-        #[cfg(not(windows))] Box<BeginVisibilityOp>,
+        #[cfg(any(windows, native_d3d))] BeginVisibilityOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<BeginVisibilityOp>,
     ),
     EndVisibility(
-        #[cfg(windows)] EndVisibilityOp,
-        #[cfg(not(windows))] Box<EndVisibilityOp>,
+        #[cfg(any(windows, native_d3d))] EndVisibilityOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<EndVisibilityOp>,
     ),
     RetireColor(
-        #[cfg(windows)] RetireColorOp,
-        #[cfg(not(windows))] Box<RetireColorOp>,
+        #[cfg(any(windows, native_d3d))] RetireColorOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<RetireColorOp>,
     ),
     RetireDepth(
-        #[cfg(windows)] RetireDepthOp,
-        #[cfg(not(windows))] Box<RetireDepthOp>,
+        #[cfg(any(windows, native_d3d))] RetireDepthOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<RetireDepthOp>,
     ),
     UploadColor(
-        #[cfg(windows)] UploadColorOp,
-        #[cfg(not(windows))] Box<UploadColorOp>,
+        #[cfg(any(windows, native_d3d))] UploadColorOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UploadColorOp>,
     ),
     UploadResampled(
-        #[cfg(windows)] UploadResampledOp,
-        #[cfg(not(windows))] Box<UploadResampledOp>,
+        #[cfg(any(windows, native_d3d))] UploadResampledOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UploadResampledOp>,
     ),
     UpdateColorRegion(
-        #[cfg(windows)] UpdateColorRegionOp,
-        #[cfg(not(windows))] Box<UpdateColorRegionOp>,
+        #[cfg(any(windows, native_d3d))] UpdateColorRegionOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UpdateColorRegionOp>,
     ),
     ReadTextureHandle(
-        #[cfg(windows)] ReadTextureHandleOp,
-        #[cfg(not(windows))] Box<ReadTextureHandleOp>,
+        #[cfg(any(windows, native_d3d))] ReadTextureHandleOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ReadTextureHandleOp>,
     ),
     GenerateMipmaps(
-        #[cfg(windows)] GenerateMipmapsOp,
-        #[cfg(not(windows))] Box<GenerateMipmapsOp>,
+        #[cfg(any(windows, native_d3d))] GenerateMipmapsOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<GenerateMipmapsOp>,
     ),
     ReadTextureColorHandle(
-        #[cfg(windows)] ReadTextureColorHandleOp,
-        #[cfg(not(windows))] Box<ReadTextureColorHandleOp>,
+        #[cfg(any(windows, native_d3d))] ReadTextureColorHandleOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<ReadTextureColorHandleOp>,
     ),
     UploadTextureAndMips(
-        #[cfg(windows)] UploadTextureAndMipsOp,
-        #[cfg(not(windows))] Box<UploadTextureAndMipsOp>,
+        #[cfg(any(windows, native_d3d))] UploadTextureAndMipsOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UploadTextureAndMipsOp>,
     ),
     UploadTexture(
-        #[cfg(windows)] UploadTextureOp,
-        #[cfg(not(windows))] Box<UploadTextureOp>,
+        #[cfg(any(windows, native_d3d))] UploadTextureOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<UploadTextureOp>,
     ),
     SetDumpDraw(
-        #[cfg(windows)] SetDumpDrawOp,
-        #[cfg(not(windows))] Box<SetDumpDrawOp>,
+        #[cfg(any(windows, native_d3d))] SetDumpDrawOp,
+        #[cfg(not(any(windows, native_d3d)))] Box<SetDumpDrawOp>,
     ),
     /// Inline op-stream-ordered `Staged` VB/IB upload.
     ///
@@ -1285,7 +1285,7 @@ impl FrameData {
     /// Called from `stamp_and_swap` with the previous frame's
     /// `ops_len()` so the new frame fills without any realloc in the
     /// common case where frame-to-frame op count is stable.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, native_d3d)))]
     pub fn reserve_ops(&mut self, count: usize) {
         self.ops.reserve(count);
     }
@@ -1407,15 +1407,15 @@ impl FrameData {
     /// Record an operation and report a latched wire capture error.
     ///
     /// # Errors
-    /// Returns allocation, size or malformed capture errors on the PE recording path.
+    /// Returns allocation, size or malformed capture errors on the wire recording path.
     pub fn try_push_op(&mut self, op: Op) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-        #[cfg(windows)]
+        #[cfg(any(windows, native_d3d))]
         {
             self.recorder
                 .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
                 .try_record(&mut self.scratch, op)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, native_d3d)))]
         {
             self.account_op_vec_realloc();
             self.ops.push(op);
@@ -1423,8 +1423,8 @@ impl FrameData {
         }
     }
 
-    /// Write a borrowed draw directly into the PE frame capture.
-    #[cfg(windows)]
+    /// Write a borrowed draw directly into the wire frame capture.
+    #[cfg(any(windows, native_d3d))]
     pub fn record_draw(&mut self, draw: &crate::draw_data::DrawOp) {
         let _ = self
             .recorder
@@ -1442,7 +1442,7 @@ impl FrameData {
     ///
     /// # Errors
     /// Returns the latched frame error or a wire capture failure.
-    #[cfg(windows)]
+    #[cfg(any(windows, native_d3d))]
     #[inline]
     pub fn record_single_stream_draw<D: crate::encoder_draw::draw_record::SingleStreamDraw>(
         &mut self,
@@ -1458,7 +1458,7 @@ impl FrameData {
     }
 
     /// Write a bound draw through the checked recorder path.
-    #[cfg(windows)]
+    #[cfg(any(windows, native_d3d))]
     #[inline(never)]
     fn record_bound_draw(
         &mut self,
@@ -1472,26 +1472,26 @@ impl FrameData {
     }
 
     /// Retain an owned draw for native replay.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, native_d3d)))]
     pub fn record_draw(&mut self, draw: crate::draw_data::DrawOp) {
         self.push_op(Op::Draw(draw));
     }
 
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    /// Record a constant delta into the wire stream, or retain its operation.
     pub fn record_vs_constants(
         &mut self,
         start_row: u16,
         rows: u16,
         data: crate::draw_data::ScratchSlice,
     ) {
-        #[cfg(windows)]
+        #[cfg(any(windows, native_d3d))]
         {
             let _ = self
                 .recorder
                 .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
                 .record_vs_constants(&mut self.scratch, start_row, rows, data);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, native_d3d)))]
         self.push_op(Op::SetVsConstRange {
             start_row,
             rows,
@@ -1499,21 +1499,21 @@ impl FrameData {
         });
     }
 
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    /// Record a constant delta into the wire stream, or retain its operation.
     pub fn record_ps_constants(
         &mut self,
         start_row: u16,
         rows: u16,
         data: crate::draw_data::ScratchSlice,
     ) {
-        #[cfg(windows)]
+        #[cfg(any(windows, native_d3d))]
         {
             let _ = self
                 .recorder
                 .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
                 .record_ps_constants(&mut self.scratch, start_row, rows, data);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, native_d3d)))]
         self.push_op(Op::SetPsConstRange {
             start_row,
             rows,
@@ -1521,21 +1521,21 @@ impl FrameData {
         });
     }
 
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    /// Record a constant delta into the wire stream, or retain its operation.
     pub fn record_ff_vs_constants(
         &mut self,
         start_row: u16,
         rows: u16,
         data: crate::draw_data::ScratchSlice,
     ) {
-        #[cfg(windows)]
+        #[cfg(any(windows, native_d3d))]
         {
             let _ = self
                 .recorder
                 .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
                 .record_ff_vs_constants(&mut self.scratch, start_row, rows, data);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, native_d3d)))]
         self.push_op(Op::SetFfVsConstRange {
             start_row,
             rows,
@@ -1598,7 +1598,7 @@ impl FrameData {
     /// double-and-memcpy. Hot-path: a single `len == capacity`
     /// compare when no realloc fires. Mirrors the `emit_command`
     /// pattern in `PassState`.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, native_d3d)))]
     #[inline]
     const fn account_op_vec_realloc(&mut self) {
         if self.ops.len() == self.ops.capacity() {
@@ -1679,16 +1679,16 @@ impl FrameData {
 
 /// Capture a typed operation without a transient allocation on the API runtime.
 ///
-/// Keep the owned operation payload inline for PE recording. Native replay borrows
+/// Keep the owned operation payload inline for wire recording. Native replay borrows
 /// fixed command records directly rather than reconstructing owned operations.
-#[cfg(windows)]
+#[cfg(any(windows, native_d3d))]
 #[must_use]
 pub const fn capture_op<T>(value: T) -> T {
     value
 }
 
 /// Box an owned operation payload for the host-side `Op` representation.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, native_d3d)))]
 #[must_use]
 pub fn capture_op<T>(value: T) -> Box<T> {
     Box::new(value)
