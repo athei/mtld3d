@@ -136,22 +136,6 @@ pub fn u64_to_f64_exact(v: u64) -> f64 {
     hi_scaled + f64::from(lo)
 }
 
-/// Lossless `usize` → f64 via [`u64_to_f64_exact`].
-///
-/// `usize` is ≤ u64 on every platform we target, so the widening cast is
-/// exact.
-///
-/// # Panics
-///
-/// Unreachable on supported targets (`x86_64-apple-darwin`,
-/// `aarch64-apple-darwin`, `i686-pc-windows-msvc`, `x86_64-pc-windows-msvc`)
-/// — usize is at most 64 bits everywhere.
-#[inline]
-#[must_use]
-pub fn usize_to_f64_exact(v: usize) -> f64 {
-    u64_to_f64_exact(u64::try_from(v).expect("usize fits u64 on all supported targets"))
-}
-
 /// Return the TSC cycle count that corresponds to the given wall-clock duration in seconds.
 ///
 /// Used to build rate-limit thresholds.

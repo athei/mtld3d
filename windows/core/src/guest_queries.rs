@@ -7,13 +7,12 @@ use std::sync::{Arc, Weak};
 
 use mtld3d_shared::{
     InPtr,
-    encoder_wire::{LeaseCompletion, LeaseCompletionPtr, WireError, WireReader, WireWriter},
+    encoder_wire::{LeaseCompletion, LeaseCompletionPtr, WireError},
     query_mailbox::QueryMailbox,
 };
 use rustc_hash::FxHashMap;
 
 use crate::{
-    encoder_value::WireValue,
     guest_completions::{CompletionPool, CompletionSlot, LeaseCells},
     visibility::VisibilityQueryCore,
 };
@@ -110,24 +109,6 @@ impl GuestQueryDescriptor {
             return Err(WireError::InvalidValue);
         }
         Ok(())
-    }
-}
-
-impl WireValue for GuestQueryDescriptor {
-    const MIN_WIRE_BYTES: usize = 2 * size_of::<u64>();
-
-    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        writer.u64(self.mailbox)?;
-        writer.u64(self.completion)
-    }
-
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        let value = Self {
-            mailbox: reader.u64()?,
-            completion: reader.u64()?,
-        };
-        value.validate()?;
-        Ok(value)
     }
 }
 

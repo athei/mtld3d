@@ -4,16 +4,13 @@ use std::sync::Arc;
 
 use mtld3d_shared::{
     InPtr,
-    encoder_wire::{LeaseCompletion, WireError, WireReader, WireWriter},
+    encoder_wire::{LeaseCompletion, WireError},
     upload_feedback::{UploadFeedback, UploadOutcome},
 };
 use rustc_hash::FxHashMap;
 
 use super::{EmittedUpload, RedirtyEntry, RedirtyQueue};
-use crate::{
-    encoder_value::WireValue,
-    guest_completions::{CompletionPool, CompletionSlot, LeaseCells},
-};
+use crate::guest_completions::{CompletionPool, CompletionSlot, LeaseCells};
 
 /// Original upload metadata and queue retained until native feedback is complete.
 pub struct GuestRedirtyLease {
@@ -224,22 +221,6 @@ impl GuestRedirtyDescriptor {
             }
         }
         Ok(())
-    }
-}
-
-impl WireValue for GuestRedirtyDescriptor {
-    const MIN_WIRE_BYTES: usize = 16;
-    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        writer.u64(self.feedback)?;
-        writer.u64(self.completion)
-    }
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        let value = Self {
-            feedback: reader.u64()?,
-            completion: reader.u64()?,
-        };
-        value.validate()?;
-        Ok(value)
     }
 }
 

@@ -2046,7 +2046,7 @@ impl DeviceInner {
             self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
         }
         self.bound_rt_mut()
-            .replace_render_target(slot, core::ptr::null_mut(), 0, 0);
+            .replace_render_target(slot, core::ptr::null_mut());
         self.last_extra_rt_bindings[slot - 1] = None;
         self.push_control(crate::device::UnbindExtraColorOp {
             slot: u8::try_from(slot).expect("validated extra color slot"),
@@ -3619,7 +3619,7 @@ impl Direct3DDevice9 {
                 info.display_sinks,
             ),
             fullscreen: info.fullscreen,
-            bound_rt: BoundRt::new(info.backbuffer_width, info.backbuffer_height),
+            bound_rt: BoundRt::new(),
             bound_buffers: BoundBuffers::new(),
             shader_bindings: ShaderBindings::new(),
             stage_bindings: StageBindings::new(&info.sampler_states),
@@ -10550,8 +10550,7 @@ extern "system" fn device_set_render_target(
     }
     dev.cur_autogen_rt_ids[slot] = new_autogen;
 
-    dev.bound_rt_mut()
-        .replace_render_target(slot, surf, desc.width, desc.height);
+    dev.bound_rt_mut().replace_render_target(slot, surf);
 
     // Remember the applied binding so a mid-frame readback flush can re-assert
     // it into the fresh frame (the encoder's pass state resets to the
@@ -13989,7 +13988,7 @@ fn promote_cpu_only_texture(dev: &mut DeviceInner, tex: &mut crate::texture::Dir
 /// Walks only the set bits of `StageBindings::bound_mask` and writes the
 /// captured bindings as an initialised prefix of the returned array: the
 /// first `popcount(packed_mask)` slots, in ascending stage order, exactly
-/// the layout `bump_packed_stage_bindings` copies into scratch. Returns
+/// the layout a `StageBindingsPtr` reads from the draw record. Returns
 /// `(packed prefix, FF bound-texture mask (stages 0–7), packed_mask)`.
 ///
 /// Writable texture unlocks dirty the draw snapshot. This walk schedules

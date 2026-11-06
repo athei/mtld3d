@@ -321,7 +321,7 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
         ),
         identity
     );
-    saved.restore_into(&mut ff);
+    saved.restore_filtered(&mut ff, mtld3d_types::StateBlockType::All);
     assert_eq!(
         first.build_bytes(
             &rs,

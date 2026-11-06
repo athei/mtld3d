@@ -132,7 +132,7 @@ fn table_fog_wins_over_vertex_mode_and_keys_source_on_projection() {
 /// `restore_filtered` writes back only the FF state owned by the block type.
 ///
 /// Transforms + material are `All`-only, lights are vertex-pipeline, and
-/// texture-stage states split per index. `All` must match `restore_into`.
+/// texture-stage states split per index. `All` restores every category.
 #[test]
 fn restore_filtered_respects_block_type() {
     use mtld3d_types::{
@@ -217,11 +217,9 @@ fn restore_filtered_respects_block_type() {
         "pixel restores texcoord index"
     );
 
-    // ALL: everything restored, identical to restore_into.
+    // ALL: everything restored.
     let mut a = FfState::new();
     snap.restore_filtered(&mut a, StateBlockType::All);
-    let mut a_ref = FfState::new();
-    snap.restore_into(&mut a_ref);
     assert_eq!(a.light(0).range.to_bits(), 42.0_f32.to_bits());
     assert_eq!(
         a.transform(D3DTS_VIEW).unwrap().m[0].to_bits(),
@@ -231,8 +229,8 @@ fn restore_filtered_respects_block_type() {
     assert_eq!(a.texture_stage_state(0, COLOROP), D3DTOP_DISABLE);
     assert_eq!(
         a.texture_stage_state(0, TCI),
-        a_ref.texture_stage_state(0, TCI),
-        "restore_filtered(All) matches restore_into"
+        5,
+        "all restores texcoord index"
     );
 }
 
@@ -782,7 +780,7 @@ fn set_light_maintains_spot_mask() {
 
 #[test]
 fn restore_recomputes_derived_masks() {
-    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_SPOT, D3DLIGHT9};
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_SPOT, D3DLIGHT9, StateBlockType};
 
     use super::FfStateSnapshot;
     // State-block Apply restores the TSS array wholesale, bypassing the
@@ -809,7 +807,7 @@ fn restore_recomputes_derived_masks() {
             ..D3DLIGHT9::default()
         },
     );
-    snap.restore_into(&mut dst);
+    snap.restore_filtered(&mut dst, StateBlockType::All);
     assert_eq!(dst.light_spot_mask(), 1, "spot bit from restored light");
     assert_eq!(
         dst.light_directional_mask(),
@@ -912,9 +910,6 @@ fn state_block_restores_rederive_the_bump_stage_mask() {
         state.set_texture_stage_state(4, color, D3DTOP_BUMPENVMAP);
         state
     };
-    let mut all = fresh_target();
-    snap.restore_into(&mut all);
-    assert_eq!(all.bump_stage_mask(), 1 << 2, "restore_into");
     for block_type in [StateBlockType::All, StateBlockType::Pixel] {
         let mut target = fresh_target();
         snap.restore_filtered(&mut target, block_type);
@@ -1109,8 +1104,6 @@ fn ff_vs_row_count_sizes_the_palette_from_the_blend_mode() {
 #[test]
 fn the_palette_section_carries_unset_world_matrices_as_identity() {
     use mtld3d_types::{D3DTS_VIEW, D3DTS_WORLD};
-
-    use crate::scratch::ScratchArena;
     // Only D3DTS_WORLD is set, so every other matrix a blended draw reads is
     // the identity D3D9 defines, and reaches the shader as identity times
     // the view.
@@ -1129,14 +1122,9 @@ fn the_palette_section_carries_unset_world_matrices_as_identity() {
         (blend_key_with(4, false), 4),
         (blend_key_with(2, true), cap + 1),
     ] {
-        let mut scratch = ScratchArena::new();
-        let (start, rows, ptr) = state
-            .build_palette_section(&key, &mut scratch)
-            .expect("vertex blending is on");
-        assert_eq!(start, super::FF_VS_PALETTE_BASE_ROW);
+        let rows = state.palette_section_rows(&key);
         assert_eq!(usize::from(rows), matrices * 4, "{matrices} matrices");
-        // SAFETY: the builder initialized `rows` 16-byte rows at `ptr`.
-        let packed = unsafe { read_section_rows(ptr, usize::from(rows)) };
+        let packed = filled_rows(rows, |dst| state.fill_palette_section(&key, dst));
         for (bone, chunk) in packed.as_chunks::<4>().0.iter().enumerate() {
             let expected = if bone == 0 { &first } else { &unset };
             for (row, lanes) in chunk.iter().enumerate() {
@@ -1159,8 +1147,8 @@ fn the_palette_section_carries_unset_world_matrices_as_identity() {
 // ─────────────────────────────────────────────────────────────────────
 
 fn emitter_high_water(key: &super::FfVsKey) -> u16 {
-    use crate::dxso::emit_vs_ff;
-    let msl = emit_vs_ff(key);
+    use crate::dxso::{DEFAULT_VS_ENTRY, emit_vs_ff_named};
+    let msl = emit_vs_ff_named(key, DEFAULT_VS_ENTRY);
     let mut max: u16 = 0;
     let mut scanner = msl.as_str();
     while let Some(pos) = scanner.find("vs_c[") {
@@ -1393,25 +1381,17 @@ fn unread_vs_state_leaves_the_key() {
 // Sparse-light compaction + eye-space packing.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Read `rows` packed `[f32; 4]` rows back out of a section pointer.
-///
-/// Decodes the raw bytes, sidestepping any pointer-alignment cast.
-///
-/// # Safety
-///
-/// `ptr` must point at `rows` consecutive `[f32; 4]` values (16 bytes
-/// each), as returned by a `build_*_section` helper.
-unsafe fn read_section_rows(ptr: *mut u8, rows: usize) -> Vec<[f32; 4]> {
-    let byte_len = rows * 16;
-    // SAFETY: caller guarantees `rows * 16` initialized bytes at `ptr`.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr.cast_const(), byte_len) };
-    bytes
-        .as_chunks::<16>()
-        .0
-        .iter()
+/// Run a `fill_*_section` helper over a fresh `rows`-row destination and return the rows.
+fn filled_rows(
+    rows: u16,
+    fill: impl FnOnce(&mut [core::mem::MaybeUninit<[f32; 4]>]),
+) -> Vec<[f32; 4]> {
+    let mut dst = vec![core::mem::MaybeUninit::new([0.0_f32; 4]); usize::from(rows)];
+    fill(&mut dst);
+    dst.iter()
         .map(|row| {
-            let (lanes, _) = row.as_chunks::<4>();
-            core::array::from_fn(|k| f32::from_le_bytes(lanes[k]))
+            // SAFETY: every row was initialized before the fill.
+            unsafe { row.assume_init_read() }
         })
         .collect()
 }
@@ -1519,8 +1499,6 @@ fn build_vs_key_compacts_sparse_lights_in_index_order() {
 #[test]
 fn eye_space_point_light_position_matches_hand_calc() {
     use mtld3d_types::{D3DLIGHT_POINT, D3DLIGHT9, D3DMATRIX, D3DTS_VIEW, D3DVECTOR};
-
-    use crate::scratch::ScratchArena;
     // VIEW = pure translation {0.5, 0.5, 0}.
     let view = D3DMATRIX {
         m: [
@@ -1547,14 +1525,9 @@ fn eye_space_point_light_position_matches_hand_calc() {
     state.set_light_enabled(0, true);
 
     let key = lit_vs_key(&state);
-    let mut scratch = ScratchArena::new();
-    let (start, rows, ptr) = state
-        .build_lights_section(&key, &mut scratch)
-        .expect("one active light → section present");
-    assert_eq!(start, 15);
+    let rows = FfState::lights_section_rows(&key);
     assert_eq!(rows, 6, "one light = 6 rows");
-    // SAFETY: build_lights_section wrote `rows` [f32;4] rows at `ptr`.
-    let data = unsafe { read_section_rows(ptr, rows as usize) };
+    let data = filled_rows(rows, |dst| state.fill_lights_section(&key, dst));
     // Row 0 = eye-space position + type-w. Hand calc for `v * view`:
     //   x' = 1*1 + 2*0 + 3*0 + 0.5 = 1.5
     //   y' = 1*0 + 2*1 + 3*0 + 0.5 = 2.5
@@ -1570,8 +1543,6 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     // below, so a future refactor of the compaction / eye-space path
     // can't silently drift them.
     use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT_POINT, D3DLIGHT9, D3DVECTOR};
-
-    use crate::scratch::ScratchArena;
     let mut state = FfState::new();
     state.set_light(
         0,
@@ -1606,11 +1577,9 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     let key = lit_vs_key(&state);
     // Identity VIEW ⇒ compacted slot 0 == physical slot 0, eye == world.
     assert_eq!(key.light_active_mask, 0b1);
-    let mut scratch = ScratchArena::new();
-    let (start, rows, ptr) = state.build_lights_section(&key, &mut scratch).unwrap();
-    assert_eq!((start, rows), (15, 6));
-    // SAFETY: 6 [f32;4] rows written at ptr.
-    let data = unsafe { read_section_rows(ptr, 6) };
+    let rows = FfState::lights_section_rows(&key);
+    assert_eq!(rows, 6);
+    let data = filled_rows(rows, |dst| state.fill_lights_section(&key, dst));
     // Position row: world == eye under identity view; POINT type-w = 1.
     assert_row_eq(data[0], [4.0, 5.0, 6.0, 1.0], "position row");
     // Diffuse colour row (row base+2), carrying the specular alpha in .w:
@@ -1737,12 +1706,6 @@ fn snapshot_restores_the_captured_lights_and_only_those() {
     }
     let mut state = FfState::new();
     changed(&mut state);
-    snap.restore_into(&mut state);
-    assert_eq!(range_at(&state, 100), Some(42.0_f32.to_bits()));
-    assert!(state.is_light_enabled_at(3), "restore_into leaves light 3");
-
-    let mut state = FfState::new();
-    changed(&mut state);
     snap.restore_filtered(&mut state, StateBlockType::Pixel);
     for index in [1, 100] {
         assert_eq!(
@@ -1844,14 +1807,6 @@ fn state_block_restores_mark_the_sections_they_write() {
             "{block_type:?} restore marked the wrong sections"
         );
     }
-    let mut state = FfState::new();
-    let _ = state.take_ff_vs_dirty();
-    snapshot.restore_into(&mut state);
-    assert_eq!(
-        state.take_ff_vs_dirty(),
-        FfVsDirty::all(),
-        "restore_into marked the wrong sections"
-    );
 }
 
 mod inverse {
@@ -2241,8 +2196,7 @@ fn ff_vs_row_count_stops_at_the_advertised_palette_index() {
 }
 
 #[test]
-fn build_palette_section_packs_no_matrix_past_the_advertised_index() {
-    use crate::scratch::ScratchArena;
+fn the_palette_section_packs_no_matrix_past_the_advertised_index() {
     let cap = usize::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits usize");
     let key = blend_key();
     for index in [cap, cap + 1, 255] {
@@ -2257,22 +2211,17 @@ fn build_palette_section_packs_no_matrix_past_the_advertised_index() {
         past.m[0] = 5.0;
         state.set_transform(256 + u32::try_from(cap + 1).expect("cap fits u32"), &past);
 
-        let mut scratch = ScratchArena::new();
-        let (start, rows, ptr) = state
-            .build_palette_section(&key, &mut scratch)
-            .expect("vertex blending is on");
-        assert_eq!(start, super::FF_VS_PALETTE_BASE_ROW);
+        let rows = state.palette_section_rows(&key);
         let expected = u16::try_from((cap + 1) * 4).expect("palette rows fit u16");
         assert_eq!(
             rows, expected,
             "D3DTS_WORLDMATRIX({index}) packed extra rows"
         );
         assert!(
-            start + rows <= FF_VS_CONST_ROWS,
+            super::FF_VS_PALETTE_BASE_ROW + rows <= FF_VS_CONST_ROWS,
             "D3DTS_WORLDMATRIX({index}) packs past the FF VS constant block"
         );
-        // SAFETY: the builder initialized `rows` 16-byte rows at `ptr`.
-        let packed = unsafe { read_section_rows(ptr, usize::from(rows)) };
+        let packed = filled_rows(rows, |dst| state.fill_palette_section(&key, dst));
         assert!(
             (packed[cap * 4][0] - 9.0).abs() < f32::EPSILON,
             "the last matrix the block holds was not packed"

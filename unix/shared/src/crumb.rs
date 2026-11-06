@@ -18,8 +18,8 @@
 //! MTLD3D_CRUMB=1 make install
 //! ```
 //!
-//! Routed through each consumer's `build.rs` (see `unix/shared/build.rs`,
-//! `unix/unix/build.rs`, `windows/d3d9/build.rs`).
+//! Routed through the `build.rs` of each crate that reads the cfg
+//! (`unix/shared/build.rs`, `windows/d3d9/build.rs`).
 
 #[cfg(not(mtld3d_crumb))]
 mod disabled {

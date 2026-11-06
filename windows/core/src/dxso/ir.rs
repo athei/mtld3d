@@ -580,8 +580,6 @@ pub enum DxsoError {
     ///
     /// Or an out-of-range minor, e.g. `vs_1_0` / `ps_1_5`.
     UnsupportedShaderModel { major: u8, minor: u8 },
-    /// Opcode is a valid control-flow instruction we don't yet handle.
-    UnsupportedControlFlow,
     /// Opcode byte doesn't map to any known SM1-3 opcode.
     UnknownOpcode(u16),
     /// Register type bits don't map to any known register kind.

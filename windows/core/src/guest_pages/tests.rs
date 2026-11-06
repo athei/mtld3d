@@ -1,28 +1,10 @@
 use std::sync::Arc;
 
-use mtld3d_shared::encoder_wire::{FrameSlab, WireReader};
-
-use super::{GuestPageDescriptor, GuestPageLease, LeaseOnlyPages};
+use super::{GuestPageLease, LeaseOnlyPages};
 use crate::{
-    encoder_value::WireValue,
     page_box::{PAGE_SIZE, PageBox, PageBoxRead},
     page_box_pool::PageBoxPool,
 };
-
-fn round_trip(value: &GuestPageDescriptor) -> GuestPageDescriptor {
-    let mut slab = FrameSlab::new();
-    slab.push_record(1, |writer| value.write_wire(writer))
-        .expect("encode descriptor");
-    let mut reader = WireReader::new(slab.as_bytes());
-    let mut record = reader
-        .next_record()
-        .expect("record stream")
-        .expect("one record");
-    let descriptor =
-        GuestPageDescriptor::read_wire(&mut record.payload).expect("decode descriptor");
-    assert!(record.payload.is_empty());
-    descriptor
-}
 
 #[test]
 fn read_handoff_never_exposes_zero_before_native_read_ends() {
@@ -31,7 +13,7 @@ fn read_handoff_never_exposes_zero_before_native_read_ends() {
     assert!(original.has_readers());
     assert!(!lease.maintain());
     assert!(original.has_readers());
-    let descriptor = round_trip(&lease.descriptor());
+    let descriptor = lease.descriptor();
     // SAFETY: lease retains the original read and all cells, with exactly one native adoption.
     let native_read = unsafe { descriptor.adopt_read() }.expect("native read");
     assert!(original.has_readers());
@@ -180,7 +162,7 @@ fn a_retired_lease_parks_staging_the_texture_released_before_it() {
         "the texture's release leaves the pages with the lease"
     );
     assert!(
-        pages.acquire_staging(3 * PAGE_SIZE).is_none(),
+        pages.take_parked(3 * PAGE_SIZE).is_none(),
         "no create can take pages native code still reads"
     );
     assert!(!lease.maintain());
@@ -194,7 +176,7 @@ fn a_retired_lease_parks_staging_the_texture_released_before_it() {
     cells.recycle(lease.into_slot().expect("pooled completion"));
     assert_eq!(pages.staging_bytes(), 3 * PAGE_SIZE);
     let reused = pages
-        .acquire_staging(3 * PAGE_SIZE)
+        .take_parked(3 * PAGE_SIZE)
         .expect("parked at retirement");
     assert_eq!(reused.as_ptr(), address);
     assert_eq!(reused.generation(), generation);
@@ -227,7 +209,7 @@ fn an_unacknowledged_lease_never_offers_its_pages() {
     // Neither acknowledgment arrived, so the owner drops instead of parking.
     drop(lease.into_slot());
     assert_eq!(pages.staging_bytes(), 0);
-    assert!(pages.acquire_staging(PAGE_SIZE).is_none());
+    assert!(pages.take_parked(PAGE_SIZE).is_none());
 }
 
 fn lease_only_bytes(leases: &[&GuestPageLease]) -> u64 {

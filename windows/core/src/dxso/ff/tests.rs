@@ -12,12 +12,12 @@ use mtld3d_types::{
 };
 
 use super::{
-    FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff,
-    emit_vs_ff,
+    FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX,
+    emit_ps_ff_named, emit_vs_ff_named,
 };
 use crate::dxso::{
     decl_passthrough_code,
-    emit::{VariantFlags, VariantKey},
+    emit::{DEFAULT_PS_ENTRY, DEFAULT_VS_ENTRY, VariantFlags, VariantKey},
     tci_entry,
 };
 
@@ -27,8 +27,8 @@ fn narrow(v: u32) -> u8 {
 }
 
 fn emit_pair_for_tests(vs_key: &FfVsKey, ps_key: &FfPsKey, variant: VariantKey) -> String {
-    let vs = emit_vs_ff(vs_key);
-    let ps = emit_ps_ff(ps_key, variant);
+    let vs = emit_vs_ff_named(vs_key, DEFAULT_VS_ENTRY);
+    let ps = emit_ps_ff_named(ps_key, variant, DEFAULT_PS_ENTRY);
     format!("{vs}\n{ps}")
 }
 
@@ -87,8 +87,12 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
         flags: FfStageFlags::HAS_TEXTURE,
     };
     assert_eq!(ps.sampled_stage_mask(), 1);
-    assert!(ps.reads_texture_factor());
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert_eq!(
+        ps.constant_rows(),
+        1,
+        "the stage reads only the texture factor"
+    );
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         msl.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xy);"),
         "{msl}"
@@ -104,7 +108,7 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
 
     ps.stages[0].flags.remove(FfStageFlags::HAS_TEXTURE);
     assert_eq!(ps.sampled_stage_mask(), 0);
-    let missing = emit_ps_ff(&ps, VariantKey::default());
+    let missing = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!missing.contains("[[texture(0)]]"), "{missing}");
     assert!(
         missing.contains("saturate((1.0 - in.color0.aaaa) + ps_c[0])"),
@@ -116,7 +120,7 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
     );
 
     ps.stages[0].color_arg1 = narrow(D3DTA_TEXTURE | D3DTA_COMPLEMENT);
-    let explicit_missing = emit_ps_ff(&ps, VariantKey::default());
+    let explicit_missing = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         explicit_missing.contains("current = float4((current).rgb,"),
         "{explicit_missing}"
@@ -141,7 +145,7 @@ fn implicit_texture_alpha_blend_without_a_texture_selects_arg2() {
         flags: FfStageFlags::empty(),
     };
     assert_eq!(ps.sampled_stage_mask(), 0);
-    let missing = emit_ps_ff(&ps, VariantKey::default());
+    let missing = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!missing.contains("[[texture(0)]]"), "{missing}");
     assert!(
         missing.contains("current = float4((ps_c[0]).rgb, (ps_c[0]).a);"),
@@ -151,7 +155,7 @@ fn implicit_texture_alpha_blend_without_a_texture_selects_arg2() {
 
     // With a texture bound the same stage weighs by the sampled alpha.
     ps.stages[0].flags.insert(FfStageFlags::HAS_TEXTURE);
-    let bound = emit_ps_ff(&ps, VariantKey::default());
+    let bound = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         bound.contains("(in.color0 * t0.a + ps_c[0] * (1.0 - t0.a))"),
         "{bound}"
@@ -248,7 +252,7 @@ fn lit_diffuse_alpha_is_clamped() {
     vs.flags.set(FfVsFlags::HAS_COLOR0, false);
     vs.light_active_mask = 1;
     vs.light_directional_mask = 1;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("out.color0 = saturate(float4(diffuseAccum.rgb, vs_c[10].a));"),
         "{msl}"
@@ -268,7 +272,7 @@ fn specular_term_is_gated_on_a_positive_half_angle() {
     vs.flags.set(FfVsFlags::SPECULAR_ENABLE, true);
     vs.light_active_mask = 1;
     vs.light_directional_mask = 1;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains(
             "float specFactor = (ndotl > 0.0 && ndoth > 0.0) ? pow(ndoth, mat_power) : 0.0;"
@@ -352,13 +356,13 @@ fn local_viewer_flag_selects_view_vector_model() {
     vs.light_directional_mask = 1;
 
     // LOCAL_VIEWER clear → constant infinite-viewer direction.
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("float3 V = float3(0.0, 0.0, -1.0);"), "{msl}");
     assert!(!msl.contains("normalize(-posEye)"), "{msl}");
 
     // LOCAL_VIEWER set → per-vertex direction to the eye.
     vs.flags.set(FfVsFlags::LOCAL_VIEWER, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("float3 V = normalize(-posEye);"), "{msl}");
 }
 
@@ -369,7 +373,7 @@ fn spot_light_emits_cone_factor() {
     vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
     vs.light_active_mask = 1;
     vs.light_spot_mask = 1;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     // Slot 0 rows: direction 16, ambient 18, attenuation 19, specular 20.
     assert!(msl.contains("float rho = dot(-L, vs_c[16].xyz);"), "{msl}");
     assert!(
@@ -387,7 +391,7 @@ fn directional_and_point_lights_emit_no_cone_factor() {
     vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
     vs.light_active_mask = 0b11;
     vs.light_directional_mask = 0b01; // slot 0 directional, slot 1 point
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(!msl.contains("rho"), "{msl}");
 }
 
@@ -406,7 +410,7 @@ fn the_light_vector_is_declared_only_where_it_is_read() {
                 vs.light_active_mask = 1;
                 vs.light_directional_mask = u8::from(directional);
                 vs.light_spot_mask = u8::from(spot);
-                let msl = emit_vs_ff(&vs);
+                let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
                 let case = format!(
                     "normal={normal} specular={specular} directional={directional} spot={spot}\n{msl}"
                 );
@@ -471,7 +475,7 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                     vs.tci[0] = tci_entry(tci, 0);
                     vs.vertex_blend_count = blend;
                     vs.declared_weights_count = blend;
-                    let msl = emit_vs_ff(&vs);
+                    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
                     let case = format!(
                         "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
                     );
@@ -563,7 +567,7 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     vs.tci[0] = tci_entry(tci, 0);
                     vs.vertex_blend_count = blend;
                     vs.declared_weights_count = blend;
-                    let msl = emit_vs_ff(&vs);
+                    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
                     let case = format!(
                         "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} normalize={normalize_normals} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
                     );
@@ -845,7 +849,7 @@ fn no_vertex_shader_local_is_declared_unread() {
     // path. Whatever a future branch declares is covered by name.
     let mut reported: Vec<(String, String)> = Vec::new();
     let mut check = |vs: &FfVsKey| {
-        for local in unread_locals(&emit_vs_ff(vs)) {
+        for local in unread_locals(&emit_vs_ff_named(vs, DEFAULT_VS_ENTRY)) {
             if !reported.iter().any(|(name, _)| *name == local) {
                 reported.push((local, format!("{vs:?}")));
             }
@@ -1030,7 +1034,7 @@ fn no_pixel_shader_local_is_declared_unread() {
 
     let mut reported: Vec<(String, String)> = Vec::new();
     let mut check = |ps: &FfPsKey, variant: VariantKey| {
-        let msl = emit_ps_ff(ps, variant);
+        let msl = emit_ps_ff_named(ps, variant, DEFAULT_PS_ENTRY);
         // The complement of the sweep, and the half Metal would refuse: a
         // local the function reads has to be declared, so a sample or a write
         // the emitter drops cannot take a reader with it.
@@ -1412,7 +1416,7 @@ fn fog_mode_4_sources_factor_from_specular_alpha() {
     let mut vs = default_vs_key();
     vs.flags.insert(FfVsFlags::HAS_COLOR1);
     vs.fog_mode = 4;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("out.fog = float4(in.v3.w, 0.0, 0.0, 0.0);"),
         "fog_mode 4 must read the specular alpha:\n{msl}"
@@ -1420,7 +1424,7 @@ fn fog_mode_4_sources_factor_from_specular_alpha() {
     // No declared specular ⇒ default oFog = 1.0 (unfogged).
     let mut vs_no_spec = default_vs_key();
     vs_no_spec.fog_mode = 4;
-    let msl_no_spec = emit_vs_ff(&vs_no_spec);
+    let msl_no_spec = emit_vs_ff_named(&vs_no_spec, DEFAULT_VS_ENTRY);
     assert!(
         msl_no_spec.contains("out.fog = float4(1.0);"),
         "fog_mode 4 without specular must default to unfogged:\n{msl_no_spec}"
@@ -1435,7 +1439,7 @@ fn ps_specular_add_emitted_before_fog_when_enabled() {
         fog_mode: 3,
         ..VariantKey::default()
     };
-    let msl = emit_ps_ff(&ps, variant);
+    let msl = emit_ps_ff_named(&ps, variant, DEFAULT_PS_ENTRY);
     let add = msl
         .find("current = float4(saturate(current.rgb + in.color1.rgb), current.a);")
         .expect("specular add missing");
@@ -1445,7 +1449,7 @@ fn ps_specular_add_emitted_before_fog_when_enabled() {
 
 #[test]
 fn ps_specular_add_absent_when_disabled() {
-    let msl = emit_ps_ff(&default_ps_key(), VariantKey::default());
+    let msl = emit_ps_ff_named(&default_ps_key(), VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("in.color1"), "{msl}");
 }
 
@@ -1459,7 +1463,7 @@ fn d3dta_specular_resolves_to_color1() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains("in.color1"), "{msl}");
 }
 
@@ -1473,7 +1477,7 @@ fn d3dta_specular_alpha_replicate_broadcasts() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains("in.color1.aaaa"), "{msl}");
 }
 
@@ -1483,7 +1487,7 @@ fn unlit_missing_color0_defaults_to_white() {
     // an absent COLOR0), not the material diffuse constant.
     let mut vs = default_vs_key();
     vs.flags.remove(FfVsFlags::HAS_COLOR0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("out.color0 = float4(1.0);"), "{msl}");
     assert!(!msl.contains("out.color0 = vs_c[10];"), "{msl}");
 }
@@ -1492,7 +1496,7 @@ fn unlit_missing_color0_defaults_to_white() {
 fn unlit_color1_passes_through_vertex_specular() {
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_COLOR1, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("out.color1 = in.v3;"), "{msl}");
 }
 
@@ -1501,7 +1505,7 @@ fn rhw_color1_passes_through_vertex_specular() {
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_RHW, true);
     vs.flags.set(FfVsFlags::HAS_COLOR1, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("out.color1 = in.v3;"), "{msl}");
 }
 
@@ -2197,7 +2201,7 @@ fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
     vs.declared_weights_count = 1;
     vs.tex_coord_count = 1;
     vs.tci[0] = tci_entry(3, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert_eq!(
         msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
         1,
@@ -2237,7 +2241,7 @@ fn texgen_reads_the_lighting_normal_lit_or_unlit() {
                 vs.light_directional_mask = u8::from(lighting);
                 vs.tex_coord_count = 1;
                 vs.tci[0] = tci_entry(tci, 0);
-                let msl = emit_vs_ff(&vs);
+                let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
                 let case = format!("lighting={lighting} tci={tci} normalize={normalize}\n{msl}");
                 assert!(
                     msl.contains("static inline float4 mtld3d_cross4("),
@@ -2426,7 +2430,7 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                     }
                     vs.tex_coord_count = 1;
                     vs.tci[0] = tci_entry(mode, 0);
-                    let msl = emit_vs_ff(&vs);
+                    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
                     let case = format!(
                         "blended={blended} lighting={lighting} normal={normal} tci={mode}\n{msl}"
                     );
@@ -2511,7 +2515,7 @@ fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
     vs.tci[0] = tci_entry(4, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert_eq!(msl.matches("float3 n = (abs(nwvdet)").count(), 1, "{msl}");
     assert!(!msl.contains("normalize(n"), "{msl}");
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
@@ -2538,7 +2542,7 @@ fn tci_spheremap_without_normal_reflects_about_a_zero_normal() {
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
     vs.tci[0] = tci_entry(4, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     assert!(!msl.contains("float3 n ="), "{msl}");
     assert!(msl.contains("        float3 R_tci = E_tci;\n"), "{msl}");
@@ -2560,7 +2564,7 @@ fn tci_spheremap_lit_reuses_the_lighting_locals() {
     vs.light_directional_mask = 1;
     vs.tex_coord_count = 1;
     vs.tci[0] = tci_entry(4, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     assert_eq!(msl.matches("float3 n =").count(), 1, "{msl}");
     assert!(!msl.contains("float3 n = normalize("), "{msl}");
@@ -2575,7 +2579,7 @@ fn tci_spheremap_vertex_blended_reads_the_blended_locals() {
     vs.declared_weights_count = 1;
     vs.tex_coord_count = 1;
     vs.tci[0] = tci_entry(4, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert_eq!(
         msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
         1,
@@ -2597,7 +2601,7 @@ fn tci_spheremap_texture_transform_applies_to_the_generated_coordinate() {
     vs.tex_coord_count = 1;
     vs.tci[0] = tci_entry(4, 0);
     vs.tt_flags[0] = 2;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     let generated = msl
         .find("raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);")
         .unwrap_or_else(|| panic!("no generated coordinate: {msl}"));
@@ -2624,7 +2628,7 @@ fn tci_mode_above_spheremap_passes_the_input_coordinate_through() {
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
     vs.tci[0] = tci_entry(5, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("float4 raw0 = float4(in.v4.xy, 0.0, 0.0);"),
         "{msl}"
@@ -2643,7 +2647,7 @@ fn tci_spheremap_on_xyzrhw_passes_the_input_coordinate_through() {
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
     vs.tci[0] = tci_entry(4, 0);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("out.texcoord0 = float4(("), "{msl}");
     assert!(msl.contains("in.v4"), "{msl}");
     assert!(!msl.contains("R_tci"), "{msl}");
@@ -2689,7 +2693,7 @@ fn vertex_blend_sequential_2_weight_emits_implicit_last_weight_and_palette_reads
     vs.vertex_blend_count = 3;
     vs.flags.set(FfVsFlags::VERTEX_BLEND_INDEXED, false);
     vs.declared_weights_count = 2;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     // VertexIn slot for blend_weight (slot 12) — no blend_indices slot in
     // sequential mode (declared_indices is false).
     assert!(
@@ -2729,7 +2733,7 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
     vs.flags.set(FfVsFlags::VERTEX_BLEND_INDEXED, true);
     vs.declared_weights_count = 3;
     vs.flags.set(FfVsFlags::DECLARED_INDICES, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("float4 blend_weight [[attribute(12)]]"),
         "{msl}"
@@ -2761,7 +2765,7 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
     vs.flags.set(FfVsFlags::VERTEX_BLEND_INDEXED, true);
     vs.declared_weights_count = 0;
     vs.flags.set(FfVsFlags::DECLARED_INDICES, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     // No BLENDWEIGHT slot needed.
     assert!(!msl.contains("blend_weight"), "{msl}");
     assert!(
@@ -2787,7 +2791,7 @@ fn vertex_blend_off_emits_unchanged_position_math() {
     // plain position decomposition with no blend paths, so meshes without
     // blending render identically.
     let vs = default_vs_key();
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("float4 pos_view = float4(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]), dot(pos, vs_c[3]));"),
         "non-blending path unchanged: {msl}"
@@ -2808,7 +2812,7 @@ fn xyzrhw_emits_half_pixel_offset_window_to_ndc() {
     // folded into ndc_x/ndc_y before the `* w` divide.
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_RHW, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     // Base window→NDC mapping still present.
     assert!(msl.contains("* 2.0 - 1.0"), "{msl}");
     assert!(
@@ -2835,7 +2839,7 @@ fn rhw_emits_pos_fixup_selected_depth_clamp() {
     // AFTER the `fog_z` write so table fog keeps reading unclamped depth.
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_RHW, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     let clamp =
         "if (pos_fixup.z != 0.0) { out.position.z = clamp(out.position.z, 0.0, out.position.w); }";
     assert!(
@@ -2858,7 +2862,7 @@ fn rhw_emits_pos_fixup_selected_depth_clamp() {
     );
     // The regular (non-RHW) transform path clips like every other draw and
     // must not grow the clamp.
-    let msl_plain = emit_vs_ff(&default_vs_key());
+    let msl_plain = emit_vs_ff_named(&default_vs_key(), DEFAULT_VS_ENTRY);
     assert!(
         !msl_plain.contains("pos_fixup.z != 0.0"),
         "non-RHW FF VS must not emit the depth clamp:\n{msl_plain}"
@@ -2880,7 +2884,7 @@ fn ff_transform_emits_half_pixel_pos_fixup() {
     // right/down so on-boundary geometry matches the D3D9 window→NDC
     // reference.
     let vs = default_vs_key();
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains(&format!(
             "constant PosFixup &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
@@ -2906,7 +2910,7 @@ fn ff_point_size_converts_the_clamped_size_to_render_pixels() {
         vs.flags | FfVsFlags::HAS_RHW,
     ] {
         vs.flags = flags;
-        let msl = emit_vs_ff(&vs);
+        let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
         assert!(
             msl.contains(
                 "out.point_size = clamp(psize, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;"
@@ -2925,7 +2929,7 @@ fn ff_point_scale_measures_the_viewport_height_in_reported_pixels() {
     // single conversion stays the only one.
     let mut vs = default_vs_key();
     vs.flags |= FfVsFlags::POINT_SCALE;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("psize *= ((-1.0 / pos_fixup.y) / pos_fixup.w) / sqrt(max("),
         "FF point scale must read the viewport height in reported pixels:\n{msl}"
@@ -2944,7 +2948,7 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         ..FfStage::default()
     };
 
-    let plain = emit_ps_ff(&ps, VariantKey::default());
+    let plain = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         !plain.contains("lod_bias"),
         "an unbiased scene keeps the shader it had:\n{plain}"
@@ -2954,7 +2958,7 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         flags: VariantFlags::LOD_BIAS,
         ..VariantKey::default()
     };
-    let biased = emit_ps_ff(&ps, variant);
+    let biased = emit_ps_ff_named(&ps, variant, DEFAULT_PS_ENTRY);
     assert!(
         biased.contains(&format!(
             "constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
@@ -2966,13 +2970,14 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         "stage 0 samples with its own slot's bias:\n{biased}"
     );
 
-    let depth = emit_ps_ff(
+    let depth = emit_ps_ff_named(
         &ps,
         VariantKey {
             depth_sampler_mask: 1,
             flags: VariantFlags::LOD_BIAS,
             ..VariantKey::default()
         },
+        DEFAULT_PS_ENTRY,
     );
     assert!(
         depth.contains("level(max(lod_bias[0].w, 0.0))"),
@@ -3018,7 +3023,7 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
             key.fog_mode = mode;
             key.vertex_blend_count = blends;
             key.declared_weights_count = u8::from(blends != 0);
-            let ordinary = emit_vs_ff(&key);
+            let ordinary = emit_vs_ff_named(&key, DEFAULT_VS_ENTRY);
             // The eye depth of the blended position when the vertex blends,
             // which without blending is the row-2 dot of the single matrix.
             assert!(
@@ -3028,7 +3033,7 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
             assert!(!ordinary.contains("abs(dot(pos"), "{ordinary}");
             assert!(!ordinary.contains("length(pos_view.xyz)"));
             key.flags.insert(FfVsFlags::RANGE_FOG);
-            let range = emit_vs_ff(&key);
+            let range = emit_vs_ff_named(&key, DEFAULT_VS_ENTRY);
             assert!(range.contains("float eyeZ = length(pos_view.xyz);"));
             assert_eq!(
                 range.replace("length(pos_view.xyz)", "abs(pos_view.z)"),
@@ -3053,12 +3058,15 @@ fn dotproduct3_supplies_the_whole_stage_result() {
         ..FfStage::default()
     };
     let expected = "    current = float4(saturate(4.0 * dot(((1.0 - in.color0.aaaa)).rgb - 0.5, (ps_c[0]).rgb - 0.5)));";
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.lines().any(|line| line == expected), "{msl}");
     // The separate alpha operation cannot affect a DOTPRODUCT3 color stage.
     ps.stages[0].alpha_op = narrow(D3DTOP_MODULATE);
     ps.stages[0].alpha_arg1 = narrow(D3DTA_TFACTOR);
-    assert_eq!(msl, emit_ps_ff(&ps, VariantKey::default()));
+    assert_eq!(
+        msl,
+        emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY)
+    );
 }
 
 #[test]
@@ -3075,7 +3083,7 @@ fn modulate_keeps_separate_color_and_alpha_arguments() {
         flags: FfStageFlags::HAS_TEXTURE,
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     let expected = "    current = float4(((t0 * in.color0)).rgb, (ps_c[0]).a);";
     assert!(msl.lines().any(|line| line == expected), "{msl}");
 }
@@ -3093,10 +3101,13 @@ fn dotproduct3_unbound_color_keeps_independent_alpha() {
         alpha_arg1: narrow(D3DTA_TFACTOR),
         ..FfStage::default()
     };
-    let fallback = emit_ps_ff(&ps, VariantKey::default());
+    let fallback = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     ps.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
     ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-    assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
+    assert_eq!(
+        fallback,
+        emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY)
+    );
     assert!(fallback.contains("current = float4((current).rgb, (ps_c[0]).a);"));
 }
 
@@ -3119,22 +3130,28 @@ fn premultiplied_alpha_follows_effective_dotproduct3_color() {
                 FfStageFlags::empty()
             },
         };
-        let dot = emit_ps_ff(&ps, VariantKey::default());
+        let dot = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
         ps.stages[0].alpha_op = narrow(D3DTOP_BLENDTEXTUREALPHAPM);
-        assert_eq!(dot, emit_ps_ff(&ps, VariantKey::default()));
+        assert_eq!(
+            dot,
+            emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
 
         // A missing explicit color argument falls back before DOT3 can
         // override alpha, leaving the independent PM operation effective.
         ps.stages[0].flags.remove(FfStageFlags::HAS_TEXTURE);
         ps.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
-        let fallback = emit_ps_ff(&ps, VariantKey::default());
+        let fallback = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(
             fallback
                 .contains("current = float4((current).rgb, (saturate(in.color0 + ps_c[0])).a);")
         );
         ps.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
         ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-        assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
+        assert_eq!(
+            fallback,
+            emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
     }
 }
 
@@ -3161,7 +3178,7 @@ fn temp_register_keeps_both_old_channels_until_whole_result_assignment() {
         specular_add: false,
         tt_projected_mask: 0,
     };
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert_eq!(msl.matches("float4 temp = float4(0.0);").count(), 1);
     assert!(msl.contains("temp = float4((temp.aaaa).rgb, ((1.0 - temp)).a);"));
     assert!(msl.contains("current = float4((temp).rgb, (current).a);"));
@@ -3193,13 +3210,19 @@ fn unused_temp_operands_and_disabled_stages_emit_no_register() {
         specular_add: false,
         tt_projected_mask: 0,
     };
-    assert!(!emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+    assert!(
+        !emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY).contains("float4 temp")
+    );
     // The unbound-texture fallback replaces this whole color expression.
     key.stages[0].color_op = narrow(D3DTOP_MODULATE);
     key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
-    assert!(!emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+    assert!(
+        !emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY).contains("float4 temp")
+    );
     key.stages[0].flags.insert(FfStageFlags::HAS_TEXTURE);
-    assert!(emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+    assert!(
+        emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY).contains("float4 temp")
+    );
 }
 
 #[test]
@@ -3304,7 +3327,7 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
         alpha_arg1: narrow(D3DTA_TEMP),
         ..FfStage::default()
     };
-    let current = emit_ps_ff(&key, VariantKey::default());
+    let current = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         !current.contains("float4 temp"),
         "effective DOT3 ignores TEMP alpha input"
@@ -3321,7 +3344,7 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let temp = emit_ps_ff(&key, VariantKey::default());
+    let temp = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(temp.contains("float4 temp = float4(0.0);"));
     assert!(temp.contains("temp = float4(saturate(4.0 * dot("));
     assert!(
@@ -3331,7 +3354,7 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
     key.stages[1] = stage_disable();
     key.stages[0].set_result(FfStageResult::Current);
     key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
-    let unbound = emit_ps_ff(&key, VariantKey::default());
+    let unbound = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(unbound.contains("float4 temp = float4(0.0);"));
     assert!(unbound.contains("current = float4((current).rgb, (temp).a);"));
 }
@@ -3390,7 +3413,7 @@ fn per_stage_constant_extent_follows_effective_operands() {
         9,
         "highest active stage has its own row"
     );
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains("current = float4((ps_c[8]).rgb"));
     // An unknown alpha operation retains the emitter's arg1 fallback.
     key.stages = [stage_disable(); 8];
@@ -3435,14 +3458,17 @@ fn disabled_alpha_under_enabled_color_keeps_the_incoming_alpha() {
     let mut key = default_ps_key();
     key.stages[0] = diffuse_stage();
     key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     let expected = "    current = float4(((t1 * current)).rgb, (current).a);";
     assert!(msl.lines().any(|line| line == expected), "{msl}");
     assert!(!msl.contains("(t1).a"), "{msl}");
     // Keeping CURRENT's alpha is exactly SELECTARG1(CURRENT) on the alpha.
     key.stages[1].alpha_op = narrow(D3DTOP_SELECTARG1);
     key.stages[1].alpha_arg1 = narrow(D3DTA_CURRENT);
-    assert_eq!(msl, emit_ps_ff(&key, VariantKey::default()));
+    assert_eq!(
+        msl,
+        emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
+    );
 }
 
 #[test]
@@ -3454,11 +3480,10 @@ fn disabled_alpha_without_a_texture_keeps_the_incoming_alpha() {
     key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::empty());
     key.stages[1].color_arg1 = narrow(D3DTA_DIFFUSE);
     key.stages[1].alpha_arg1 = narrow(D3DTA_TFACTOR);
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     let expected = "    current = float4(((in.color0 * current)).rgb, (current).a);";
     assert!(msl.lines().any(|line| line == expected), "{msl}");
     assert!(!msl.contains("ps_c[0]"), "{msl}");
-    assert!(!key.reads_texture_factor());
     assert_eq!(key.constant_rows(), 0);
 }
 
@@ -3479,7 +3504,7 @@ fn disabled_alpha_keeps_the_temporary_alpha_when_the_stage_writes_temp() {
             alpha_arg1: narrow(D3DTA_TEMP),
             ..FfStage::default()
         };
-        let msl = emit_ps_ff(&key, VariantKey::default());
+        let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
         let color = if flags.contains(FfStageFlags::HAS_TEXTURE) {
             "(t1 * current)"
         } else {
@@ -3510,7 +3535,7 @@ fn disabled_alpha_on_a_first_stage_writing_temp_keeps_the_zeroed_temporary_alpha
         alpha_arg1: narrow(D3DTA_TEMP),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains("float4 temp = float4(0.0);"), "{msl}");
     let expected = "    temp = float4(((t0 * current)).rgb, (temp).a);";
     assert!(msl.lines().any(|line| line == expected), "{msl}");
@@ -3525,7 +3550,7 @@ fn disabled_alpha_samples_no_texture_the_color_does_not_read() {
     key.stages[0] = diffuse_stage();
     key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
     key.stages[1].color_op = narrow(D3DTOP_SELECTARG2);
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("float4 t1 ="), "{msl}");
     assert!(
         msl.contains("current = float4((current).rgb, (current).a);"),
@@ -3543,7 +3568,7 @@ fn disabled_alpha_leaves_a_dotproduct3_stage_writing_its_whole_result() {
     key.stages[0] = diffuse_stage();
     key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
     key.stages[1].color_op = narrow(D3DTOP_DOTPRODUCT3);
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     let expected =
         "    current = float4(saturate(4.0 * dot((t1).rgb - 0.5, (current).rgb - 0.5)));";
     assert!(msl.lines().any(|line| line == expected), "{msl}");
@@ -3565,12 +3590,15 @@ fn modulate_alpha_add_color_unbound_operands_keep_ordinary_fallback_source() {
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
-        let fallback = emit_ps_ff(&key, VariantKey::default());
+        let fallback = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(!fallback.contains("[[texture("));
         assert!(!fallback.contains("[[sampler("));
         key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
         key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-        assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+        assert_eq!(
+            fallback,
+            emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
     }
 }
 
@@ -3586,10 +3614,10 @@ fn modulate_alpha_add_color_nontexture_inputs_add_no_sampler_or_uniform() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("[[texture("));
     assert!(!msl.contains("[[sampler("));
-    assert!(!key.reads_texture_factor());
+    assert_eq!(key.constant_rows(), 0);
     assert_eq!(key.sampled_stage_mask(), 0);
     assert!(msl.contains("saturate((1.0 - in.color0) + ((1.0 - in.color0)).a * current)"));
 }
@@ -3654,12 +3682,15 @@ fn modulate_color_add_alpha_unbound_operands_keep_ordinary_fallback_source() {
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
-        let fallback = emit_ps_ff(&key, VariantKey::default());
+        let fallback = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(!fallback.contains("[[texture("));
         assert!(!fallback.contains("[[sampler("));
         key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
         key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-        assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+        assert_eq!(
+            fallback,
+            emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
     }
 }
 
@@ -3675,10 +3706,10 @@ fn modulate_color_add_alpha_nontexture_inputs_add_no_sampler_or_uniform() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("[[texture("));
     assert!(!msl.contains("[[sampler("));
-    assert!(!key.reads_texture_factor());
+    assert_eq!(key.constant_rows(), 0);
     assert_eq!(key.sampled_stage_mask(), 0);
     assert!(msl.contains("saturate((1.0 - in.color0) * current + ((1.0 - in.color0)).a)"));
 }
@@ -3749,7 +3780,7 @@ fn modulate_color_add_alpha_dependency_extent_keeps_alpha_and_factor_policy() {
         1,
         "texture-factor capture stays conservative"
     );
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         !msl.contains("ps_c[0]"),
         "suppressed factor has no expression"
@@ -3777,12 +3808,15 @@ fn modulate_inverse_alpha_add_color_fallback_preserves_source_identity() {
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
-        let fallback = emit_ps_ff(&key, VariantKey::default());
+        let fallback = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(!fallback.contains("[[texture("));
         assert!(!fallback.contains("[[sampler("));
         key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
         key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-        assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+        assert_eq!(
+            fallback,
+            emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
     }
 }
 
@@ -3834,7 +3868,7 @@ fn modulate_inverse_alpha_add_color_uses_existing_binary_constant_extent() {
             "inherited conservative TFACTOR extent"
         );
         assert!(
-            emit_ps_ff(&key, VariantKey::default())
+            emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
                 .contains("current = float4((current).rgb, (current).a);")
         );
         key.stages[0].color_op = narrow(D3DTOP_DISABLE);
@@ -3864,12 +3898,15 @@ fn modulate_inv_color_add_alpha_unbound_operands_keep_ordinary_fallback_source()
                 alpha_arg1: narrow(D3DTA_TFACTOR),
                 ..FfStage::default()
             };
-            let fallback = emit_ps_ff(&key, VariantKey::default());
+            let fallback = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
             assert!(!fallback.contains("[[texture("));
             assert!(!fallback.contains("[[sampler("));
             key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
             key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
-            assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+            assert_eq!(
+                fallback,
+                emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
+            );
         }
     }
 }
@@ -3886,7 +3923,7 @@ fn modulate_inv_color_add_alpha_nontexture_inputs_add_no_resource() {
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
-    let msl = emit_ps_ff(&key, VariantKey::default());
+    let msl = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("[[texture("));
     assert!(!msl.contains("[[sampler("));
     assert_eq!(key.constant_rows(), 0);
@@ -3926,7 +3963,7 @@ fn modulate_inv_color_add_alpha_constant_rows_follow_binary_arguments() {
         assert_eq!(key.constant_rows(), rows, "args {arg1}/{arg2}");
         assert_eq!(key.stages[1].reads_argument(D3DTA_CONSTANT), rows == 3);
         if arg2 == D3DTA_TEXTURE {
-            let fallback = emit_ps_ff(&key, VariantKey::default());
+            let fallback = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
             assert!(fallback.contains("current = float4((current).rgb, (current).a)"));
             key.stages[1].alpha_arg1 = narrow(D3DTA_CONSTANT);
             assert_eq!(key.constant_rows(), 3);
@@ -3972,7 +4009,7 @@ fn modulate_inv_color_add_alpha_constant_values_leave_shader_identity_unchanged(
         3,
         "unused unbound ARG0 does not suppress the binary operation"
     );
-    let source = emit_ps_ff(&key, VariantKey::default());
+    let source = emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY);
     for alpha in [0x40, 0x80, 0x40] {
         state.set_texture_stage_state(
             1,
@@ -3981,7 +4018,10 @@ fn modulate_inv_color_add_alpha_constant_values_leave_shader_identity_unchanged(
         );
         let changed = state.build_ps_key(&render_states, 0);
         assert_eq!(key, changed);
-        assert_eq!(source, emit_ps_ff(&changed, VariantKey::default()));
+        assert_eq!(
+            source,
+            emit_ps_ff_named(&changed, VariantKey::default(), DEFAULT_PS_ENTRY)
+        );
     }
 }
 
@@ -4001,7 +4041,7 @@ fn rhw_passthrough_key() -> FfVsKey {
 
 #[test]
 fn rhw_passes_declaration_elements_through_by_semantic() {
-    let msl = emit_vs_ff(&rhw_passthrough_key());
+    let msl = emit_vs_ff_named(&rhw_passthrough_key(), DEFAULT_VS_ENTRY);
     for line in [
         "float4 p0 [[attribute(15)]];",
         "float4 p1 [[attribute(16)]];",
@@ -4026,7 +4066,7 @@ fn rhw_specular_alpha_fog_keeps_the_fog_varying() {
     let mut vs = rhw_passthrough_key();
     vs.flags.set(FfVsFlags::HAS_COLOR1, true);
     vs.fog_mode = 4;
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("out.fog = float4(in.v3.w, 0.0, 0.0, 0.0);"),
         "{msl}"
@@ -4039,12 +4079,12 @@ fn rhw_specular_alpha_fog_keeps_the_fog_varying() {
 fn an_untransformed_key_passes_nothing_through_and_keeps_its_normal() {
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
-    let msl = emit_vs_ff(&vs);
+    let msl = emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY);
     assert!(msl.contains("float4 v1 [[attribute(1)]];"), "{msl}");
     assert!(!msl.contains("in.p0"), "{msl}");
     assert!(!msl.contains("normal0"), "{msl}");
     // The FF pixel stage declares no extra member whatever the vertex stage outputs.
-    let ps = emit_ps_ff(&default_ps_key(), VariantKey::default());
+    let ps = emit_ps_ff_named(&default_ps_key(), VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!ps.contains("normal0"), "{ps}");
 }
 
@@ -4061,7 +4101,7 @@ fn tci_entry_clamps_without_changing_the_emitted_shader() {
         vs.input_tex_coord_count = 1;
         vs.tex_coord_dims[0] = 2;
         vs.tci[0] = tci_entry(mode, 0);
-        emit_vs_ff(&vs)
+        emit_vs_ff_named(&vs, DEFAULT_VS_ENTRY)
     };
     assert_eq!(msl(5), msl(0x14));
 }
@@ -4109,7 +4149,7 @@ fn bump_stage_displaces_the_next_sample_with_its_own_matrix() {
     let mut ps = default_ps_key();
     ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[1] = select_texture_stage();
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         msl.contains("constant float4 *bump_env [[buffer(12)]]"),
         "{msl}"
@@ -4134,7 +4174,7 @@ fn bump_stage_displaces_the_next_sample_with_its_own_matrix() {
     later.stages[1] = select_texture_stage();
     later.stages[2] = bump_stage(D3DTOP_BUMPENVMAP, true);
     later.stages[3] = select_texture_stage();
-    let msl = emit_ps_ff(&later, VariantKey::default());
+    let msl = emit_ps_ff_named(&later, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains(&displaced(3, 2, "in.texcoord3")), "{msl}");
     assert!(msl.contains("bump_env[4]"), "{msl}");
     assert!(!msl.contains("bump_env[6]"), "{msl}");
@@ -4147,7 +4187,7 @@ fn luminance_bump_stage_scales_all_four_channels_of_the_next_sample() {
     let mut ps = default_ps_key();
     ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAPLUMINANCE, true);
     ps.stages[1] = select_texture_stage();
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(msl.contains(&displaced(1, 0, "in.texcoord1")), "{msl}");
     assert!(
         msl.contains("t1 *= saturate(t0.z * bump_env[1].x + bump_env[1].y);"),
@@ -4160,7 +4200,7 @@ fn luminance_bump_stage_scales_all_four_channels_of_the_next_sample() {
     later.stages[1] = select_texture_stage();
     later.stages[2] = bump_stage(D3DTOP_BUMPENVMAPLUMINANCE, true);
     later.stages[3] = select_texture_stage();
-    let msl = emit_ps_ff(&later, VariantKey::default());
+    let msl = emit_ps_ff_named(&later, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         msl.contains("t3 *= saturate(t2.z * bump_env[5].x + bump_env[5].y);"),
         "{msl}"
@@ -4175,7 +4215,7 @@ fn a_projected_destination_is_divided_before_the_displacement() {
     ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[1] = select_texture_stage();
     ps.tt_projected_mask = 0b10;
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(
         msl.contains(
             "float4 pc1 = in.texcoord1.w != 0.0 ? float4(in.texcoord1.xyz / in.texcoord1.w, 1.0) : float4(0.0, 0.0, 0.0, 1.0);"
@@ -4228,7 +4268,7 @@ fn every_destination_kind_samples_the_displaced_coordinate() {
             "float4 t1 = s1.gather(samp1, (bc1.xy) + 0.5",
         ),
     ] {
-        let msl = emit_ps_ff(&ps, variant);
+        let msl = emit_ps_ff_named(&ps, variant, DEFAULT_PS_ENTRY);
         // Only `xy` moves: the third coordinate and `w` are the stage's own.
         assert!(msl.contains(&displaced(1, 0, "in.texcoord1")), "{msl}");
         assert!(msl.contains(sample), "{variant:?}:\n{msl}");
@@ -4244,7 +4284,7 @@ fn an_unbound_bump_stage_follows_the_unbound_texture_rules() {
     let mut ps = default_ps_key();
     ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, false);
     ps.stages[1] = select_texture_stage();
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert!(!msl.contains("bump_env"), "{msl}");
     assert!(
         msl.contains("float4 t1 = s1.sample(samp1, in.texcoord1.xy);"),
@@ -4270,7 +4310,7 @@ fn an_unbound_bump_stage_follows_the_unbound_texture_rules() {
             ..bump_stage(op, false)
         };
         ps.stages[1] = select_texture_stage();
-        let msl = emit_ps_ff(&ps, VariantKey::default());
+        let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(
             msl.contains("float4 t1 = s1.sample(samp1, in.texcoord1.xy);"),
             "{msl}"
@@ -4308,7 +4348,7 @@ fn a_bump_stage_without_a_sampled_next_stage_samples_nothing() {
             ..select_texture_stage()
         };
         for ps in [terminal, unbound, unread] {
-            let msl = emit_ps_ff(&ps, VariantKey::default());
+            let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
             assert!(!msl.contains("float4 t0"), "{msl}");
             assert!(!msl.contains("float4 t1"), "{msl}");
             assert!(!msl.contains("bump_env"), "{msl}");
@@ -4324,7 +4364,7 @@ fn consecutive_bump_stages_chain() {
     ps.stages[0] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[1] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[2] = select_texture_stage();
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     let order = [
         "float4 t0 = s0.sample(samp0, in.texcoord0.xy);".to_string(),
         displaced(1, 0, "in.texcoord1"),
@@ -4373,7 +4413,7 @@ fn a_bump_stage_writes_neither_current_nor_temp() {
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::empty(),
     };
-    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
     assert_eq!(msl.matches("    temp = ").count(), 1, "{msl}");
     assert!(
         msl.contains("temp = float4((ps_c[0]).rgb, (ps_c[0]).a);"),
@@ -4397,7 +4437,7 @@ fn a_bump_alpha_operation_keeps_the_register_alpha() {
             alpha_arg1: narrow(D3DTA_TEMP),
             ..select_texture_stage()
         };
-        let msl = emit_ps_ff(&ps, VariantKey::default());
+        let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
         assert!(
             msl.contains("current = float4((t0).rgb, (current).a);"),
             "{msl}"
@@ -4431,7 +4471,7 @@ fn bump_env_is_declared_only_for_a_bump_colour_operation() {
                     ps.stages[0] = stage;
                     ps.stages[1] = select_texture_stage();
                     ps.tt_projected_mask = projected;
-                    let msl = emit_ps_ff(&ps, VariantKey::default());
+                    let msl = emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY);
                     let bump_colour = !role_alpha
                         && matches!(
                             u32::from(op),
@@ -4454,5 +4494,5 @@ fn bump_env_is_declared_only_for_a_bump_colour_operation() {
     ps.stages[0] = select_texture_stage();
     ps.stages[2] = bump_stage(D3DTOP_BUMPENVMAP, true);
     ps.stages[3] = select_texture_stage();
-    assert!(!emit_ps_ff(&ps, VariantKey::default()).contains("bump_env"));
+    assert!(!emit_ps_ff_named(&ps, VariantKey::default(), DEFAULT_PS_ENTRY).contains("bump_env"));
 }

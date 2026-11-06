@@ -16,8 +16,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    POS_FIXUP_MSL, VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers,
-    emit_ps_programmable, emit_vs_programmable, emit_vs_programmable_named,
+    DEFAULT_PS_ENTRY, DEFAULT_VS_ENTRY, POS_FIXUP_MSL, VariantFlags, VariantKey, VsSamplerKinds,
+    declared_ps_samplers, emit_ps_programmable, emit_vs_programmable, emit_vs_programmable_named,
 };
 use crate::{
     dxso::{ir::TextureType, parser::parse},
@@ -2014,7 +2014,7 @@ fn ps_sampler_index_8_emits_slot_8_binding_and_compiles() {
 
 #[test]
 fn fog_msl_compiles_under_metal() {
-    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff};
+    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff_named};
     // Every fog blend shape through a real Metal compile: `precise::exp`,
     // the `in.position` fragcoord read, and the two-row `fog_data` binding
     // must all be valid MSL on both the FF and programmable PS emitters.
@@ -2042,7 +2042,7 @@ fn fog_msl_compiles_under_metal() {
             flags,
             ..VariantKey::default()
         };
-        metal_compile_or_fail(&emit_ps_ff(&ps_key, variant));
+        metal_compile_or_fail(&emit_ps_ff_named(&ps_key, variant, DEFAULT_PS_ENTRY));
         let ps = parse(&red_constant_ps()).expect("PS parse");
         let msl = emit_ps_programmable(&ps, variant).expect("emit PS");
         metal_compile_or_fail(&msl);
@@ -3819,7 +3819,7 @@ fn dp3_emits_plain_dot() {
 
 #[test]
 fn vertex_blend_msl_compiles_under_metal() {
-    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff_named};
     // Exercise the three blend shapes through a real Metal compile so the
     // emitted code is syntactically and semantically valid MSL — same
     // discipline as `every_emitted_msl_compiles_under_metal` for the SM3
@@ -3845,14 +3845,14 @@ fn vertex_blend_msl_compiles_under_metal() {
         clip_plane_count: 0,
         passthrough: [0; 8],
     };
-    metal_compile_or_fail(&emit_vs_ff(&sequential));
+    metal_compile_or_fail(&emit_vs_ff_named(&sequential, DEFAULT_VS_ENTRY));
 
     sequential.vertex_blend_count = 4;
     sequential
         .flags
         .insert(FfVsFlags::VERTEX_BLEND_INDEXED | FfVsFlags::DECLARED_INDICES);
     sequential.declared_weights_count = 3;
-    metal_compile_or_fail(&emit_vs_ff(&sequential));
+    metal_compile_or_fail(&emit_vs_ff_named(&sequential, DEFAULT_VS_ENTRY));
 
     let indexed_only = FfVsKey {
         vertex_blend_count: 1,
@@ -3861,12 +3861,12 @@ fn vertex_blend_msl_compiles_under_metal() {
         passthrough: [0; 8],
         ..sequential
     };
-    metal_compile_or_fail(&emit_vs_ff(&indexed_only));
+    metal_compile_or_fail(&emit_vs_ff_named(&indexed_only, DEFAULT_VS_ENTRY));
 }
 
 #[test]
 fn ff_vs_lit_specular_msl_compiles_under_metal() {
-    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff_named};
     // Lit + specular + one directional, one point, and one spot light,
     // through a real Metal compile — covers the Blinn-Phong block, the
     // per-light specular-row reads, and the spot cone factor.
@@ -3894,12 +3894,12 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
         clip_plane_count: 0,
         passthrough: [0; 8],
     };
-    metal_compile_or_fail(&emit_vs_ff(&key));
+    metal_compile_or_fail(&emit_vs_ff_named(&key, DEFAULT_VS_ENTRY));
 }
 
 #[test]
 fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
-    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff_named};
     // Two enabled planes: the VS-only Varyings member carries two lanes (MSL
     // wants the attribute between the name and the dimension), the world
     // position comes back through the inverse view, and one distance is
@@ -3925,7 +3925,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         clip_plane_count: 2,
         passthrough: [0; 8],
     };
-    let msl = emit_vs_ff(&key);
+    let msl = emit_vs_ff_named(&key, DEFAULT_VS_ENTRY);
     assert!(
         msl.contains("float clip_distance [[clip_distance]] [2];"),
         "VS Varyings must declare two clip lanes:\n{msl}"
@@ -3945,7 +3945,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         ..key
     };
     assert!(
-        !emit_vs_ff(&no_clip).contains("clip_distance"),
+        !emit_vs_ff_named(&no_clip, DEFAULT_VS_ENTRY).contains("clip_distance"),
         "a draw without planes pays nothing"
     );
 }
@@ -3993,7 +3993,7 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
 
 #[test]
 fn ff_ps_specular_add_msl_compiles_under_metal() {
-    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff};
+    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff_named};
     // End-of-cascade specular add plus a D3DTA_SPECULAR stage argument,
     // through a real Metal compile.
     let mut stages = [FfStage {
@@ -4012,7 +4012,11 @@ fn ff_ps_specular_add_msl_compiles_under_metal() {
         specular_add: true,
         tt_projected_mask: 0,
     };
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
 }
 
 #[test]
@@ -5458,7 +5462,7 @@ fn ff_depth_samples_under_the_lod_table_compile_under_metal() {
     // level, and the cascade must still compile with the table declared.
     use mtld3d_types::D3DTA_TEXTURE;
 
-    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, emit_ps_ff};
+    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, emit_ps_ff_named};
     let mut stages = [FfStage {
         color_op: narrow(D3DTOP_DISABLE),
         ..FfStage::default()
@@ -5477,7 +5481,7 @@ fn ff_depth_samples_under_the_lod_table_compile_under_metal() {
         tt_projected_mask: 0,
     };
     for (fetch, red) in [(0, 0), (1, 0), (1, 1)] {
-        let msl = emit_ps_ff(
+        let msl = emit_ps_ff_named(
             &ps_key,
             VariantKey {
                 depth_sampler_mask: 1,
@@ -5486,6 +5490,7 @@ fn ff_depth_samples_under_the_lod_table_compile_under_metal() {
                 flags: VariantFlags::LOD_BIAS,
                 ..VariantKey::default()
             },
+            DEFAULT_PS_ENTRY,
         );
         assert!(
             msl.contains("level(max(lod_bias[0].w, 0.0))"),
@@ -5883,7 +5888,7 @@ fn ff_temp_register_compiles_with_simultaneous_color_alpha_updates() {
         D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTOP_SELECTARG1,
     };
 
-    use crate::dxso::{FfPsKey, FfStage, FfStageResult, emit_ps_ff};
+    use crate::dxso::{FfPsKey, FfStage, FfStageResult, emit_ps_ff_named};
     let narrow = |value| u8::try_from(value).expect("D3D stage value fits one byte");
     let mut stages = [FfStage {
         color_op: narrow(D3DTOP_DISABLE),
@@ -5904,11 +5909,23 @@ fn ff_temp_register_compiles_with_simultaneous_color_alpha_updates() {
         specular_add: false,
         tt_projected_mask: 0,
     };
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
     key.stages[0].color_op = narrow(mtld3d_types::D3DTOP_DOTPRODUCT3);
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
     key.stages[0].color_arg1 = narrow(mtld3d_types::D3DTA_TEXTURE);
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
 }
 
 #[test]
@@ -5918,7 +5935,7 @@ fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
         D3DTOP_SELECTARG1,
     };
 
-    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, FfStageResult, emit_ps_ff};
+    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, FfStageResult, emit_ps_ff_named};
     let narrow = |value| u8::try_from(value).expect("D3D stage value fits one byte");
     let mut stages = [FfStage {
         color_op: narrow(D3DTOP_DISABLE),
@@ -5946,10 +5963,18 @@ fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
         specular_add: false,
         tt_projected_mask: 0,
     };
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
     key.stages[0].set_result(FfStageResult::Temp);
     key.stages[1].set_result(FfStageResult::Temp);
-    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    metal_compile_or_fail(&emit_ps_ff_named(
+        &key,
+        VariantKey::default(),
+        DEFAULT_PS_ENTRY,
+    ));
 }
 
 /// A pixel shader reading `oDepth` as a source parses, and the emitter rejects it.

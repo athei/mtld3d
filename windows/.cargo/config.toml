@@ -78,7 +78,7 @@ rustflags = ["-C", "target-feature=-crt-static"]
 # xwin include paths repeated for C and C++ — cc-rs reads CFLAGS_<target>
 # and CXXFLAGS_<target> separately with no cross-fallback, and TOML has
 # no variable substitution. snmalloc-sys needs the C++ path for <atomic>;
-# libmimalloc-sys only needs the C one.
+# zstd-sys, which the end-to-end tests link, only needs the C one.
 #
 # `-march` mirrors the rustflags `target-cpu` baseline so build-script C/C++
 # code (snmalloc-sys is the big one — ~300 KB of object in release on x86_64)

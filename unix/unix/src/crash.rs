@@ -204,18 +204,11 @@ pub fn install() {
 
     resolve_wine_current_teb();
 
-    // Diagnostic escape hatch: with `MTLD3D_NO_CRASH_HANDLER=1` we do NOT
-    // intercept SIGSEGV/SIGBUS, so Wine's own SEH machinery translates the
-    // fault into a Windows exception and prints a PE-side backtrace
-    // (`d3d9.dll`/`winemac.drv`+offset) — the frame our async-signal-safe
-    // handler can't recover when the stack chain is broken.
-    if std::env::var_os("MTLD3D_NO_CRASH_HANDLER").is_none() {
-        install_signal_handler(libc::SIGSEGV);
-        install_signal_handler(libc::SIGBUS);
-        // A trap instruction: a framework's own assertion (`__builtin_trap`)
-        // ends a process this way, and so does a jump into non-code.
-        install_signal_handler(libc::SIGILL);
-    }
+    install_signal_handler(libc::SIGSEGV);
+    install_signal_handler(libc::SIGBUS);
+    // A trap instruction: a framework's own assertion (`__builtin_trap`)
+    // ends a process this way, and so does a jump into non-code.
+    install_signal_handler(libc::SIGILL);
     install_signal_handler(libc::SIGABRT);
 }
 
@@ -459,7 +452,6 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // saved registers name the culprit: the first-argument register holds a COM
     // call's `this` (the freed object), and the caller is one register or one
     // stack slot away. The register names differ per arch, the roles do not.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         let mut b = [0u8; 192];
@@ -540,7 +532,6 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // still on the stack even when the frame pointer is garbage. Done last
     // because an unmapped read re-faults into the re-entrancy guard (`_exit`),
     // which would otherwise drop the crumb dump + native backtrace above.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         if sp != 0 {
@@ -611,11 +602,8 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     push_hex(&mut b, &mut p, pc);
     // The native first argument: for a fault in `objc_release` or
     // `objc_msgSend` it is the object that was gone.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        push(&mut b, &mut p, b" arg0=");
-        push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
-    }
+    push(&mut b, &mut p, b" arg0=");
+    push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
     let site = image_site(&info, pc);
     match site {
         FaultSite::Image => push(&mut b, &mut p, b" image="),
@@ -676,7 +664,6 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     // must not fault itself: the kernel copies each word or reports failure.
     // A mapping probe cannot establish readability, and a Wine thread runs
     // unix calls on a stack Wine allocated, not its pthread stack.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         if sp != 0 && !terminal {
@@ -1326,7 +1313,6 @@ const fn caller_pc(ctx: *mut c_void, _sp: u64) -> u64 {
 /// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte
 /// exception state + 32 thread-state `u64`s (272). Both are shipped: the `.so`
 /// follows the arch of the Wine that loads it.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn fault_pc(ctx: *mut c_void) -> u64 {
     #[cfg(target_arch = "x86_64")]
     const PC_OFFSET: usize = 144;
@@ -1351,14 +1337,6 @@ const fn fault_pc(ctx: *mut c_void) -> u64 {
     unsafe { pc_field.cast::<u64>().read_unaligned() }
 }
 
-/// Architectures where we can't decode the saved PC: report 0.
-///
-/// The handler falls back to the frame-pointer backtrace alone.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const fn fault_pc(_ctx: *mut c_void) -> u64 {
-    0
-}
-
 /// Read a `u64` at byte `offset` within the signal `ucontext`'s `mcontext`.
 ///
 /// Offsets follow `__darwin_mcontext64` for the arch this built for: a 16-byte
@@ -1366,7 +1344,6 @@ const fn fault_pc(_ctx: *mut c_void) -> u64 {
 /// `rcx` at 32, `rsp` at 72, `rip` at 144; `arm64` has `x0` at 16 (the rest of
 /// `__x[29]` following), then `fp` at 248, `lr` at 256, `sp` at 264, `pc` at
 /// 272. Returns 0 if the context can't be read.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
     if ctx.is_null() {
         return 0;

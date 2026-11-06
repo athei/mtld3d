@@ -21,7 +21,7 @@ use super::{
     FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, build, fill, fill_default,
     texture_extent_fits, texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
 };
-use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
+use crate::dxso::{DEFAULT_PS_ENTRY, FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff_named};
 
 fn filled() -> D3DCAPS9 {
     // Calls `fill_default` directly so the assertions describe the
@@ -284,7 +284,7 @@ fn one_stage_ps(color_op: u32, alpha_op: u32) -> String {
         specular_add: false,
         tt_projected_mask: 0,
     };
-    emit_ps_ff(&key, VariantKey::default())
+    emit_ps_ff_named(&key, VariantKey::default(), DEFAULT_PS_ENTRY)
 }
 
 #[test]

@@ -33,7 +33,6 @@ pub mod display_mode;
 pub mod draw_data;
 pub mod dxso;
 pub mod encoder_config;
-pub mod encoder_controls;
 pub mod encoder_data;
 pub mod encoder_draw;
 pub mod encoder_failure;

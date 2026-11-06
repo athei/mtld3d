@@ -1019,16 +1019,16 @@ The per-call and per-draw timers run in one frame in 16 on average (`FRAME_SAMPL
 
 `Encode+commit` splits into three children the unix side times with `NanosSetTimer` inside `SubmitFrame`: the frame-leading blits, the replay of every pass descriptor (upload and draw, each pass's own blits included), and the frame buffer's completion-handler install plus both commits. A `resid` row takes what is left (command-buffer creation, the present settle less its wait, the upload buffer's handler, submission bookkeeping), so the children add up to their parent. The `GPU` block reports `GPUEndTime - GPUStartTime` per command-buffer role (frame, upload, present) as ms per frame, with the number of buffers behind each and no peak, since a report does not line up with one frame. It is not the device's whole GPU time: snapshot copies, read-backs, creation-time clears, the cursor overlay and the shutdown fence are not counted, nor a frame or upload buffer submitted before its sequence or counters were wired. A synchronous submit behind a barrier is timed and folded like an async one and adds to what the barrier drained, so `Encode+commit` and its children always describe the same submissions. Each completion handler adds its buffer's time to the device record, and the next `SubmitFrame` of that device moves the sums into its `SubmitTimings` output and leaves zero behind, so every buffer is reported once, one submission after it finished. Buffers of one queue can overlap on the GPU, so the roles add up to busy time, not wall time, which the block's label says. All of it travels as nanoseconds in the native `SubmissionOutcome.timings` result; outside a `PERF=1` build, or with the perf target off, the handlers read no time and every field stays zero.
 
-The API frame telemetry payload uses a separate duration contract: its symbolic
-`SourceElapsedTicks` wire tag (`2`) identifies elapsed ticks from the source
-runtime, not nanoseconds or absolute timestamps. Each device owns a source-clock
-calibration mailbox. A background
-worker publishes its immutable `u64` frequency through an `AtomicU32` state
-(`Pending`, `Ready`, or `Failed`), with release/acquire ordering. The PE owner
-retains this mailbox while the native runtime can read it, joins its calibration
-worker before native destruction, and releases it only after native readers stop.
-The native runtime also owns its local calibration worker. Neither side assumes
-a frequency or subtracts timestamps from different clocks.
+The API frame telemetry payload uses a separate duration contract: its
+durations are elapsed ticks of the source runtime's clock, not nanoseconds or
+absolute timestamps. Each device owns a source-clock calibration mailbox. A
+background worker publishes its immutable `u64` frequency through an
+`AtomicU32` state (`Pending`, `Ready`, or `Failed`), with release/acquire
+ordering. The PE owner retains this mailbox while the native runtime can read
+it, joins its calibration worker before native destruction, and releases it
+only after native readers stop. The native runtime also owns its local
+calibration worker. Neither side assumes a frequency or subtracts timestamps
+from different clocks.
 
 Calibration runs on background workers, so neither the API nor encoder intake
 waits for it. The encoder thread retains up to 4096 frame samples while either
@@ -1270,10 +1270,7 @@ out silently.
 Native phase durations cross the PE/Unix boundary as nanoseconds in fixed
 `repr(C)` output fields, including on failure. Unreached or disabled phases
 are zero. `NanosSetTimer` measures each duration in its owning runtime; raw PE
-and native ticks are never subtracted. The `TimingOutput` wrapper reserves the
-same wire layout without PERF but elides its initialization, writes, and reads.
-PERF callers initialize a zero fallback before crossing the boundary, so mixed
-PERF/native builds are safe.
+and native ticks are never subtracted.
 Collection and slow-event storage also compile out. The prewarm thread recreates
 the deduplicated shader libraries and recorded render pipelines. Native creation
 uses device-local batches capped at eight callers, including the coordinator,
@@ -1345,7 +1342,7 @@ Typical workflow:
 RUST_LOG=mtld3d=warn,mtld3d::d3d9=debug,mtld3d::dxso=trace MTLD3D_CONFIG="debug.bytecodeDumpDir=/tmp/mtld3d_shaders" ./<game>.exe > /tmp/trace.log 2>&1
 ```
 
-Reproduce → grep `pass RT` for suspect ids → grep `── PS MSL <id>` for emitted MSL → `cargo run --example disasm` for deeper analysis → seed a regression test in `core/src/dxso/emit_tests.rs`.
+Reproduce → grep `pass RT` for suspect ids → grep `── PS MSL <id>` for emitted MSL → `cargo run --example disasm` for deeper analysis → seed a regression test in `windows/core/src/dxso/emit/tests.rs`.
 
 ## Debugging heap corruption — `MTLD3D_CRUMB=1` mmap breadcrumb
 
@@ -1370,7 +1367,7 @@ Slot layout (8 bytes each, 128-byte map):
 | `0x20` | any | `(thunk_code << 32) \| (status << 8) \| marker` — `0xEE` mid-call, `0xDD` returned |
 | `0x28` | any | `unix_call` `params` pointer at entry |
 | `0x30` | API | `(seq << 32) \| (tcc_max << 16) \| tcc_last` — `FfVsKey::tex_coord_count` at draw-snapshot capture |
-| `0x38` | encoder | same shape — same field at `emit_vs_ff` dispatch |
+| `0x38` | encoder | same shape, same field at `emit_vs_ff_named` dispatch |
 | `0x40` | API | address of the captured `&FfVsKey` (PE frame storage) |
 | `0x48` | encoder | address of the dispatched `&FfVsKey` |
 | `0x50` | API | wrapping byte-sum + rotate fingerprint of all FfVsKey bytes at capture |
