@@ -708,7 +708,7 @@ impl Drop for ReplayCompletion {
 ///
 /// # Safety
 ///
-/// The metadata must describe authentic retained allocations from the paired PE
+/// The metadata must describe authentic retained allocations from the paired
 /// recorder. Metadata, command regions and payloads remain immutable until completion.
 /// Their owners and the completion mailbox remain live throughout native replay.
 /// This is the packet's only native consumer.

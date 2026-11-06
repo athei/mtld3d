@@ -56,7 +56,7 @@ impl PacketLease {
     }
 }
 
-/// PE-owned frame bytes and leases retained until native acknowledgment.
+/// Frame bytes and leases retained until native acknowledgment.
 pub struct FramePacket {
     metadata: MetadataStorage,
     completion_pool: crate::guest_completions::CompletionPool,
