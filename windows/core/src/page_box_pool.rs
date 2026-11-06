@@ -278,7 +278,24 @@ impl PageBoxPool {
     /// panicked mid-operation; nothing recoverable remains then.
     #[must_use]
     pub fn acquire(&self, logical_len: usize) -> Option<PageBox> {
-        self.acquire_in(LaneKind::Buffer, logical_len)
+        if !self.serves(logical_len) {
+            #[cfg(perf_tracking)]
+            self.record_acquire(
+                LaneKind::Buffer,
+                if self.enabled() {
+                    diagnostics::Acquire::Oversize
+                } else {
+                    diagnostics::Acquire::Disabled
+                },
+                logical_len,
+            );
+            return None;
+        }
+        self.inner.lock().expect("PageBoxPool mutex poisoned").pop(
+            LaneKind::Buffer,
+            logical_len,
+            &self.pooled_bytes,
+        )
     }
 
     /// [`Self::acquire`], retried once after `retire` when the first pop misses.
@@ -417,6 +434,15 @@ impl PageBoxPool {
             .bytes
     }
 
+    /// Take `len` bytes of staging the way a texture create does, answering the box only on a hit.
+    #[cfg(test)]
+    #[must_use]
+    pub fn take_parked(&self, len: usize) -> Option<PageBox> {
+        let mut take = self.take_staging();
+        let page = take.take(len);
+        (take.finish() == (1, 0)).then_some(page)
+    }
+
     /// Report pool totals on the renderer's existing performance cadence.
     ///
     /// Counters include every device sharing this pool and never reset at frame boundaries.
@@ -476,27 +502,6 @@ impl PageBoxPool {
     /// Whether a box of `logical_len` can be parked here: the pool is enabled and its class fits.
     fn serves(&self, logical_len: usize) -> bool {
         self.enabled() && PageBox::padded_len(logical_len) / PAGE_SIZE <= MAX_POOL_CLASSES
-    }
-
-    fn acquire_in(&self, kind: LaneKind, logical_len: usize) -> Option<PageBox> {
-        if !self.serves(logical_len) {
-            #[cfg(perf_tracking)]
-            self.record_acquire(
-                kind,
-                if self.enabled() {
-                    diagnostics::Acquire::Oversize
-                } else {
-                    diagnostics::Acquire::Disabled
-                },
-                logical_len,
-            );
-            return None;
-        }
-        self.inner.lock().expect("PageBoxPool mutex poisoned").pop(
-            kind,
-            logical_len,
-            &self.pooled_bytes,
-        )
     }
 
     fn recycle_in(&self, kind: LaneKind, pb: PageBox) -> Option<PageBox> {

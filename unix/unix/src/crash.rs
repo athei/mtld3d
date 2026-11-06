@@ -452,7 +452,6 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // saved registers name the culprit: the first-argument register holds a COM
     // call's `this` (the freed object), and the caller is one register or one
     // stack slot away. The register names differ per arch, the roles do not.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         let mut b = [0u8; 192];
@@ -533,7 +532,6 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // still on the stack even when the frame pointer is garbage. Done last
     // because an unmapped read re-faults into the re-entrancy guard (`_exit`),
     // which would otherwise drop the crumb dump + native backtrace above.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         if sp != 0 {
@@ -604,11 +602,8 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     push_hex(&mut b, &mut p, pc);
     // The native first argument: for a fault in `objc_release` or
     // `objc_msgSend` it is the object that was gone.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        push(&mut b, &mut p, b" arg0=");
-        push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
-    }
+    push(&mut b, &mut p, b" arg0=");
+    push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
     let site = image_site(&info, pc);
     match site {
         FaultSite::Image => push(&mut b, &mut p, b" image="),
@@ -669,7 +664,6 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     // must not fault itself: the kernel copies each word or reports failure.
     // A mapping probe cannot establish readability, and a Wine thread runs
     // unix calls on a stack Wine allocated, not its pthread stack.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
         if sp != 0 && !terminal {
@@ -1350,7 +1344,6 @@ const fn fault_pc(ctx: *mut c_void) -> u64 {
 /// `rcx` at 32, `rsp` at 72, `rip` at 144; `arm64` has `x0` at 16 (the rest of
 /// `__x[29]` following), then `fp` at 248, `lr` at 256, `sp` at 264, `pc` at
 /// 272. Returns 0 if the context can't be read.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
     if ctx.is_null() {
         return 0;

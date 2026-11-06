@@ -150,7 +150,6 @@ impl WireWriter<'_> {
     }
 
     /// Append to the slab, refusing growth past the `u32` byte limit.
-    #[inline(never)]
     fn append_vector(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), WireError> {
         let length = bytes
             .len()

@@ -818,7 +818,7 @@ fn snapshot_upload_records_carry_their_offset_and_check_their_span() {
     while replay(&mut packet, |command, _, _| {
         let record = borrow::<TextureUploadRecord>(command.payload())?;
         let flagged = record.mip_flags & u32::from(UploadTextureOpFlags::SNAPSHOT.bits()) != 0;
-        // The replay check: a snapshot's span against its chunk, a staging source at offset 0.
+        // `FrameEncoder::run_texture_record_upload`'s check: snapshot span, staging source at 0.
         let valid = if flagged {
             record
                 .validate_snapshot(record.page.wire_fields()[2])

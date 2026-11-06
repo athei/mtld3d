@@ -2325,9 +2325,9 @@ clippy: clippy-pe-i686 clippy-pe-x86_64 $(ARM64X_LEG:%=clippy-pe-%) clippy-nativ
 # for so each is one job. No --all-targets on the whole-workspace PE runs: that
 # would build every member's test targets for PE, including mtld3d-core's
 # apple-only objc2 dev-deps (the Metal compile checks in `dxso/emit/tests.rs`),
-# which hard `compile_error!` off Apple. Lib/bin only there; mtld3d-tests' integration tests aren't covered
-# by those runs, so its own per-crate pass lints all its targets (it has no apple
-# dev-deps).
+# which hard `compile_error!` off Apple. Lib/bin only there; mtld3d-tests'
+# integration tests aren't covered by those runs, so its own per-crate pass
+# lints all its targets (it has no apple dev-deps).
 clippy-pe-i686:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_i386) $(DENY_WARNINGS)

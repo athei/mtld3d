@@ -1173,8 +1173,8 @@ impl Pass {
         &self.extra_color
     }
     /// Bit `i` set ⇒ render target `i + 1` is bound on this pass.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub fn extra_present_mask(&self) -> u8 {
         self.extra_color
             .iter()
@@ -1246,8 +1246,8 @@ impl Pass {
     /// Included in `PipelineKey` so cache hits distinguish pipelines by
     /// rt format — a pipeline built for `BGRA8Unorm` would be rejected by
     /// Metal if bound against an rt with a different format.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn color_format(&self) -> PixelFormat {
         self.color_format
     }
@@ -1340,14 +1340,14 @@ impl Pass {
         self.visibility_buffer
     }
 
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn color_writes_observed(&self) -> bool {
         self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
     }
 
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub fn color_clear_quad_ranges(&self) -> &[(usize, usize)] {
         &self.color_clear_quad_ranges
     }
@@ -2687,8 +2687,8 @@ impl PassState {
     }
 
     /// Bit `i` set ⇒ render target `i + 1` takes part in the next pass.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn extra_present_mask(&self) -> u8 {
         self.current_extra_present_mask
     }
@@ -2998,8 +2998,8 @@ impl PassState {
     /// Read per draw to decide between the hardware post-blend encode and
     /// the pixel shader's OETF variant, and per `Clear` to decide whether
     /// the clear colour is encoded on the way in.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn pass_srgb_write(&self) -> bool {
         self.pass_srgb_write
     }
@@ -3169,8 +3169,8 @@ impl PassState {
         self.pending_color_clear
     }
 
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn pending_depth_clear(&self) -> Option<u32> {
         self.pending_depth_clear
     }

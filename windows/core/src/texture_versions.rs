@@ -526,15 +526,15 @@ impl<V> TextureVersions<V> {
     }
 
     /// Bytes of storage parked as spares across every texture.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn parked_bytes(&self) -> u64 {
         self.parked_bytes
     }
 
     /// Bytes of storage queued to be destroyed and still allocated.
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn pending_destroy_bytes(&self) -> u64 {
         self.doomed_bytes
     }

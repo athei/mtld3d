@@ -1021,14 +1021,14 @@ The per-call and per-draw timers run in one frame in 16 on average (`FRAME_SAMPL
 
 The API frame telemetry payload uses a separate duration contract: its
 durations are elapsed ticks of the source runtime's clock, not nanoseconds or
-absolute timestamps. Each device owns a source-clock
-calibration mailbox. A background
-worker publishes its immutable `u64` frequency through an `AtomicU32` state
-(`Pending`, `Ready`, or `Failed`), with release/acquire ordering. The PE owner
-retains this mailbox while the native runtime can read it, joins its calibration
-worker before native destruction, and releases it only after native readers stop.
-The native runtime also owns its local calibration worker. Neither side assumes
-a frequency or subtracts timestamps from different clocks.
+absolute timestamps. Each device owns a source-clock calibration mailbox. A
+background worker publishes its immutable `u64` frequency through an
+`AtomicU32` state (`Pending`, `Ready`, or `Failed`), with release/acquire
+ordering. The PE owner retains this mailbox while the native runtime can read
+it, joins its calibration worker before native destruction, and releases it
+only after native readers stop. The native runtime also owns its local
+calibration worker. Neither side assumes a frequency or subtracts timestamps
+from different clocks.
 
 Calibration runs on background workers, so neither the API nor encoder intake
 waits for it. The encoder thread retains up to 4096 frame samples while either

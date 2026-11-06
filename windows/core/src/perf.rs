@@ -2403,8 +2403,8 @@ impl FramePerfPayload {
         Self
     }
 
-    #[inline]
     #[cfg(test)]
+    #[inline]
     pub const fn set_present_block_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
@@ -3386,13 +3386,13 @@ impl EncoderPerfState {
     #[inline]
     pub const fn finish_deferred(&mut self) {}
 
-    #[inline]
     #[cfg(test)]
+    #[inline]
     pub const fn set_op_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn add_op_cycles(&mut self, _cycles: u64) {}
-    #[inline]
     #[cfg(test)]
+    #[inline]
     pub const fn set_submit_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn op_cycles_ptr(&mut self) -> *mut u64 {

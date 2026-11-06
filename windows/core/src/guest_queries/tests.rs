@@ -95,7 +95,7 @@ fn reissue_preserves_pending_segment_generation_checks() {
     state.push_pending(1, Arc::clone(&second), (1, 2), true);
     let _ = state.intake_completed(1);
     assert_eq!(original.status(), QueryStatus::Issued);
-    assert_eq!(original.get_u32(), 7);
+    assert_eq!(original.get_u64(), 7);
     drop(first);
     drop(second);
     assert!(first_lease.completed());

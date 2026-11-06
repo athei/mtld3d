@@ -84,10 +84,6 @@ impl<T: WireValue> WireValue for Vec<T> {
     const MIN_WIRE_BYTES: usize = 4;
 
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        // Nonempty collections of zero-byte values cannot be bounded by payload size.
-        if T::MIN_WIRE_BYTES == 0 && !self.is_empty() {
-            return Err(WireError::InvalidValue);
-        }
         writer.u32(u32::try_from(self.len()).map_err(|_| WireError::TooLarge)?)?;
         for value in self {
             value.write_wire(writer)?;
@@ -97,9 +93,6 @@ impl<T: WireValue> WireValue for Vec<T> {
 
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         let count = usize::try_from(reader.u32()?).map_err(|_| WireError::TooLarge)?;
-        if count != 0 && T::MIN_WIRE_BYTES == 0 {
-            return Err(WireError::InvalidValue);
-        }
         if count
             .checked_mul(T::MIN_WIRE_BYTES)
             .ok_or(WireError::TooLarge)?

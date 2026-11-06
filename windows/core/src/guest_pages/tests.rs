@@ -6,13 +6,6 @@ use crate::{
     page_box_pool::PageBoxPool,
 };
 
-/// Take `len` bytes of staging the way a texture create does, answering the box only on a hit.
-fn take_parked(pool: &PageBoxPool, len: usize) -> Option<PageBox> {
-    let mut take = pool.take_staging();
-    let page = take.take(len);
-    (take.finish() == (1, 0)).then_some(page)
-}
-
 #[test]
 fn read_handoff_never_exposes_zero_before_native_read_ends() {
     let original = Arc::new(PageBox::new_zeroed(7));
@@ -169,7 +162,7 @@ fn a_retired_lease_parks_staging_the_texture_released_before_it() {
         "the texture's release leaves the pages with the lease"
     );
     assert!(
-        take_parked(pages, 3 * PAGE_SIZE).is_none(),
+        pages.take_parked(3 * PAGE_SIZE).is_none(),
         "no create can take pages native code still reads"
     );
     assert!(!lease.maintain());
@@ -182,7 +175,9 @@ fn a_retired_lease_parks_staging_the_texture_released_before_it() {
     assert!(lease.maintain());
     cells.recycle(lease.into_slot().expect("pooled completion"));
     assert_eq!(pages.staging_bytes(), 3 * PAGE_SIZE);
-    let reused = take_parked(pages, 3 * PAGE_SIZE).expect("parked at retirement");
+    let reused = pages
+        .take_parked(3 * PAGE_SIZE)
+        .expect("parked at retirement");
     assert_eq!(reused.as_ptr(), address);
     assert_eq!(reused.generation(), generation);
     assert!(!reused.has_readers());
@@ -214,7 +209,7 @@ fn an_unacknowledged_lease_never_offers_its_pages() {
     // Neither acknowledgment arrived, so the owner drops instead of parking.
     drop(lease.into_slot());
     assert_eq!(pages.staging_bytes(), 0);
-    assert!(take_parked(pages, PAGE_SIZE).is_none());
+    assert!(pages.take_parked(PAGE_SIZE).is_none());
 }
 
 fn lease_only_bytes(leases: &[&GuestPageLease]) -> u64 {

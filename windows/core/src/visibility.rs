@@ -279,18 +279,6 @@ impl VisibilityQueryCore {
         self.mailbox().uncounted.store(1, Ordering::Release);
     }
 
-    /// `GetData` result: DWORD visible-pixel count clamped at `u32::MAX`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the clamped accumulator overflows `u32::MAX` — unreachable
-    /// because the `.min(u32::MAX)` directly above bounds it.
-    #[cfg(test)]
-    pub fn get_u32(&self) -> u32 {
-        let v = self.get_u64();
-        u32::try_from(v.min(u64::from(u32::MAX))).expect("clamped above to u32::MAX")
-    }
-
     /// Raw 64-bit visible-sample sum (un-clamped).
     ///
     /// `GetData` writes up to 8 bytes from this when the caller's buffer
@@ -627,8 +615,8 @@ impl RetiredVisibilityBuffer {
         &self.backing
     }
 
-    #[must_use]
     #[cfg(test)]
+    #[must_use]
     pub const fn release_seq(&self) -> u64 {
         self.release_seq
     }
