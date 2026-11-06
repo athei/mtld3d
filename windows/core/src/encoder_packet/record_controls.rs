@@ -272,7 +272,7 @@ macro_rules! capture_control {
                 if result.is_err() { $recorder.rejected_ops.push(self.into_rejected()); }
                 result
             }
-            fn into_rejected(self) -> Op { Op::$variant(crate::encoder_data::capture_op(self)) }
+            fn into_rejected(self) -> Op { Op::$variant(self) }
         }
     };
 }
@@ -683,7 +683,7 @@ impl CaptureControl for AdoptProgramOp {
         result
     }
     fn into_rejected(self) -> Op {
-        Op::AdoptProgram(crate::encoder_data::capture_op(self))
+        Op::AdoptProgram(self)
     }
 }
 
@@ -859,7 +859,7 @@ macro_rules! capture_resource {
                 )
             }
             fn into_rejected(self) -> Op {
-                Op::$variant(crate::encoder_data::capture_op(self))
+                Op::$variant(self)
             }
         }
     };

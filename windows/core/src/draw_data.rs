@@ -366,7 +366,7 @@ const _: () = {
 
 /// Per-draw varying parameters.
 ///
-/// Carried by `Op::Draw` or `Op::DrawWithSnapshot`; consumed by `emit_draw`
+/// Carried by the `EncoderOpcode::Draw` record; consumed by `emit_draw`
 /// which combines them with the encoder's `CurrentSnapshot` to issue the
 /// actual GPU commands. State shared with the previous draw (RS, textures,
 /// constants, etc.) lives in `CurrentSnapshot` and is updated via separate

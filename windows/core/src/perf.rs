@@ -929,8 +929,8 @@ struct FrameCounters {
     draw_snapshot_bumps_cycles: u64,
     /// TSC cycles inside the Draw methods spent in the push-op phase.
     ///
-    /// `Box::new` of the `emit_draw` closure plus `push_op` append onto
-    /// the current frame's op list. Closure-build cost.
+    /// The `record_draw` write of the draw record into the current frame's
+    /// command stream.
     draw_push_op_cycles: u64,
     /// Per-[`SnapshotSection`] cycles of the section's rebuild block, on the sampled draws only.
     ///
@@ -1253,14 +1253,6 @@ struct FrameTiming {
     /// The API thread's wall-clock frame period. Zero on the very first
     /// frame (no predecessor).
     frame_total_cycles: u64,
-    /// `FrameData.ops.capacity() * size_of::<Op>()` sampled at `stamp_and_swap`.
-    ///
-    /// The API→encoder `Vec<Op>`'s resident footprint.
-    op_vec_capacity_bytes: u64,
-    /// Per-frame total drained from `FrameData::take_op_vec_realloc_bytes()` at `stamp_and_swap`.
-    ///
-    /// Bytes Rust's `Vec::push` memcpy'd when `FrameData.ops` doubled.
-    op_vec_realloc_bytes: u64,
     /// TSC cycles the API thread spent in `Present` waiting for the frame-latency bound.
     ///
     /// Zero when the frame the bound names had already finished.
@@ -1288,8 +1280,6 @@ impl FrameTiming {
         Self {
             present_block_cycles: 0,
             frame_total_cycles: 0,
-            op_vec_capacity_bytes: 0,
-            op_vec_realloc_bytes: 0,
             latency_wait_cycles: 0,
             latency_waits: 0,
             frames_in_flight: 0,
@@ -1761,7 +1751,7 @@ impl ApiPerfState {
 
     /// Pointer the `CycleAddTimer` writes into for the Draw-internal push-op phase.
     ///
-    /// `Box::new` + `push_op`.
+    /// The `record_draw` write.
     pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.counters.draw_push_op_cycles
     }
@@ -2176,10 +2166,10 @@ impl ApiPerfState {
         let now = rdtsc();
         let prev = core::mem::replace(&mut self.prev_present_rdtsc, now);
         // Move this frame's counters into the payload, leaving a zeroed
-        // `FrameCounters` behind (`mem::take`). `present_block` / `op_vec_*`
-        // are written to `payload.timing` by their own setters after this
-        // drain, so moving only `counters` + `frame_total_cycles` here never
-        // clobbers them.
+        // `FrameCounters` behind (`mem::take`). `present_block` is
+        // written to `payload.timing` by its own setter after this drain,
+        // so moving only `counters` + `frame_total_cycles` here never
+        // clobbers it.
         payload.counters = core::mem::take(&mut self.counters);
         payload.counters.reset_epoch = self.reset_epoch;
         payload.counters.reset_epoch_saturated = u32::from(self.reset_epoch_saturated);
@@ -2372,16 +2362,6 @@ impl FramePerfPayload {
         }
     }
 
-    /// Stamp the API→encoder `Vec<Op>` footprint metrics into the payload.
-    ///
-    /// At `stamp_and_swap` time: called once per frame from
-    /// `DeviceInner::stamp_and_swap` after the running `ApiPerfState` has
-    /// been drained into the payload.
-    pub const fn set_op_vec_metrics(&mut self, capacity_bytes: u64, realloc_bytes: u64) {
-        self.timing.op_vec_capacity_bytes = capacity_bytes;
-        self.timing.op_vec_realloc_bytes = realloc_bytes;
-    }
-
     pub const fn set_present_block_cycles(&mut self, cycles: u64) {
         self.timing.present_block_cycles = cycles;
     }
@@ -2423,8 +2403,6 @@ impl FramePerfPayload {
         Self
     }
 
-    #[inline]
-    pub const fn set_op_vec_metrics(&mut self, _capacity_bytes: u64, _realloc_bytes: u64) {}
     #[inline]
     pub const fn set_present_block_cycles(&mut self, _cycles: u64) {}
     #[inline]
@@ -3661,10 +3639,6 @@ struct PerfWindow {
     /// The peak is monotonic since the pool keeps the vectors. Paired with
     /// `cmd_vec_realloc_bytes` (footprint vs churn).
     cmd_vec_capacity_bytes: Stat,
-    /// Resident `FrameData.ops` `Vec<Op>` footprint sampled at `stamp_and_swap`.
-    ///
-    /// Paired with `op_vec_realloc_bytes`.
-    op_vec_capacity_bytes: Stat,
     frame_total: Stat,
     outside_d3d9: Stat,
     /// `api_cyc` = Σ of all raw `ApiCategory` buckets.
@@ -3856,10 +3830,6 @@ struct PerfWindow {
     /// The `realloc=` half of the `cmd_vec` row (sum across the window +
     /// outlier peak).
     cmd_vec_realloc_bytes: Stat,
-    /// Bytes memcpy'd by `FrameData.ops` Vec doublings on the API thread.
-    ///
-    /// The `realloc=` half of the `op_vec` row (sum + outlier peak).
-    op_vec_realloc_bytes: Stat,
     /// `PageBox` allocations reaching the global allocator (count sum + peak).
     ///
     /// With the byte twins below, the window totals feed the `pagebox`
@@ -3972,8 +3942,6 @@ impl PerfWindow {
             .add(u64::from(s.scratch_oversized_blocks));
         self.scratch_bytes.add(s.scratch_bytes);
         self.cmd_vec_capacity_bytes.add(s.cmd_vec_capacity_bytes);
-        self.op_vec_capacity_bytes
-            .add(s.timing.op_vec_capacity_bytes);
         self.frame_total.add(s.timing.frame_total_cycles);
         self.outside_d3d9.add(s.outside_d3d9);
         self.api_cyc.add(s.api_cyc);
@@ -4150,7 +4118,6 @@ impl PerfWindow {
         self.tex_staging_retained_bytes
             .add(s.tex_staging_retained_bytes as u64);
         self.cmd_vec_realloc_bytes.add(s.cmd_vec_realloc_bytes);
-        self.op_vec_realloc_bytes.add(s.timing.op_vec_realloc_bytes);
         self.pagebox_allocs.add(s.pagebox_allocs);
         self.pagebox_alloc_bytes.add(s.pagebox_alloc_bytes);
         self.pagebox_frees.add(s.pagebox_frees);
@@ -5386,7 +5353,7 @@ impl<'a> Summary<'a> {
                         bold_label: false,
                         ms: Some(push_ms),
                         aux: ns_per_draw_aux(w.draw_push_op.sum, draws_total),
-                        desc: Some("inline Op::Draw push"),
+                        desc: Some("inline draw record"),
                         peak: Some(cycles_to_ms(w.draw_push_op.max)),
                     },
                 );
@@ -6559,7 +6526,7 @@ impl<'a> Summary<'a> {
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "{b}Per-frame allocator footprint{r}  scratch as small/oversized blocks; op_vec + cmd_vec each split into size + realloc",
+            "{b}Per-frame allocator footprint{r}  scratch as small/oversized blocks; cmd_vec split into size + realloc",
             b = s.bold,
             r = s.reset,
         );
@@ -6582,39 +6549,6 @@ impl<'a> Summary<'a> {
                 pk = scratch_peak_fmt,
             )),
             "per-frame bump arena (VS/PS constants + UP vertices); cleared at begin_frame",
-        );
-        // op_vec — `FrameData.ops: Vec<Op>` shipped from the API
-        // thread to the encoder via `sync_channel(1)`. The encoder
-        // drains every Op in turn, translates D3D9 state to Metal,
-        // and emits the `Vec<Command>` that becomes the cmd_vec
-        // below.
-        self.res_row(
-            out,
-            "op_vec",
-            "",
-            None,
-            "API→encoder: Vec<Op> shipped via sync_channel(1); encoder drains and translates each Op",
-        );
-        let op_cap_avg_kb = u64_to_f64_exact(w.op_vec_capacity_bytes.sum) / f / 1024.0;
-        let op_cap_peak_kb = u64_to_f64_exact(w.op_vec_capacity_bytes.max) / 1024.0;
-        let (op_cap_avg_fmt, op_cap_peak_fmt) = format_kb_pair(op_cap_avg_kb, op_cap_peak_kb);
-        self.res_row(
-            out,
-            "  size",
-            &format!("{op_cap_avg_fmt} avg"),
-            Some(&format!("peak {op_cap_peak_fmt}")),
-            "high-water-reserved Vec<Op> capacity per frame (peak_ops_count)",
-        );
-        let op_realloc_avg_kb = u64_to_f64_exact(w.op_vec_realloc_bytes.sum) / f / 1024.0;
-        let op_realloc_peak_kb = u64_to_f64_exact(w.op_vec_realloc_bytes.max) / 1024.0;
-        let (op_realloc_avg_fmt, op_realloc_peak_fmt) =
-            format_kb_pair(op_realloc_avg_kb, op_realloc_peak_kb);
-        self.res_row(
-            out,
-            "  realloc",
-            &format!("{op_realloc_avg_fmt} avg"),
-            Some(&format!("peak {op_realloc_peak_fmt}")),
-            "Vec<Op> doubling memcpy on push_op (target ≈ 0 with peak_ops_count reserve)",
         );
         // cmd_vec — `Pass::commands: Vec<Command>` built on the
         // encoder thread and shipped to unix via
@@ -7166,8 +7100,6 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.count("scratch_small_peak", c.scratch_small_blocks.max);
     kv.count("scratch_oversized_peak", c.scratch_oversized_blocks.max);
     kv.bytes("scratch", c.scratch_bytes.max);
-    kv.bytes("op_vec_capacity", c.op_vec_capacity_bytes.max);
-    kv.total("op_vec_realloc_bytes", c.op_vec_realloc_bytes.sum);
     kv.bytes("cmd_vec_capacity", c.cmd_vec_capacity_bytes.max);
     kv.total("cmd_vec_realloc_bytes", c.cmd_vec_realloc_bytes.sum);
     kv.total("pagebox_alloc", c.pagebox_allocs.sum);
@@ -7281,16 +7213,14 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_waits) == 992);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_recording) == 996);
     assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_cycles) == 1000);
-    assert!(size_of::<FrameTiming>() == 48);
+    assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
-    assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
-    assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(core::mem::offset_of!(FrameTiming, latency_wait_cycles) == 32);
-    assert!(core::mem::offset_of!(FrameTiming, latency_waits) == 40);
-    assert!(core::mem::offset_of!(FrameTiming, frames_in_flight) == 44);
-    assert!(size_of::<FramePerfPayload>() == 1056);
+    assert!(core::mem::offset_of!(FrameTiming, latency_wait_cycles) == 16);
+    assert!(core::mem::offset_of!(FrameTiming, latency_waits) == 24);
+    assert!(core::mem::offset_of!(FrameTiming, frames_in_flight) == 28);
+    assert!(size_of::<FramePerfPayload>() == 1040);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
     assert!(core::mem::offset_of!(FramePerfPayload, timing) == 1008);

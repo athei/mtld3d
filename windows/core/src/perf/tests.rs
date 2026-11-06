@@ -623,7 +623,7 @@ fn summary_golden_layout() {
         "│  │  │  │  │  └─ rest  0.01 ms   ( 100 ns/draw)      keys less its parts   peak  0.01 ms\n",
         "│  │  │  │  ├─ bumps    0.01 ms   ( 100 ns/draw)      scratch+cache+wrapper peak  0.01 ms\n",
         "│  │  │  │  └─ resid    0.01 ms   ( 100 ns/draw)      uninstrumented noise  peak  0.01 ms\n",
-        "│  │  │  └─ push_op     0.02 ms   ( 200 ns/draw)      inline Op::Draw push  peak  0.02 ms\n",
+        "│  │  │  └─ push_op     0.02 ms   ( 200 ns/draw)      inline draw record    peak  0.02 ms\n",
         "│  │  ├─ RenderState    0.06 ms   (2000 ns/call)                            peak  0.06 ms\n",
         "│  │  ├─ TexStageState  0.03 ms   (1667 ns/call)                            peak  0.03 ms\n",
         "│  │  ├─ SamplerState   0.02 ms   (1667 ns/call)                            peak  0.02 ms\n",
@@ -776,11 +776,8 @@ fn summary_golden_layout() {
         "  PS_CONST_B               0             (  0.0%)\n",
         "inverse-view interval epoch=0 builds=0 bypass=0 hit=0 recompute=0 enabled-hit=n/a saturated=false\n",
         "\n",
-        "Per-frame allocator footprint  scratch as small/oversized blocks; op_vec + cmd_vec each split into size + realloc\n",
+        "Per-frame allocator footprint  scratch as small/oversized blocks; cmd_vec split into size + realloc\n",
         "scratch     24.0/0.0  2.0 MB avg    peak 24/0   peak 2.0 MB     per-frame bump arena (VS/PS constants + UP vertices); cleared at begin_frame\n",
-        "op_vec                                                          API→encoder: Vec<Op> shipped via sync_channel(1); encoder drains and translates each Op\n",
-        "  size      72 KB avg               peak 72 KB                  high-water-reserved Vec<Op> capacity per frame (peak_ops_count)\n",
-        "  realloc   32 KB avg               peak 32 KB                  Vec<Op> doubling memcpy on push_op (target ≈ 0 with peak_ops_count reserve)\n",
         "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
         "  size      64 KB avg               peak 64 KB                  submitted payload Vec<Command> capacity (excludes idle pool and other payloads)\n",
         "  realloc   192 KB avg              peak 192 KB                 Vec<Command> potential growth copies on emit_command (excludes initial allocations)\n",
@@ -949,7 +946,6 @@ fn kv_golden_line() {
         " keys_set_ps_const_skips_total=0 inverse_bypass_total=0 inverse_hit_total=0",
         " inverse_recompute_total=0 scratch_small_peak_count=24",
         " scratch_oversized_peak_count=0 scratch_bytes=2097152",
-        " op_vec_capacity_bytes=73728 op_vec_realloc_bytes_total=32768",
         " cmd_vec_capacity_bytes=65536 cmd_vec_realloc_bytes_total=196608",
         " pagebox_alloc_total=17 pagebox_alloc_bytes_total=4980736 pagebox_free_total=15",
         " pagebox_free_bytes_total=4849664 pagebox_uncached_total=1",
@@ -1376,15 +1372,6 @@ fn sample_window() -> PerfWindow {
         timing: FrameTiming {
             present_block_cycles: 3_200_000,
             frame_total_cycles: 10_000_000,
-            // peak_ops_count × size_of::<Op>() — peak ~1000 ops at
-            // ~72 B/Op rounds to ~72 KB. Pick 72 KB exactly so the
-            // golden assertion pins the row and `format_kb_pair`
-            // renders cleanly.
-            op_vec_capacity_bytes: 72 * 1024,
-            // Steady-state target is 0; pick a small non-zero value
-            // so the realloc row's number column is exercised by the
-            // golden assertion.
-            op_vec_realloc_bytes: 32 * 1024,
             // A GPU-bound frame: `Present` waited 1 ms for the latency bound
             // with three presents outstanding.
             latency_wait_cycles: 1_000_000,

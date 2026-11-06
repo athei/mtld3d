@@ -1812,8 +1812,6 @@ impl DeviceInner {
             self.current_frame.mark_gpu_capture(carried);
         }
         // Keep the perf payload fields while command bytes and UP data share the frame arena.
-        let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
-        let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
         self.perf_mut()
             .drain_into_payload(frame.perf_mut(), !no_present);
         // The summary runs in `mtld3d.so`, whose `PageBox` counters and pool
@@ -1827,9 +1825,6 @@ impl DeviceInner {
                 hz,
             );
         }
-        frame
-            .perf_mut()
-            .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
         // `Staged` uploads ride the op stream (inline `Op::StageUpload`),
         // so their page leases were recorded at `Unlock`. The encoder owns
         // counting their `PageBox` bytes into
@@ -2136,7 +2131,7 @@ impl DeviceInner {
 
     /// Swap in a fresh frame and send the full op list to the encoder.
     ///
-    /// Clears and attachment changes flow through `push_op` operations inside
+    /// Clears and attachment changes flow through `push_control` records inside
     /// the frame itself, so no per-Device clear snapshot is needed.
     ///
     /// This is also where the per-frame perf counters are published:
@@ -13130,7 +13125,7 @@ fn clamp_const_rows(max_const_used: u32) -> u16 {
 
 /// Bump the new VS const rows into the current-frame scratch arena and push a delta op.
 ///
-/// The `Op::SetVsConstRange` delta keeps the encoder-side mirror
+/// The `EncoderOpcode::SetVsConstRange` delta keeps the encoder-side mirror
 /// in sync with `ShaderBindings::vs_constants`. The encoder
 /// snapshots from its own mirror at `emit_draw` time, so the API thread
 /// records only the delta rather than bumping
@@ -13189,9 +13184,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let stages_timer = CycleAddTimer::start(stages_ptr);
 
     // STAGES first: `flush_dirty_mips` inside `snapshot_stage_bindings`
-    // pushes upload ops via `dev.push_op`, which mutably borrows
-    // `current_frame.ops`. Done before we hold our own `&mut` on
-    // scratch/ops below.
+    // records upload controls via `dev.push_control`, which mutably borrows
+    // `current_frame`. Done before we hold our own `&mut` on its scratch
+    // below.
     let stage_bindings_arr_opt = if dirty.contains(SnapshotDirty::STAGES) {
         let dev = obj.inner();
         // Vertex bindings ride encoder ops, but their CPU writes dirty the
@@ -13622,7 +13617,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     //
     // FF VS uses an encoder-side mirror parallel to the programmable
     // path: when any `FfVsDirty` section changed since the last
-    // snapshot, rebuild the blob, push as `Op::SetFfVsConstRange`,
+    // snapshot, rebuild the blob, push as `EncoderOpcode::SetFfVsConstRange`,
     // and clear the dirty mask. The mirror persists across frames; the
     // encoder snapshots `max_row + 1` rows from it into per-frame
     // scratch at `emit_draw` time via `ff_vs_const_scratch`.
@@ -15004,7 +14999,7 @@ extern "system" fn device_set_vertex_shader_constant_f(
         .write_vs_constants(start_register, slice);
     if changed {
         // Propagate the new rows to the encoder-side mirror via a delta op.
-        // The encoder applies it before the next `Op::Draw` sees programmable
+        // The encoder applies it before the next `EncoderOpcode::Draw` sees programmable
         // VS const state, so emit_snapshot_deltas does not need to bump
         // `vs_constants` into the API-thread arena (the encoder snapshots
         // from its own mirror at emit_draw time).
