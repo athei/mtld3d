@@ -1896,9 +1896,9 @@ pub fn spawn_private_log_child(
     let mut command = std::process::Command::new(&child);
     command.args(["--exact", test, "--nocapture"]);
     // The workloads consume unix-side records even when the suite disables
-    // them. Wine inherits its Unix environment separately from the PE
-    // child's: its promotion prefix sets the native filter too.
-    command.envs([("RUST_LOG", filter), ("__CX_UNIX_RUST_LOG", filter)]);
+    // them. The unix side takes the PE side's filter, so one variable covers
+    // both.
+    command.env("RUST_LOG", filter);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
     // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
     // child that inherited it would write into that shared directory. So the
