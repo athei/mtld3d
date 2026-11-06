@@ -1826,9 +1826,9 @@ impl DeviceInner {
             );
         }
         // `Staged` uploads ride the frame's command stream as a
-        // `StageUploadOp` control, so their page leases were recorded at `Unlock`. The encoder owns
-        // counting their `PageBox` bytes into
-        // the shared `vbib_retained_bytes` at intake.
+        // `StageUploadOp` control, so their page leases were recorded at
+        // `Unlock`. The encoder owns counting their `PageBox` bytes into the
+        // shared `vbib_retained_bytes` at intake.
         self.pending_retention_bytes = 0;
         frame.set_no_present(no_present);
 
