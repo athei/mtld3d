@@ -315,21 +315,6 @@ impl PageBoxPool {
         self.acquire(logical_len)
     }
 
-    /// Pop a parked texture staging box whose padded size matches `logical_len`'s class.
-    ///
-    /// The staging-lane twin of [`Self::acquire`], with the same contract:
-    /// a hit keeps its pages, alignment and generation and carries stale
-    /// contents, which every staging consumer tolerates because staging is
-    /// created uninitialized.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pool mutex was poisoned.
-    #[must_use]
-    pub fn acquire_staging(&self, logical_len: usize) -> Option<PageBox> {
-        self.acquire_in(LaneKind::Staging, logical_len)
-    }
-
     /// Start taking one API call's texture staging, under one lock while the pool is enabled.
     ///
     /// # Panics
@@ -425,6 +410,7 @@ impl PageBoxPool {
     /// # Panics
     ///
     /// Panics if the pool mutex was poisoned.
+    #[cfg(test)]
     #[must_use]
     pub fn staging_bytes(&self) -> usize {
         self.inner.lock().expect("PageBoxPool mutex poisoned").lanes[LaneKind::Staging as usize]

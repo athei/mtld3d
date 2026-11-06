@@ -2,10 +2,10 @@
 //!
 //! Platform-independent pure Rust. The `parser` submodule turns a `&[u32]` of
 //! DXSO bytecode into a structured `DxsoProgram`; the MSL emitters
-//! (`emit_vs_programmable` / `emit_ps_programmable` for DXSO and `emit_vs_ff`
-//! / `emit_ps_ff` for fixed-function) each produce a standalone translation
-//! unit containing a single `mtld3d_vs` or `mtld3d_ps` entry point. A render
-//! pipeline can mix any VS source with any PS source.
+//! (`emit_vs_programmable_named` / `emit_ps_programmable_named` for DXSO and
+//! `emit_vs_ff_named` / `emit_ps_ff_named` for fixed-function) each produce a
+//! standalone translation unit containing a single entry point of the given
+//! name. A render pipeline can mix any VS source with any PS source.
 
 mod emit;
 mod ff;
@@ -29,8 +29,8 @@ pub use emit::{
 };
 pub use ff::{
     FF_PASSTHROUGH_ATTR_BASE, FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags,
-    FfStageResult, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff, emit_ps_ff_named,
-    emit_vs_ff, emit_vs_ff_named, ff_attr_index_for_semantic, is_bump_env_op, tci_entry,
+    FfStageResult, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff_named,
+    emit_vs_ff_named, ff_attr_index_for_semantic, is_bump_env_op, tci_entry,
 };
 pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,

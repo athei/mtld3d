@@ -1174,6 +1174,7 @@ impl Pass {
     }
     /// Bit `i` set ⇒ render target `i + 1` is bound on this pass.
     #[must_use]
+    #[cfg(test)]
     pub fn extra_present_mask(&self) -> u8 {
         self.extra_color
             .iter()
@@ -1246,6 +1247,7 @@ impl Pass {
     /// rt format — a pipeline built for `BGRA8Unorm` would be rejected by
     /// Metal if bound against an rt with a different format.
     #[must_use]
+    #[cfg(test)]
     pub const fn color_format(&self) -> PixelFormat {
         self.color_format
     }
@@ -1339,11 +1341,13 @@ impl Pass {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn color_writes_observed(&self) -> bool {
         self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn color_clear_quad_ranges(&self) -> &[(usize, usize)] {
         &self.color_clear_quad_ranges
     }
@@ -2684,6 +2688,7 @@ impl PassState {
 
     /// Bit `i` set ⇒ render target `i + 1` takes part in the next pass.
     #[must_use]
+    #[cfg(test)]
     pub const fn extra_present_mask(&self) -> u8 {
         self.current_extra_present_mask
     }
@@ -2994,6 +2999,7 @@ impl PassState {
     /// the pixel shader's OETF variant, and per `Clear` to decide whether
     /// the clear colour is encoded on the way in.
     #[must_use]
+    #[cfg(test)]
     pub const fn pass_srgb_write(&self) -> bool {
         self.pass_srgb_write
     }
@@ -3073,7 +3079,7 @@ impl PassState {
     ///
     /// Bit 0 is render target 0 and bits 1..3 render targets 1..3. Zero while
     /// the state is off and while the pass binds twin views
-    /// ([`Self::pass_srgb_write`]), where Metal encodes after the blender.
+    /// (`pass_srgb_write`), where Metal encodes after the blender.
     /// Otherwise it names the attached targets whose format takes an sRGB
     /// write: those then reach the pass through their linear view, so the
     /// shader's OETF variant has to encode them. A target of a format without
@@ -3164,6 +3170,7 @@ impl PassState {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn pending_depth_clear(&self) -> Option<u32> {
         self.pending_depth_clear
     }
@@ -3956,7 +3963,10 @@ impl PassState {
         }
     }
 
-    /// Splice one texture-upload pass into the front of the frame.
+    /// Build one texture-upload pass, at the frame head or (`ORDERED`) in application order.
+    ///
+    /// Ordered callers first close the application pass and supply its pending
+    /// blits, so an upload follows every earlier read and write of its texture.
     ///
     /// `commands` is the upload quad's binding + draw sequence; the viewport
     /// scoping the pass to `rect` is prepended here so the pass carries it as
@@ -3967,7 +3977,7 @@ impl PassState {
     ///
     /// `leading_blits` carries the uploads and preservation copies issued
     /// since the preceding upload pass, so both upload forms keep API order.
-    /// The upload lands at the head of the frame, where the blit uploads it
+    /// An unordered upload lands at the head of the frame, where the blit uploads it
     /// replaces already land: a draw earlier in the frame that sampled the
     /// destination is served by the encoder's texture rename, exactly as
     /// before. The load action discards only when `rect` covers the whole
@@ -3978,19 +3988,6 @@ impl PassState {
     /// the attachment instead of discarding it (Rule A), and the sampled set
     /// so the pass's own colour store survives Rule C even in a frame where
     /// nothing samples the texture.
-    pub fn push_upload_pass(
-        &mut self,
-        target: &UploadPassTarget,
-        commands: &[Command],
-        leading_blits: Vec<BlitCommand>,
-    ) {
-        self.push_upload_pass_with_order::<false>(target, commands, leading_blits);
-    }
-
-    /// Build an upload pass at the frame head or in application order.
-    ///
-    /// Ordered callers first close the application pass and supply its pending
-    /// blits, so an upload follows every earlier read and write of its texture.
     pub fn push_upload_pass_with_order<const ORDERED: bool>(
         &mut self,
         target: &UploadPassTarget,

@@ -2361,6 +2361,7 @@ impl FramePerfPayload {
         }
     }
 
+    #[cfg(test)]
     pub const fn set_present_block_cycles(&mut self, cycles: u64) {
         self.timing.present_block_cycles = cycles;
     }
@@ -2403,6 +2404,7 @@ impl FramePerfPayload {
     }
 
     #[inline]
+    #[cfg(test)]
     pub const fn set_present_block_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
@@ -2757,6 +2759,7 @@ impl EncoderPerfState {
         }
     }
 
+    #[cfg(test)]
     pub const fn set_op_cycles(&mut self, cycles: u64) {
         self.enc.op_cycles = cycles;
     }
@@ -2766,6 +2769,7 @@ impl EncoderPerfState {
         self.enc.op_cycles = self.enc.op_cycles.saturating_add(cycles);
     }
 
+    #[cfg(test)]
     pub const fn set_submit_cycles(&mut self, cycles: u64) {
         self.enc.submit_cycles = cycles;
     }
@@ -3383,10 +3387,12 @@ impl EncoderPerfState {
     pub const fn finish_deferred(&mut self) {}
 
     #[inline]
+    #[cfg(test)]
     pub const fn set_op_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn add_op_cycles(&mut self, _cycles: u64) {}
     #[inline]
+    #[cfg(test)]
     pub const fn set_submit_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn op_cycles_ptr(&mut self) -> *mut u64 {

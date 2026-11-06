@@ -11,12 +11,11 @@ use std::sync::Arc;
 use mtld3d_shared::encoder_wire::LeaseCompletionPtr;
 use mtld3d_shared::{
     InPtr,
-    encoder_wire::{LeaseCompletion, WireError, WireReader, WireWriter},
+    encoder_wire::{LeaseCompletion, WireError},
 };
 use rustc_hash::FxHashMap;
 
 use crate::{
-    encoder_value::WireValue,
     guest_completions::{CompletionPool, CompletionSlot, LeaseCells},
     page_box::{PAGE_SIZE, PageBox, PageBoxRead},
     page_box_pool::PageBoxPool,
@@ -39,7 +38,11 @@ pub struct GuestPageLease {
 }
 
 impl GuestPageLease {
-    /// Retain an existing read until native acquisition closes the handoff.
+    /// Retain an existing read on standalone cells, for the isolated protocol tests.
+    ///
+    /// Runtime leases are pooled (`for_read_pooled`): their queued cells complete
+    /// only once the owner drains them, which these tests do not model.
+    #[cfg(test)]
     #[must_use]
     pub fn for_read(read: PageBoxRead) -> Self {
         Self {
@@ -305,34 +308,6 @@ impl GuestPageDescriptor {
             return Err(WireError::InvalidValue);
         }
         Ok(())
-    }
-}
-
-impl WireValue for GuestPageDescriptor {
-    const MIN_WIRE_BYTES: usize = 7 * size_of::<u64>();
-
-    fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        writer.u64(self.source)?;
-        writer.u64(self.padded_len)?;
-        writer.u64(self.logical_len)?;
-        writer.u64(self.generation)?;
-        writer.u64(self.readers)?;
-        writer.u64(self.completion)?;
-        writer.u64(self.read_acquired)
-    }
-
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        let value = Self {
-            source: reader.u64()?,
-            padded_len: reader.u64()?,
-            logical_len: reader.u64()?,
-            generation: reader.u64()?,
-            readers: reader.u64()?,
-            completion: reader.u64()?,
-            read_acquired: reader.u64()?,
-        };
-        value.validate()?;
-        Ok(value)
     }
 }
 

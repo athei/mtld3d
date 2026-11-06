@@ -285,6 +285,7 @@ impl VisibilityQueryCore {
     ///
     /// Panics if the clamped accumulator overflows `u32::MAX` — unreachable
     /// because the `.min(u32::MAX)` directly above bounds it.
+    #[cfg(test)]
     pub fn get_u32(&self) -> u32 {
         let v = self.get_u64();
         u32::try_from(v.min(u64::from(u32::MAX))).expect("clamped above to u32::MAX")
@@ -381,6 +382,7 @@ impl VisibilityQueryCore {
     ///
     /// `0` means the encoder has not processed the END of the bracket the
     /// API thread last requested.
+    #[cfg(test)]
     pub fn seq_end_loaded(&self) -> u64 {
         if self.mailbox().end_generation.load(Ordering::Acquire)
             == self.mailbox().requested_generation.load(Ordering::Acquire)
@@ -626,6 +628,7 @@ impl RetiredVisibilityBuffer {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn release_seq(&self) -> u64 {
         self.release_seq
     }

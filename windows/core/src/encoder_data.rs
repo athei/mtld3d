@@ -1091,17 +1091,6 @@ impl FrameData {
         &mut self.scratch
     }
 
-    /// Byte layout of the frame's back-buffer texture.
-    ///
-    /// Read by `GetFrontBufferData` to check its destination against the image
-    /// it copies: the back buffer is created `Bgra8Unorm` whatever format the
-    /// swap chain was asked for, so this is the layout, not the declared
-    /// `D3DFMT_*`.
-    #[must_use]
-    pub const fn backbuffer_format(&self) -> PixelFormat {
-        self.backbuffer_format
-    }
-
     /// Return retired frame storage after all borrowed frame values have been consumed.
     pub fn take_recording_scratch(&mut self) -> ScratchArena {
         self.scratch.clear();

@@ -168,13 +168,6 @@ impl FramePacket {
             .is_some_and(|cell| cell.was_rejected())
     }
 
-    #[must_use]
-    pub fn registrations(&self) -> &[u64] {
-        self.recorder
-            .as_ref()
-            .map_or(&[], |recorder| recorder.registrations.as_slice())
-    }
-
     /// Take registrations that native ordered replay has not adopted.
     #[must_use]
     pub fn take_rejected_registrations(&mut self) -> Vec<u64> {

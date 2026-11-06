@@ -492,8 +492,8 @@ impl ScratchArena {
     /// Bump-allocate uninitialised space for one `T` and return a raw pointer.
     ///
     /// Caller writes the value via `ptr::write` or per-field
-    /// `addr_of_mut!(...).write(...)` — useful when avoiding a stack
-    /// temp that would otherwise be memcpy'd in via `alloc_value`.
+    /// `addr_of_mut!(...).write(...)`, which builds the value in place
+    /// rather than memcpying a stack temp into the arena.
     ///
     /// The returned pointer is aligned to the arena's `ALIGN` (16 B),
     /// which exceeds any primitive's alignment requirement.
@@ -515,66 +515,6 @@ impl ScratchArena {
             .checked_mul(core::mem::size_of::<T>())
             .expect("scratch alloc_uninit_slice: byte length overflow");
         self.reserve(bytes).cast::<T>()
-    }
-
-    /// Memcpy the bytes of `*value` into the arena and return a typed pointer.
-    ///
-    /// Like `alloc_value` but takes a reference, so works for non-Copy
-    /// types.
-    ///
-    /// # Safety
-    ///
-    /// The scratch copy is never dropped, so this is sound only when
-    /// `T` has no Drop with side effects (e.g. owns no heap memory
-    /// the original `*value` will also drop). Bit-identical duplicate
-    /// would-be owners of a `Vec` / `Box` / refcount would silently
-    /// leak or alias.
-    pub unsafe fn alloc_from<T>(&mut self, value: &T) -> *mut T {
-        // SAFETY: bytewise view of any T is sound. Caller covers Drop
-        // soundness per the contract above.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref::<T>(value).cast::<u8>(),
-                core::mem::size_of::<T>(),
-            )
-        };
-        self.alloc(bytes) as *mut T
-    }
-
-    /// Bump-copy a single `T` into the arena and return a typed pointer.
-    ///
-    /// The arena's `ALIGN` (16 bytes) is ≥ any primitive's alignment, so
-    /// `T: Copy` with native primitive fields is safe. Caller asserts `T`
-    /// has no padding-sensitive invariants.
-    pub fn alloc_value<T: Copy>(&mut self, value: T) -> *mut T {
-        // SAFETY: T is Copy, so a byte-level view is sound. The
-        // returned pointer is aligned to ALIGN (16), which exceeds any
-        // primitive alignment requirement.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref::<T>(&value).cast::<u8>(),
-                core::mem::size_of::<T>(),
-            )
-        };
-        self.alloc(bytes) as *mut T
-    }
-
-    /// Bump-copy a slice of `T` into the arena and return a typed pointer + length.
-    ///
-    /// Same alignment notes as `alloc_value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `slice.len()` exceeds `u32::MAX` — unreachable in any
-    /// realistic per-frame workload.
-    pub fn alloc_slice<T: Copy>(&mut self, slice: &[T]) -> (*mut T, u32) {
-        // SAFETY: T is Copy and slice is `&[T]`; bytewise view is sound.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), core::mem::size_of_val(slice))
-        };
-        let ptr = self.alloc(bytes) as *mut T;
-        let len = u32::try_from(slice.len()).expect("scratch alloc_slice: len fits u32");
-        (ptr, len)
     }
 
     /// Reuse the single retained pool after all frame readers have released it.

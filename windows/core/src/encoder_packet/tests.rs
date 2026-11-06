@@ -708,7 +708,6 @@ fn canonical_upload_retains_source_and_feedback_through_native_use() {
             assert!(matches!(command.opcode(), EncoderOpcode::UploadTexture));
             let record = borrow::<crate::encoder_records::TextureUploadRecord>(command.payload())?;
             assert_eq!(record.upload_generation, 1);
-            record.validate_source(record.page.wire_fields()[2])?;
             // SAFETY: the actual producer retained these unique read and feedback descriptors.
             read = Some(unsafe { record.page.adopt_read()? });
             // SAFETY: the feedback lease remains owned by this admitted packet through native use.
@@ -819,11 +818,19 @@ fn snapshot_upload_records_carry_their_offset_and_check_their_span() {
     while replay(&mut packet, |command, _, _| {
         let record = borrow::<TextureUploadRecord>(command.payload())?;
         let flagged = record.mip_flags & u32::from(UploadTextureOpFlags::SNAPSHOT.bits()) != 0;
+        // The replay check: a snapshot's span against its chunk, a staging source at offset 0.
+        let valid = if flagged {
+            record
+                .validate_snapshot(record.page.wire_fields()[2])
+                .is_ok()
+        } else {
+            record.source_offset == 0
+        };
         seen.push((
             flagged,
             record.snapshot_offset(),
             record.source_offset,
-            record.validate_source(record.page.wire_fields()[2]).is_ok(),
+            valid,
         ));
         // SAFETY: the actual producer retained these unique read and feedback descriptors.
         let read = unsafe { record.page.adopt_read()? };
