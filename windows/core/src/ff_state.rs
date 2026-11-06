@@ -59,7 +59,7 @@ bitflags! {
     ///
     /// Set by `FfState` setters when their owning section changes; consumed
     /// (and cleared) by `take_dirty()` at `emit_snapshot_deltas` time. The
-    /// API thread then walks each set bit and emits one `Op::SetFfVsConstRange`
+    /// API thread then walks each set bit and emits one `EncoderOpcode::SetFfVsConstRange`
     /// per dirty section, copying only the changed rows into the per-frame
     /// scratch arena and onto the encoder's `ff_vs_constants_mirror`.
     ///
@@ -241,7 +241,7 @@ pub struct FfState {
     /// Set by setters (and by `SetRenderState` for the RS-driven sections)
     /// whenever a section's source values change; consumed and cleared by
     /// [`take_ff_vs_dirty`] when `emit_snapshot_deltas` walks dirty sections
-    /// and pushes `Op::SetFfVsConstRange` deltas onto the encoder's mirror.
+    /// and pushes `EncoderOpcode::SetFfVsConstRange` deltas onto the encoder's mirror.
     /// Initial state is [`FfVsDirty::all()`] so the first FF draw uploads
     /// every section.
     ff_vs_dirty: FfVsDirty,
@@ -303,7 +303,7 @@ impl FfState {
     /// Returns the current dirty mask and clears it.
     ///
     /// Called from `emit_snapshot_deltas` at the start of the FF VS arm; the
-    /// returned mask drives one `Op::SetFfVsConstRange` per dirty section.
+    /// returned mask drives one `EncoderOpcode::SetFfVsConstRange` per dirty section.
     #[inline]
     pub const fn take_ff_vs_dirty(&mut self) -> FfVsDirty {
         let bits = self.ff_vs_dirty;

@@ -15,9 +15,9 @@ use mtld3d_types::SAMPLER_STATE_COUNT;
 use crate::{
     buffer_rename::BufferMapMode,
     dirty_rect::DirtyRect,
-    draw_data::{DrawOp, ScratchSlice},
+    draw_data::ScratchSlice,
     encoder_reply::{ReplyBool, ReplyU64},
-    ids::{BufferId, ProgramId, TextureId},
+    ids::{BufferId, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::BackbufferContents,
     perf::FramePerfPayload,
@@ -662,11 +662,6 @@ pub struct AdoptProgramOp {
     pub registration: u64,
 }
 
-pub struct RegisterProgramOp {
-    pub shader_id: ProgramId,
-    pub program: crate::dxso::DxsoProgram,
-}
-
 pub struct BeginVisibilityOp {
     pub generation: u64,
     pub c: Arc<crate::visibility::VisibilityQueryCore>,
@@ -728,6 +723,10 @@ pub struct UploadTextureOp {
     pub job: TextureUploadJob,
 }
 
+/// A `Staged` VB/IB upload, ordered in the frame's command stream.
+///
+/// Carries the transient `PageBox` snapshot of the bytes the game wrote
+/// between `Lock` and `Unlock`, taken on the API thread with no Metal thunk.
 pub struct StageUploadOp {
     pub buffer_id: BufferId,
     pub page_box: PageBox,
@@ -772,210 +771,50 @@ impl TextureUploadJob {
     }
 }
 
-/// Discriminated union over the work the API thread queues for the encoder.
+/// The owned payload of a typed capture the frame recorder rejected.
 ///
-/// The hot per-draw path uses `Draw`, with no
-/// per-op heap allocation. The latter carries changed state. Non-draw
-/// operations carry typed, owned payloads and dispatch exhaustively.
-///
-/// See `windows/core/src/scratch.rs` for why hot payloads (snapshots,
-/// const ranges, stage bindings) are pointers into the per-frame arena
-/// rather than `Box<T>`.
+/// A control that fails to capture, or arrives after the frame latched an error, moves into
+/// `FrameRecorder::rejected_ops` as one of these, so the owners it carries (page boxes, reply
+/// slots, query cores) live as long as the rejected packet does instead of dropping while an
+/// earlier native frame may still read them.
 pub enum Op {
-    /// Apply a delta into the encoder-side VS programmable constant mirror.
-    ///
-    /// `data` is a scratch-allocated `[u8]` of `rows × 16` bytes starting
-    /// at row `start_row`. Pushed by `SetVertexShaderConstantF` (and
-    /// state-block-apply sites) on the API thread; consumed by `run_frame`
-    /// which copies the bytes into `FrameEncoder::vs_constants_mirror`.
-    SetVsConstRange {
-        start_row: u16,
-        rows: u16,
-        data: ScratchSlice,
-    },
-    SetPsConstRange {
-        start_row: u16,
-        rows: u16,
-        data: ScratchSlice,
-    },
-    /// Section delta into the FF VS const mirror.
-    ///
-    /// Pushed once per dirty `FfVsDirty` section from
-    /// `emit_ff_vs_section_deltas`. Structurally identical to
-    /// `SetVsConstRange` but routes to a separate mirror because FF and
-    /// programmable VS feed different content into the same shader slot
-    /// (slot 0 c-bank).
-    SetFfVsConstRange {
-        start_row: u16,
-        rows: u16,
-        data: ScratchSlice,
-    },
-    /// Issue a draw using the current snapshot.
-    Draw(DrawOp),
-    SetViewport(
-        #[cfg(windows)] SetViewportOp,
-        #[cfg(not(windows))] Box<SetViewportOp>,
-    ),
-    SetVertexSampler(
-        #[cfg(windows)] SetVertexSamplerOp,
-        #[cfg(not(windows))] Box<SetVertexSamplerOp>,
-    ),
-    SetVertexTexture(
-        #[cfg(windows)] SetVertexTextureOp,
-        #[cfg(not(windows))] Box<SetVertexTextureOp>,
-    ),
-    BindDepth(
-        #[cfg(windows)] BindDepthOp,
-        #[cfg(not(windows))] Box<BindDepthOp>,
-    ),
-    BindColor(
-        #[cfg(windows)] BindColorOp,
-        #[cfg(not(windows))] Box<BindColorOp>,
-    ),
-    GenerateMipmapsOrdered(
-        #[cfg(windows)] GenerateMipmapsOrderedOp,
-        #[cfg(not(windows))] Box<GenerateMipmapsOrderedOp>,
-    ),
-    UnbindExtraColor(
-        #[cfg(windows)] UnbindExtraColorOp,
-        #[cfg(not(windows))] Box<UnbindExtraColorOp>,
-    ),
-    DestroyTexture(
-        #[cfg(windows)] DestroyTextureOp,
-        #[cfg(not(windows))] Box<DestroyTextureOp>,
-    ),
-    DestroyBuffer(
-        #[cfg(windows)] DestroyBufferOp,
-        #[cfg(not(windows))] Box<DestroyBufferOp>,
-    ),
-    ReadColorHandle(
-        #[cfg(windows)] ReadColorHandleOp,
-        #[cfg(not(windows))] Box<ReadColorHandleOp>,
-    ),
-    NoteColorRead(
-        #[cfg(windows)] NoteColorReadOp,
-        #[cfg(not(windows))] Box<NoteColorReadOp>,
-    ),
-    ResolveDepthSurface(
-        #[cfg(windows)] ResolveDepthSurfaceOp,
-        #[cfg(not(windows))] Box<ResolveDepthSurfaceOp>,
-    ),
-    StretchBlit(
-        #[cfg(windows)] StretchBlitOp,
-        #[cfg(not(windows))] Box<StretchBlitOp>,
-    ),
-    ColorFill(
-        #[cfg(windows)] ColorFillOp,
-        #[cfg(not(windows))] Box<ColorFillOp>,
-    ),
-    CarryDepth(
-        #[cfg(windows)] CarryDepthOp,
-        #[cfg(not(windows))] Box<CarryDepthOp>,
-    ),
-    ClearColor(
-        #[cfg(windows)] ClearColorOp,
-        #[cfg(not(windows))] Box<ClearColorOp>,
-    ),
-    ClearColorRects(
-        #[cfg(windows)] ClearColorRectsOp,
-        #[cfg(not(windows))] Box<ClearColorRectsOp>,
-    ),
-    ClearDepthStencilRects(
-        #[cfg(windows)] ClearDepthStencilRectsOp,
-        #[cfg(not(windows))] Box<ClearDepthStencilRectsOp>,
-    ),
-    ClearDepthStencil(
-        #[cfg(windows)] ClearDepthStencilOp,
-        #[cfg(not(windows))] Box<ClearDepthStencilOp>,
-    ),
-    ResolveDynamicDepth(
-        #[cfg(windows)] ResolveDynamicDepthOp,
-        #[cfg(not(windows))] Box<ResolveDynamicDepthOp>,
-    ),
-    ResolveDepthTexture(
-        #[cfg(windows)] ResolveDepthTextureOp,
-        #[cfg(not(windows))] Box<ResolveDepthTextureOp>,
-    ),
-    ReadDeviceBuffer(
-        #[cfg(windows)] ReadDeviceBufferOp,
-        #[cfg(not(windows))] Box<ReadDeviceBufferOp>,
-    ),
-    RegisterProgram(
-        #[cfg(windows)] RegisterProgramOp,
-        #[cfg(not(windows))] Box<RegisterProgramOp>,
-    ),
-    AdoptProgram(
-        #[cfg(windows)] AdoptProgramOp,
-        #[cfg(not(windows))] Box<AdoptProgramOp>,
-    ),
-    BeginVisibility(
-        #[cfg(windows)] BeginVisibilityOp,
-        #[cfg(not(windows))] Box<BeginVisibilityOp>,
-    ),
-    EndVisibility(
-        #[cfg(windows)] EndVisibilityOp,
-        #[cfg(not(windows))] Box<EndVisibilityOp>,
-    ),
-    RetireColor(
-        #[cfg(windows)] RetireColorOp,
-        #[cfg(not(windows))] Box<RetireColorOp>,
-    ),
-    RetireDepth(
-        #[cfg(windows)] RetireDepthOp,
-        #[cfg(not(windows))] Box<RetireDepthOp>,
-    ),
-    UploadColor(
-        #[cfg(windows)] UploadColorOp,
-        #[cfg(not(windows))] Box<UploadColorOp>,
-    ),
-    UploadResampled(
-        #[cfg(windows)] UploadResampledOp,
-        #[cfg(not(windows))] Box<UploadResampledOp>,
-    ),
-    UpdateColorRegion(
-        #[cfg(windows)] UpdateColorRegionOp,
-        #[cfg(not(windows))] Box<UpdateColorRegionOp>,
-    ),
-    ReadTextureHandle(
-        #[cfg(windows)] ReadTextureHandleOp,
-        #[cfg(not(windows))] Box<ReadTextureHandleOp>,
-    ),
-    GenerateMipmaps(
-        #[cfg(windows)] GenerateMipmapsOp,
-        #[cfg(not(windows))] Box<GenerateMipmapsOp>,
-    ),
-    ReadTextureColorHandle(
-        #[cfg(windows)] ReadTextureColorHandleOp,
-        #[cfg(not(windows))] Box<ReadTextureColorHandleOp>,
-    ),
-    UploadTextureAndMips(
-        #[cfg(windows)] UploadTextureAndMipsOp,
-        #[cfg(not(windows))] Box<UploadTextureAndMipsOp>,
-    ),
-    UploadTexture(
-        #[cfg(windows)] UploadTextureOp,
-        #[cfg(not(windows))] Box<UploadTextureOp>,
-    ),
-    SetDumpDraw(
-        #[cfg(windows)] SetDumpDrawOp,
-        #[cfg(not(windows))] Box<SetDumpDrawOp>,
-    ),
-    /// Inline op-stream-ordered `Staged` VB/IB upload.
-    ///
-    /// Carries the transient `PageBox` snapshot of the bytes the game
-    /// wrote between `Lock` and `Unlock` (taken on the API thread, no
-    /// Metal thunk there). The encoder wraps it as a `bytesNoCopy` blit
-    /// source and copies its range into the buffer's persistent `Private`
-    /// device buffer via `frame_blit_commands` (a leading phase, before
-    /// any draw). If a draw earlier this frame already read an overlapping
-    /// region, the encoder first renames the device buffer so the earlier
-    /// draw keeps its bytes, see `apply_stage_upload`.
-    StageUpload {
-        buffer_id: BufferId,
-        page_box: PageBox,
-        dst_offset: u32,
-        size: u32,
-    },
+    SetViewport(SetViewportOp),
+    SetVertexSampler(SetVertexSamplerOp),
+    SetVertexTexture(SetVertexTextureOp),
+    BindDepth(BindDepthOp),
+    BindColor(BindColorOp),
+    GenerateMipmapsOrdered(GenerateMipmapsOrderedOp),
+    UnbindExtraColor(UnbindExtraColorOp),
+    DestroyTexture(DestroyTextureOp),
+    DestroyBuffer(DestroyBufferOp),
+    ReadColorHandle(ReadColorHandleOp),
+    NoteColorRead(NoteColorReadOp),
+    ResolveDepthSurface(ResolveDepthSurfaceOp),
+    StretchBlit(StretchBlitOp),
+    ColorFill(ColorFillOp),
+    CarryDepth(CarryDepthOp),
+    ClearColor(ClearColorOp),
+    ClearColorRects(ClearColorRectsOp),
+    ClearDepthStencilRects(ClearDepthStencilRectsOp),
+    ClearDepthStencil(ClearDepthStencilOp),
+    ResolveDynamicDepth(ResolveDynamicDepthOp),
+    ResolveDepthTexture(ResolveDepthTextureOp),
+    ReadDeviceBuffer(ReadDeviceBufferOp),
+    AdoptProgram(AdoptProgramOp),
+    BeginVisibility(BeginVisibilityOp),
+    EndVisibility(EndVisibilityOp),
+    RetireColor(RetireColorOp),
+    RetireDepth(RetireDepthOp),
+    UploadColor(UploadColorOp),
+    UploadResampled(UploadResampledOp),
+    UpdateColorRegion(UpdateColorRegionOp),
+    ReadTextureHandle(ReadTextureHandleOp),
+    GenerateMipmaps(GenerateMipmapsOp),
+    ReadTextureColorHandle(ReadTextureColorHandleOp),
+    UploadTextureAndMips(UploadTextureAndMipsOp),
+    UploadTexture(UploadTextureOp),
+    SetDumpDraw(SetDumpDrawOp),
+    StageUpload(StageUploadOp),
 }
 
 bitflags::bitflags! {
@@ -1041,7 +880,6 @@ pub struct VbibWarmupEntry {
 
 pub struct FrameData {
     pub recorder: Option<crate::encoder_packet::FrameRecorder>,
-    pub ops: Vec<Op>,
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub record_handle: DeviceRecordHandle,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
@@ -1126,22 +964,11 @@ pub struct FrameData {
     /// Used by `snapshot_shared` to allocate per-draw VS/PS constants +
     /// alpha-ref + fog-color bytes without per-draw `Vec::to_vec()` heap
     /// traffic, pointers handed across the channel via `ScratchSlice` stay
-    /// valid until this `FrameData` is dropped after the encoder finishes
-    /// draining `ops`. Separate from `FrameEncoder::scratch` (which the
+    /// valid until the packet's replay completes and its storage is
+    /// recycled. Separate from `FrameEncoder::scratch` (which the
     /// encoder thread uses for clear-pass constants etc.) so no two threads
     /// ever write the same arena.
     pub scratch: ScratchArena,
-    /// Running per-frame total of bytes `Vec::push` memcpys when `ops` doubles its capacity.
-    ///
-    /// The API→encoder bridge counterpart to
-    /// `PassState::cmd_vec_realloc_bytes`. `push_op` / `push_op_inline`
-    /// check `len == capacity` before push and add
-    /// `capacity × size_of::<Op>()` here on equality (= the bytes the
-    /// imminent realloc memcpys). `peak_ops_count` in `DeviceInner` reserves
-    /// the new frame's `ops` at the running peak, so steady-state should land
-    /// at 0, non-zero signals a new variant or workload that perturbed the
-    /// peak.
-    pub op_vec_realloc_bytes: u64,
     pub replay_completion: Option<crate::encoder_packet::ReplayCompletion>,
 }
 
@@ -1224,7 +1051,6 @@ impl FrameData {
         Self {
             recorder: None,
             replay_completion: None,
-            ops: Vec::new(),
             device_handle: init.device_handle,
             record_handle: init.record_handle,
             backbuffer_handle: init.backbuffer_handle,
@@ -1252,7 +1078,6 @@ impl FrameData {
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
             scratch: ScratchArena::new(),
-            op_vec_realloc_bytes: 0,
         }
     }
 
@@ -1264,30 +1089,6 @@ impl FrameData {
     /// the frame), so pointers stay valid for the entire op-replay window.
     pub const fn scratch_mut(&mut self) -> &mut ScratchArena {
         &mut self.scratch
-    }
-
-    /// Number of ops queued in this frame so far.
-    ///
-    /// `stamp_and_swap` reads this on the outgoing frame to pre-size the
-    /// incoming frame's ops Vec, eliminating the per-frame Vec doubling
-    /// burden (which was statistically landing on Draw `push_op` calls after
-    /// `Set*ConstRange` ops bumped the per-frame total by ~50%).
-    #[must_use]
-    pub const fn ops_len(&self) -> usize {
-        match &self.recorder {
-            Some(recorder) => recorder.len(),
-            None => self.ops.len(),
-        }
-    }
-
-    /// Pre-reserve `count` elements of capacity in the ops Vec.
-    ///
-    /// Called from `stamp_and_swap` with the previous frame's
-    /// `ops_len()` so the new frame fills without any realloc in the
-    /// common case where frame-to-frame op count is stable.
-    #[cfg(not(windows))]
-    pub fn reserve_ops(&mut self, count: usize) {
-        self.ops.reserve(count);
     }
 
     /// Byte layout of the frame's back-buffer texture.
@@ -1392,39 +1193,12 @@ impl FrameData {
         &mut self,
         value: T,
     ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-        if let Some(recorder) = &mut self.recorder {
-            recorder.record_typed(&mut self.scratch, value)
-        } else {
-            self.ops.push(value.into_rejected());
-            Ok(())
-        }
+        self.recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .record_typed(&mut self.scratch, value)
     }
 
-    pub fn push_op(&mut self, op: Op) {
-        let _ = self.try_push_op(op);
-    }
-
-    /// Record an operation and report a latched wire capture error.
-    ///
-    /// # Errors
-    /// Returns allocation, size or malformed capture errors on the PE recording path.
-    pub fn try_push_op(&mut self, op: Op) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-        #[cfg(windows)]
-        {
-            self.recorder
-                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-                .try_record(&mut self.scratch, op)
-        }
-        #[cfg(not(windows))]
-        {
-            self.account_op_vec_realloc();
-            self.ops.push(op);
-            Ok(())
-        }
-    }
-
-    /// Write a borrowed draw directly into the PE frame capture.
-    #[cfg(windows)]
+    /// Write a borrowed draw directly into the wire frame capture.
     pub fn record_draw(&mut self, draw: &crate::draw_data::DrawOp) {
         let _ = self
             .recorder
@@ -1442,7 +1216,6 @@ impl FrameData {
     ///
     /// # Errors
     /// Returns the latched frame error or a wire capture failure.
-    #[cfg(windows)]
     #[inline]
     pub fn record_single_stream_draw<D: crate::encoder_draw::draw_record::SingleStreamDraw>(
         &mut self,
@@ -1458,7 +1231,6 @@ impl FrameData {
     }
 
     /// Write a bound draw through the checked recorder path.
-    #[cfg(windows)]
     #[inline(never)]
     fn record_bound_draw(
         &mut self,
@@ -1469,78 +1241,6 @@ impl FrameData {
         self.recorder
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
             .record_bound_draw(&mut self.scratch, prefix, vertices, indices)
-    }
-
-    /// Retain an owned draw for native replay.
-    #[cfg(not(windows))]
-    pub fn record_draw(&mut self, draw: crate::draw_data::DrawOp) {
-        self.push_op(Op::Draw(draw));
-    }
-
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
-    pub fn record_vs_constants(
-        &mut self,
-        start_row: u16,
-        rows: u16,
-        data: crate::draw_data::ScratchSlice,
-    ) {
-        #[cfg(windows)]
-        {
-            let _ = self
-                .recorder
-                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-                .record_vs_constants(&mut self.scratch, start_row, rows, data);
-        }
-        #[cfg(not(windows))]
-        self.push_op(Op::SetVsConstRange {
-            start_row,
-            rows,
-            data,
-        });
-    }
-
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
-    pub fn record_ps_constants(
-        &mut self,
-        start_row: u16,
-        rows: u16,
-        data: crate::draw_data::ScratchSlice,
-    ) {
-        #[cfg(windows)]
-        {
-            let _ = self
-                .recorder
-                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-                .record_ps_constants(&mut self.scratch, start_row, rows, data);
-        }
-        #[cfg(not(windows))]
-        self.push_op(Op::SetPsConstRange {
-            start_row,
-            rows,
-            data,
-        });
-    }
-
-    /// Record a constant delta directly on PE, or retain its operation on Unix.
-    pub fn record_ff_vs_constants(
-        &mut self,
-        start_row: u16,
-        rows: u16,
-        data: crate::draw_data::ScratchSlice,
-    ) {
-        #[cfg(windows)]
-        {
-            let _ = self
-                .recorder
-                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-                .record_ff_vs_constants(&mut self.scratch, start_row, rows, data);
-        }
-        #[cfg(not(windows))]
-        self.push_op(Op::SetFfVsConstRange {
-            start_row,
-            rows,
-            data,
-        });
     }
 
     /// Capture API constant rows directly into the command payload.
@@ -1584,40 +1284,6 @@ impl FrameData {
             .and_then(crate::encoder_packet::FrameRecorder::recording_error)
     }
 
-    /// Push an `Op` variant directly.
-    ///
-    /// Used by the hot draw path (`emit_snapshot_deltas` + `Op::Draw`) so it
-    /// can emit inline state-delta + draw variants without a payload allocation.
-    pub fn push_op_inline(&mut self, op: Op) {
-        self.push_op(op);
-    }
-
-    /// Add the old capacity's bytes to the per-frame counter before `Vec::push` reallocs.
-    ///
-    /// The imminent push is the one that trips `Vec::push`'s
-    /// double-and-memcpy. Hot-path: a single `len == capacity`
-    /// compare when no realloc fires. Mirrors the `emit_command`
-    /// pattern in `PassState`.
-    #[cfg(not(windows))]
-    #[inline]
-    const fn account_op_vec_realloc(&mut self) {
-        if self.ops.len() == self.ops.capacity() {
-            let bytes = (self.ops.capacity() as u64).saturating_mul(size_of::<Op>() as u64);
-            self.op_vec_realloc_bytes = self.op_vec_realloc_bytes.saturating_add(bytes);
-        }
-    }
-
-    /// Resident `Vec<Op>` capacity in bytes.
-    ///
-    /// Read by `stamp_and_swap` to seed the outgoing frame's
-    /// `FramePerfPayload` so the `op_vec size` row in the per-frame allocator
-    /// footprint reflects steady-state footprint paired with the realloc
-    /// churn.
-    #[must_use]
-    pub const fn op_vec_capacity_bytes(&self) -> u64 {
-        (self.ops.capacity() as u64).saturating_mul(size_of::<Op>() as u64)
-    }
-
     /// Put a Reset's queued `PresentationInterval` change on this frame.
     ///
     /// Called from `stamp_and_swap` for the frame being handed to the
@@ -1641,14 +1307,6 @@ impl FrameData {
                 .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
                 .capture_gamma(&mut self.scratch, self.layer_handle.raw(), change);
         }
-    }
-
-    /// Drain the per-frame `Vec<Op>` realloc-byte counter into the caller and zero it.
-    ///
-    /// Called once per frame from `stamp_and_swap` so the outgoing frame
-    /// ships its realloc total to the encoder via `FramePerfPayload`.
-    pub const fn take_op_vec_realloc_bytes(&mut self) -> u64 {
-        core::mem::replace(&mut self.op_vec_realloc_bytes, 0)
     }
 
     /// Queue a texture for eager `MTLTexture` creation at the head of the next `run_frame`.
@@ -1675,23 +1333,6 @@ impl FrameData {
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
             .capture_vbib_retention(&mut self.scratch, entry);
     }
-}
-
-/// Capture a typed operation without a transient allocation on the API runtime.
-///
-/// Keep the owned operation payload inline for PE recording. Native replay borrows
-/// fixed command records directly rather than reconstructing owned operations.
-#[cfg(windows)]
-#[must_use]
-pub const fn capture_op<T>(value: T) -> T {
-    value
-}
-
-/// Box an owned operation payload for the host-side `Op` representation.
-#[cfg(not(windows))]
-#[must_use]
-pub fn capture_op<T>(value: T) -> Box<T> {
-    Box::new(value)
 }
 
 #[cfg(test)]

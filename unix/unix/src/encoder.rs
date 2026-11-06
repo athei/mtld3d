@@ -1277,7 +1277,7 @@ pub struct FrameEncoder {
     /// Encoder-thread mirror of the programmable VS constant array.
     ///
     /// Kept in sync with `ShaderBindings::vs_constants` (API thread) via
-    /// `Op::SetVsConstRange` delta ops. Boxed to keep `FrameEncoder` small
+    /// `EncoderOpcode::SetVsConstRange` delta ops. Boxed to keep `FrameEncoder` small
     /// despite the 4 KB array. Lifetime spans the encoder thread; persists
     /// across frames just like the API mirror.
     vs_constants_mirror: Box<[[f32; 4]; CONSTANT_ROWS]>,
@@ -1303,7 +1303,7 @@ pub struct FrameEncoder {
     /// Encoder-thread mirror of the FF VS const buffer.
     ///
     /// Kept in sync with `FfState`-derived section deltas via
-    /// `Op::SetFfVsConstRange`. Parallel to `vs_constants_mirror`
+    /// `EncoderOpcode::SetFfVsConstRange`. Parallel to `vs_constants_mirror`
     /// (programmable). No populated-rows watermark needed — every FF draw
     /// carries `max_row + 1` via `VsSource::FixedFunction.max_row`.
     ff_vs_constants_mirror: Box<[[f32; 4]; CONSTANT_ROWS]>,
@@ -5300,7 +5300,7 @@ impl FrameEncoder {
         self.scratch.alloc(data)
     }
 
-    /// Apply an `Op::SetVsConstRange` delta to the encoder-side VS mirror.
+    /// Apply an `EncoderOpcode::SetVsConstRange` delta to the encoder-side VS mirror.
     ///
     /// Reads `rows × 16` bytes from `data` (a scratch-allocated slice from
     /// the previous-frame arena's API-thread tail), copies them into
@@ -5383,7 +5383,7 @@ impl FrameEncoder {
         slice
     }
 
-    /// Apply an `Op::SetFfVsConstRange` delta to the FF VS mirror.
+    /// Apply an `EncoderOpcode::SetFfVsConstRange` delta to the FF VS mirror.
     ///
     /// Parallel to `apply_vs_const_range` but routes to the FF mirror.
     /// **Always** invalidates `ff_vs_const_scratch_cache` so the next
@@ -5441,7 +5441,7 @@ impl FrameEncoder {
     /// Populated-row high-watermark of the encoder-side VS mirror.
     ///
     /// The maximum `start_row + rows` seen across every
-    /// `Op::SetVsConstRange` applied. `emit_draw` uses this for shaders
+    /// `EncoderOpcode::SetVsConstRange` applied. `emit_draw` uses this for shaders
     /// that bind constants via relative addressing (`c[a0.x + N]`), where
     /// the static-analysis bound from `max_const_used` would truncate.
     pub const fn vs_constants_populated_rows(&self) -> u16 {

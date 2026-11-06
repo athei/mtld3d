@@ -1165,7 +1165,7 @@ in its row, and every family carries the suffixes its row names.
 | `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
 | `inverse_bypass_total`, `inverse_hit_total`, `inverse_recompute_total` | The `inverse-view` rows, summed over the window's reset epochs. |
 | `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |
-| `op_vec_capacity_bytes`, `op_vec_realloc_bytes_total`, `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `op_vec` and `cmd_vec`: peak `size` and window `realloc` bytes. |
+| `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `cmd_vec`: peak `size` and window `realloc` bytes. |
 | `pagebox_alloc_total`, `pagebox_alloc_bytes_total`, `pagebox_free_total`, `pagebox_free_bytes_total`, `pagebox_uncached_total` | `pagebox` and `uncached`. |
 | `pe_pagebox_alloc_total`, `pe_pagebox_alloc_bytes_total`, `pe_pagebox_free_total`, `pe_pagebox_free_bytes_total`, `pe_pagebox_uncached_total`, `pe_pagebox_pool_recycled_total`, `pe_pagebox_pool_recycled_bytes_total`, `pe_pagebox_pool_parked_bytes` | `d3d9.dll`'s share of `pagebox`, `uncached`, the pool's `recycled` and `parked` (peak), carried in the frame payload. The grid adds it to the encoder runtime's, which the `pagebox_*` keys hold alone. |
 | `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
