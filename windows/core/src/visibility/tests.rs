@@ -943,7 +943,6 @@ fn finalize_reports_the_count_in_reported_pixels_of_the_target_begun_against() {
     core.accumulate_segment(76_800);
     core.publish_span();
     assert_eq!(core.get_u64(), 307_200);
-    assert_eq!(core.get_u64(), 307_200);
     assert_eq!(core.status(), QueryStatus::Issued);
 }
 
