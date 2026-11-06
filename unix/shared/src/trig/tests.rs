@@ -1,20 +1,15 @@
 //! Accuracy tests for the hand-rolled single-precision trig approximations.
 //!
-//! Dense sweeps compare `sin_cos`, `atan`, `atan2` and `acos` against an `f64`
-//! reference under fixed error bounds, so a mistyped minimax coefficient or a
-//! flipped sign fails loudly instead of skewing a spotlight cone. The rest pins
-//! the octant bookkeeping (cardinal angles, odd/even symmetry, the Pythagorean
-//! identity), the `f64` fallback that keeps huge angles inside `[-1, 1]`, and
-//! non-finite inputs returning NaN rather than panicking or hanging.
+//! A dense sweep compares `sin_cos` against an `f64` reference under a fixed
+//! error bound, so a mistyped minimax coefficient or a flipped sign fails
+//! loudly instead of skewing a spotlight cone. The rest pins the octant
+//! bookkeeping (cardinal angles, odd/even symmetry, the Pythagorean identity),
+//! the `f64` fallback that keeps huge angles inside `[-1, 1]`, and non-finite
+//! inputs returning NaN rather than panicking or hanging.
 
 use core::f32::consts::PI;
 
-use super::{acos, atan, atan2, sin_cos};
-
-/// Arc-function tolerance: the reduction's division adds error over the raw polynomial.
-///
-/// So a slightly looser bound than the sin/cos `TOL`.
-const ATOL: f32 = 6e-6;
+use super::sin_cos;
 
 /// Max absolute error against an `f64` reference over a dense sweep.
 ///
@@ -58,60 +53,6 @@ fn matches_reference_over_dense_sweep() {
     }
     assert!(max_s < TOL, "max sin error {max_s} exceeds {TOL}");
     assert!(max_c < TOL, "max cos error {max_c} exceeds {TOL}");
-}
-
-#[test]
-fn atan_matches_reference() {
-    let n = 20_000;
-    let mut max = 0.0f32;
-    for i in 0..n {
-        let x = (i as f32 / n as f32) * 200.0 - 100.0; // [-100, 100)
-        let got = atan(x);
-        max = max.max((got - f64::from(x).atan() as f32).abs());
-    }
-    assert!(max < ATOL, "max atan error {max} exceeds {ATOL}");
-}
-
-#[test]
-fn atan2_resolves_all_quadrants() {
-    // Cardinal directions land on the exact axis angles.
-    assert!((atan2(0.0, 1.0) - 0.0).abs() < ATOL);
-    assert!((atan2(1.0, 0.0) - PI / 2.0).abs() < ATOL);
-    assert!((atan2(0.0, -1.0) - PI).abs() < ATOL);
-    assert!((atan2(-1.0, 0.0) + PI / 2.0).abs() < ATOL);
-    assert_eq!(atan2(0.0, 0.0), 0.0);
-
-    // Dense sweep over the plane vs the f64 reference (skip the origin).
-    let n = 200;
-    let mut max = 0.0f32;
-    for i in 0..n {
-        for j in 0..n {
-            let y = (i as f32 / n as f32) * 8.0 - 4.0;
-            let x = (j as f32 / n as f32) * 8.0 - 4.0;
-            if x == 0.0 && y == 0.0 {
-                continue;
-            }
-            let got = atan2(y, x);
-            let want = f64::from(y).atan2(f64::from(x)) as f32;
-            max = max.max((got - want).abs());
-        }
-    }
-    assert!(max < ATOL, "max atan2 error {max} exceeds {ATOL}");
-}
-
-#[test]
-fn acos_matches_reference_incl_endpoints() {
-    assert!((acos(1.0) - 0.0).abs() < ATOL);
-    assert!((acos(-1.0) - PI).abs() < ATOL);
-    assert!((acos(0.0) - PI / 2.0).abs() < ATOL);
-
-    let n = 20_000;
-    let mut max_ac = 0.0f32;
-    for i in 0..=n {
-        let x = (i as f32 / n as f32) * 2.0 - 1.0; // [-1, 1]
-        max_ac = max_ac.max((acos(x) - f64::from(x).acos() as f32).abs());
-    }
-    assert!(max_ac < ATOL, "max acos error {max_ac} exceeds {ATOL}");
 }
 
 #[test]

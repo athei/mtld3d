@@ -204,18 +204,11 @@ pub fn install() {
 
     resolve_wine_current_teb();
 
-    // Diagnostic escape hatch: with `MTLD3D_NO_CRASH_HANDLER=1` we do NOT
-    // intercept SIGSEGV/SIGBUS, so Wine's own SEH machinery translates the
-    // fault into a Windows exception and prints a PE-side backtrace
-    // (`d3d9.dll`/`winemac.drv`+offset) — the frame our async-signal-safe
-    // handler can't recover when the stack chain is broken.
-    if std::env::var_os("MTLD3D_NO_CRASH_HANDLER").is_none() {
-        install_signal_handler(libc::SIGSEGV);
-        install_signal_handler(libc::SIGBUS);
-        // A trap instruction: a framework's own assertion (`__builtin_trap`)
-        // ends a process this way, and so does a jump into non-code.
-        install_signal_handler(libc::SIGILL);
-    }
+    install_signal_handler(libc::SIGSEGV);
+    install_signal_handler(libc::SIGBUS);
+    // A trap instruction: a framework's own assertion (`__builtin_trap`)
+    // ends a process this way, and so does a jump into non-code.
+    install_signal_handler(libc::SIGILL);
     install_signal_handler(libc::SIGABRT);
 }
 
@@ -1326,7 +1319,6 @@ const fn caller_pc(ctx: *mut c_void, _sp: u64) -> u64 {
 /// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte
 /// exception state + 32 thread-state `u64`s (272). Both are shipped: the `.so`
 /// follows the arch of the Wine that loads it.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn fault_pc(ctx: *mut c_void) -> u64 {
     #[cfg(target_arch = "x86_64")]
     const PC_OFFSET: usize = 144;
@@ -1349,14 +1341,6 @@ const fn fault_pc(ctx: *mut c_void) -> u64 {
     let pc_field = unsafe { mctx.add(PC_OFFSET) };
     // SAFETY: reads the saved PC (unaligned-safe, no write).
     unsafe { pc_field.cast::<u64>().read_unaligned() }
-}
-
-/// Architectures where we can't decode the saved PC: report 0.
-///
-/// The handler falls back to the frame-pointer backtrace alone.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const fn fault_pc(_ctx: *mut c_void) -> u64 {
-    0
 }
 
 /// Read a `u64` at byte `offset` within the signal `ucontext`'s `mcontext`.
