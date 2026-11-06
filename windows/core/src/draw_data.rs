@@ -377,9 +377,9 @@ pub struct DrawOp {
     pub index_source: IndexSource,
 }
 
-// CPU backing addresses stay native-width in the API-to-encoder queue.
-// Widening them before the wire boundary adds two unused words per buffer
-// to every op slot in a 32-bit process.
+// CPU backing addresses stay native-width in the borrowed draw the API
+// thread serializes into the wire draw record. Widening them before that
+// write adds two unused words per buffer to every draw in a 32-bit process.
 #[cfg(target_pointer_width = "32")]
 const _: () = {
     assert!(core::mem::size_of::<StreamBinding>() <= 40);
@@ -390,7 +390,7 @@ const _: () = {
 /// Cached vertex-attribute layout.
 ///
 /// A pointer into retained command storage or native scratch plus the metadata `emit_draw` needs
-/// to pipeline-key against. Updated via `Op::SetVertexAttrs` when the
+/// to pipeline-key against. Updated via `EncoderOpcode::SetSnapshot` when the
 /// vertex declaration or FVF changes; reused across draws otherwise.
 ///
 /// `Copy` (pointer + scalars + the per-stream extents) is structurally

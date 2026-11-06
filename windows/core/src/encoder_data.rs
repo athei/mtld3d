@@ -723,6 +723,10 @@ pub struct UploadTextureOp {
     pub job: TextureUploadJob,
 }
 
+/// A `Staged` VB/IB upload, ordered in the frame's command stream.
+///
+/// Carries the transient `PageBox` snapshot of the bytes the game wrote
+/// between `Lock` and `Unlock`, taken on the API thread with no Metal thunk.
 pub struct StageUploadOp {
     pub buffer_id: BufferId,
     pub page_box: PageBox,
@@ -810,22 +814,7 @@ pub enum Op {
     UploadTextureAndMips(UploadTextureAndMipsOp),
     UploadTexture(UploadTextureOp),
     SetDumpDraw(SetDumpDrawOp),
-    /// Inline op-stream-ordered `Staged` VB/IB upload.
-    ///
-    /// Carries the transient `PageBox` snapshot of the bytes the game
-    /// wrote between `Lock` and `Unlock` (taken on the API thread, no
-    /// Metal thunk there). The encoder wraps it as a `bytesNoCopy` blit
-    /// source and copies its range into the buffer's persistent `Private`
-    /// device buffer via `frame_blit_commands` (a leading phase, before
-    /// any draw). If a draw earlier this frame already read an overlapping
-    /// region, the encoder first renames the device buffer so the earlier
-    /// draw keeps its bytes, see `apply_stage_upload`.
-    StageUpload {
-        buffer_id: BufferId,
-        page_box: PageBox,
-        dst_offset: u32,
-        size: u32,
-    },
+    StageUpload(StageUploadOp),
 }
 
 bitflags::bitflags! {
@@ -975,8 +964,8 @@ pub struct FrameData {
     /// Used by `snapshot_shared` to allocate per-draw VS/PS constants +
     /// alpha-ref + fog-color bytes without per-draw `Vec::to_vec()` heap
     /// traffic, pointers handed across the channel via `ScratchSlice` stay
-    /// valid until this `FrameData` is dropped after the encoder finishes
-    /// replaying the frame. Separate from `FrameEncoder::scratch` (which the
+    /// valid until the packet's replay completes and its storage is
+    /// recycled. Separate from `FrameEncoder::scratch` (which the
     /// encoder thread uses for clear-pass constants etc.) so no two threads
     /// ever write the same arena.
     pub scratch: ScratchArena,

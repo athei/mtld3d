@@ -619,7 +619,7 @@ fn emit_draw_view(
         ps_variant.linked_input_mask = enc.linked_input_mask(source.ps_id, vs);
     }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
-    // in sync via `EncoderOpcode::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
+    // in sync via `EncoderOpcode::Set{Vs,Ps}ConstRange` deltas). FF: symmetric:
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
     // `EncoderOpcode::SetFfVsConstRange`). Each path's `*_const_scratch` bumps
     // fresh scratch bytes per "mirror epoch" so Metal's submit-time

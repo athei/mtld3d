@@ -894,12 +894,7 @@ impl CaptureControl for crate::encoder_data::StageUploadOp {
         )
     }
     fn into_rejected(self) -> Op {
-        Op::StageUpload {
-            buffer_id: self.buffer_id,
-            page_box: self.page_box,
-            dst_offset: self.dst_offset,
-            size: self.size,
-        }
+        Op::StageUpload(self)
     }
 }
 

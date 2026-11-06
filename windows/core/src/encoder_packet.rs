@@ -121,7 +121,7 @@ impl FrameRecorder {
         self.finish_record(result)
     }
 
-    /// Capture a draw without constructing the larger operation enum.
+    /// Capture a draw directly into the frame's command stream.
     ///
     /// # Errors
     /// Returns the latched frame error or a wire capture failure.

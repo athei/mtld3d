@@ -1676,7 +1676,7 @@ impl FfState {
     /// XYZRHW path: pack `[vp_w, vp_h, vp_x, vp_y]` into row 0.
     ///
     /// Caller pushes a single
-    /// `EncoderOpcode::SetFfVsConstRange { start_row: 0, rows: 1, .. }`. The non-XYZRHW
+    /// `Op::SetFfVsConstRange { start_row: 0, rows: 1, .. }`. The non-XYZRHW
     /// path uses the per-section helpers below (one per `FfVsDirty` bit) and
     /// never enters this function.
     ///

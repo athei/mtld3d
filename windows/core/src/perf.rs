@@ -929,8 +929,7 @@ struct FrameCounters {
     draw_snapshot_bumps_cycles: u64,
     /// TSC cycles inside the Draw methods spent in the push-op phase.
     ///
-    /// The `record_draw` write of the draw record into the current frame's
-    /// command stream.
+    /// The draw record write (`record_single_stream_draw` or `record_draw`).
     draw_push_op_cycles: u64,
     /// Per-[`SnapshotSection`] cycles of the section's rebuild block, on the sampled draws only.
     ///
@@ -1751,7 +1750,7 @@ impl ApiPerfState {
 
     /// Pointer the `CycleAddTimer` writes into for the Draw-internal push-op phase.
     ///
-    /// The `record_draw` write.
+    /// The draw record write (`record_single_stream_draw` or `record_draw`).
     pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.counters.draw_push_op_cycles
     }
@@ -2166,10 +2165,10 @@ impl ApiPerfState {
         let now = rdtsc();
         let prev = core::mem::replace(&mut self.prev_present_rdtsc, now);
         // Move this frame's counters into the payload, leaving a zeroed
-        // `FrameCounters` behind (`mem::take`). `present_block` is
-        // written to `payload.timing` by its own setter after this drain,
-        // so moving only `counters` + `frame_total_cycles` here never
-        // clobbers it.
+        // `FrameCounters` behind (`mem::take`). The other `payload.timing`
+        // fields are written through their own pointers and setters, so
+        // moving only `counters` + `frame_total_cycles` here never clobbers
+        // them.
         payload.counters = core::mem::take(&mut self.counters);
         payload.counters.reset_epoch = self.reset_epoch;
         payload.counters.reset_epoch_saturated = u32::from(self.reset_epoch_saturated);
@@ -2339,9 +2338,9 @@ pub struct FramePerfPayload {
     counters: FrameCounters,
     /// Payload-injected per-frame timing (see [`FrameTiming`]).
     ///
-    /// The backpressure stall, the wall-clock frame period, and the op-vec
-    /// footprint — set by the setters below and `drain_into_payload`, not
-    /// bumped on the API thread.
+    /// The backpressure stall, the wall-clock frame period, the latency-bound
+    /// wait and the frames in flight: set by the setters below and
+    /// `drain_into_payload`, not bumped on the API thread.
     timing: FrameTiming,
 }
 

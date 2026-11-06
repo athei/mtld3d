@@ -25,9 +25,7 @@
 //!
 //! # Why arena over `Box<T>`
 //!
-//! Fragmentation is not the concern (snmalloc handles it). `Op` enum
-//! size is not the concern either — both `Box<T>` and an arena pointer
-//! are 8 B inline, so neither inflates the variant. The real concern is
+//! Fragmentation is not the concern (snmalloc handles it). The real concern is
 //! *allocator-call frequency*: ~1800 scratch allocations per frame on
 //! the per-draw path. snmalloc's thread-local fast path is ~30-50 ns;
 //! bump is ~5-10 ns. Per call the difference is small, but at this

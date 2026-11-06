@@ -1825,8 +1825,8 @@ impl DeviceInner {
                 hz,
             );
         }
-        // `Staged` uploads ride the op stream (inline `Op::StageUpload`),
-        // so their page leases were recorded at `Unlock`. The encoder owns
+        // `Staged` uploads ride the frame's command stream as a
+        // `StageUploadOp` control, so their page leases were recorded at `Unlock`. The encoder owns
         // counting their `PageBox` bytes into
         // the shared `vbib_retained_bytes` at intake.
         self.pending_retention_bytes = 0;
