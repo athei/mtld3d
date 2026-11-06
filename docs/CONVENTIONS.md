@@ -41,7 +41,7 @@ Every finding names the section it came from. The confined-pattern checks compar
 Two traps worth knowing, since both were live in the tree:
 
 - **Square brackets in prose are link syntax.** `palette[0]`, `saturate to [0,1]` — rustdoc reads each as an intra-doc link and warns. Backtick them.
-- **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_into`]`` is broken; it needs ``[`Self::restore_into`]``.
+- **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_filtered`]`` is broken; it needs ``[`Self::restore_filtered`]``.
 
 The windows workspace is documented for the **i686 PE target**, not the host: `d3d9` and `mtld3d` are `cdylib`s with raw-dylib imports and don't build for the host, so a host-only run would silently skip them.
 
@@ -94,7 +94,7 @@ helpers, not native workers or Win32 integration.
 How to apply:
 
 - New `IDirect3DXxx9::Method` body: "unpack args → call helper → route return". Helper lives in `mtld3d-core` with a unit test.
-- Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use — never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_into(&mut FfState)`.
+- Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use, never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_filtered(&mut FfState, StateBlockType)`.
 - Pure helpers needing a platform operation receive an injected function or trait in their own runtime. Native callers use direct native operations. An injected Rust callback is never part of the PE/Unix wire protocol.
 - "Done" = green host tests, not only a green Windows build.
 
@@ -194,7 +194,7 @@ State carried on the hot path — every per-draw snapshot, every cache key, ever
 The default for a struct >16 B is **no derive**. `Copy` and `Clone` are added only when a concrete callsite needs them and the structural alternative (passing references, moving once, building in place into the scratch arena) doesn't fit.
 
 - **`Copy`** turns every accidental whole-struct read into a silent memcpy. Aggregate snapshot types (`CurrentSnapshot`, `RenderStateSnapshot`, `StageBinding`, `TextureInfo`, `FfVsKey`, `FfPsKey`, `PipelineSnapshot`, etc.) do not derive `Copy`. Removing `Copy` is how silent per-draw memcpys become compile errors — it has exposed ~200 B/draw copies hiding on the snapshot path.
-- **`Clone`** is the opt-in form of the same hazard: a `.clone()` call on a wide aggregate is a per-call heap-bandwidth tax, just one the compiler doesn't flag. The default replacement for "I need a copy of this big struct in scratch" is `ScratchArena::alloc_from(&value)` (bytewise copy, no `Clone` bound) or `scratch.alloc_uninit::<T>()` + per-field `addr_of_mut!().write()` for in-place construction. The `scratch.alloc_from(&cache)` form — replacing per-field writes — is the canonical construction pattern.
+- **`Clone`** is the opt-in form of the same hazard: a `.clone()` call on a wide aggregate is a per-call heap-bandwidth tax, just one the compiler doesn't flag. The default replacement for "I need a copy of this big struct in scratch" is `scratch.alloc_uninit::<T>()` + per-field `addr_of_mut!().write()`, which constructs the value in place in the arena.
 - **Small types keep `Copy`.** Single-word newtypes (`MetalHandle<K>`, `TextureId`, `ProgramId`, `ScratchSlice`, the various `*Flags` bitflag bytes) keep `Copy` because they exist to be cheap pointer-sized handles and the trait is structurally needed (Op enum payload, `Option<...>` field load). The rough threshold is 16 B. Wider than that, justify each derive at the use site or don't derive it.
 - **Tests stay unaffected.** Removing `Copy`/`Clone` doesn't break `#[derive(PartialEq, Eq, Hash, Debug)]`; tests compare via reference.
 
@@ -365,7 +365,7 @@ These handle ~95% of every clippy complaint raised in the tree. Apply the fix; d
 | `cast_possible_truncation`        | `T::try_from(v).expect("<contractual bound>")` — turns silent truncation into a loud panic at the violated bound |
 | `cast_possible_wrap`              | same; or fix the storage type at definition                                                                      |
 | `cast_sign_loss`                  | `u32::try_from(signed).expect(...)` or `signed.unsigned_abs()`                                                   |
-| `cast_precision_loss`             | use a wider float (`f64`) at the source; for D3DCOLOR-style u32→u8 unpack use `to_le_bytes` destructure; for u64→f64 use the `u64_to_f64_exact` / `usize_to_f64_exact` helpers in `tsc.rs` (hi/lo split + `mul_add`) |
+| `cast_precision_loss`             | use a wider float (`f64`) at the source; for D3DCOLOR-style u32→u8 unpack use `to_le_bytes` destructure; for u64→f64 use the `u64_to_f64_exact` helper in `tsc.rs` (hi/lo split + `mul_add`) |
 | `cast_ptr_alignment`              | `core::ptr::read_unaligned` instead of a direct pointer cast                                                     |
 | `too_many_arguments`              | introduce a `FooParams` / `FooCreateInfo` struct                                                                 |
 | `items_after_statements`          | hoist `const` / `type` / `use` to function top, or to file scope                                                 |

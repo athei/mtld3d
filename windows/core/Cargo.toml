@@ -30,7 +30,7 @@ required-features = ["disk-cache"]
 [build-dependencies]
 xxhash-rust = { workspace = true }
 
-# Used by the `dxso::emit_tests` MSL-compile checks (`metal_compile_or_fail`)
+# Used by the `dxso::emit::tests` MSL-compile checks (`metal_compile_or_fail`)
 # to compile every emitted shader through
 # `MTLDevice::newLibraryWithSource_options_error`. Same crates the
 # production unix .so uses (`unix/unix/Cargo.toml`) so test and runtime
@@ -38,7 +38,6 @@ xxhash-rust = { workspace = true }
 # only passes `--all-targets` for the unix target), so no target-gate is
 # needed.
 [dev-dependencies]
-objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-metal = { workspace = true }
 # `tests/snmalloc_drift.rs` installs this as its own `#[global_allocator]` so

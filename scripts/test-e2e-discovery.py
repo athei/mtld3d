@@ -125,15 +125,14 @@ class E2eDiscoveryTests(unittest.TestCase):
         runner = self.root / "bench-runner"
         runner.write_text(
             "#!/bin/sh\n"
-            f"printf '%s|%s\\n' \"$RUST_LOG\" \"$__CX_UNIX_RUST_LOG\" > {shlex.quote(str(marker))}\n"
+            f"printf '%s\\n' \"$RUST_LOG\" > {shlex.quote(str(marker))}\n"
             f"touch {shlex.quote(str(log_dir / 'bench-fixture.txt'))}\n"
         )
         runner.chmod(0o755)
         for mode, (_, unix) in MODES.items():
-            for pe, unix_filter in [("warn", "off"), ("off", "mtld3d::perf=off")]:
-                with self.subTest(mode=mode, pe=pe, unix=unix_filter):
+            for pe in ["warn", "off"]:
+                with self.subTest(mode=mode, pe=pe):
                     self.environment["RUST_LOG"] = pe
-                    self.environment["__CX_UNIX_RUST_LOG"] = unix_filter
                     marker.unlink(missing_ok=True)
                     result = self.run_make(
                         mode,
@@ -150,7 +149,7 @@ class E2eDiscoveryTests(unittest.TestCase):
                         fail_target="",
                     )
                     self.assertEqual(result.returncode, 0, result.stdout)
-                    self.assertEqual(marker.read_text(), "info|info\n")
+                    self.assertEqual(marker.read_text(), "info\n")
 
     def test_partial_output_is_not_staged(self):
         outputs = self.root / "outputs"

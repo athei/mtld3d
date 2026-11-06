@@ -443,12 +443,7 @@ fn a_selection_notes_each_unmatched_filter_once_and_needs_something_to_compare()
 
 #[test]
 fn benchmark_children_override_hostile_inherited_logging() {
-    for (pe, unix) in [
-        (Some("warn"), Some("off")),
-        (Some("off"), Some("mtld3d::perf=off")),
-        (None, Some("off")),
-        (Some("mtld3d=off"), None),
-    ] {
+    for inherited in [Some("warn"), Some("off"), None, Some("mtld3d=off")] {
         let mut child = Command::new(std::env::current_exe().expect("test executable"));
         child.args([
             "--exact",
@@ -456,17 +451,15 @@ fn benchmark_children_override_hostile_inherited_logging() {
             "--ignored",
             "--nocapture",
         ]);
-        for (key, value) in [("RUST_LOG", pe), ("__CX_UNIX_RUST_LOG", unix)] {
-            if let Some(value) = value {
-                child.env(key, value);
-            } else {
-                child.env_remove(key);
-            }
+        if let Some(value) = inherited {
+            child.env("RUST_LOG", value);
+        } else {
+            child.env_remove("RUST_LOG");
         }
         let result = child.output().expect("run fixture with inherited filters");
         assert!(
             result.status.success(),
-            "{pe:?}/{unix:?}: {}{}",
+            "{inherited:?}: {}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
@@ -491,16 +484,8 @@ fn benchmark_log_environment_fixture() {
         .join(std::process::id().to_string());
     fs::create_dir_all(&dir).unwrap();
     let script = dir.join("logging.sh");
-    fs::write(
-        &script,
-        "printf '%s|%s: test\n' \"${RUST_LOG-unset}\" \"${__CX_UNIX_RUST_LOG-unset}\"\n",
-    )
-    .unwrap();
-    let expected_inherited = format!(
-        "{}|{}",
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "unset".to_owned()),
-        std::env::var("__CX_UNIX_RUST_LOG").unwrap_or_else(|_| "unset".to_owned())
-    );
+    fs::write(&script, "printf '%s: test\n' \"${RUST_LOG-unset}\"\n").unwrap();
+    let expected_inherited = std::env::var("RUST_LOG").unwrap_or_else(|_| "unset".to_owned());
     let timeout = Duration::from_secs(5);
     let mut ordinary = WineLauncher::new(
         Path::new("/bin/sh"),
@@ -517,7 +502,7 @@ fn benchmark_log_environment_fixture() {
         leg.prefix = dir.join(name);
         for filter in ["info", SHAPE_RUST_LOG] {
             let mut launcher = leg_launcher(&leg, &script, Some(&dir), timeout, filter).unwrap();
-            assert_eq!(launcher.list().unwrap(), [format!("{filter}|{filter}")]);
+            assert_eq!(launcher.list().unwrap(), [filter]);
         }
     }
     fs::remove_dir_all(dir).unwrap();
