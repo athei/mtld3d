@@ -283,8 +283,8 @@ pub const fn planar_stretch_route(
 /// the source as-is, the packed modes fetch the 4:2:2 macropixel and the
 /// planar modes the luma texel and its 4:2:0 chroma sample, and all four YUV
 /// modes convert to RGB. The opaque-alpha mode replaces alpha with one, and
-/// the luminance mode replicates red to RGB. The discriminants are the uniform's values; the MSL in
-/// `unix/unix/src/metal/blit.rs` matches on them.
+/// the luminance mode replicates red to RGB. The discriminants are the
+/// uniform's values; the MSL in `unix/unix/src/metal/blit.rs` matches on them.
 #[repr(u32)]
 pub enum BlitDecode {
     /// Sample the source texture as-is (any RGB format).
@@ -299,7 +299,10 @@ pub enum BlitDecode {
     Nv12 = 4,
     /// An X format: sample as-is, alpha one, since its padding bits carry no alpha.
     OpaqueAlpha = 5,
-    /// Replicate luminance into RGB and set alpha to one.
+    /// `D3DFMT_L8`: replicate red into RGB and set alpha to one.
+    ///
+    /// A render-target L8 source is the R8 attachment base, which has no RRR1
+    /// swizzle, so the decode replicates the luminance itself.
     Luminance = 6,
 }
 
