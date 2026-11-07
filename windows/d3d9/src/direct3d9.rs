@@ -423,8 +423,7 @@ const fn is_present_compatible(src: u32, dst: u32) -> bool {
 /// The render-quad path samples colour formats the device can render and
 /// decodes the packed 4:2:2 (`YUY2` / `UYVY`) and planar 4:2:0 (`YV12` /
 /// `NV12`) YUV formats in its fragment function; the offscreen-plain CPU
-/// converter covers the YUV members too. L8 is excluded by the conversion
-/// query below, even though the blit path can decode it.
+/// converter covers the YUV members too.
 const fn is_conversion_source(fmt: u32) -> bool {
     mtld3d_core::format::is_render_target_format(fmt)
         || mtld3d_core::stretch_rect::is_packed_yuv(fmt)
@@ -438,7 +437,6 @@ const fn is_conversion_source(fmt: u32) -> bool {
 /// ([`is_conversion_source`] — a pure predicate, since sources are sampled on
 /// every device) and the destination a colour format this device renders into
 /// (`is_render_target_format_on_device` — the render-quad writes into it).
-/// L8 is restricted to identity conversion despite being renderable.
 /// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
 /// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
 /// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
@@ -446,6 +444,8 @@ fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> 
     if src == dst {
         return true;
     }
+    // L8 renders, but Windows drivers answer NOTAVAILABLE for a conversion into
+    // it, and as a source it keeps the identity-only answer.
     if src == D3DFMT_L8 || dst == D3DFMT_L8 {
         return false;
     }
