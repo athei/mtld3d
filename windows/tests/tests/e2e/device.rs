@@ -879,7 +879,11 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             converted += u32::from(converts);
             assert_eq!(
                 h.check_device_format_conversion(format, target),
-                if converts { D3D_OK } else { D3DERR_NOTAVAILABLE },
+                if converts {
+                    D3D_OK
+                } else {
+                    D3DERR_NOTAVAILABLE
+                },
                 "{name} -> {target:#x} converts where it renders, L8 aside ({converts})"
             );
             assert_eq!(
