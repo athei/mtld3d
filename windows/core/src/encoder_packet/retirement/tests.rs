@@ -410,14 +410,14 @@ fn staging_released_before_its_upload_retires_is_parked_by_the_retiring_pass() {
         0,
         "native code still holds the page and its wrapper keepalive"
     );
-    assert!(pages.acquire_staging(64 * 256).is_none());
+    assert!(pages.take_parked(64 * 256).is_none());
     drop(native);
     retirement.maintain(&pool, &mut calls);
     assert_eq!(registered(&retirement), [] as [usize; 0]);
     assert_eq!(pages.staging_bytes(), PAGE_SIZE);
     assert_eq!(
         pages
-            .acquire_staging(64 * 256)
+            .take_parked(64 * 256)
             .expect("parked by the pass that retired the lease")
             .as_ptr(),
         address
@@ -456,7 +456,7 @@ fn device_teardown_retires_staging_leases_and_the_drain_empties_the_lane() {
     assert_eq!(pages.drain_staging(), 3 * PAGE_SIZE);
     assert_eq!(pages.staging_bytes(), 0);
     assert_eq!(pages.pooled_bytes(), 0);
-    assert!(pages.acquire_staging(64 * 256).is_none());
+    assert!(pages.take_parked(64 * 256).is_none());
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn a_native_wrapper_keepalive_defers_parking_until_it_drops() {
         0,
         "the wrapper keepalive still pins the pages"
     );
-    assert!(pages.acquire_staging(64 * 256).is_none());
+    assert!(pages.take_parked(64 * 256).is_none());
     assert_eq!(
         registered(&retirement).len(),
         1,
@@ -498,7 +498,7 @@ fn a_native_wrapper_keepalive_defers_parking_until_it_drops() {
     assert_eq!(pages.staging_bytes(), PAGE_SIZE);
     assert_eq!(
         pages
-            .acquire_staging(64 * 256)
+            .take_parked(64 * 256)
             .expect("parked once the keepalive dropped")
             .as_ptr(),
         address

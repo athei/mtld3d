@@ -4,7 +4,7 @@ Code-organisation and style rules enforced across the codebase. New code follows
 
 ## Mechanical audit
 
-Most of this document is enforced by `make check`: `cargo +nightly fmt --check`, then clippy with `nursery` + `pedantic` enabled workspace-wide, then `make audit`, then `make doc`. Lint levels are `warn` in the Cargo manifests so a plain `cargo clippy` (or an editor) reports without blocking a build; the `check` legs pass cargo's `build.warnings = "deny"` config, which fails the run if any warning was emitted — so `make check` is the hard gate, and it shares the build cache with plain invocations because no compiler flags change, except for its `PERF=1` legs, which build into `target/perf` (`CONTRIBUTING.md` lists the gate's legs). But a lint can only express a lint-shaped rule, and the rules a lint *can't* express are exactly the ones that drift — nothing runs them, so they decay into prose nobody rereads.
+Most of this document is enforced by `make check`: `cargo +nightly fmt --check`, then clippy with `nursery` + `pedantic` enabled workspace-wide, then `make audit`, then `make doc`. Lint levels are `warn` in the Cargo manifests so a plain `cargo clippy` (or an editor) reports without blocking a build; the `check` legs pass cargo's `build.warnings = "deny"` config, which fails the run if any warning was emitted, so `make check` is the hard gate, and it shares the build cache with plain invocations because no compiler flags change, except for its `PERF=1` legs, which build into `target/perf` (`CONTRIBUTING.md` lists the gate's legs). But a lint can only express a lint-shaped rule, and the rules a lint *can't* express are exactly the ones that drift: nothing runs them, so they decay into prose nobody rereads.
 
 `make audit` (`scripts/audit.sh`) closes that gap, and `make check` runs it — so a violation fails the same gate as a clippy warning, and the tree stays at zero rather than drifting until someone notices. It covers:
 
@@ -41,7 +41,7 @@ Every finding names the section it came from. The confined-pattern checks compar
 Two traps worth knowing, since both were live in the tree:
 
 - **Square brackets in prose are link syntax.** `palette[0]`, `saturate to [0,1]` — rustdoc reads each as an intra-doc link and warns. Backtick them.
-- **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_into`]`` is broken; it needs ``[`Self::restore_into`]``.
+- **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_filtered`]`` is broken; it needs ``[`Self::restore_filtered`]``.
 
 The windows workspace is documented for the **i686 PE target**, not the host: `d3d9` and `mtld3d` are `cdylib`s with raw-dylib imports and don't build for the host, so a host-only run would silently skip them.
 
@@ -94,7 +94,7 @@ helpers, not native workers or Win32 integration.
 How to apply:
 
 - New `IDirect3DXxx9::Method` body: "unpack args → call helper → route return". Helper lives in `mtld3d-core` with a unit test.
-- Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use — never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_into(&mut FfState)`.
+- Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use, never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_filtered(&mut FfState, StateBlockType)`.
 - Pure helpers needing a platform operation receive an injected function or trait in their own runtime. Native callers use direct native operations. An injected Rust callback is never part of the PE/Unix wire protocol.
 - "Done" = green host tests, not only a green Windows build.
 
@@ -194,7 +194,7 @@ State carried on the hot path — every per-draw snapshot, every cache key, ever
 The default for a struct >16 B is **no derive**. `Copy` and `Clone` are added only when a concrete callsite needs them and the structural alternative (passing references, moving once, building in place into the scratch arena) doesn't fit.
 
 - **`Copy`** turns every accidental whole-struct read into a silent memcpy. Aggregate snapshot types (`CurrentSnapshot`, `RenderStateSnapshot`, `StageBinding`, `TextureInfo`, `FfVsKey`, `FfPsKey`, `PipelineSnapshot`, etc.) do not derive `Copy`. Removing `Copy` is how silent per-draw memcpys become compile errors — it has exposed ~200 B/draw copies hiding on the snapshot path.
-- **`Clone`** is the opt-in form of the same hazard: a `.clone()` call on a wide aggregate is a per-call heap-bandwidth tax, just one the compiler doesn't flag. The default replacement for "I need a copy of this big struct in scratch" is `ScratchArena::alloc_from(&value)` (bytewise copy, no `Clone` bound) or `scratch.alloc_uninit::<T>()` + per-field `addr_of_mut!().write()` for in-place construction. The `scratch.alloc_from(&cache)` form — replacing per-field writes — is the canonical construction pattern.
+- **`Clone`** is the opt-in form of the same hazard: a `.clone()` call on a wide aggregate is a per-call heap-bandwidth tax, just one the compiler doesn't flag. The default replacement for "I need a copy of this big struct in scratch" is `scratch.alloc_uninit::<T>()` + per-field `addr_of_mut!().write()`, which constructs the value in place in the arena.
 - **Small types keep `Copy`.** Single-word newtypes (`MetalHandle<K>`, `TextureId`, `ProgramId`, `ScratchSlice`, the various `*Flags` bitflag bytes) keep `Copy` because they exist to be cheap pointer-sized handles and the trait is structurally needed (Op enum payload, `Option<...>` field load). The rough threshold is 16 B. Wider than that, justify each derive at the use site or don't derive it.
 - **Tests stay unaffected.** Removing `Copy`/`Clone` doesn't break `#[derive(PartialEq, Eq, Hash, Debug)]`; tests compare via reference.
 
@@ -365,7 +365,7 @@ These handle ~95% of every clippy complaint raised in the tree. Apply the fix; d
 | `cast_possible_truncation`        | `T::try_from(v).expect("<contractual bound>")` — turns silent truncation into a loud panic at the violated bound |
 | `cast_possible_wrap`              | same; or fix the storage type at definition                                                                      |
 | `cast_sign_loss`                  | `u32::try_from(signed).expect(...)` or `signed.unsigned_abs()`                                                   |
-| `cast_precision_loss`             | use a wider float (`f64`) at the source; for D3DCOLOR-style u32→u8 unpack use `to_le_bytes` destructure; for u64→f64 use the `u64_to_f64_exact` / `usize_to_f64_exact` helpers in `tsc.rs` (hi/lo split + `mul_add`) |
+| `cast_precision_loss`             | use a wider float (`f64`) at the source; for D3DCOLOR-style u32→u8 unpack use `to_le_bytes` destructure; for u64→f64 use the `u64_to_f64_exact` helper in `tsc.rs` (hi/lo split + `mul_add`) |
 | `cast_ptr_alignment`              | `core::ptr::read_unaligned` instead of a direct pointer cast                                                     |
 | `too_many_arguments`              | introduce a `FooParams` / `FooCreateInfo` struct                                                                 |
 | `items_after_statements`          | hoist `const` / `type` / `use` to function top, or to file scope                                                 |
@@ -385,7 +385,7 @@ These handle ~95% of every clippy complaint raised in the tree. Apply the fix; d
 
 ### Accepted per-site exceptions
 
-1. **`unix/unix/src/metal/macdrv.rs` `mod bounded_cast`** — `cast_possible_truncation` + `cast_sign_loss` + `cast_precision_loss`, mod-level. Three numeric-cast helpers (`f64_to_u32_saturating`, `f64_to_f32`, `i32_to_f32`) whose bounds are established by callers. The structural alternative (IEEE-754 bit-manipulation reimplementing `as`) is ~25 lines of mantissa/exponent extraction producing identical bits with zero precision benefit. Each fn doc names the bound; callers document why their input satisfies it.
+1. **`unix/unix/src/metal.rs` `mod bounded_cast`**: `cast_possible_truncation` + `cast_sign_loss` + `cast_precision_loss`, mod-level. Four numeric-cast helpers (`f64_to_u32_saturating`, `f64_to_u64_saturating`, `f64_to_f32`, `i32_to_f32`) whose bounds are established by callers. The structural alternative (IEEE-754 bit-manipulation reimplementing `as`) is ~25 lines of mantissa/exponent extraction producing identical bits with zero precision benefit. Each fn doc names the bound; callers document why their input satisfies it.
 2. **`unix/unix/src/metal/command.rs` `PendingCmdBuf`** — `non_send_fields_in_send_ty`. Wraps `Retained<dyn MTLCommandBuffer>`; the three ops we use (refcount inc/dec, `waitUntilCompleted`) are Apple-documented thread-safe. Alternatives are `SendWrapper` (panics on cross-thread access) or raw `usize` + `Retained::retain` everywhere — both worse than a well-documented `unsafe impl Send` at one narrow site.
 3. **`windows/core/src/config.rs` `Mtld3dConfig`** — `struct_excessive_bools`. The config is a flat one-`bool`-per-`mtld3d.conf`-key bag; each field name mirrors a file key (`caps_all` ↔ `debug.capsAll`). Packing into `bitflags!` (the §"Booleans pack" default) would decouple the field names from the conf keys for no hot-path benefit — `Mtld3dConfig` is read once per `IDirect3D9`, never per-draw. The clarity of the 1:1 mapping outweighs the byte savings, so the bools stay flat.
 

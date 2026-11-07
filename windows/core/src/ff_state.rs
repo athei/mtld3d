@@ -59,7 +59,7 @@ bitflags! {
     ///
     /// Set by `FfState` setters when their owning section changes; consumed
     /// (and cleared) by `take_dirty()` at `emit_snapshot_deltas` time. The
-    /// API thread then walks each set bit and emits one `Op::SetFfVsConstRange`
+    /// API thread then walks each set bit and emits one `EncoderOpcode::SetFfVsConstRange`
     /// per dirty section, copying only the changed rows into the per-frame
     /// scratch arena and onto the encoder's `ff_vs_constants_mirror`.
     ///
@@ -69,7 +69,7 @@ bitflags! {
     ///
     /// **Why these granules**: each section is read by the FF VS shader as
     /// an independent block of rows in the layout (see the per-section
-    /// `build_*_section` helpers and `ff_vs_row_count`). Sections never
+    /// `fill_*_section` helpers and `ff_vs_row_count`). Sections never
     /// overlap, and the row ranges are fixed at emit time. RS-driven
     /// sections (`FOG`, `AMBIENT`) live here too — their setter is
     /// `SetRenderState` rather than an `FfState` method, but the dirty mark
@@ -119,7 +119,7 @@ struct OverflowLight {
 /// indices must be packed down into contiguous shader slots in ascending
 /// D3D9-index order. `ty` is the `D3DLIGHT9::type_` (1=POINT, 2=SPOT,
 /// 3=DIRECTIONAL); cached so neither `build_vs_key` nor
-/// `build_lights_section` re-reads it.
+/// `fill_lights_section` re-reads it.
 struct ActiveLight {
     light: D3DLIGHT9,
     ty: u32,
@@ -241,7 +241,7 @@ pub struct FfState {
     /// Set by setters (and by `SetRenderState` for the RS-driven sections)
     /// whenever a section's source values change; consumed and cleared by
     /// [`take_ff_vs_dirty`] when `emit_snapshot_deltas` walks dirty sections
-    /// and pushes `Op::SetFfVsConstRange` deltas onto the encoder's mirror.
+    /// and pushes `EncoderOpcode::SetFfVsConstRange` deltas onto the encoder's mirror.
     /// Initial state is [`FfVsDirty::all()`] so the first FF draw uploads
     /// every section.
     ff_vs_dirty: FfVsDirty,
@@ -303,7 +303,7 @@ impl FfState {
     /// Returns the current dirty mask and clears it.
     ///
     /// Called from `emit_snapshot_deltas` at the start of the FF VS arm; the
-    /// returned mask drives one `Op::SetFfVsConstRange` per dirty section.
+    /// returned mask drives one `EncoderOpcode::SetFfVsConstRange` per dirty section.
     #[inline]
     pub const fn take_ff_vs_dirty(&mut self) -> FfVsDirty {
         let bits = self.ff_vs_dirty;
@@ -468,6 +468,7 @@ impl FfState {
     }
 
     /// Read-only access to the world-matrix palette.
+    #[cfg(test)]
     #[must_use]
     pub const fn world_palette(&self) -> &[D3DMATRIX; 256] {
         &self.world_palette
@@ -594,7 +595,7 @@ impl FfState {
     /// The FF VS key's active, directional and spot light masks, over compacted shader slots.
     ///
     /// Bit `i` refers to compacted slot `i` of [`Self::resolve_active_lights`],
-    /// the packing order `build_lights_section` uses: the active mask is the
+    /// the packing order `fill_lights_section` uses: the active mask is the
     /// low `n` bits, and a slot with neither type bit is POINT.
     fn compacted_light_masks(&self) -> [u8; 3] {
         let active = self.resolve_active_lights();
@@ -659,6 +660,7 @@ impl FfState {
     /// Bit `i` set iff the active light at slot `i` is DIRECTIONAL.
     ///
     /// Only meaningful when the corresponding `light_active_mask` bit is set.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub const fn light_directional_mask(&self) -> u8 {
@@ -668,6 +670,7 @@ impl FfState {
     /// Bit `i` set iff the active light at slot `i` is SPOT.
     ///
     /// Only meaningful when the corresponding `light_active_mask` bit is set.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub const fn light_spot_mask(&self) -> u8 {
@@ -1242,7 +1245,7 @@ impl FfState {
         // list, not the physical slots: D3D9 lights live at arbitrary indices
         // but the FF VS reads a dense `light[0..n]` range, so bit `i` here
         // refers to compacted shader slot `i`, matching the packing order in
-        // `build_lights_section`. Active = the low `n` bits set; the type
+        // `fill_lights_section`. Active = the low `n` bits set; the type
         // masks carry the per-slot DIRECTIONAL / SPOT branch (a slot with
         // neither bit is POINT). Lighting off (or XYZRHW) zeroes the
         // contribution. For the common contiguous layout the compacted list
@@ -1613,7 +1616,7 @@ impl FfState {
     ///
     /// Evaluated from `vs_key` against the current `FfState`. The extent
     /// matches the sum of section ranges contributed by the per-section
-    /// `build_*_section` helpers; callers (the snapshot path, `emit_draw`)
+    /// `fill_*_section` helpers; callers (the snapshot path, `emit_draw`)
     /// use it to size the encoder mirror snapshot and to bound
     /// `setVertexBytes`.
     ///
@@ -1673,25 +1676,11 @@ impl FfState {
         u16::try_from(row_count).expect("FF VS row_count ≤ 95 + 40*4 fits u16")
     }
 
-    /// XYZRHW path: pack `[vp_w, vp_h, vp_x, vp_y]` into row 0.
+    /// XYZRHW path: fill row 0 with `[vp_w, vp_h, vp_x, vp_y]`.
     ///
-    /// Caller pushes a single
-    /// `Op::SetFfVsConstRange { start_row: 0, rows: 1, .. }`. The non-XYZRHW
-    /// path uses the per-section helpers below (one per `FfVsDirty` bit) and
-    /// never enters this function.
-    ///
-    /// `viewport` is `(x, y, width, height)` in pixels.
-    pub fn build_xyzrhw_row(viewport: (f32, f32, f32, f32), scratch: &mut ScratchArena) -> *mut u8 {
-        let rows: u16 = 1;
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        Self::fill_xyzrhw_row(viewport, dst);
-        dst_ptr.cast::<u8>()
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// The non-XYZRHW path uses the per-section helpers below (one per
+    /// `FfVsDirty` bit) and never enters this function. `viewport` is
+    /// `(x, y, width, height)` in pixels.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1703,21 +1692,7 @@ impl FfState {
         dst[0].write([viewport.2, viewport.3, viewport.0, viewport.1]);
     }
 
-    /// Bump-copy the row 0..4 WV section into the scratch arena.
-    ///
-    /// The section holds `transpose(world_palette[0] × view)`. Returns
-    /// `(start_row=0, rows=4, ptr)`.
-    pub fn build_wv_section(&self, scratch: &mut ScratchArena) -> (u16, u16, *mut u8) {
-        let rows: u16 = 4;
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_wv_section(dst);
-        (0, 4, dst_ptr.cast::<u8>())
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// Fill the row 0..4 WV section, `transpose(world_palette[0] × view)`.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1727,20 +1702,7 @@ impl FfState {
         write_matrix_rows(dst, &wv_t);
     }
 
-    /// Bump-copy the row 4..8 PROJ section (`transpose(projection)`) into the scratch arena.
-    ///
-    /// Returns `(start_row=4, rows=4, ptr)`.
-    pub fn build_proj_section(&self, scratch: &mut ScratchArena) -> (u16, u16, *mut u8) {
-        let rows: u16 = 4;
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_proj_section(dst);
-        (4, 4, dst_ptr.cast::<u8>())
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// Fill the row 4..8 PROJ section, `transpose(projection)`.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1750,26 +1712,11 @@ impl FfState {
         write_matrix_rows(dst, &proj_t);
     }
 
-    /// Bump-copy the row 8 FOG section into the scratch arena.
+    /// Fill the row 8 FOG section.
     ///
     /// Reads `D3DRS_FOGSTART/END/DENSITY`; zero-fills when `fog_mode == 0` so
     /// the row contents are defined even if a different dim pulled the
-    /// extent past 8. Returns `(start_row=8, rows=1, ptr)`.
-    pub fn build_fog_section(
-        render_states: &[u32; RENDER_STATE_COUNT],
-        fog_mode: u8,
-        scratch: &mut ScratchArena,
-    ) -> (u16, u16, *mut u8) {
-        let rows: u16 = 1;
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        Self::fill_fog_section(render_states, fog_mode, dst);
-        (8, 1, dst_ptr.cast::<u8>())
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// extent past 8.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1792,23 +1739,7 @@ impl FfState {
         dst[0].write(row);
     }
 
-    /// Bump-copy the row 9 AMBIENT section (global ambient color from `D3DRS_AMBIENT`).
-    ///
-    /// Returns `(start_row=9, rows=1, ptr)`.
-    pub fn build_ambient_section(
-        render_states: &[u32; RENDER_STATE_COUNT],
-        scratch: &mut ScratchArena,
-    ) -> (u16, u16, *mut u8) {
-        let rows: u16 = 1;
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        Self::fill_ambient_section(render_states, dst);
-        (9, 1, dst_ptr.cast::<u8>())
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// Fill the row 9 AMBIENT section (global ambient color from `D3DRS_AMBIENT`).
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1821,7 +1752,7 @@ impl FfState {
         dst[0].write(row);
     }
 
-    /// Bump-copy the row 10..14 MATERIAL section.
+    /// Fill the row 10..14 MATERIAL section.
     ///
     /// Extent depends on the `FfVsKey`'s lit + specular bits:
     /// - unlit: 1 row (row 10; the unlit emitter defaults a missing COLOR0
@@ -1829,23 +1760,6 @@ impl FfState {
     ///   keeps one shape across the lit flip)
     /// - lit, no specular: 4 rows (diffuse..emissive)
     /// - lit + specular: 5 rows (diffuse..emissive + power)
-    ///
-    /// Returns `(start_row=10, rows, ptr)`.
-    pub fn build_material_section(
-        &self,
-        vs_key: &FfVsKey,
-        scratch: &mut ScratchArena,
-    ) -> (u16, u16, *mut u8) {
-        let rows: u16 = Self::material_section_rows(vs_key);
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_material_section(vs_key, dst);
-        (10, rows, dst_ptr.cast::<u8>())
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -1874,37 +1788,13 @@ impl FfState {
         }
     }
 
-    /// Bump-copy the row 15..62 LIGHTS section, one 6-row block per compacted active light.
+    /// Fill the row 15..62 LIGHTS section, one 6-row block per compacted active light.
     ///
     /// See `resolve_active_lights`. The active mask is always the low
     /// `n` bits set, so every covered slot is occupied — there are no gaps to
     /// zero-fill. Light positions/directions are packed in EYE space
-    /// (transformed by the VIEW matrix). Returns `None` when
-    /// `vs_key.light_active_mask == 0` (nothing to upload — the shader
-    /// won't read these rows either).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `light_active_mask.leading_zeros()` exceeds `u8::MAX`
-    /// — unreachable (the mask is a `u8` so the count is ≤ 8).
-    pub fn build_lights_section(
-        &self,
-        vs_key: &FfVsKey,
-        scratch: &mut ScratchArena,
-    ) -> Option<(u16, u16, *mut u8)> {
-        let rows: u16 = Self::lights_section_rows(vs_key);
-        if rows == 0 {
-            return None;
-        }
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_lights_section(vs_key, dst);
-        Some((15, rows, dst_ptr.cast::<u8>()))
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
+    /// (transformed by the VIEW matrix). Writes nothing when
+    /// `vs_key.light_active_mask == 0` (the shader won't read these rows).
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -2009,32 +1899,13 @@ impl FfState {
         }
     }
 
-    /// Bump-copy the row 63..94 TT section (per-stage texture transform).
+    /// Fill the row 63..94 TT section (per-stage texture transform).
     ///
     /// Extent: 4 rows per stage up through the high bit of
     /// `tt_active_mask`; inactive stages in the covered range get a
     /// transposed identity transform (their TTFF flag is 0, so the
-    /// shader won't read these rows either). Returns `None` when
+    /// shader won't read these rows either). Writes nothing when
     /// `tt_active_mask == 0`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tt_active_mask.leading_zeros()` exceeds `u8::MAX` —
-    /// unreachable (the mask is a `u8` so the count is ≤ 8).
-    pub fn build_tt_section(&self, scratch: &mut ScratchArena) -> Option<(u16, u16, *mut u8)> {
-        let rows: u16 = self.tt_section_rows();
-        if rows == 0 {
-            return None;
-        }
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_tt_section(dst);
-        Some((63, rows, dst_ptr.cast::<u8>()))
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -2054,35 +1925,12 @@ impl FfState {
         }
     }
 
-    /// Bump-copy the row 95+ PALETTE section (world-matrix palette × view).
+    /// Fill the row 95+ PALETTE section (world-matrix palette × view).
     ///
     /// Extent: four rows per matrix the key's blending can read
-    /// (`palette_matrices`). Returns `None` when
+    /// (`palette_matrices`). Writes nothing when
     /// `vs_key.vertex_blend_count == 0` (palette is never read by the
     /// shader in that case).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the uploaded palette exceeds `u16` capacity — unreachable
-    /// (bounded by [`MAX_VERTEX_BLEND_MATRIX_INDEX`] → `40 * 4 = 160`).
-    pub fn build_palette_section(
-        &self,
-        vs_key: &FfVsKey,
-        scratch: &mut ScratchArena,
-    ) -> Option<(u16, u16, *mut u8)> {
-        let rows: u16 = self.palette_section_rows(vs_key);
-        if rows == 0 {
-            return None;
-        }
-        let dst_ptr =
-            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
-        // SAFETY: the arena exclusively reserved this many aligned rows.
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
-        self.fill_palette_section(vs_key, dst);
-        Some((FF_VS_PALETTE_BASE_ROW, rows, dst_ptr.cast::<u8>()))
-    }
-
-    /// Fill the supplied final constant-row destination without allocating.
     ///
     /// # Panics
     /// Panics when the destination length does not match this section's row count.
@@ -2622,25 +2470,10 @@ impl FfStateSnapshot {
         }
     }
 
-    pub fn restore_into(&self, ff: &mut FfState) {
-        ff.view = self.view;
-        ff.projection = self.projection;
-        ff.world_palette = self.world_palette;
-        ff.world_palette_high_water = self.world_palette_high_water;
-        ff.texture_transforms = self.texture_transforms;
-        ff.material = self.material;
-        self.restore_lights(ff);
-        ff.texture_stage_states = self.texture_stage_states;
-        ff.recompute_stage_masks();
-        // The arrays were written past the setters, so the constant sections
-        // they feed are marked here; every section reads something restored.
-        ff.ff_vs_dirty |= FfVsDirty::all();
-    }
-
     /// Restore only the fixed-function state a `block_type` state block owns.
     ///
-    /// Leaves the rest of `ff` untouched. `All` matches [`Self::restore_into`]
-    /// exactly. The split follows the D3D9 `D3DSBT_VERTEXSTATE` /
+    /// Leaves the rest of `ff` untouched; `All` restores everything the
+    /// snapshot holds. The split follows the D3D9 `D3DSBT_VERTEXSTATE` /
     /// `D3DSBT_PIXELSTATE` classification of which states each filtered
     /// block owns:
     ///
@@ -2652,8 +2485,8 @@ impl FfStateSnapshot {
     /// - texture-stage states are filtered per index via
     ///   [`StateBlockType::includes_tss`].
     ///
-    /// As with [`Self::restore_into`], the lights go back through their
-    /// setters, which keep the light masks, while `tt_active_mask` and
+    /// The lights go back through their setters, which keep the light
+    /// masks, while `tt_active_mask` and
     /// `bump_stage_mask` re-derive from the restored stage states via
     /// `FfState::recompute_stage_masks`, since a bulk array restore bypasses
     /// the setter that maintains them.

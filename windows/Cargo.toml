@@ -18,9 +18,9 @@ homepage = "https://github.com/athei/mtld3d"
 mtld3d-core = { path = "core" }
 mtld3d-shared = { path = "../unix/shared" }
 mtld3d-types = { path = "types" }
+mtld3d-unix = { path = "../unix/unix" }
 bitflags = "2"
 log = "0.4"
-objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary"] }
 rustc-hash = "2"

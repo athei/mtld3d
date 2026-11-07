@@ -1,31 +1,15 @@
 use std::sync::Arc;
 
-use mtld3d_shared::{
-    MetalHandle,
-    encoder_wire::{FrameSlab, WireReader},
-};
+use mtld3d_shared::MetalHandle;
 
-use super::{GuestQueryDescriptor, GuestQueryLease, QueryLeaseCache};
+use super::{GuestQueryLease, QueryLeaseCache};
 use crate::{
-    encoder_value::WireValue,
     page_box::PageBox,
     visibility::{
         BUFFER_SLOTS_256K, QueryStatus, RetiredVisibilityBuffer, VisibilityQueryCore,
         VisibilityQueryState,
     },
 };
-
-fn descriptor(lease: &GuestQueryLease) -> GuestQueryDescriptor {
-    let mut slab = FrameSlab::new();
-    slab.push_record(1, |writer| lease.descriptor().write_wire(writer))
-        .expect("encode lease");
-    let mut reader = WireReader::new(slab.as_bytes());
-    let mut record = reader
-        .next_record()
-        .expect("record stream")
-        .expect("one record");
-    GuestQueryDescriptor::read_wire(&mut record.payload).expect("query descriptor")
-}
 
 #[test]
 fn begin_and_end_share_native_arc_identity() {
@@ -34,9 +18,9 @@ fn begin_and_end_share_native_arc_identity() {
     let end_lease = GuestQueryLease::new(original);
     let mut cache = QueryLeaseCache::default();
     // SAFETY: distinct leases remain live until completion and each is adopted exactly once.
-    let begin = unsafe { cache.adopt(descriptor(&begin_lease)) }.expect("begin core");
+    let begin = unsafe { cache.adopt(begin_lease.descriptor()) }.expect("begin core");
     // SAFETY: end_lease is a distinct retained publication of the same mailbox.
-    let end = unsafe { cache.adopt(descriptor(&end_lease)) }.expect("end core");
+    let end = unsafe { cache.adopt(end_lease.descriptor()) }.expect("end core");
     assert!(Arc::ptr_eq(&begin, &end));
     assert!(end_lease.completed());
     assert!(!begin_lease.completed());
@@ -111,7 +95,7 @@ fn reissue_preserves_pending_segment_generation_checks() {
     state.push_pending(1, Arc::clone(&second), (1, 2), true);
     let _ = state.intake_completed(1);
     assert_eq!(original.status(), QueryStatus::Issued);
-    assert_eq!(original.get_u32(), 7);
+    assert_eq!(original.get_u64(), 7);
     drop(first);
     drop(second);
     assert!(first_lease.completed());

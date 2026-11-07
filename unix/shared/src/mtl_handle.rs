@@ -122,7 +122,6 @@ pub struct MTLDeviceKind;
 pub struct MTLTextureKind;
 pub struct MTLBufferKind;
 pub struct MTLCommandQueueKind;
-pub struct MTLCommandBufferKind;
 pub struct MTLRenderPipelineStateKind;
 pub struct MTLComputePipelineStateKind;
 pub struct MTLDepthStencilStateKind;

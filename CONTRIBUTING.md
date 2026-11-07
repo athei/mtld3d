@@ -236,10 +236,11 @@ choice explicit when a test needs the non-client frame.
 
 ## Benchmarks
 
-The benchmark launchers set `RUST_LOG=info` and `__CX_UNIX_RUST_LOG=info`
-for timed Wine processes, independent of the shell's filters: startup identity
-and perf records are required inputs, even when no warning occurs. Untimed
-shape processes set both variables to the pass-trace filter described below.
+The benchmark launchers set `RUST_LOG=info` for timed Wine processes,
+independent of the shell's filter: startup identity and perf records are
+required inputs, even when no warning occurs. The unix side takes its filter
+from the PE side. Untimed shape processes set `RUST_LOG` to the pass-trace
+filter described below.
 Ordinary test runs keep the caller's logging settings.
 
 The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so

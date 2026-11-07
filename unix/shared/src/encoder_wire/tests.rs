@@ -3,7 +3,7 @@ use std::{
     thread,
 };
 
-use super::{FrameSlab, LeaseCompletion, ReplayMailbox, WireError, WireReader, WireWriter};
+use super::{FrameSlab, LeaseCompletion, WireError, WireReader};
 
 #[test]
 fn scalar_records_round_trip_without_payload_copy() {
@@ -13,13 +13,11 @@ fn scalar_records_round_trip_without_payload_copy() {
         writer.u16(0x5678)?;
         writer.u32(0x1234_5678)?;
         writer.u64(0x0123_4567_89ab_cdef)?;
-        writer.i32(-123)?;
-        writer.f32(f32::from_bits(0x7fc0_0042))?;
         writer.bytes(&[11, 22, 33])
     })
     .unwrap();
     slab.push_record(2, |_| Ok(())).unwrap();
-    assert_eq!(&slab.as_bytes()[..6], &[0x34, 0x12, 26, 0, 0, 0]);
+    assert_eq!(&slab.as_bytes()[..6], &[0x34, 0x12, 18, 0, 0, 0]);
     let mut reader = WireReader::new(slab.as_bytes());
     let record = reader.next_record().unwrap().unwrap();
     assert_eq!(record.tag, 0x1234);
@@ -28,11 +26,9 @@ fn scalar_records_round_trip_without_payload_copy() {
     assert_eq!(payload.u16(), Ok(0x5678));
     assert_eq!(payload.u32(), Ok(0x1234_5678));
     assert_eq!(payload.u64(), Ok(0x0123_4567_89ab_cdef));
-    assert_eq!(payload.i32(), Ok(-123));
-    assert_eq!(payload.f32().unwrap().to_bits(), 0x7fc0_0042);
     let tail = payload.bytes(3).unwrap();
     assert_eq!(tail, &[11, 22, 33]);
-    assert_eq!(tail.as_ptr(), slab.as_bytes()[29..].as_ptr());
+    assert_eq!(tail.as_ptr(), slab.as_bytes()[21..].as_ptr());
     assert!(payload.is_empty());
     let empty = reader.next_record().unwrap().unwrap();
     assert_eq!(empty.tag, 2);
@@ -102,92 +98,4 @@ fn lease_acknowledgment_publishes_prior_work() {
         }
         assert_eq!(prior_work.load(Ordering::Relaxed), 42);
     });
-}
-
-#[test]
-fn replay_completion_orders_and_isolates_device_progress() {
-    let first = ReplayMailbox::new();
-    let second = ReplayMailbox::new();
-    let prior_work = AtomicU64::new(0);
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            for sequence in 1..=100 {
-                prior_work.store(sequence, Ordering::Relaxed);
-                first.publish(sequence);
-            }
-        });
-        while first.completed() < 100 {
-            thread::yield_now();
-        }
-        assert_eq!(prior_work.load(Ordering::Relaxed), 100);
-        assert_eq!(second.completed(), 0);
-    });
-}
-
-#[test]
-fn retained_ranges_reject_escape_and_survive_record_nesting() {
-    let mut slab = FrameSlab::new();
-    slab.push_record(1, |writer| writer.u32(7)).unwrap();
-    let ranges = [(0x1000, 0x100), (0x2000, 0x20), (u64::MAX - 2, 8)];
-    // SAFETY: this test queries integer membership only and never decodes an address.
-    let mut reader = unsafe { WireReader::new_trusted_with_ranges(slab.as_bytes(), &ranges) };
-    assert!(reader.permits_range(0x1000, 0x100));
-    assert!(reader.permits_range(0x1010, 0x10));
-    assert!(!reader.permits_range(0x10ff, 2));
-    assert!(!reader.permits_range(0x1100, 1));
-    assert!(!reader.permits_range(0x0fff, 2));
-    assert!(!reader.permits_range(0, 1));
-    assert!(!reader.permits_range(u64::MAX - 1, 3));
-    assert!(!reader.permits_range(u64::MAX - 2, 1));
-    let record = reader.next_record().unwrap().unwrap();
-    assert!(record.payload.permits_range(0x2000, 0x20));
-    assert!(!record.payload.permits_range(0x2000, 0x21));
-    assert!(!WireReader::new(&[]).permits_range(0x1000, 1));
-}
-
-#[test]
-fn reserved_scalar_stores_match_growing_storage() {
-    fn write_fields(writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        writer.u8(0xa5)?;
-        writer.u16(0x5678)?;
-        writer.u32(0x1234_5678)?;
-        writer.u64(0x0123_4567_89ab_cdef)?;
-        writer.i32(-123)?;
-        writer.f32(f32::from_bits(0x7fc0_0042))?;
-        writer.bytes(&[11, 22, 33])
-    }
-    let mut slab = FrameSlab::new();
-    slab.push_record(0x1234, write_fields).unwrap();
-    let mut reserved = [0xaa; 40];
-    let length = WireWriter::record_into(&mut reserved, 0x1234, write_fields).unwrap();
-    assert_eq!(&reserved[..length], slab.as_bytes());
-    assert_eq!(&reserved[length..], &[0xaa; 8]);
-    for limit in 0..length {
-        let mut truncated = [0xaa; 40];
-        assert_eq!(
-            WireWriter::record_into(&mut truncated[..limit], 0x1234, write_fields),
-            Err(WireError::TooLarge)
-        );
-        assert!(truncated[limit..].iter().all(|byte| *byte == 0xaa));
-    }
-}
-
-#[test]
-fn failed_reserved_scalar_does_not_advance_or_partially_write() {
-    for available in 0..8 {
-        let mut reserved = [0xaa; 14];
-        let length = WireWriter::record_into(&mut reserved[..6 + available], 7, |writer| {
-            assert_eq!(writer.u64(u64::MAX), Err(WireError::TooLarge));
-            if available != 0 {
-                writer.u8(42)?;
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(length, 6 + usize::from(available != 0));
-        if available != 0 {
-            assert_eq!(reserved[6], 42);
-        }
-        assert!(reserved[length..].iter().all(|byte| *byte == 0xaa));
-    }
 }

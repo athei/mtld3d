@@ -7060,7 +7060,7 @@ fn mixed_command_frame(s: &mut PassState) {
     s.pending_depth_clear = Some(f32::to_bits(1.0));
     s.push_depth_clear_pass();
     for target in [tex(0x5000), tex(0x6000)] {
-        s.push_upload_pass(
+        s.push_upload_pass_with_order::<false>(
             &UploadPassTarget {
                 texture: target,
                 subresource: (0, 0),
@@ -7084,7 +7084,7 @@ fn upload_passes_keep_every_volume_depth_plane_and_level() {
     let mut s = fresh();
     let planes = [0, 7, 8, 255, 256, 2047];
     for plane in planes {
-        s.push_upload_pass(
+        s.push_upload_pass_with_order::<false>(
             &UploadPassTarget {
                 texture: tex(0x5000),
                 subresource: (plane, 1),
@@ -7195,7 +7195,7 @@ fn upload_prefix_preserves_order_through_pass_optimization() {
         ),
         (fresh_texture, vec![copy_blit(old, fresh_texture)]),
     ] {
-        s.push_upload_pass(
+        s.push_upload_pass_with_order::<false>(
             &UploadPassTarget {
                 texture: target,
                 subresource: (0, 1),
@@ -9550,7 +9550,7 @@ fn rule_j_leaves_the_upload_prefix_alone() {
         rect: (0, 0, 8, 8),
     };
     let mut s = fresh();
-    s.push_upload_pass(&upload, &[dummy_draw()], Vec::new());
+    s.push_upload_pass_with_order::<false>(&upload, &[dummy_draw()], Vec::new());
     s.set_color_render_target(
         target,
         BB_SIZE.0,

@@ -2,9 +2,9 @@
 //!
 //! Covers slot allocation over the current buffer (bump, reset, a full buffer), `sum_slots`
 //! over half-open and out-of-range spans of a buffer's bytes, a span summed near the last slot
-//! of a buffer of the device's size, and the BEGIN/END/publish state machine with its `u32`
-//! clamp. The sizing cases pin the policy: a frame's first buffer is one page until recent
-//! submissions reserved more, then a quarter above their decayed peak rounded up to a power of
+//! of a buffer of the device's size, and the BEGIN/END/publish state machine. The sizing
+//! cases pin the policy: a frame's first buffer is one page until recent submissions reserved
+//! more, then a quarter above their decayed peak rounded up to a power of
 //! two, never more than the device's buffer; a full buffer below that size grows in place and
 //! one at it spills into another, a span open across the spill summing the slots of both. The
 //! pool and state cases pin the lifetime rules: intake publishes only queries whose END frame
@@ -143,8 +143,8 @@ fn intake_sums_a_span_counted_up_to_the_last_slot_of_a_device_size_buffer() {
     state.push_pending(1, late.clone(), (5_000, BUFFER_SLOTS_256K), true);
 
     let _ = state.intake_completed(1);
-    assert_eq!(early.get_u32(), 11);
-    assert_eq!(late.get_u32(), 324, "every slot up to the last one");
+    assert_eq!(early.get_u64(), 11);
+    assert_eq!(late.get_u64(), 324, "every slot up to the last one");
 }
 
 #[test]
@@ -280,10 +280,10 @@ fn a_span_open_across_a_spill_sums_the_slots_of_both_buffers() {
     assert_eq!(retired_mut(&mut state, 1, 1).reserved, 2);
 
     let _ = state.intake_completed(1);
-    assert_eq!(closed.get_u32(), 5, "the span inside the first buffer");
+    assert_eq!(closed.get_u64(), 5, "the span inside the first buffer");
     assert_eq!(spanning.status(), QueryStatus::Issued);
     assert_eq!(
-        spanning.get_u32(),
+        spanning.get_u64(),
         123,
         "the span's slots in the full buffer and in the next one"
     );
@@ -363,7 +363,7 @@ fn query_core_status_transitions() {
     core.accumulate_segment(42);
     core.publish_span();
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), 42);
+    assert_eq!(core.get_u64(), 42);
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn query_core_adds_up_the_segments_of_a_split_span() {
     core.end(2, 1);
     core.accumulate_segment(234);
     core.publish_span();
-    assert_eq!(core.get_u32(), 1_234);
+    assert_eq!(core.get_u64(), 1_234);
     assert_eq!(core.seq_end_loaded(), 2);
 }
 
@@ -396,8 +396,8 @@ fn query_core_uncounted_span_publishes_fully_visible() {
     core.end(1, 5);
     core.publish_span();
     assert_eq!(
-        core.get_u32(),
-        u32::MAX,
+        core.get_u64(),
+        u64::from(u32::MAX),
         "a span that lost part of its count reads fully visible, never a partial sum"
     );
     // A re-issue clears the flag, so the next span reports its real count.
@@ -405,7 +405,7 @@ fn query_core_uncounted_span_publishes_fully_visible() {
     core.end(2, 6);
     core.accumulate_segment(7);
     core.publish_span();
-    assert_eq!(core.get_u32(), 7);
+    assert_eq!(core.get_u64(), 7);
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn query_core_uncounted_span_with_no_draw_publishes_zero() {
     // zero is the exact answer and the permissive one would be invented.
     core.end(1, 9);
     core.publish_span();
-    assert_eq!(core.get_u32(), 0);
+    assert_eq!(core.get_u64(), 0);
 }
 
 #[test]
@@ -427,24 +427,14 @@ fn query_core_reissue_resets_accumulator() {
     core.end(1, 1);
     core.accumulate_segment(100);
     core.publish_span();
-    assert_eq!(core.get_u32(), 100);
+    assert_eq!(core.get_u64(), 100);
     // Re-issue with a different span: accumulator must zero out.
     core.begin(2, 2, (640, 480), (640, 480), 0);
     assert_eq!(core.status(), QueryStatus::Pending);
     core.end(2, 1);
     core.accumulate_segment(7);
     core.publish_span();
-    assert_eq!(core.get_u32(), 7);
-}
-
-#[test]
-fn query_core_u32_clamp() {
-    let core = VisibilityQueryCore::new();
-    core.begin(0, 0, (640, 480), (640, 480), 0);
-    core.end(0, 1);
-    core.accumulate_segment(u64::MAX);
-    core.publish_span();
-    assert_eq!(core.get_u32(), u32::MAX);
+    assert_eq!(core.get_u64(), 7);
 }
 
 #[test]
@@ -546,7 +536,7 @@ fn state_intake_adds_a_split_span_up_across_its_two_frames() {
     );
     let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), 1_000);
+    assert_eq!(core.get_u64(), 1_000);
 }
 
 #[test]
@@ -572,7 +562,7 @@ fn state_reissue_before_intake_discards_the_abandoned_span() {
 
     let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), 7);
+    assert_eq!(core.get_u64(), 7);
 }
 
 #[test]
@@ -605,7 +595,7 @@ fn state_reissue_waits_for_the_replacement_segments_sequence() {
 
     let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), 7);
+    assert_eq!(core.get_u64(), 7);
 }
 
 #[test]
@@ -626,7 +616,7 @@ fn state_intake_reads_an_empty_segment_without_a_buffer() {
 
     let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), 55);
+    assert_eq!(core.get_u64(), 55);
 }
 
 #[test]
@@ -641,7 +631,7 @@ fn state_intake_answers_permissively_when_a_counted_segments_buffer_is_gone() {
     state.push_pending(1, core.clone(), (0, 2), true);
     let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
-    assert_eq!(core.get_u32(), u32::MAX);
+    assert_eq!(core.get_u64(), u64::from(u32::MAX));
 }
 
 #[test]
@@ -731,7 +721,7 @@ fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
     let _ = state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
-        core.get_u32(),
+        core.get_u64(),
         1_000,
         "both halves of the span the drain cut"
     );
@@ -752,8 +742,8 @@ fn state_mark_exhausted_makes_every_open_span_uncounted() {
     let _ = state.intake_completed(1);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(
-        core.get_u32(),
-        u32::MAX,
+        core.get_u64(),
+        u64::from(u32::MAX),
         "an exhausted frame reports fully visible, not the zero an empty span sums to"
     );
 }
@@ -774,8 +764,8 @@ fn state_draw_counter_carries_across_a_frame_boundary() {
     core.end(2, state.draws_seen());
     core.publish_span();
     assert_eq!(
-        core.get_u32(),
-        u32::MAX,
+        core.get_u64(),
+        u64::from(u32::MAX),
         "two draws inside the span, and the count of them was lost"
     );
 }
@@ -865,7 +855,7 @@ fn a_frame_of_more_buffers_than_the_pool_keeps_sums_every_one() {
     let evicted = state.intake_completed(1);
     assert_eq!(spanning.status(), QueryStatus::Issued);
     assert_eq!(
-        spanning.get_u32(),
+        spanning.get_u64(),
         7,
         "the first, a middle and the last buffer"
     );
@@ -952,7 +942,6 @@ fn finalize_reports_the_count_in_reported_pixels_of_the_target_begun_against() {
     core.end(1, 1);
     core.accumulate_segment(76_800);
     core.publish_span();
-    assert_eq!(core.get_u32(), 307_200);
     assert_eq!(core.get_u64(), 307_200);
     assert_eq!(core.status(), QueryStatus::Issued);
 }
@@ -1063,7 +1052,7 @@ fn state_a_span_begun_without_a_slot_splits_into_an_empty_segment() {
     let _ = state.intake_completed(2);
     assert_eq!(starved.status(), QueryStatus::Issued);
     assert_eq!(
-        starved.get_u32(),
+        starved.get_u64(),
         0,
         "a span with no draw in it counts none of the slots reserved before it began"
     );

@@ -40,15 +40,6 @@ impl FrameSlab {
         &self.bytes
     }
 
-    /// Update the trailing fixed-width length field of a descriptor record.
-    ///
-    /// # Panics
-    /// Panics if the slab has fewer than four bytes.
-    pub fn replace_last_u32(&mut self, value: u32) {
-        let end = self.bytes.len();
-        self.bytes[end - 4..].copy_from_slice(&value.to_le_bytes());
-    }
-
     /// Append one complete operation directly into the slab.
     ///
     /// The callback writes only payload fields. A failure rolls back the entire
@@ -77,7 +68,7 @@ impl FrameSlab {
         write: impl FnOnce(&mut WireWriter<'_>) -> Result<(), WireError>,
     ) -> Result<(), WireError> {
         let mut writer = WireWriter {
-            storage: WireStorage::Vector(&mut self.bytes),
+            bytes: &mut self.bytes,
         };
         writer.u16(tag)?;
         let length_offset = writer.len();
@@ -91,103 +82,17 @@ impl FrameSlab {
     }
 }
 
-enum WireStorage<'a> {
-    Vector(&'a mut Vec<u8>),
-    Slice { bytes: &'a mut [u8], used: usize },
-}
-
 pub struct WireWriter<'a> {
-    storage: WireStorage<'a>,
+    bytes: &'a mut Vec<u8>,
 }
 
 impl WireWriter<'_> {
     const fn len(&self) -> usize {
-        match &self.storage {
-            WireStorage::Vector(bytes) => bytes.len(),
-            WireStorage::Slice { used, .. } => *used,
-        }
+        self.bytes.len()
     }
 
     fn overwrite(&mut self, offset: usize, value: &[u8]) {
-        match &mut self.storage {
-            WireStorage::Vector(bytes) => {
-                bytes[offset..offset + value.len()].copy_from_slice(value);
-            }
-            WireStorage::Slice { bytes, .. } => {
-                bytes[offset..offset + value.len()].copy_from_slice(value);
-            }
-        }
-    }
-
-    /// Write only payload fields into an already reserved command destination.
-    ///
-    /// # Errors
-    /// Returns the callback error or a bounds failure.
-    pub fn payload_into(
-        destination: &mut [u8],
-        write: impl FnOnce(&mut WireWriter<'_>) -> Result<(), WireError>,
-    ) -> Result<usize, WireError> {
-        let mut writer = WireWriter {
-            storage: WireStorage::Slice {
-                bytes: destination,
-                used: 0,
-            },
-        };
-        write(&mut writer)?;
-        Ok(writer.len())
-    }
-
-    /// Reserve an initialized byte window for an explicit fixed-layout payload.
-    ///
-    /// # Errors
-    /// Returns an allocation or bounds failure.
-    pub fn reserve_bytes(&mut self, length: usize) -> Result<&mut [u8], WireError> {
-        match &mut self.storage {
-            WireStorage::Vector(bytes) => {
-                let start = bytes.len();
-                let end = start.checked_add(length).ok_or(WireError::TooLarge)?;
-                if end > u32::MAX as usize {
-                    return Err(WireError::TooLarge);
-                }
-                bytes
-                    .try_reserve(length)
-                    .map_err(|_| WireError::AllocationFailed)?;
-                bytes.resize(end, 0);
-                Ok(&mut bytes[start..end])
-            }
-            WireStorage::Slice { bytes, used } => {
-                let start = *used;
-                let end = start.checked_add(length).ok_or(WireError::TooLarge)?;
-                let destination = bytes.get_mut(start..end).ok_or(WireError::TooLarge)?;
-                *used = end;
-                Ok(destination)
-            }
-        }
-    }
-
-    /// Write a record directly into a reserved arena window without allocating.
-    ///
-    /// # Errors
-    /// Returns the payload error or `TooLarge` if the reserved window is exhausted.
-    pub fn record_into(
-        destination: &mut [u8],
-        tag: u16,
-        write: impl FnOnce(&mut WireWriter<'_>) -> Result<(), WireError>,
-    ) -> Result<usize, WireError> {
-        u32::try_from(destination.len()).map_err(|_| WireError::TooLarge)?;
-        let mut writer = WireWriter {
-            storage: WireStorage::Slice {
-                bytes: destination,
-                used: 0,
-            },
-        };
-        writer.u16(tag)?;
-        writer.u32(0)?;
-        write(&mut writer)?;
-        let total = writer.len();
-        let payload = u32::try_from(total - 6).map_err(|_| WireError::TooLarge)?;
-        writer.overwrite(2, &payload.to_le_bytes());
-        Ok(total)
+        self.bytes[offset..offset + value.len()].copy_from_slice(value);
     }
 
     /// Append a little-endian `u8` field.
@@ -230,43 +135,9 @@ impl WireWriter<'_> {
         self.fixed(value.to_le_bytes())
     }
 
-    /// Append a little-endian `i32` field.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
-    #[inline]
-    pub fn i32(&mut self, value: i32) -> Result<(), WireError> {
-        self.fixed(value.to_le_bytes())
-    }
-
-    /// Append a little-endian `f32` field.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
-    #[inline]
-    pub fn f32(&mut self, value: f32) -> Result<(), WireError> {
-        self.fixed(value.to_le_bytes())
-    }
-
-    /// Keep scalar stores visible to callers without inlining vector growth.
-    ///
-    /// The reserved window was checked against the wire size limit at construction.
     #[inline]
     fn fixed<const N: usize>(&mut self, value: [u8; N]) -> Result<(), WireError> {
-        match &mut self.storage {
-            WireStorage::Slice { bytes, used } => {
-                let destination = bytes
-                    .get_mut(*used..)
-                    .and_then(<[u8]>::first_chunk_mut::<N>)
-                    .ok_or(WireError::TooLarge)?;
-                *destination = value;
-                *used += N;
-                Ok(())
-            }
-            WireStorage::Vector(bytes) => Self::append_vector(bytes, &value),
-        }
+        Self::append_vector(self.bytes, &value)
     }
 
     /// Append bytes without adding a length prefix.
@@ -275,31 +146,10 @@ impl WireWriter<'_> {
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
     pub fn bytes(&mut self, value: &[u8]) -> Result<(), WireError> {
-        let length = self
-            .len()
-            .checked_add(value.len())
-            .ok_or(WireError::TooLarge)?;
-        u32::try_from(length).map_err(|_| WireError::TooLarge)?;
-        match &mut self.storage {
-            WireStorage::Vector(bytes) => {
-                Self::append_vector(bytes, value)?;
-            }
-            WireStorage::Slice { bytes, used } => {
-                bytes
-                    .get_mut(*used..length)
-                    .ok_or(WireError::TooLarge)?
-                    .copy_from_slice(value);
-                *used = length;
-            }
-        }
-        Ok(())
+        Self::append_vector(self.bytes, value)
     }
 
-    /// Keep fallible vector growth out of each inlined reserved scalar store.
-    ///
-    /// Production codegen otherwise duplicates allocation paths and leaves some
-    /// scalar writes out of line even when every operation uses a reserved slice.
-    #[inline(never)]
+    /// Append to the slab, refusing growth past the `u32` byte limit.
     fn append_vector(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), WireError> {
         let length = bytes
             .len()
@@ -321,79 +171,12 @@ pub struct WireRecord<'a> {
 
 pub struct WireReader<'a> {
     remaining: &'a [u8],
-    trusted_addresses: bool,
-    retained_ranges: Option<&'a [(u64, u64)]>,
 }
 
 impl<'a> WireReader<'a> {
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            remaining: bytes,
-            trusted_addresses: false,
-            retained_ranges: None,
-        }
-    }
-
-    /// Read a frame whose address fields are covered by a live producer lease.
-    ///
-    /// # Safety
-    ///
-    /// `bytes` must come from the paired in-process encoder using the current
-    /// schema. Every nonzero address must identify the expected object kind or
-    /// allocation with the alignment and extent the field requires. The caller
-    /// must keep each object and allocation alive until every decoded consumer
-    /// releases it, including deferred replay and GPU use after this reader drops.
-    #[must_use]
-    pub const unsafe fn new_trusted(bytes: &'a [u8]) -> Self {
-        Self {
-            remaining: bytes,
-            trusted_addresses: true,
-            retained_ranges: None,
-        }
-    }
-
-    /// Read a frame with an explicit inventory of retained byte allocations.
-    ///
-    /// # Safety
-    ///
-    /// The object-kind and lifetime requirements of `new_trusted` apply. Each
-    /// `(address, length)` range must additionally describe live retained storage.
-    /// The inventory must come from the owner, independently of operation fields.
-    #[must_use]
-    pub const unsafe fn new_trusted_with_ranges(bytes: &'a [u8], ranges: &'a [(u64, u64)]) -> Self {
-        Self {
-            remaining: bytes,
-            trusted_addresses: true,
-            retained_ranges: Some(ranges),
-        }
-    }
-
-    /// Whether a byte extent is fully contained in one retained allocation.
-    #[must_use]
-    pub fn permits_range(&self, address: u64, length: u64) -> bool {
-        if length == 0 {
-            return true;
-        }
-        let Some(end) = address.checked_add(length) else {
-            return false;
-        };
-        if !self.trusted_addresses || address == 0 || length > isize::MAX as u64 {
-            return false;
-        }
-        self.retained_ranges.is_none_or(|ranges| {
-            ranges.iter().any(|&(base, size)| {
-                base != 0
-                    && base <= address
-                    && base.checked_add(size).is_some_and(|limit| end <= limit)
-            })
-        })
-    }
-
-    /// Whether the caller established the address and lease contract.
-    #[must_use]
-    pub const fn has_trusted_addresses(&self) -> bool {
-        self.trusted_addresses
+        Self { remaining: bytes }
     }
 
     #[must_use]
@@ -421,15 +204,11 @@ impl<'a> WireReader<'a> {
         }
         let mut cursor = Self {
             remaining: self.remaining,
-            trusted_addresses: self.trusted_addresses,
-            retained_ranges: self.retained_ranges,
         };
         let tag = cursor.u16()?;
         let length = cursor.u32()?;
         let payload = Self {
             remaining: cursor.bytes(length)?,
-            trusted_addresses: self.trusted_addresses,
-            retained_ranges: self.retained_ranges,
         };
         self.remaining = cursor.remaining;
         Ok(Some(WireRecord { tag, payload }))
@@ -473,26 +252,6 @@ impl<'a> WireReader<'a> {
     #[inline]
     pub fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    /// Read a little-endian `i32` field.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Truncated` without advancing when the field is incomplete.
-    #[inline]
-    pub fn i32(&mut self) -> Result<i32, WireError> {
-        Ok(i32::from_le_bytes(self.array()?))
-    }
-
-    /// Read a little-endian `f32` field.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Truncated` without advancing when the field is incomplete.
-    #[inline]
-    pub fn f32(&mut self) -> Result<f32, WireError> {
-        Ok(f32::from_le_bytes(self.array()?))
     }
 
     /// Borrow a byte range without crossing the current payload's bounds.
@@ -740,40 +499,6 @@ impl CompletionQueue {
     }
 }
 
-/// Ordered replay-consumed sequences for a single device.
-///
-/// The submit owner publishes increasing sequences after it stops borrowing
-/// each frame's bytes. Sequence zero denotes no completed frame. The PE owner
-/// keeps this mailbox alive until the native device and its workers shut down.
-#[repr(C, align(8))]
-pub struct ReplayMailbox {
-    completed: AtomicU64,
-}
-
-impl Default for ReplayMailbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ReplayMailbox {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            completed: AtomicU64::new(0),
-        }
-    }
-
-    pub fn publish(&self, sequence: u64) {
-        self.completed.store(sequence, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn completed(&self) -> u64 {
-        self.completed.load(Ordering::Acquire)
-    }
-}
-
 /// Borrowed address of a PE-owned `LeaseCompletion` mailbox.
 #[repr(transparent)]
 pub struct LeaseCompletionPtr(u64);
@@ -797,35 +522,11 @@ impl LeaseCompletionPtr {
     }
 }
 
-/// Borrowed address of a PE-owned `ReplayMailbox` mailbox.
-#[repr(transparent)]
-pub struct ReplayMailboxPtr(u64);
-
-impl ReplayMailboxPtr {
-    /// Tag an explicitly retained mailbox address for the wire.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must address an initialized, 8-byte-aligned `ReplayMailbox`.
-    /// Its owner must keep it at that address while any native work can access it.
-    /// Only the mailbox's atomic methods may mutate the shared storage.
-    #[must_use]
-    pub const unsafe fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[must_use]
-    pub const fn raw(&self) -> u64 {
-        self.0
-    }
-}
-
 const _: () = {
     assert!(cfg!(target_has_atomic = "64"));
     assert!(size_of::<AtomicU64>() == 8);
     assert!(std::mem::offset_of!(LeaseCompletion, complete) == 0);
     assert!(std::mem::offset_of!(LeaseCompletion, reserved) == 4);
-    assert!(std::mem::offset_of!(ReplayMailbox, completed) == 0);
     assert!(size_of::<LeaseCompletion>() == 32);
     assert!(std::mem::offset_of!(LeaseCompletion, queue) == 8);
     assert!(std::mem::offset_of!(LeaseCompletion, next) == 16);
@@ -834,8 +535,5 @@ const _: () = {
     assert!(align_of::<CompletionQueue>() == 8);
     assert!(std::mem::offset_of!(CompletionQueue, head) == 0);
     assert!(align_of::<LeaseCompletion>() == 8);
-    assert!(size_of::<ReplayMailbox>() == 8);
-    assert!(align_of::<ReplayMailbox>() == 8);
     assert!(size_of::<LeaseCompletionPtr>() == 8);
-    assert!(size_of::<ReplayMailboxPtr>() == 8);
 };

@@ -56,7 +56,7 @@ impl PacketLease {
     }
 }
 
-/// PE-owned frame bytes and leases retained until native acknowledgment.
+/// Frame bytes and leases retained until native acknowledgment.
 pub struct FramePacket {
     metadata: MetadataStorage,
     completion_pool: crate::guest_completions::CompletionPool,
@@ -84,10 +84,6 @@ impl FramePacket {
     /// by an earlier native frame, so the returned owner must survive until native quiescence.
     pub fn new(mut frame: FrameData) -> Result<Self, (WireError, Box<Self>)> {
         let mut recorder = frame.recorder.take().unwrap_or_default();
-        #[cfg(not(windows))]
-        for op in core::mem::take(&mut frame.ops) {
-            recorder.record(&mut frame.scratch, op);
-        }
         // The replay completion is queued on the device's pool with the lease notifications,
         // so the one queue tells maintenance whether anything has arrived.
         let completion = recorder.completion_pool.replay_completion();
@@ -170,13 +166,6 @@ impl FramePacket {
         self.completion
             .as_ref()
             .is_some_and(|cell| cell.was_rejected())
-    }
-
-    #[must_use]
-    pub fn registrations(&self) -> &[u64] {
-        self.recorder
-            .as_ref()
-            .map_or(&[], |recorder| recorder.registrations.as_slice())
     }
 
     /// Take registrations that native ordered replay has not adopted.

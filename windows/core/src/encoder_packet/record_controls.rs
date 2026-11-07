@@ -68,9 +68,6 @@ const fn rasterized_level(kind: &StretchKind, level: u32) -> u32 {
 fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
     SurfaceRecord {
         identity: identity(&value.kind),
-        autogen_id: value
-            .autogen_texture_id
-            .map_or(0, crate::ids::TextureId::raw),
         msaa: value.msaa.raw(),
         msaa_srgb: value.msaa_srgb.raw(),
         width: value.width,
@@ -81,11 +78,11 @@ fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
         format: value.format,
         mip_level: rasterized_level(&value.kind, value.mip_level),
         slice: value.slice.unwrap_or(0),
-        pool: value.pool,
         flags: u32::from(value.flags.bits()),
         sample_count: u32::from(value.sample_count),
         present: u32::from(value.slice.is_some())
             | (u32::from(value.autogen_texture_id.is_some()) << 1),
+        reserved: 0,
     }
 }
 
@@ -272,7 +269,7 @@ macro_rules! capture_control {
                 if result.is_err() { $recorder.rejected_ops.push(self.into_rejected()); }
                 result
             }
-            fn into_rejected(self) -> Op { Op::$variant(crate::encoder_data::capture_op(self)) }
+            fn into_rejected(self) -> Op { Op::$variant(self) }
         }
     };
 }
@@ -544,7 +541,6 @@ capture_control!(ColorFillOp, ColorFill, v, recorder, scratch, tag, {
         tag,
         ColorFillRecord {
             identity: identity(&v.kind),
-            handle: v.fill.texture.raw(),
             msaa: v.fill.msaa.raw(),
             msaa_srgb: v.fill.msaa_srgb.raw(),
             logical_width: v.fill.logical_size.0,
@@ -683,7 +679,7 @@ impl CaptureControl for AdoptProgramOp {
         result
     }
     fn into_rejected(self) -> Op {
-        Op::AdoptProgram(crate::encoder_data::capture_op(self))
+        Op::AdoptProgram(self)
     }
 }
 
@@ -859,7 +855,7 @@ macro_rules! capture_resource {
                 )
             }
             fn into_rejected(self) -> Op {
-                Op::$variant(crate::encoder_data::capture_op(self))
+                Op::$variant(self)
             }
         }
     };
@@ -894,12 +890,7 @@ impl CaptureControl for crate::encoder_data::StageUploadOp {
         )
     }
     fn into_rejected(self) -> Op {
-        Op::StageUpload {
-            buffer_id: self.buffer_id,
-            page_box: self.page_box,
-            dst_offset: self.dst_offset,
-            size: self.size,
-        }
+        Op::StageUpload(self)
     }
 }
 

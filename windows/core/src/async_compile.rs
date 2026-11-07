@@ -108,11 +108,6 @@ impl<J> CompileLanes<J> {
         self.pipelines.push_back((ticket, job));
     }
 
-    /// Queue `job` behind the other urgent ones, ahead of every normal job.
-    pub fn push_urgent(&mut self, ticket: JobTicket, job: J) {
-        self.urgent.push_back((ticket, job));
-    }
-
     /// The next job to start: the oldest urgent one, else the oldest pipeline, else any other.
     pub fn pop(&mut self) -> Option<(JobTicket, J)> {
         self.urgent

@@ -42,6 +42,7 @@ pub const HUD_DOMAIN: &str = "mtld3d";
 pub const HUD_COLUMNS: usize = 33;
 
 /// Columns the HUD puts before every metadata key.
+#[cfg(test)]
 pub const HUD_KEY_INDENT: usize = 2;
 
 /// The longest release identity the domain row carries beside the domain and one space.

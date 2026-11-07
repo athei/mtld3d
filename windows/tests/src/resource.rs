@@ -2106,13 +2106,6 @@ impl Query<'_> {
         unsafe { deref_vtbl::<IDirect3DQuery9Vtbl>(self.ptr) }
     }
 
-    /// `GetType` (`D3DQUERYTYPE_*`).
-    #[must_use]
-    pub fn query_type(&self) -> u32 {
-        // SAFETY: vtable thunk; `self.ptr` is live.
-        unsafe { (self.vtbl().get_type)(self.ptr) }
-    }
-
     /// Byte size of the result `GetData` writes.
     #[must_use]
     pub fn data_size(&self) -> u32 {

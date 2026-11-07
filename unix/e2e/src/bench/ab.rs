@@ -558,11 +558,11 @@ pub fn names_host(pattern: &str) -> bool {
     !pattern.is_empty() && HOST_ID.contains(pattern)
 }
 
-/// A benchmark launcher with the same explicit log filter on both sides of Wine.
+/// A benchmark launcher with an explicit log filter.
 ///
 /// Timed runs need INFO identity and perf records even if the caller disabled
-/// logging. Shape runs supply their trace filter instead. Set the Unix-side
-/// override too, so an inherited Wine setting cannot suppress either account.
+/// logging. Shape runs supply their trace filter instead. The unix side takes
+/// the PE side's filter, so one variable covers both.
 fn leg_launcher(
     spec: &LegSpec,
     exe: &Path,
@@ -574,8 +574,7 @@ fn leg_launcher(
         WineLauncher::new(&spec.wine, exe, log_dir, timeout, Box::new(|_| {}))?
             .ignored_only(true)
             .with_env("WINEPREFIX", &spec.prefix.to_string_lossy())
-            .with_env("RUST_LOG", log_filter)
-            .with_env("__CX_UNIX_RUST_LOG", log_filter),
+            .with_env("RUST_LOG", log_filter),
     )
 }
 

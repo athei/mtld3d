@@ -598,21 +598,6 @@ impl FfPsKey {
         mask
     }
 
-    /// Whether any active stage reads the texture-factor row.
-    ///
-    /// `D3DTA_TFACTOR` on an argument and the `D3DTOP_BLENDFACTORALPHA` op are
-    /// the readers of row zero, which holds `D3DRS_TEXTUREFACTOR`. Stage
-    /// constants occupy later rows independently. Over-approximates
-    /// on the argument an op discards (`D3DTOP_SELECTARG1` ignoring arg2), which
-    /// only costs a bind that would otherwise be skipped.
-    #[must_use]
-    pub fn reads_texture_factor(&self) -> bool {
-        self.stages
-            .iter()
-            .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
-            .any(|s| s.references_texture_factor())
-    }
-
     /// Number of fragment constant rows read by the active combiner cascade.
     ///
     /// Row zero retains texture factor; row `stage + 1` holds that stage's
@@ -661,16 +646,6 @@ pub const fn ff_attr_index_for_semantic(usage: u8, usage_index: u8) -> Option<u1
         (D3DDECLUSAGE_PSIZE, 0) => Some(14),
         _ => None,
     }
-}
-
-#[must_use]
-pub fn emit_vs_ff(vs_key: &FfVsKey) -> String {
-    emit_vs_ff_named(vs_key, super::emit::DEFAULT_VS_ENTRY)
-}
-
-#[must_use]
-pub fn emit_ps_ff(ps_key: &FfPsKey, variant: VariantKey) -> String {
-    emit_ps_ff_named(ps_key, variant, super::emit::DEFAULT_PS_ENTRY)
 }
 
 #[must_use]

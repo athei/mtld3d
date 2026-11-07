@@ -944,7 +944,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     // does not follow on its own, so without this the frames between the
     // resize and the guest's own reaction would be composited at the old
     // size, which means rescaled.
-    super::macdrv::sync_drawable_size(&layer);
+    super::layer::sync_drawable_size(&layer);
     mtld3d_shared::crumb!("present:nextdraw", seq);
     let mut drawable_wait_ns: u64 = 0;
     let drawable = {

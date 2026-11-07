@@ -40,7 +40,6 @@ unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PresentDebugFlags Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs PresentWaitPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
-unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs ReadbackPlanes Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs SnapshotFlags Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs SoftwareCursorPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -68,8 +67,8 @@ unix/unix/src/metal/command.rs BlitSite Clone,Copy
 unix/unix/src/metal/command.rs CopyRejectReason Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/command.rs PresentGeometry Clone,Copy,PartialEq,Eq
 unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
+unix/unix/src/metal/layer.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
-unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerMode Clone,Copy,Debug,PartialEq,Eq
 unix/unix/src/metal/macdrv/attachment.rs AttachFlags Clone,Copy,Debug,Default,PartialEq,Eq

@@ -366,7 +366,7 @@ const _: () = {
 
 /// Per-draw varying parameters.
 ///
-/// Carried by `Op::Draw` or `Op::DrawWithSnapshot`; consumed by `emit_draw`
+/// Carried by the `EncoderOpcode::Draw` record; consumed by `emit_draw`
 /// which combines them with the encoder's `CurrentSnapshot` to issue the
 /// actual GPU commands. State shared with the previous draw (RS, textures,
 /// constants, etc.) lives in `CurrentSnapshot` and is updated via separate
@@ -377,9 +377,9 @@ pub struct DrawOp {
     pub index_source: IndexSource,
 }
 
-// CPU backing addresses stay native-width in the API-to-encoder queue.
-// Widening them before the wire boundary adds two unused words per buffer
-// to every op slot in a 32-bit process.
+// CPU backing addresses stay native-width in the borrowed draw the API
+// thread serializes into the wire draw record. Widening them before that
+// write adds two unused words per buffer to every draw in a 32-bit process.
 #[cfg(target_pointer_width = "32")]
 const _: () = {
     assert!(core::mem::size_of::<StreamBinding>() <= 40);
@@ -390,7 +390,7 @@ const _: () = {
 /// Cached vertex-attribute layout.
 ///
 /// A pointer into retained command storage or native scratch plus the metadata `emit_draw` needs
-/// to pipeline-key against. Updated via `Op::SetVertexAttrs` when the
+/// to pipeline-key against. Updated via `EncoderOpcode::SetSnapshot` when the
 /// vertex declaration or FVF changes; reused across draws otherwise.
 ///
 /// `Copy` (pointer + scalars + the per-stream extents) is structurally
@@ -597,58 +597,6 @@ impl<'a> Iterator for StageBindingsIter<'a> {
             unsafe { slot_ptr.as_ref() }.expect("packed StageBinding pointer is non-null");
         self.next_packed_idx += 1;
         Some((stage, binding))
-    }
-}
-
-/// Bump-allocate an already-packed `StageBinding` prefix into `scratch`.
-///
-/// Returns a `StageBindingsPtr` referencing the
-/// `[StageBinding; popcount(mask)]` payload. `packed` must agree with
-/// `mask`: entry `i` is the binding for the `i`-th set bit, ascending
-/// (the layout `snapshot_stage_bindings` produces); a debug-assert
-/// verifies the length.
-///
-/// Mask 0 (no bound stages) returns a `dangling()` pointer; readers
-/// see an iter that immediately returns `None`, so the pointer is
-/// never dereferenced.
-///
-/// # Safety
-///
-/// `StageBinding` is currently not `Copy`, but its fields are all
-/// integer/enum/bitflag primitives with trivial `Drop`. The bytewise
-/// scratch copy never has its own drop run; callers must ensure no
-/// field gains a non-trivial `Drop`. Keep the arena and copied values immutable
-/// and allocated until every copy of the returned token is forgotten.
-/// `packed.len()` must equal `mask.count_ones()`.
-///
-/// # Panics
-///
-/// Panics if the packed length disagrees with the mask in a debug build.
-pub unsafe fn bump_packed_stage_bindings(
-    scratch: &mut ScratchArena,
-    mask: u16,
-    packed: &[StageBinding],
-) -> StageBindingsPtr {
-    debug_assert_eq!(
-        packed.len(),
-        mask.count_ones() as usize,
-        "packed prefix length must equal popcount(mask)"
-    );
-    if mask == 0 {
-        return StageBindingsPtr {
-            mask: 0,
-            bindings: NonNull::dangling(),
-        };
-    }
-    let dst = scratch.alloc_uninit_slice::<StageBinding>(packed.len());
-    // SAFETY: `alloc_uninit_slice` reserved `packed.len()` consecutive
-    // `StageBinding` slots at `dst`; source and destination are disjoint
-    // allocations. The bytewise copy is sound per this function's
-    // trivial-Drop contract.
-    unsafe { core::ptr::copy_nonoverlapping(packed.as_ptr(), dst, packed.len()) };
-    StageBindingsPtr {
-        mask,
-        bindings: NonNull::new(dst).expect("ScratchArena returned non-null"),
     }
 }
 

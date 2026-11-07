@@ -788,13 +788,15 @@ windows-arm64x:
 # stamps the inner DWARF file after the input's basename and lldb looks it up
 # by that name — renaming the bundle afterwards produces one lldb won't find.
 unix-x64:
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_x64) \
+		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
 	cp -c $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
 	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_x64)/mtld3d.so
 
 unix-arm64:
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_arm64) \
+		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
 	cp -c $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
@@ -1958,7 +1960,7 @@ bench: install-windows-$(BENCH_ARCH) install-unix-$(UNIX_ARCH)
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
 	$(BENCH_SUITE_COPY) && cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
-		RUST_LOG=info __CX_UNIX_RUST_LOG=info \
+		RUST_LOG=info \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
 	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \
@@ -2321,10 +2323,10 @@ clippy: clippy-pe-i686 clippy-pe-x86_64 $(ARM64X_LEG:%=clippy-pe-%) clippy-nativ
 # the ARM64X one), split by the target they lint
 # for so each is one job. No --all-targets on the whole-workspace PE runs: that
 # would build every member's test targets for PE, including mtld3d-core's
-# apple-only objc2 dev-deps (the SM3 corpus test), which hard `compile_error!`
-# off Apple. Lib/bin only there; mtld3d-tests' integration tests aren't covered
-# by those runs, so its own per-crate pass lints all its targets (it has no apple
-# dev-deps).
+# apple-only objc2 dev-deps (the Metal compile checks in `dxso/emit/tests.rs`),
+# which hard `compile_error!` off Apple. Lib/bin only there; mtld3d-tests'
+# integration tests aren't covered by those runs, so its own per-crate pass
+# lints all its targets (it has no apple dev-deps).
 clippy-pe-i686:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_i386) $(DENY_WARNINGS)

@@ -275,7 +275,6 @@ record!(SurfaceIdentityRecord {
 });
 record!(SurfaceRecord {
     identity: SurfaceIdentityRecord,
-    autogen_id: u64,
     msaa: u64,
     msaa_srgb: u64,
     width: u32,
@@ -286,10 +285,10 @@ record!(SurfaceRecord {
     format: u32,
     mip_level: u32,
     slice: u32,
-    pool: u32,
     flags: u32,
     sample_count: u32,
-    present: u32
+    present: u32,
+    reserved: u32
 });
 record!(StretchBlitRecord {
     source: SurfaceRecord,
@@ -303,7 +302,6 @@ record!(StretchBlitRecord {
 });
 record!(ColorFillRecord {
     identity: SurfaceIdentityRecord,
-    handle: u64,
     msaa: u64,
     msaa_srgb: u64,
     logical_width: u32,
@@ -538,117 +536,6 @@ impl TextureUploadRecord {
                 .checked_add(span)
                 .is_none_or(|end| end > logical_len)
         {
-            return Err(WireError::InvalidValue);
-        }
-        Ok(())
-    }
-
-    /// Check the retained source extent without adopting any resource.
-    ///
-    /// # Errors
-    /// Returns an error for an invalid subresource, layout or source span.
-    pub fn validate_source(&self, logical_len: u64) -> Result<(), WireError> {
-        use mtld3d_shared::{blit_geometry::source_rows_end, mtl::TextureCreateFlags};
-        if self.level >= 32 || self.level >= self.texture.levels || self.depth == 0 {
-            return Err(WireError::InvalidValue);
-        }
-        let cube = self
-            .texture
-            .creation_flags()?
-            .contains(TextureCreateFlags::TYPE_CUBE);
-        if self.destination_slice >= if cube { 6 } else { 1 } {
-            return Err(WireError::InvalidValue);
-        }
-        let expected_index = self
-            .destination_slice
-            .checked_mul(self.texture.levels)
-            .and_then(|base| base.checked_add(self.level))
-            .ok_or(WireError::InvalidValue)?;
-        if self.staging_index != expected_index {
-            return Err(WireError::InvalidValue);
-        }
-        let source_bpp = if matches!(
-            self.source_format,
-            mtld3d_types::D3DFMT_YV12 | mtld3d_types::D3DFMT_NV12
-        ) {
-            1
-        } else if let Some(bytes) = crate::format::depth_format_bytes_per_pixel(self.source_format)
-        {
-            bytes
-        } else {
-            crate::format::map_d3d_format(self.source_format)
-                .ok_or(WireError::InvalidValue)?
-                .bytes_per_pixel()
-        };
-        if self.bytes_per_pixel != source_bpp {
-            return Err(WireError::InvalidValue);
-        }
-        if self.snapshot_offset().is_some() {
-            return self.validate_snapshot(logical_len);
-        }
-        if self.source_offset != 0 {
-            return Err(WireError::InvalidValue);
-        }
-        let mip_depth = (self.texture.depth >> self.level).max(1);
-        if self.depth > mip_depth {
-            return Err(WireError::InvalidValue);
-        }
-        // Planar API capture describes the full storage texture, including chroma rows.
-        // It is never a partial luma upload, even when the application dirtied a subrectangle.
-        if matches!(
-            self.source_format,
-            mtld3d_types::D3DFMT_YV12 | mtld3d_types::D3DFMT_NV12
-        ) && (self.level != 0
-            || self.origin_x != 0
-            || self.origin_y != 0
-            || self.width != self.texture.width
-            || self.height != self.texture.height
-            || u64::from(self.pitch) * u64::from(self.texture.height) > logical_len)
-        {
-            return Err(WireError::InvalidValue);
-        }
-        let end_x = self
-            .origin_x
-            .checked_add(self.width)
-            .ok_or(WireError::InvalidValue)?;
-        let end_y = self
-            .origin_y
-            .checked_add(self.height)
-            .ok_or(WireError::InvalidValue)?;
-        let (row_bytes, row_end) = if self.bytes_per_pixel == 0 {
-            let format =
-                crate::format::map_d3d_format(self.source_format).ok_or(WireError::InvalidValue)?;
-            if !format.is_compressed() {
-                return Err(WireError::InvalidValue);
-            }
-            let mip_width = (self.texture.width >> self.level).max(1);
-            let mip_height = (self.texture.height >> self.level).max(1);
-            if end_x > mip_width || end_y > mip_height {
-                return Err(WireError::InvalidValue);
-            }
-            let row_bytes = u64::from(mip_width.div_ceil(format.block_width()))
-                * u64::from(format.block_bytes());
-            (row_bytes, mip_height.div_ceil(format.block_height()))
-        } else {
-            (u64::from(end_x) * u64::from(self.bytes_per_pixel), end_y)
-        };
-        if row_bytes > u64::from(self.pitch) {
-            return Err(WireError::InvalidValue);
-        }
-        let first_slice_end =
-            source_rows_end(0, self.pitch, row_end).ok_or(WireError::InvalidValue)?;
-        let required = if self.depth > 1 {
-            if u64::from(self.slice_pitch) < first_slice_end {
-                return Err(WireError::InvalidValue);
-            }
-            u64::from(self.slice_pitch)
-                .checked_mul(u64::from(self.depth - 1))
-                .and_then(|last| last.checked_add(first_slice_end))
-                .ok_or(WireError::InvalidValue)?
-        } else {
-            first_slice_end
-        };
-        if required > logical_len {
             return Err(WireError::InvalidValue);
         }
         Ok(())

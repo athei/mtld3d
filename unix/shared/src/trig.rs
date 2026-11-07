@@ -166,14 +166,6 @@ fn reduce_large(xa: f32) -> (u32, f32) {
     (j as u32, xx as f32)
 }
 
-/// Sine of `x` (radians).
-///
-/// Shares [`sin_cos`]; the unused cosine is cheap and folds away when the
-/// caller only needs the sine.
-pub fn sin(x: f32) -> f32 {
-    sin_cos(x).0
-}
-
 /// Cosine of `x` (radians).
 ///
 /// Shares [`sin_cos`]; the unused sine folds away when the caller only needs
@@ -181,69 +173,5 @@ pub fn sin(x: f32) -> f32 {
 pub fn cos(x: f32) -> f32 {
     sin_cos(x).1
 }
-
-/// `pi / 2` and `pi / 4`, the arctangent reduction anchors.
-const FRAC_PI_2: f32 = core::f32::consts::FRAC_PI_2;
-const FRAC_PI_4: f32 = core::f32::consts::FRAC_PI_4;
-/// `tan(3*pi/8)` and `tan(pi/8)` — the two arctangent range-reduction thresholds.
-const TAN_3PI_8: f32 = 2.414_213_5;
-const TAN_PI_8: f32 = 0.414_213_57;
-
-/// Arctangent of `x` in radians, result in `[-pi/2, pi/2]`.
-///
-/// Minimax polynomial on `[-tan(pi/8), tan(pi/8)]` with two reciprocal/sum
-/// reductions folding the rest of the line in (the classic Cephes `atanf`),
-/// accurate to ~1 ULP.
-pub fn atan(x: f32) -> f32 {
-    let sign = x.is_sign_negative();
-    let a = x.abs();
-
-    // Fold |x| into [0, tan(pi/8)] and remember the constant the reduction adds.
-    let (mut y, a) = if a > TAN_3PI_8 {
-        (FRAC_PI_2, -1.0 / a)
-    } else if a > TAN_PI_8 {
-        (FRAC_PI_4, (a - 1.0) / (a + 1.0))
-    } else {
-        (0.0, a)
-    };
-
-    let z = a * a;
-    y += ((((0.080_537_44 * z - 0.138_776_85) * z + 0.199_777_11) * z - 0.333_329_5) * z) * a + a;
-    if sign { -y } else { y }
-}
-
-/// Full-plane arctangent of `y / x` in radians, result in `(-pi, pi]`.
-///
-/// The quadrant is resolved from the signs of both arguments (`x == 0` and
-/// `y == 0` handled). Built on [`atan`].
-pub fn atan2(y: f32, x: f32) -> f32 {
-    if x > 0.0 {
-        atan(y / x)
-    } else if x < 0.0 {
-        if y >= 0.0 {
-            atan(y / x) + PI
-        } else {
-            atan(y / x) - PI
-        }
-    } else if y > 0.0 {
-        FRAC_PI_2
-    } else if y < 0.0 {
-        -FRAC_PI_2
-    } else {
-        0.0
-    }
-}
-
-/// Arccosine of `x` (clamped domain `[-1, 1]`), result in `[0, pi]`.
-///
-/// Formulated as `atan2(sqrt((1-x)(1+x)), x)` — the standard identity;
-/// `(1-x)(1+x)` keeps precision near `|x| = 1` better than `1 - x*x`. `sqrt` is
-/// the hardware `sqrtss`, not a libm call.
-pub fn acos(x: f32) -> f32 {
-    atan2(((1.0 - x) * (1.0 + x)).max(0.0).sqrt(), x)
-}
-
-const PI: f32 = core::f32::consts::PI;
-
 #[cfg(test)]
 mod tests;

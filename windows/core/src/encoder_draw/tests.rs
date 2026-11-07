@@ -150,13 +150,11 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
     assert_eq!(clearing_bytes.len(), 24);
     // SAFETY: both command arenas and uniforms outlive decoded tokens.
     let mut decoder = unsafe { DrawReader::new() };
-    // SAFETY: fixture command storage and referenced uniform bytes stay immutable and live.
-    let mut first_reader = unsafe { WireReader::new_trusted(initial_bytes) };
+    let mut first_reader = WireReader::new(initial_bytes);
     let first = decode_snapshot(&mut decoder, &mut first_reader).unwrap();
     let first_vs = vs_address(first.vs.unwrap().as_ref());
     assert_eq!(first.ps_constants.unwrap().as_raw(), uniform.as_raw());
-    // SAFETY: the clearing command remains live through all decoded token uses.
-    let mut second_reader = unsafe { WireReader::new_trusted(clearing_bytes) };
+    let mut second_reader = WireReader::new(clearing_bytes);
     let second = decode_snapshot(&mut decoder, &mut second_reader).unwrap();
     assert!(std::ptr::eq(
         first_vs,
@@ -170,14 +168,12 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
 fn invalid_delta_mask_poisoning_prevents_partial_replay() {
     // SAFETY: no record in this test contains a borrowed address.
     let mut decoder = unsafe { DrawReader::new() };
-    // SAFETY: this invalid scalar-only fixture borrows no external data.
-    let mut invalid = unsafe { WireReader::new_trusted(&[0, 0, 2, 0, 0, 0, 0, 0]) };
+    let mut invalid = WireReader::new(&[0, 0, 2, 0, 0, 0, 0, 0]);
     assert!(matches!(
         decode_snapshot(&mut decoder, &mut invalid),
         Err(WireError::InvalidValue)
     ));
-    // SAFETY: empty bytes contain no referents.
-    let mut empty = unsafe { WireReader::new_trusted(&[]) };
+    let mut empty = WireReader::new(&[]);
     assert!(matches!(
         decode_snapshot(&mut decoder, &mut empty),
         Err(WireError::InvalidValue)
@@ -246,8 +242,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         depth_stencil_state::DepthStencilSnapshot,
         draw_data::{
             AttrSnapshot, DepthScissorFlags, DepthStencilFlags, PsSource, PsSourcePtr,
-            PsSourceView, RenderStatePtr, RenderStateSnapshot, StageBinding,
-            bump_packed_stage_bindings,
+            PsSourceView, RenderStatePtr, RenderStateSnapshot, StageBinding, StageBindingsPtr,
         },
         dxso::{FfPsKey, FfStage, FfVsFlags, FfVsKey, VariantKey},
         ids::TextureId,
@@ -323,27 +318,38 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         texture_id: TextureId::new_unique(),
         sampler_state: [7; 14],
     });
-    // SAFETY: all 16 initialized bindings match the full mask and source survives every token.
-    let stages = unsafe { bump_packed_stage_bindings(&mut source, u16::MAX, &packed) };
+    // SAFETY: all 16 initialized bindings match the full mask, and `packed` stays immutable and
+    // alive through every token use.
+    let stages = unsafe {
+        StageBindingsPtr::from_raw_parts(
+            u16::MAX,
+            std::ptr::NonNull::from(&packed).cast::<StageBinding>(),
+        )
+    };
     let attributes: [VertexAttrDesc; 16] = std::array::from_fn(|index| VertexAttrDesc {
         attr_index: u32::try_from(index).unwrap(),
         buffer_index: u32::try_from(index).unwrap(),
         format: VertexFormat::Float4,
         offset: 0,
     });
-    let (pointer, length) = source.alloc_slice(&attributes);
     let header = store(
         &mut source,
         crate::draw_data::DeclarationHeader {
             vdecl_hash: 0xaabb,
             extents: [16; 16],
-            count: length,
+            count: 16,
             used_streams: 1,
             reserved: 0,
         },
     );
-    // SAFETY: source retains the initialized descriptor array and header through every token use.
-    let attrs = unsafe { AttrSnapshot::new(std::ptr::NonNull::new(pointer).unwrap(), header) };
+    // SAFETY: `attributes` and source retain the initialized descriptor array and header through
+    // every token use.
+    let attrs = unsafe {
+        AttrSnapshot::new(
+            std::ptr::NonNull::from(&attributes).cast::<VertexAttrDesc>(),
+            header,
+        )
+    };
     // SAFETY: source retains this render state throughout the test.
     let render = unsafe { RenderStatePtr::new(render) };
     // SAFETY: source retains this vertex source throughout the test.
@@ -403,12 +409,10 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
     for length in 0..payload.len() {
         // SAFETY: any complete ranges in this prefix name the live immutable bytes above.
         let mut truncated_decoder = unsafe { DrawReader::new() };
-        // SAFETY: the encoded borrowed uniform range stays initialized through this decode.
-        let mut truncated = unsafe { WireReader::new_trusted(&payload[..length]) };
+        let mut truncated = WireReader::new(&payload[..length]);
         assert!(decode_snapshot(&mut truncated_decoder, &mut truncated).is_err());
     }
-    // SAFETY: the only wire addresses name bytes above, alive through all decoded-token uses.
-    let mut record = unsafe { WireReader::new_trusted(payload) };
+    let mut record = WireReader::new(payload);
     // SAFETY: the bytes remain allocated and immutable throughout the returned token's life.
     let mut decoder = unsafe { DrawReader::new() };
     let restored = decode_snapshot(&mut decoder, &mut record).unwrap();
@@ -620,8 +624,7 @@ fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete
     assert!(
         decode_snapshot(
             &mut decoder,
-            // SAFETY: this truncated command still borrows the retained fixture arena.
-            &mut unsafe { WireReader::new_trusted(&payload[..payload.len() - 1]) },
+            &mut WireReader::new(&payload[..payload.len() - 1]),
         )
         .is_err()
     );
@@ -648,8 +651,7 @@ fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete
     };
     let mut empty_slab = ScratchArena::new();
     let empty_payload = encode_snapshot(&mut empty_slab, &empty);
-    // SAFETY: empty_slab retains the initialized command through all decoded token uses.
-    let mut empty_reader = unsafe { WireReader::new_trusted(empty_payload) };
+    let mut empty_reader = WireReader::new(empty_payload);
     let second = decode_snapshot(&mut decoder, &mut empty_reader).unwrap();
     assert_eq!(second.stage_bindings.as_ref().unwrap().iter().count(), 0);
     assert!(second.attrs.as_ref().unwrap().as_slice().is_empty());
@@ -691,8 +693,7 @@ fn canonical_pixel_source_rejects_invalid_bool_before_borrowing() {
         let mut copied = AlignedPayload([0; 80]);
         copied.0.copy_from_slice(payload);
         copied.0[offset] = invalid;
-        // SAFETY: the aligned fixture remains initialized and immutable through decoding.
-        let mut reader = unsafe { WireReader::new_trusted(&copied.0) };
+        let mut reader = WireReader::new(&copied.0);
         // SAFETY: the fixture remains live through all decoded token uses.
         let mut decoder = unsafe { DrawReader::new() };
         assert!(decode_snapshot(&mut decoder, &mut reader).is_err());

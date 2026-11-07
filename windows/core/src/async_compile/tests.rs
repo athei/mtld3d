@@ -16,6 +16,12 @@ fn texture(raw: u64) -> MetalHandle<MTLTextureKind> {
     unsafe { MetalHandle::new(raw) }
 }
 
+/// Queue `job` in the urgent lane the way a waiting caller does: queue it, then promote it.
+fn push_urgent<J>(lanes: &mut CompileLanes<J>, ticket: JobTicket, job: J) {
+    lanes.push_normal(ticket, job);
+    assert!(lanes.promote(ticket));
+}
+
 /// Urgent jobs start before normal ones, and each lane keeps its order.
 #[test]
 fn urgent_jobs_pop_first_in_order() {
@@ -26,7 +32,7 @@ fn urgent_jobs_pop_first_in_order() {
     let urgent = tickets.issue();
     lanes.push_normal(first, "first");
     lanes.push_normal(second, "second");
-    lanes.push_urgent(urgent, "urgent");
+    push_urgent(&mut lanes, urgent, "urgent");
     assert_eq!(lanes.len(), 3);
     assert_eq!(lanes.pop(), Some((urgent, "urgent")));
     assert_eq!(lanes.pop(), Some((first, "first")));
@@ -72,8 +78,8 @@ fn steal_takes_only_the_named_urgent_job() {
     let urgent = tickets.issue();
     let other = tickets.issue();
     lanes.push_normal(normal, "normal");
-    lanes.push_urgent(urgent, "urgent");
-    lanes.push_urgent(other, "other");
+    push_urgent(&mut lanes, urgent, "urgent");
+    push_urgent(&mut lanes, other, "other");
     assert_eq!(
         lanes.steal(normal, 0),
         None,
@@ -104,7 +110,7 @@ fn pipelines_pop_ahead_of_libraries_and_behind_urgent_jobs() {
     lanes.push_pipeline(pipeline_a, "pipeline a");
     lanes.push_normal(library_c, "library c");
     lanes.push_pipeline(pipeline_b, "pipeline b");
-    lanes.push_urgent(urgent, "urgent");
+    push_urgent(&mut lanes, urgent, "urgent");
     assert_eq!(lanes.len(), 6);
     let order: Vec<_> = core::iter::from_fn(|| lanes.pop()).collect();
     assert_eq!(
@@ -381,7 +387,7 @@ fn an_upload_pass_spliced_ahead_leaves_recorded_reads_on_their_pass() {
     sample_into(&mut passes, kept, scratch.raw());
     // The upload writes the scratch target, which is rebuilt: were the read
     // shifted onto it, the kept pass's read would go unmarked.
-    passes.push_upload_pass(
+    passes.push_upload_pass_with_order::<false>(
         &UploadPassTarget {
             texture: scratch,
             subresource: (0, 0),
@@ -491,9 +497,9 @@ fn stealing_leaves_the_idle_workers_their_jobs() {
     let mut tickets = TicketSource::new();
     let mut lanes = CompileLanes::new();
     let (first, second, third) = (tickets.issue(), tickets.issue(), tickets.issue());
-    lanes.push_urgent(first, "first");
-    lanes.push_urgent(second, "second");
-    lanes.push_urgent(third, "third");
+    push_urgent(&mut lanes, first, "first");
+    push_urgent(&mut lanes, second, "second");
+    push_urgent(&mut lanes, third, "third");
     assert_eq!(lanes.steal(first, 2), None, "an idle worker takes it next");
     assert_eq!(lanes.steal(second, 2), None, "so does the other one");
     assert_eq!(

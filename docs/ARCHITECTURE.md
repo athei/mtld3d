@@ -758,7 +758,7 @@ mip dimensions before encoding the copy. Array slices remain separate in
 
 ## The drawable is the layer's size, and present owns the resample
 
-`CAMetalLayer.drawableSize` is kept at the layer's own `bounds × contentsScale`, never at the guest's back-buffer size. `macdrv::sync_drawable_size` pushes it at attach and again on the presenter before every `nextDrawable`, because the documented default is captured once and does not follow the layer: a freshly created wine metal view reports a real `bounds` beside a `0x0` `drawableSize`, and a window resize moves `bounds` without moving `drawableSize`. The one layer whose `drawableSize` is not its own geometry is a parked one, shrunk to drop its pool while no device presents through it and restored at the next attach.
+`CAMetalLayer.drawableSize` is kept at the layer's own `bounds × contentsScale`, never at the guest's back-buffer size. `layer::sync_drawable_size` pushes it at attach and again on the presenter before every `nextDrawable`, because the documented default is captured once and does not follow the layer: a freshly created wine metal view reports a real `bounds` beside a `0x0` `drawableSize`, and a window resize moves `bounds` without moving `drawableSize`. The one layer whose `drawableSize` is not its own geometry is a parked one, shrunk to drop its pool while no device presents through it and restored at the next attach.
 
 That is what makes the composite pass a 1:1 copy. A drawable that is not the size of the layer's backing store gets rescaled by the compositor, on top of whatever present already did, and the phase of that second resample is not ours to control: a ratio near 1.0 shows up as the whole frame, interface included, sitting a pixel off where it was drawn. Re-syncing per present rather than per `Reset` is what covers the frames between a window resize and the guest reacting to it. The same reasoning is why `contentsGravity` is inert here rather than load-bearing.
 
@@ -1019,16 +1019,16 @@ The per-call and per-draw timers run in one frame in 16 on average (`FRAME_SAMPL
 
 `Encode+commit` splits into three children the unix side times with `NanosSetTimer` inside `SubmitFrame`: the frame-leading blits, the replay of every pass descriptor (upload and draw, each pass's own blits included), and the frame buffer's completion-handler install plus both commits. A `resid` row takes what is left (command-buffer creation, the present settle less its wait, the upload buffer's handler, submission bookkeeping), so the children add up to their parent. The `GPU` block reports `GPUEndTime - GPUStartTime` per command-buffer role (frame, upload, present) as ms per frame, with the number of buffers behind each and no peak, since a report does not line up with one frame. It is not the device's whole GPU time: snapshot copies, read-backs, creation-time clears, the cursor overlay and the shutdown fence are not counted, nor a frame or upload buffer submitted before its sequence or counters were wired. A synchronous submit behind a barrier is timed and folded like an async one and adds to what the barrier drained, so `Encode+commit` and its children always describe the same submissions. Each completion handler adds its buffer's time to the device record, and the next `SubmitFrame` of that device moves the sums into its `SubmitTimings` output and leaves zero behind, so every buffer is reported once, one submission after it finished. Buffers of one queue can overlap on the GPU, so the roles add up to busy time, not wall time, which the block's label says. All of it travels as nanoseconds in the native `SubmissionOutcome.timings` result; outside a `PERF=1` build, or with the perf target off, the handlers read no time and every field stays zero.
 
-The API frame telemetry payload uses a separate duration contract: its symbolic
-`SourceElapsedTicks` wire tag (`2`) identifies elapsed ticks from the source
-runtime, not nanoseconds or absolute timestamps. Each device owns a source-clock
-calibration mailbox. A background
-worker publishes its immutable `u64` frequency through an `AtomicU32` state
-(`Pending`, `Ready`, or `Failed`), with release/acquire ordering. The PE owner
-retains this mailbox while the native runtime can read it, joins its calibration
-worker before native destruction, and releases it only after native readers stop.
-The native runtime also owns its local calibration worker. Neither side assumes
-a frequency or subtracts timestamps from different clocks.
+The API frame telemetry payload uses a separate duration contract: its
+durations are elapsed ticks of the source runtime's clock, not nanoseconds or
+absolute timestamps. Each device owns a source-clock calibration mailbox. A
+background worker publishes its immutable `u64` frequency through an
+`AtomicU32` state (`Pending`, `Ready`, or `Failed`), with release/acquire
+ordering. The PE owner retains this mailbox while the native runtime can read
+it, joins its calibration worker before native destruction, and releases it
+only after native readers stop. The native runtime also owns its local
+calibration worker. Neither side assumes a frequency or subtracts timestamps
+from different clocks.
 
 Calibration runs on background workers, so neither the API nor encoder intake
 waits for it. The encoder thread retains up to 4096 frame samples while either
@@ -1165,7 +1165,7 @@ in its row, and every family carries the suffixes its row names.
 | `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
 | `inverse_bypass_total`, `inverse_hit_total`, `inverse_recompute_total` | The `inverse-view` rows, summed over the window's reset epochs. |
 | `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |
-| `op_vec_capacity_bytes`, `op_vec_realloc_bytes_total`, `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `op_vec` and `cmd_vec`: peak `size` and window `realloc` bytes. |
+| `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `cmd_vec`: peak `size` and window `realloc` bytes. |
 | `pagebox_alloc_total`, `pagebox_alloc_bytes_total`, `pagebox_free_total`, `pagebox_free_bytes_total`, `pagebox_uncached_total` | `pagebox` and `uncached`. |
 | `pe_pagebox_alloc_total`, `pe_pagebox_alloc_bytes_total`, `pe_pagebox_free_total`, `pe_pagebox_free_bytes_total`, `pe_pagebox_uncached_total`, `pe_pagebox_pool_recycled_total`, `pe_pagebox_pool_recycled_bytes_total`, `pe_pagebox_pool_parked_bytes` | `d3d9.dll`'s share of `pagebox`, `uncached`, the pool's `recycled` and `parked` (peak), carried in the frame payload. The grid adds it to the encoder runtime's, which the `pagebox_*` keys hold alone. |
 | `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
@@ -1270,10 +1270,7 @@ out silently.
 Native phase durations cross the PE/Unix boundary as nanoseconds in fixed
 `repr(C)` output fields, including on failure. Unreached or disabled phases
 are zero. `NanosSetTimer` measures each duration in its owning runtime; raw PE
-and native ticks are never subtracted. The `TimingOutput` wrapper reserves the
-same wire layout without PERF but elides its initialization, writes, and reads.
-PERF callers initialize a zero fallback before crossing the boundary, so mixed
-PERF/native builds are safe.
+and native ticks are never subtracted.
 Collection and slow-event storage also compile out. The prewarm thread recreates
 the deduplicated shader libraries and recorded render pipelines. Native creation
 uses device-local batches capped at eight callers, including the coordinator,
@@ -1345,7 +1342,7 @@ Typical workflow:
 RUST_LOG=mtld3d=warn,mtld3d::d3d9=debug,mtld3d::dxso=trace MTLD3D_CONFIG="debug.bytecodeDumpDir=/tmp/mtld3d_shaders" ./<game>.exe > /tmp/trace.log 2>&1
 ```
 
-Reproduce → grep `pass RT` for suspect ids → grep `── PS MSL <id>` for emitted MSL → `cargo run --example disasm` for deeper analysis → seed a regression test in `core/src/dxso/emit_tests.rs`.
+Reproduce → grep `pass RT` for suspect ids → grep `── PS MSL <id>` for emitted MSL → `cargo run --example disasm` for deeper analysis → seed a regression test in `windows/core/src/dxso/emit/tests.rs`.
 
 ## Debugging heap corruption — `MTLD3D_CRUMB=1` mmap breadcrumb
 
@@ -1370,7 +1367,7 @@ Slot layout (8 bytes each, 128-byte map):
 | `0x20` | any | `(thunk_code << 32) \| (status << 8) \| marker` — `0xEE` mid-call, `0xDD` returned |
 | `0x28` | any | `unix_call` `params` pointer at entry |
 | `0x30` | API | `(seq << 32) \| (tcc_max << 16) \| tcc_last` — `FfVsKey::tex_coord_count` at draw-snapshot capture |
-| `0x38` | encoder | same shape — same field at `emit_vs_ff` dispatch |
+| `0x38` | encoder | same shape, same field at `emit_vs_ff_named` dispatch |
 | `0x40` | API | address of the captured `&FfVsKey` (PE frame storage) |
 | `0x48` | encoder | address of the dispatched `&FfVsKey` |
 | `0x50` | API | wrapping byte-sum + rotate fingerprint of all FfVsKey bytes at capture |
