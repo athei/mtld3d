@@ -7802,8 +7802,7 @@ fn allocate_color_target(
     // than a returned error, and this create is the last point that can answer
     // the application with a D3D9 error instead. Nothing between here and the
     // draw catches it: `A8` (Metal's `A8Unorm`, which the format tables list as
-    // sampleable only) and `L8` both built a render-target surface fine before
-    // this gate.
+    // sampleable only) would otherwise build a render-target surface.
     //
     // Without the usage the surface is only locked, sampled and blitted, so the
     // narrower question stands: a format whose texels are widened on the way

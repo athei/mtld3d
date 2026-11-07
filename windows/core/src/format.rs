@@ -467,7 +467,8 @@ pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
 /// `A8B8G8R8` and `X8B8G8R8` back `Rgba8Unorm`, colour-renderable on both GPU
 /// families, and a render-target handle is always handed out unswizzled, so
 /// the alpha force `X8B8G8R8` carries on the sampling side does not exclude
-/// it.
+/// it. `L8` carries a swizzle too (RRR1), but a render write lands in
+/// `R8Unorm`'s red, which is the channel the swizzle replicates on reads.
 ///
 /// The float family is renderable on every device: Metal's pixel-format
 /// capability table lists `R16Float` / `RG16Float` / `RGBA16Float` and
@@ -480,9 +481,10 @@ pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
 /// the native `B5G6R5Unorm` / `BGR5A1Unorm` Metal formats, which a device
 /// without those formats does not have; every advertisement and create gate
 /// that concerns rendering into a surface asks
-/// [`is_render_target_format_device`] instead. This pure form answers the one
-/// question that stays device-independent, the conversion SOURCE side, since
-/// a source is sampled rather than rendered into.
+/// [`is_render_target_format_device`] instead. This pure form serves the one
+/// question that stays device-independent, which formats a conversion may
+/// read, since a source is sampled rather than rendered into. The conversion
+/// query takes `L8` back out of that set: it answers identity only.
 #[must_use]
 pub const fn is_render_target_format(d3d_format: u32) -> bool {
     matches!(
@@ -493,6 +495,7 @@ pub const fn is_render_target_format(d3d_format: u32) -> bool {
             | D3DFMT_X8B8G8R8
             | D3DFMT_R5G6B5
             | D3DFMT_A1R5G5B5
+            | D3DFMT_L8
             | D3DFMT_G16R16
             | D3DFMT_A16B16G16R16
             | D3DFMT_R16F

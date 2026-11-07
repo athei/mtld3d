@@ -1808,13 +1808,17 @@ Sites: 12006=expected
 
 Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
 G32R32F) with blending on, then samples it and expects absent channels to
-read as 1.0. Render targets now keep separate attachment and sampling views,
-including both linear and sRGB roles for X8 formats. Native Apple GPUs apply
-the sampling swizzle while stored channels retain their blended values.
+read as 1.0. L8 is the other case: the test expects green and blue to repeat
+the luminance (visual.c:11870, 0x00181818 blended), which the RRR1 swizzle of
+its R8 sampling view gives. Render targets now keep separate attachment and
+sampling views, including both linear and sRGB roles for X8 formats. Native
+Apple GPUs apply the sampling swizzle while stored channels retain their
+blended values.
 
 The remaining failure is the Mac2 Paravirtual device's ignored texture-view
 swizzle, shared with ordinary sampled textures below. It reads absent colour
-lanes as zero despite reporting the requested view swizzle. The E2E controls
+lanes as zero despite reporting the requested view swizzle, and L8 there
+reads its luminance in red only, with green and blue zero. The E2E controls
 compare those lanes with an ordinary same-format texture on that device and
 still verify stored lanes, mip and cube addressing, and view retirement.
 Physical-GPU tests additionally require the specified all-ones missing lanes.

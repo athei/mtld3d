@@ -21,6 +21,10 @@
 //! destination with alpha is a pair whose byte copy would hand the padding over as alpha,
 //! on a device with the packed 16-bit formats and on one that widens them.
 //!
+//! An L8 source selects the luminance decode, which replicates red into RGB, since a
+//! render-target L8 source is sampled through its R8 attachment base without the RRR1
+//! swizzle.
+//!
 //! The render quad covers its destination only when the rect starts at the origin and
 //! spans the level on both axes; a shorter rect, one moved off the origin and a level of
 //! another size each leave pixels the pass has to load.
@@ -254,6 +258,10 @@ fn identical_same_surface_rects_are_a_no_op() {
 
 #[test]
 fn blit_decode_follows_the_source_format() {
+    assert!(matches!(
+        blit_decode(mtld3d_types::D3DFMT_L8),
+        BlitDecode::Luminance
+    ));
     assert!(matches!(blit_decode(D3DFMT_YUY2), BlitDecode::Yuy2));
     assert!(matches!(blit_decode(D3DFMT_UYVY), BlitDecode::Uyvy));
     for format in [
@@ -282,6 +290,7 @@ fn blit_decode_follows_the_source_format() {
         BlitDecode::OpaqueAlpha.uniform().to_bits(),
         5.0f32.to_bits()
     );
+    assert_eq!(BlitDecode::Luminance.uniform().to_bits(), 6.0f32.to_bits());
     assert!(is_packed_yuv(D3DFMT_YUY2) && is_packed_yuv(D3DFMT_UYVY));
     assert!(!is_packed_yuv(mtld3d_types::D3DFMT_R5G6B5));
 }

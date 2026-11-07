@@ -409,6 +409,53 @@ fn get_dc_on_an_x1r5g5b5_level_round_trips_a_texel() {
 }
 
 #[test]
+fn luminance_render_target_draws_reads_back_and_samples() {
+    use mtld3d_types::D3DRS_LIGHTING;
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let tex = h.create_texture(64, 64, 1, D3DUSAGE_RENDERTARGET, D3DFMT_L8, D3DPOOL_DEFAULT);
+    let surface = tex.surface_level(0);
+    assert_eq!(h.set_render_target(0, &surface), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    // Lighting is on by default; with no lights and the zero material it would
+    // drop the vertex colour and the target would store 0.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    let mut quad = fullscreen_quad();
+    for vertex in &mut quad {
+        vertex.color = 0xff80_8080;
+    }
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_L8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(h.get_render_target_data_hr(&surface, &sysmem), 0);
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+    let value = locked.as_u8(pitch * 64)[pitch * 32 + 32];
+    assert!((126..=130).contains(&value), "stored luminance {value}");
+    drop(locked);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.stretch_rect(&surface, &backbuffer, D3DTEXF_POINT), 0);
+    });
+    let stretched = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (126..=130).contains(&stretched.r)
+            && stretched.r == stretched.g
+            && stretched.g == stretched.b,
+        "stretched luminance {stretched:?}"
+    );
+    if !h.device_is_paravirtual() {
+        let px = sample_center(&h, &tex);
+        assert!(
+            (126..=130).contains(&px.r) && px.r == px.g && px.g == px.b,
+            "sample {px:?}"
+        );
+    }
+}
+
+#[test]
 fn luminance_format_samples_gray() {
     let h = Harness::new();
     if h.device_is_paravirtual() {
@@ -1084,7 +1131,6 @@ fn creates_reject_a_render_target_in_a_non_renderable_format() {
         D3DFMT_DXT5,
         D3DFMT_ATI1,
         D3DFMT_A8,
-        D3DFMT_L8,
         D3DFMT_V8U8,
         D3DFMT_A4R4G4B4,
     ] {

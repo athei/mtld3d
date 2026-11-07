@@ -521,6 +521,7 @@ fn the_render_target_family_holds_the_formats_a_colour_attachment_accepts() {
         D3DFMT_X8B8G8R8,
         D3DFMT_R5G6B5,
         D3DFMT_A1R5G5B5,
+        D3DFMT_L8,
         D3DFMT_G16R16,
         D3DFMT_A16B16G16R16,
         D3DFMT_R16F,
@@ -534,15 +535,13 @@ fn the_render_target_family_holds_the_formats_a_colour_attachment_accepts() {
     }
     // The swizzled pair reads through a channel correction a render write
     // cannot undo, R8G8B8 has no Metal counterpart and is widened on upload,
-    // and the compressed and single-channel formats no D3D9 device rendered
-    // into stay out.
+    // compressed formats and A8 (Metal cannot render into A8Unorm) stay out.
     for fmt in [
         D3DFMT_X1R5G5B5,
         D3DFMT_A4R4G4B4,
         D3DFMT_R8G8B8,
         D3DFMT_DXT1,
         D3DFMT_A8,
-        D3DFMT_L8,
         D3DFMT_D24S8,
     ] {
         assert!(

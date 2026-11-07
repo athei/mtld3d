@@ -100,7 +100,8 @@ fragment float4 mtld3d_blit_ps(
     // src_level.x is the source mip level (the sampler's point mip filter
     // makes the explicit level exact); src_level.y is the source decode,
     // 0 = sample as-is, 1 = YUY2, 2 = UYVY, 3 = YV12, 4 = NV12, 5 = sample
-    // as-is with alpha one (an X format, whose padding bits carry no alpha).
+    // as-is with alpha one (an X format, whose padding bits carry no alpha),
+    // 6 = replicate luminance into RGB.
     // The numbering is owned by mtld3d_core::stretch_rect::BlitDecode.
     // src_level.zw is the source's logical extent, which only the planar
     // decodes read.
@@ -110,6 +111,10 @@ fragment float4 mtld3d_blit_ps(
     }
     if (decode == 5u) {
         return float4(src.sample(samp, in.texcoord, level(src_level.x)).rgb, 1.0);
+    }
+    if (decode == 6u) {
+        float luminance = src.sample(samp, in.texcoord, level(src_level.x)).r;
+        return float4(luminance, luminance, luminance, 1.0);
     }
     float y;
     float u;

@@ -7,8 +7,8 @@
 //! function runs.
 
 use mtld3d_types::{
-    D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFMT_YV12,
+    D3DFMT_L8, D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFMT_YV12,
 };
 
 use crate::{
@@ -282,9 +282,9 @@ pub const fn planar_stretch_route(
 /// pipeline per destination format serves every source format: mode 0 samples
 /// the source as-is, the packed modes fetch the 4:2:2 macropixel and the
 /// planar modes the luma texel and its 4:2:0 chroma sample, and all four YUV
-/// modes convert to RGB. The opaque-alpha mode samples as-is and replaces the
-/// alpha with one. The discriminants are the uniform's values; the MSL in
-/// `unix/unix/src/metal/blit.rs` matches on them.
+/// modes convert to RGB. The opaque-alpha mode replaces alpha with one, and
+/// the luminance mode replicates red to RGB. The discriminants are the
+/// uniform's values; the MSL in `unix/unix/src/metal/blit.rs` matches on them.
 #[repr(u32)]
 pub enum BlitDecode {
     /// Sample the source texture as-is (any RGB format).
@@ -299,6 +299,11 @@ pub enum BlitDecode {
     Nv12 = 4,
     /// An X format: sample as-is, alpha one, since its padding bits carry no alpha.
     OpaqueAlpha = 5,
+    /// `D3DFMT_L8`: replicate red into RGB and set alpha to one.
+    ///
+    /// A render-target L8 source is the R8 attachment base, which has no RRR1
+    /// swizzle, so the decode replicates the luminance itself.
+    Luminance = 6,
 }
 
 impl BlitDecode {
@@ -312,6 +317,7 @@ impl BlitDecode {
             Self::Yv12 => 3.0,
             Self::Nv12 => 4.0,
             Self::OpaqueAlpha => 5.0,
+            Self::Luminance => 6.0,
         }
     }
 }
@@ -324,6 +330,7 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
         D3DFMT_UYVY => BlitDecode::Uyvy,
         D3DFMT_YV12 => BlitDecode::Yv12,
         D3DFMT_NV12 => BlitDecode::Nv12,
+        D3DFMT_L8 => BlitDecode::Luminance,
         D3DFMT_X8R8G8B8 | D3DFMT_X8B8G8R8 | D3DFMT_X1R5G5B5 => BlitDecode::OpaqueAlpha,
         _ => BlitDecode::None,
     }

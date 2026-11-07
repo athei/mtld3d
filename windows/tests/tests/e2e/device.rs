@@ -685,9 +685,11 @@ fn check_format_conversion() {
         D3DERR_NOTAVAILABLE,
         "mismatched conversion must reject",
     );
-    // StretchRect converts any renderable colour format and the packed YUV
-    // formats into a renderable colour format (render-quad sample/decode),
-    // so the query says so, as every desktop driver does for these rows.
+    // StretchRect converts the renderable colour formats and the packed YUV
+    // formats into a renderable colour format (render-quad sample/decode), and
+    // the query answers yes for these rows, as every desktop driver does. For L8
+    // the query answers identity only, as source and as destination, although
+    // StretchRect converts it.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
         D3D_OK,
@@ -716,8 +718,8 @@ fn check_format_conversion() {
         },
         "UYVY -> R5G6B5 is decoded by the StretchRect render quad where R5G6B5 renders",
     );
-    // Only renderable colour formats are conversion targets: YUV and
-    // luminance destinations reject.
+    // YUV destinations reject because they do not render; L8 renders but
+    // answers identity only.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_X8R8G8B8, D3DFMT_YUY2),
         D3DERR_NOTAVAILABLE,
@@ -727,6 +729,11 @@ fn check_format_conversion() {
         h.check_device_format_conversion(D3DFMT_X8R8G8B8, D3DFMT_L8),
         D3DERR_NOTAVAILABLE,
         "RGB -> L8 is not a conversion target",
+    );
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_L8, D3DFMT_X8R8G8B8),
+        D3DERR_NOTAVAILABLE,
+        "L8 -> RGB is not advertised as a conversion",
     );
     // A format converts to itself, L8 included.
     assert_eq!(
@@ -785,9 +792,9 @@ fn windowed_device_type_follows_format_conversion() {
 /// `YV12` and `NV12` answer as plain surfaces and as `StretchRect` sources, and as nothing else.
 ///
 /// The surface answer holds without usage only, every texture-typed resource
-/// answers no whatever the usage, and the conversion answer follows the
-/// render-target answer of the destination the device gives, since the decode
-/// runs in the quad that draws into it.
+/// answers no whatever the usage, and the conversion answer is yes for every
+/// destination the device answers as a render target, since the decode runs in
+/// the quad that draws into it; L8 is the exception and answers identity only.
 #[test]
 fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
     let h = Harness::factory_only();
@@ -843,7 +850,7 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             }
         }
 
-        // Every destination the device renders into, and no other.
+        // Every renderable destination except L8, which answers identity only.
         let mut converted = 0;
         for target in [
             D3DFMT_A8R8G8B8,
@@ -867,12 +874,17 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             D3DFMT_YUY2,
             D3DFMT_UYVY,
         ] {
-            let renders = check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, target) == D3D_OK;
-            converted += u32::from(renders);
+            let converts = target != D3DFMT_L8
+                && check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, target) == D3D_OK;
+            converted += u32::from(converts);
             assert_eq!(
                 h.check_device_format_conversion(format, target),
-                if renders { D3D_OK } else { D3DERR_NOTAVAILABLE },
-                "{name} -> {target:#x} follows the render-target answer ({renders})"
+                if converts {
+                    D3D_OK
+                } else {
+                    D3DERR_NOTAVAILABLE
+                },
+                "{name} -> {target:#x} converts where it renders, L8 aside ({converts})"
             );
             assert_eq!(
                 h.check_device_format_conversion(target, format),
