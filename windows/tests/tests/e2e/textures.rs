@@ -410,6 +410,7 @@ fn get_dc_on_an_x1r5g5b5_level_round_trips_a_texel() {
 
 #[test]
 fn luminance_render_target_draws_reads_back_and_samples() {
+    use mtld3d_types::D3DRS_LIGHTING;
     let h = Harness::new();
     let backbuffer = h.render_target(0);
     let tex = h.create_texture(64, 64, 1, D3DUSAGE_RENDERTARGET, D3DFMT_L8, D3DPOOL_DEFAULT);
@@ -417,6 +418,9 @@ fn luminance_render_target_draws_reads_back_and_samples() {
     assert_eq!(h.set_render_target(0, &surface), 0);
     h.select_diffuse_stage(0);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    // Lighting is on by default; with no lights and the zero material it would
+    // drop the vertex colour and the target would store 0.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
     let mut quad = fullscreen_quad();
     for vertex in &mut quad {
         vertex.color = 0xff80_8080;
