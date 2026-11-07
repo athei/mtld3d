@@ -1,0 +1,30 @@
+name: cache-cleanup
+
+# Deletes every Actions cache a pull request's runs saved once the pull
+# request closes, merged or not. Those caches are scoped to the pull request's
+# merge ref, which no other run can restore from, so they only take room from
+# main's caches under the repository's cache limit until GitHub evicts them.
+#
+# `pull_request_target` rather than `pull_request`: a fork's pull request gets
+# a read-only token under `pull_request`, which cannot delete caches. This
+# runs from the default branch, checks nothing out and runs none of the pull
+# request's code, so the write token it gets is safe to hold.
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  # The cache deletion.
+  actions: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the pull request's caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh cache delete --all --ref "refs/pull/$PR_NUMBER/merge" --succeed-on-no-caches

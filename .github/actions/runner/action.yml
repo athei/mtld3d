@@ -38,13 +38,14 @@ runs:
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "asset=wine-$tag-macos-$asset.tar.xz" >> "$GITHUB_OUTPUT"
 
-    # Restore-and-save: the build job primes this cache for its own image's
-    # Wine only, so the first leg of another Wine or arch downloads the bundle
-    # and saves it for the rest. `make install` writes into the tree afterwards, which is why
-    # the save happens on a miss right here rather than at the end of the job.
-    - name: Wine SDK
+    # The build job primes this cache for its own image's Wine only, so the
+    # first leg of another Wine or arch downloads the bundle and saves it for
+    # the rest. `make install` writes our builtin into the tree later in the
+    # job, so the save is its own step, right after the download, and not the
+    # end-of-job save of `actions/cache`, which would store the installed tree.
+    - name: Restore the Wine SDK
       id: wine-cache
-      uses: actions/cache@v6
+      uses: actions/cache/restore@v6
       with:
         path: ~/wine-sdk
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
@@ -57,6 +58,13 @@ runs:
         curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
           "https://github.com/athei/wine-build/releases/download/${{ steps.wine.outputs.tag }}/${{ steps.wine.outputs.asset }}"
         tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
+
+    - name: Save the Wine SDK
+      if: steps.wine-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/wine-sdk
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
 
     # The x86_64 Wine and every PE it loads are x86 code, which an Apple
     # Silicon image runs through Rosetta; a no-op on Intel. The arm64 Wine

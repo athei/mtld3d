@@ -40,7 +40,9 @@ inputs:
   prime:
     description: >
       This is the build job: warm the cargo registry and save every cache it
-      touched. The check job only ever restores.
+      missed. A key that was restored is never saved again, so a pull request
+      saves only what main's caches lack, such as a new lockfile or pin. The
+      check jobs only ever restore.
     default: 'false'
 
 runs:
@@ -70,14 +72,42 @@ runs:
     # The Rust target list is hashed with them, since the toolchain directory
     # holds those targets: `setup-rust`'s `rustup target add` command and the
     # PE_*/UNIX_TARGET_* triples it names, and nothing else of the Makefile.
-    - name: Compute the tools cache key
+    #
+    # The MSVC SDK splat's key is built the same way, from the only inputs
+    # that decide what `setup-xwin` writes: the three XWIN_* pins of the
+    # Makefile (CRT and SDK versions, the architectures), the XWIN command
+    # line, the `setup-xwin` recipe and the xwin version in CARGO_TOOLS. Any
+    # other Makefile edit leaves it alone. A save runs only on a miss, so a
+    # recipe change that kept the key would leave a stale splat that every run
+    # re-splats and none saves.
+    #
+    # Each extraction is checked, since a pin rewritten to another assignment
+    # form would drop out of its hash without a word: every triple the
+    # `rustup target add` line names has its definition, and all three XWIN_*
+    # pins, the command line and the recipe are found.
+    - name: Compute the tools and MSVC SDK cache keys
       id: keys
       shell: bash
       run: |
-        targets=$(sed -n -e '/^PE_[a-z0-9]* *:=/p' -e '/^UNIX_TARGET_[a-z0-9]* *:=/p' \
-          -e '/^[[:space:]]*rustup target add/,/[^\\]$/p' Makefile | shasum | cut -c1-16)
+        triples=$(sed -n -e '/^PE_[a-z0-9]* *:=/p' -e '/^UNIX_TARGET_[a-z0-9]* *:=/p' Makefile)
+        command=$(sed -n -e '/^[[:space:]]*rustup target add/,/[^\\]$/p' Makefile)
+        named=$(printf '%s\n' "$command" | { grep -oE '\$\((PE|UNIX_TARGET)_[a-z0-9]+\)' || true; } | wc -l)
+        if [ -z "$command" ] || [ "$(printf '%s\n' "$triples" | grep -c .)" -ne "$named" ]; then
+          echo "::error::the Makefile's target triples or its rustup target add line no longer match the tools key's patterns"
+          exit 1
+        fi
+        targets=$(printf '%s\n%s\n' "$triples" "$command" | shasum | cut -c1-16)
         pins=$(printf '%s|%s|%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" "$NEXTEST_VERSION" "$targets" | shasum | cut -c1-16)
         echo "tools=tools-${{ runner.os }}-${{ runner.arch }}-$pins" >> "$GITHUB_OUTPUT"
+        xwin_pins=$(sed -n -e '/^XWIN_CRT_VERSION *:=/p' -e '/^XWIN_SDK_VERSION *:=/p' -e '/^XWIN_ARCH *:=/p' Makefile)
+        xwin_command=$(sed -n -e '/^XWIN *:=/,/[^\\]$/p' Makefile)
+        xwin_recipe=$(sed -n -e '/^setup-xwin:/,/^$/p' Makefile)
+        if [ "$(printf '%s\n' "$xwin_pins" | grep -c .)" -ne 3 ] || [ -z "$xwin_command" ] || [ -z "$xwin_recipe" ]; then
+          echo "::error::the Makefile's XWIN_* pins, XWIN command line or setup-xwin recipe no longer match the MSVC SDK key's patterns"
+          exit 1
+        fi
+        xwin=$(printf '%s\n%s\n%s\n%s' "$xwin_pins" "$xwin_command" "$xwin_recipe" "$CARGO_TOOLS" | shasum | cut -c1-16)
+        echo "xwin=xwin-${{ runner.os }}-${{ runner.arch }}-$xwin" >> "$GITHUB_OUTPUT"
 
     # Two caches, because the two halves of a cargo home change for different
     # reasons and one of them must never be restored partially.
@@ -89,6 +119,7 @@ runs:
     # prefix fallback can hand back one without the other; a miss costs the setup
     # job one cold install and the other legs nothing.
     - name: Restore the toolchains and cargo tools
+      id: tools-cache
       uses: actions/cache/restore@v6
       with:
         path: |
@@ -100,7 +131,10 @@ runs:
 
     # The crate registry is keyed on the lockfiles and a prefix fallback is right
     # here: a partial registry costs a fetch of what is missing, nothing more.
+    # `cache-hit` is true only for an exact key match, so a prefix fallback is
+    # still saved under the new key.
     - name: Restore the crate registry
+      id: registry-cache
       uses: actions/cache/restore@v6
       with:
         path: |
@@ -125,14 +159,18 @@ runs:
       shell: bash
       run: make xwin-dir
 
+    # No prefix fallback. A splat of other CRT or SDK versions or architectures
+    # is no use: `setup-xwin` re-splats, and the download cache it would
+    # re-splat from is not cached, so it downloads everything again. A splat of
+    # the same versions made by another xwin release carries the same stamp, so
+    # `setup-xwin` would keep it and the new key would save the old tree.
     - name: Restore the MSVC SDK splat
+      id: xwin-cache
       uses: actions/cache/restore@v6
       if: inputs.pe == 'true'
       with:
         path: /opt/xwin
-        key: xwin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
-        restore-keys: |
-          xwin-${{ runner.os }}-${{ runner.arch }}-
+        key: ${{ steps.keys.outputs.xwin }}
 
     # A no-op on a hit: the splat carries a stamp of what it holds, and the
     # Makefile pins the versions this compares against.
@@ -158,7 +196,8 @@ runs:
 
     # The tarball unpacks to `wine/`, so this lands at $HOME/wine-sdk/wine, which
     # is what WINE_SDK points at above. `make install` writes our builtin into
-    # this tree, which is why the legs restore it but never save it back.
+    # this tree, so the build job saves it on a miss at the end of this action,
+    # before the job's own targets run; the check jobs and release never save it.
     - name: Download the pinned Wine SDK
       if: inputs.pe == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
       shell: bash
@@ -210,9 +249,13 @@ runs:
       shell: bash
       run: make fetch
 
+    # Each save runs on a miss only. A cache entry cannot be overwritten, and a
+    # pull request's scope holds none of main's keys, so saving a key that was
+    # restored would upload another copy of main's cache under the pull
+    # request.
     - name: Save the toolchains and cargo tools
       uses: actions/cache/save@v6
-      if: inputs.prime == 'true'
+      if: inputs.prime == 'true' && steps.tools-cache.outputs.cache-hit != 'true'
       with:
         path: |
           ~/.rustup
@@ -223,7 +266,7 @@ runs:
 
     - name: Save the crate registry
       uses: actions/cache/save@v6
-      if: inputs.prime == 'true'
+      if: inputs.prime == 'true' && steps.registry-cache.outputs.cache-hit != 'true'
       with:
         path: |
           ~/.cargo/registry
@@ -232,14 +275,14 @@ runs:
 
     - name: Save the MSVC SDK splat
       uses: actions/cache/save@v6
-      if: inputs.prime == 'true' && inputs.pe == 'true'
+      if: inputs.prime == 'true' && inputs.pe == 'true' && steps.xwin-cache.outputs.cache-hit != 'true'
       with:
         path: /opt/xwin
-        key: xwin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+        key: ${{ steps.keys.outputs.xwin }}
 
     - name: Save the Wine SDK
       uses: actions/cache/save@v6
-      if: inputs.prime == 'true' && inputs.pe == 'true'
+      if: inputs.prime == 'true' && inputs.pe == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
       with:
         path: ~/wine-sdk
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ steps.wine.outputs.tag }}
