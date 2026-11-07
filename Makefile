@@ -2427,8 +2427,9 @@ doc-unix:
 # PERF=1 clippy legs and unit tests, the conventions audit, the Makefile
 # regressions, and the doc build. fmt-check first (fast, fails early on drift);
 # clippy reuses the targets above; audit and the Makefile regressions are fast;
-# doc stays last. Each leg is also its own target, so CI's check job runs each
-# as a step of its own instead of this sequence.
+# doc stays last. Each leg is also its own target, so CI runs each as a step of
+# its own instead of this sequence: the `PERF=1` legs in the check-perf job, the
+# rest in the check job.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
