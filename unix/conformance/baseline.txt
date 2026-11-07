@@ -350,7 +350,7 @@
   visual.c:5088 count=1
   visual.c:5167 count=1
   visual.c:6032 count=1
-  visual.c:12006 count=5
+  visual.c:12006 count=6
   visual.c:15686 count=15
   visual.c:15745 count=28
   visual.c:16481 count=2
@@ -936,7 +936,7 @@
   visual.c:5088 count=1
   visual.c:5167 count=1
   visual.c:6032 count=1
-  visual.c:12006 count=5
+  visual.c:12006 count=6
   visual.c:15686 count=13
   visual.c:15745 count=28
   visual.c:16481 count=2
