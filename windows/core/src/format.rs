@@ -484,7 +484,7 @@ pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
 /// [`is_render_target_format_device`] instead. This pure form serves the one
 /// question that stays device-independent, which formats a conversion may
 /// read, since a source is sampled rather than rendered into. The conversion
-/// query takes `L8` back out of that set: it converts only to itself.
+/// query takes `L8` back out of that set: it answers identity only.
 #[must_use]
 pub const fn is_render_target_format(d3d_format: u32) -> bool {
     matches!(

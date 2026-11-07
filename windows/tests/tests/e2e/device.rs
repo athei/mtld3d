@@ -687,8 +687,9 @@ fn check_format_conversion() {
     );
     // StretchRect converts the renderable colour formats and the packed YUV
     // formats into a renderable colour format (render-quad sample/decode), and
-    // the query answers yes for these rows, as every desktop driver does. L8 is
-    // the exception on both sides: it renders, but converts only to itself.
+    // the query answers yes for these rows, as every desktop driver does. For L8
+    // the query answers identity only, as source and as destination, although
+    // StretchRect converts it.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
         D3D_OK,
@@ -717,8 +718,8 @@ fn check_format_conversion() {
         },
         "UYVY -> R5G6B5 is decoded by the StretchRect render quad where R5G6B5 renders",
     );
-    // Only renderable colour formats are conversion targets: YUV and
-    // luminance destinations reject.
+    // YUV destinations reject because they do not render; L8 renders but
+    // answers identity only.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_X8R8G8B8, D3DFMT_YUY2),
         D3DERR_NOTAVAILABLE,
@@ -792,9 +793,8 @@ fn windowed_device_type_follows_format_conversion() {
 ///
 /// The surface answer holds without usage only, every texture-typed resource
 /// answers no whatever the usage, and the conversion answer is yes for every
-/// destination the device answers as a render target except L8, which converts
-/// only to itself, since the decode runs in the quad that draws into the
-/// destination.
+/// destination the device answers as a render target, since the decode runs in
+/// the quad that draws into it; L8 is the exception and answers identity only.
 #[test]
 fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
     let h = Harness::factory_only();
@@ -850,7 +850,7 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
             }
         }
 
-        // Every renderable destination except L8, which only converts to itself.
+        // Every renderable destination except L8, which answers identity only.
         let mut converted = 0;
         for target in [
             D3DFMT_A8R8G8B8,
