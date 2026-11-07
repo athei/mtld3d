@@ -82,8 +82,8 @@ env:
   # builds, lints, tests and bundles the ARM64X build, legs i686 and arm64x),
   # macos-15 runs the x86_64 Wine under Rosetta and macos-15-intel runs it
   # natively (the x86_64 mode, legs i686 and x86_64). Every job passes its
-  # image's Wine to the prepare or runner action as `wine`; build, check and
-  # release run on macos-26.
+  # image's Wine to the prepare or runner action as `wine`; build, check,
+  # check-perf and release run on macos-26.
   #
   # The x86_64 release has two bounds. It is cx-26.3.0-2 or later, the first
   # bundle without MoltenVK: with the library, win32u's display-device
@@ -108,20 +108,26 @@ env:
   RUST_NIGHTLY: nightly-2026-10-11
   CARGO_TOOLS: xwin@0.10.0
   NEXTEST_VERSION: 0.9.148
+  # Every job compiles into a fresh target directory that no later job reads,
+  # so incremental state would be written and never used.
+  CARGO_INCREMENTAL: 0
 
-# The shape: two machines compile, everything else replays. `build` makes the
+# The shape: three machines compile, everything else replays. `build` makes the
 # stage every test leg installs and runs from, so the suites fan out over
 # machines that carry no toolchain, the slow Intel image included, and no
-# compile happens twice. `check` runs every lint, doc and unit leg as steps of
-# one job, with the cheap checks first for earlier feedback. A tag push runs
-# only `release`, which reads the result the same commit already got on main.
+# compile happens twice. `check` runs the lint, doc and unit legs as steps of
+# one job, with the cheap checks first for earlier feedback, and `check-perf`
+# runs the `PERF=1` lint and unit legs beside it, since they build into a
+# target directory of their own and would only add to `check`'s length. A tag
+# push runs only `release`, which reads the result the same commit already got
+# on main.
 jobs:
   # Everything a test machine needs, built once on the fast image in the
   # arm64 mode: the i686, x86_64 and ARM64X builds, both unix `.so` builds,
   # the e2e test binaries of both PE arches, and the e2e and conformance
   # runners for both host arches, so one stage serves macos-26's arm64 legs
   # and the x86_64 legs of macos-15 and the Intel image. Primes the caches the
-  # check job restores too.
+  # check jobs restore too.
   #
   # It also decides, once for both test matrices, which images they run on.
   # A pull request runs the two arm64 images and gates on them. The Intel
@@ -214,12 +220,35 @@ jobs:
       - name: clippy-native
         if: ${{ !cancelled() }}
         run: make clippy-native
-      - name: clippy-perf
-        if: ${{ !cancelled() }}
-        run: make clippy-perf
       - name: test-unit
         if: ${{ !cancelled() }}
         run: make test-unit
+
+  # The `PERF=1` legs of `make check`, which build into `target/perf` and so
+  # share no compile with the `check` job: on their own machine they finish
+  # about when `check` does instead of adding to it. `clippy-perf` lints the
+  # native and i686 PE legs, so `pe` is needed for the same reasons as above,
+  # and the arm64 Wine is this image's Wine. No step here links the ARM64X
+  # build, but `prepare` restores llvm-mingw for every arm64-Wine PE leg and
+  # downloads the release it is given on a miss, so the pin goes in too. Like
+  # `check`, every step runs whatever the one before it did, and the job runs
+  # on the same events as `check`.
+  check-perf:
+    if: ${{ !inputs.probe_only && !inputs.intel_only && github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: arm64
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
+      - name: clippy-perf
+        run: make clippy-perf
       - name: test-unit-perf
         if: ${{ !cancelled() }}
         run: make test-unit-perf
