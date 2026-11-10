@@ -140,6 +140,14 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   device take `D3DPOOL_MANAGED_EX` (pool 6) as `D3DPOOL_MANAGED`, and an
   extended device, which refuses `D3DPOOL_MANAGED`, accepts it; such a
   resource reports `D3DPOOL_MANAGED`.
+- Every named export of Windows' `d3d9.dll` apart from the 9On12
+  factories, so a proxy `d3d9.dll` that forwards each name through the
+  address it resolved forwards to null only for those two. `DebugSetMute`,
+  `DebugSetLevel`, `Direct3D9EnableMaximizedWindowedModeShim`, `PSGPError`
+  and `PSGPSampleTexture` do nothing, the two that return a value returning
+  0. Every export Windows' d3d9.dll has sits at the ordinal Windows gives
+  it, on every PE build, and ordinal 16 is the unnamed
+  `Direct3D9ForceHybridEnumeration`, which does nothing either.
 
 ## Not implemented yet
 
@@ -245,9 +253,12 @@ unless its entry says otherwise.
 
 ## Deliberately not implemented
 
-- D3D9On12: `Direct3DCreate9On12` is not exported and there is no bridge
-  behind it. It maps a D3D9 device onto a D3D12 device, which has no
-  counterpart here.
+- D3D9On12: `Direct3DCreate9On12` and `Direct3DCreate9On12Ex` are not
+  exported and there is no bridge behind them. It maps a D3D9 device onto a
+  D3D12 device, which has no counterpart here. An export that created a
+  plain interface would hand a caller that asked for the bridge a device
+  answering `E_NOINTERFACE` for `IDirect3DDevice9On12`, which such a caller
+  does not expect; with no export it sees a d3d9.dll without the bridge.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
   [Fullscreen](../INSTALL.md#fullscreen) section of `INSTALL.md`.
 - Device loss on focus changes: no exclusive mode is taken, so a focus
