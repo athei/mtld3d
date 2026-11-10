@@ -278,6 +278,52 @@ hookable_export! {
     "D3DPERF_GetStatus" => const fn d3dperf_get_status() -> u32 = perf_get_status;
 }
 
+// The rest of the names Windows' d3d9.dll exports, apart from the 9On12
+// factories. Callers resolve them by name: `d3dx9_43.dll` looks up
+// `DebugSetMute` and calls it when found, and a proxy `d3d9.dll` in a game
+// folder exports every name and forwards each through the address it got from
+// this image with no null check, so a missing export becomes a jump to address
+// 0 the moment anything calls the proxy's copy. Each keeps the Windows
+// signature, so on i386 it removes as many argument bytes as its callers
+// expect. None has anything to do here: there is no debug runtime and no
+// processor-specific vertex pipeline.
+
+hookable_export! {
+    /// `DebugSetMute`: silences the debug runtime's output; there is none here.
+    ///
+    /// Takes no arguments, so on i386 it returns with a plain `ret`: `d3dx9`
+    /// pushes one argument and pops it itself after the call.
+    "DebugSetMute" => fn debug_set_mute_export() = debug_set_mute;
+}
+
+hookable_export! {
+    /// `DebugSetLevel`: the debug runtime's output level; `0`, there is no debug runtime.
+    #[must_use]
+    "DebugSetLevel" => fn debug_set_level_export() -> i32 = debug_set_level;
+}
+
+hookable_export! {
+    /// `Direct3D9EnableMaximizedWindowedModeShim`: an application-compatibility switch; `0`.
+    #[must_use]
+    "Direct3D9EnableMaximizedWindowedModeShim" => fn direct3d9_enable_maximized_windowed_mode_shim(enable: u32) -> i32 = enable_maximized_windowed_mode_shim;
+}
+
+hookable_export! {
+    /// `PSGPError`: an error report from a processor-specific vertex pipeline; ignored.
+    "PSGPError" => fn psgp_error_export(vertices: *mut c_void, error: u32, value: u32) = psgp_error;
+}
+
+hookable_export! {
+    /// `PSGPSampleTexture`: a texture fetch for a processor-specific vertex pipeline; does nothing.
+    "PSGPSampleTexture" => fn psgp_sample_texture_export(
+        vertices: *mut c_void,
+        stage: u32,
+        coords: *mut c_void,
+        count: u32,
+        result: *mut c_void,
+    ) = psgp_sample_texture;
+}
+
 extern "system" fn create9(_sdk_version: u32) -> *mut c_void {
     create_interface(false).cast::<c_void>()
 }
@@ -345,6 +391,49 @@ const extern "system" fn perf_set_options(_options: u32) {}
 
 const extern "system" fn perf_get_status() -> u32 {
     0
+}
+
+extern "system" fn debug_set_mute() {
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "DebugSetMute: no debug runtime to mute, no-op"
+    );
+}
+
+extern "system" fn debug_set_level() -> i32 {
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "DebugSetLevel: no debug runtime → 0"
+    );
+    0
+}
+
+extern "system" fn enable_maximized_windowed_mode_shim(_enable: u32) -> i32 {
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "Direct3D9EnableMaximizedWindowedModeShim: no shim to switch → 0"
+    );
+    0
+}
+
+extern "system" fn psgp_error(_vertices: *mut c_void, _error: u32, _value: u32) {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "stub PSGPError: no processor-specific vertex pipeline, ignored"
+    );
+}
+
+extern "system" fn psgp_sample_texture(
+    _vertices: *mut c_void,
+    _stage: u32,
+    _coords: *mut c_void,
+    _count: u32,
+    _result: *mut c_void,
+) {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "stub PSGPSampleTexture: no processor-specific vertex pipeline, nothing sampled"
+    );
 }
 
 // Wires up the PE-side `env_logger` for this cdylib, then fires a

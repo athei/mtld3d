@@ -10,3 +10,8 @@ EXPORTS
     D3DPERF_SetRegion @9
     Direct3DCreate9Ex @17
     Direct3DShaderValidatorCreate9 @16
+    DebugSetLevel
+    DebugSetMute
+    Direct3D9EnableMaximizedWindowedModeShim
+    PSGPError
+    PSGPSampleTexture

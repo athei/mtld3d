@@ -1756,9 +1756,10 @@ dxmt tree its default rules select), so every arm64 Wine key reads 1:
 Wine (cx-26.3.0-7) only the 64-bit test process loads one, so its `x86_64`
 keys read 1 and its `i686` keys 0. Not test-source drift: every leg runs the
 same build of the tests, so the difference is the Wine's own d3d12.
-Exporting a stub `Direct3DCreate9On12` would not clear it: `test_d3d9on12`
-calls the function and checks what it creates, so the failures would move
-there.
+Exporting a stub `Direct3DCreate9On12` would not clear it: with the export
+present, `test_d3d9on12` expects `S_OK` from the device's `QueryInterface`
+for `IDirect3DDevice9On12` at 15228 and calls through the returned pointer
+at 15229, so the test would crash on the NULL interface.
 
 ### device.c/test_d3d9on12
 Sites: 15176=expected
