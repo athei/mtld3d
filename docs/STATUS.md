@@ -145,7 +145,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   address it resolved forwards to null only for those two. `DebugSetMute`,
   `DebugSetLevel`, `Direct3D9EnableMaximizedWindowedModeShim`, `PSGPError`
   and `PSGPSampleTexture` do nothing, the two that return a value returning
-  0.
+  0. Every export Windows' d3d9.dll has sits at the ordinal Windows gives
+  it, on every PE build, and ordinal 16 is the unnamed
+  `Direct3D9ForceHybridEnumeration`, which does nothing either.
 
 ## Not implemented yet
 

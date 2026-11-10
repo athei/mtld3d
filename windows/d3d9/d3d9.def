@@ -1,17 +1,25 @@
+; The exports of d3d9.dll at the ordinals Windows' d3d9.dll gives them.
+;
+; The comment after each entry is the bytes of arguments the stdcall entry
+; takes on i386. build.rs writes the i686 link its own copy of this file with
+; each entry pointed at the decorated symbol (`Name=_Name@N`): rustc exports
+; that symbol itself, and an entry naming the undecorated one would lose its
+; ordinal to rustc's. The x86_64 and ARM64X links read this file as it is.
 LIBRARY D3D9.DLL
 EXPORTS
-    Direct3DCreate9 @2
-    D3DPERF_BeginEvent @3
-    D3DPERF_EndEvent @4
-    D3DPERF_GetStatus @5
-    D3DPERF_QueryRepeatFrame @6
-    D3DPERF_SetMarker @7
-    D3DPERF_SetOptions @8
-    D3DPERF_SetRegion @9
-    Direct3DCreate9Ex @17
-    Direct3DShaderValidatorCreate9 @16
-    DebugSetLevel
-    DebugSetMute
-    Direct3D9EnableMaximizedWindowedModeShim
-    PSGPError
-    PSGPSampleTexture
+    Direct3D9ForceHybridEnumeration @16 NONAME PRIVATE ; 4
+    Direct3DShaderValidatorCreate9 @24 ; 0
+    PSGPError @25 ; 12
+    PSGPSampleTexture @26 ; 20
+    D3DPERF_BeginEvent @27 ; 8
+    D3DPERF_EndEvent @28 ; 0
+    D3DPERF_GetStatus @29 ; 0
+    D3DPERF_QueryRepeatFrame @30 ; 0
+    D3DPERF_SetMarker @31 ; 8
+    D3DPERF_SetOptions @32 ; 4
+    D3DPERF_SetRegion @33 ; 8
+    DebugSetLevel @34 ; 0
+    DebugSetMute @35 ; 0
+    Direct3D9EnableMaximizedWindowedModeShim @36 ; 4
+    Direct3DCreate9 @37 ; 4
+    Direct3DCreate9Ex @38 ; 8

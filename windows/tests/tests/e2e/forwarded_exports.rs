@@ -9,7 +9,9 @@
 //! software-pipeline stubs, and on i386 checks that `DebugSetMute` returns
 //! without popping the argument `d3dx9` pushes and pops itself.
 //! `Direct3DCreate9On12` and `Direct3DCreate9On12Ex` stay unexported, as on a
-//! d3d9.dll without the 9On12 bridge (`docs/STATUS.md`).
+//! d3d9.dll without the 9On12 bridge (`docs/STATUS.md`). Ordinal 16, which
+//! Windows exports with no name (`Direct3D9ForceHybridEnumeration`), resolves
+//! by ordinal and not by that name, and on i386 pops its one argument.
 //!
 //! No shared harness: the point is the export table, as in `d3dperf.rs`.
 
@@ -28,6 +30,10 @@ type ShimFn = unsafe extern "system" fn(u32) -> i32;
 type PsgpErrorFn = unsafe extern "system" fn(*mut c_void, u32, u32);
 type PsgpSampleTextureFn =
     unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut c_void);
+type ForceHybridEnumerationFn = unsafe extern "system" fn(u32);
+
+/// The ordinal of Windows' unnamed `Direct3D9ForceHybridEnumeration`.
+const FORCE_HYBRID_ENUMERATION: u16 = 16;
 
 /// The names Windows' d3d9.dll exports that a forwarding proxy resolves from the layer.
 const FORWARDED: [&CStr; 15] = [
@@ -51,6 +57,14 @@ const FORWARDED: [&CStr; 15] = [
 fn resolve(lib: *mut c_void, name: &CStr) -> *mut c_void {
     // SAFETY: `lib` is a live module handle and the name is NUL-terminated.
     unsafe { GetProcAddress(lib, name.as_ptr()) }
+}
+
+fn resolve_ordinal(lib: *mut c_void, ordinal: u16) -> *mut c_void {
+    // `MAKEINTRESOURCE`: an ordinal is passed as the low word of the name pointer.
+    let by_ordinal = core::ptr::without_provenance::<c_char>(usize::from(ordinal));
+    // SAFETY: `lib` is a live module handle and an ordinal below 0x10000 is a
+    // valid name argument.
+    unsafe { GetProcAddress(lib, by_ordinal) }
 }
 
 #[test]
@@ -109,12 +123,31 @@ fn every_forwarded_export_resolves_and_the_stubs_return() {
         );
     };
 
-    #[cfg(target_arch = "x86")]
-    assert_eq!(
-        stack_drift_with_one_pushed_argument(resolve(lib, c"DebugSetMute")),
-        0,
-        "DebugSetMute popped the argument its caller pushed"
+    let hybrid = resolve_ordinal(lib, FORCE_HYBRID_ENUMERATION);
+    assert!(!hybrid.is_null(), "GetProcAddress(@16)");
+    assert!(
+        resolve(lib, c"Direct3D9ForceHybridEnumeration").is_null(),
+        "ordinal 16 is exported by name, Windows exports it by ordinal only"
     );
+    // SAFETY: ordinal 16 has the one-argument stdcall signature of
+    // `Direct3D9ForceHybridEnumeration`.
+    let force_hybrid: ForceHybridEnumerationFn = unsafe { core::mem::transmute(hybrid) };
+    // SAFETY: the resolved export with its one flag argument.
+    unsafe { force_hybrid(1) };
+
+    #[cfg(target_arch = "x86")]
+    {
+        assert_eq!(
+            stack_drift_when_caller_pops(resolve(lib, c"DebugSetMute")),
+            0,
+            "DebugSetMute popped the argument its caller pushed"
+        );
+        assert_eq!(
+            stack_drift_when_callee_pops(hybrid),
+            0,
+            "ordinal 16 left its stdcall argument on the stack"
+        );
+    }
 
     // SAFETY: balancing the LoadLibrary above.
     assert_ne!(unsafe { FreeLibrary(lib) }, 0, "FreeLibrary(d3d9.dll)");
@@ -126,18 +159,48 @@ fn every_forwarded_export_resolves_and_the_stubs_return() {
 /// ecx`), so a callee that popped the argument itself would leave the caller's
 /// stack four bytes off.
 #[cfg(target_arch = "x86")]
-fn stack_drift_with_one_pushed_argument(f: *mut c_void) -> usize {
+fn stack_drift_when_caller_pops(f: *mut c_void) -> usize {
     let drift: usize;
     // SAFETY: `f` is the resolved `DebugSetMute`, which takes no arguments and
     // touches nothing the caller owns; `edi` is callee-saved, so it holds the
-    // stack pointer across the call.
+    // stack pointer across the call, and `esp` is put back from it before the
+    // block ends, whatever the callee did to it.
     unsafe {
         core::arch::asm!(
             "mov edi, esp",
             "push 0",
             "call {f}",
             "add esp, 4",
-            "sub edi, esp",
+            "mov eax, esp",
+            "mov esp, edi",
+            "sub edi, eax",
+            f = in(reg) f,
+            out("edi") drift,
+            clobber_abi("system"),
+        );
+    }
+    drift
+}
+
+/// The bytes `esp` moved across a stdcall call of `f` with one pushed argument.
+///
+/// The callee of a one-argument stdcall function removes the argument, so
+/// one that did not would leave the caller's stack four bytes off.
+#[cfg(target_arch = "x86")]
+fn stack_drift_when_callee_pops(f: *mut c_void) -> usize {
+    let drift: usize;
+    // SAFETY: `f` is the resolved ordinal 16, which takes one `UINT` and
+    // touches nothing the caller owns; `edi` is callee-saved, so it holds the
+    // stack pointer across the call, and `esp` is put back from it before the
+    // block ends, whatever the callee did to it.
+    unsafe {
+        core::arch::asm!(
+            "mov edi, esp",
+            "push 0",
+            "call {f}",
+            "mov eax, esp",
+            "mov esp, edi",
+            "sub edi, eax",
             f = in(reg) f,
             out("edi") drift,
             clobber_abi("system"),

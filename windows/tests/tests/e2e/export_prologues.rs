@@ -8,12 +8,12 @@
 //! prologue per arch that such decoders know, so this reads them through
 //! `GetProcAddress`, the address a hook engine patches, and compares them
 //! byte for byte. The list of exports is read from `d3d9.def`, so an export
-//! added there as a plain function fails here.
+//! added there as a plain function fails here. Each is resolved by its
+//! ordinal, and a named one by its name too, which has to give the same
+//! address, so an export the link moved to another ordinal fails as well.
 //!
 //! No shared harness: the point is the export table, as in `d3dperf.rs`.
 
-#[cfg(not(target_arch = "aarch64"))]
-use core::ffi::CStr;
 use core::ffi::{c_char, c_void};
 #[cfg(not(target_arch = "aarch64"))]
 use std::ffi::CString;
@@ -26,7 +26,7 @@ unsafe extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
-/// The `.def` file `d3d9.dll` links with: its `EXPORTS` section names every export.
+/// The `.def` file `d3d9.dll` links with: its `EXPORTS` section lists every export and its ordinal.
 #[cfg(not(target_arch = "aarch64"))]
 const D3D9_DEF: &str = include_str!("../../../d3d9/d3d9.def");
 
@@ -68,14 +68,14 @@ fn check_prologues(lib: *mut c_void) {
     assert!(
         exports
             .iter()
-            .any(|name| name.as_c_str() == c"Direct3DCreate9"),
+            .any(|export| export.name.as_deref() == Some(c"Direct3DCreate9")),
         "d3d9.def lists Direct3DCreate9: {exports:?}"
     );
     let wrong: Vec<String> = exports
         .iter()
-        .filter_map(|name| {
-            let found = first_bytes(lib, name);
-            (found != PROLOGUE).then(|| format!("{}: {found:02X?}", name.to_str().unwrap_or("?")))
+        .filter_map(|export| {
+            let found = first_bytes(lib, export);
+            (found != PROLOGUE).then(|| format!("{}: {found:02X?}", export.label()))
         })
         .collect();
     assert!(
@@ -85,29 +85,70 @@ fn check_prologues(lib: *mut c_void) {
     );
 }
 
-/// Every name the `EXPORTS` section of `d3d9.def` lists, the first word of each line.
+/// One entry of the `EXPORTS` section of `d3d9.def`.
 #[cfg(not(target_arch = "aarch64"))]
-fn def_exports() -> Vec<CString> {
+#[derive(Debug)]
+struct DefExport {
+    /// The export's name, `None` for a `NONAME` entry.
+    name: Option<CString>,
+    ordinal: u16,
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+impl DefExport {
+    /// The name the entry has in a failure message.
+    fn label(&self) -> String {
+        let name = self
+            .name
+            .as_ref()
+            .map_or("NONAME", |name| name.to_str().unwrap_or("?"));
+        format!("{name} @{}", self.ordinal)
+    }
+}
+
+/// Every entry the `EXPORTS` section of `d3d9.def` lists: `Name @ordinal [NONAME]`.
+#[cfg(not(target_arch = "aarch64"))]
+fn def_exports() -> Vec<DefExport> {
     let (_, exports) = D3D9_DEF
-        .split_once("EXPORTS")
+        .split_once("\nEXPORTS")
         .expect("d3d9.def has an EXPORTS section");
     exports
         .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(|name| CString::new(name).expect("an export name has no NUL"))
+        .filter_map(|line| {
+            let entry = line.split_once(';').map_or(line, |(entry, _)| entry);
+            let mut fields = entry.split_whitespace();
+            let name = fields.next()?;
+            let ordinal = fields
+                .next()
+                .and_then(|field| field.strip_prefix('@'))
+                .and_then(|ordinal| ordinal.parse().ok())
+                .unwrap_or_else(|| panic!("d3d9.def: {name} has no `@ordinal`"));
+            let named = fields.next() != Some("NONAME");
+            Some(DefExport {
+                name: named.then(|| CString::new(name).expect("an export name has no NUL")),
+                ordinal,
+            })
+        })
         .collect()
 }
 
-/// The first bytes of the export `name`, as many as the prologue has.
+/// The first bytes of `export`, as many as the prologue has.
+///
+/// Resolved by ordinal, and a named export by name too, the two addresses
+/// required to match.
 #[cfg(not(target_arch = "aarch64"))]
-fn first_bytes(lib: *mut c_void, name: &CStr) -> [u8; PROLOGUE.len()] {
-    // SAFETY: `lib` is a live module handle and the name is NUL-terminated.
-    let addr = unsafe { GetProcAddress(lib, name.as_ptr()) };
-    assert!(
-        !addr.is_null(),
-        "GetProcAddress({})",
-        name.to_str().unwrap_or("?")
-    );
+fn first_bytes(lib: *mut c_void, export: &DefExport) -> [u8; PROLOGUE.len()] {
+    // `MAKEINTRESOURCE`: an ordinal is passed as the low word of the name pointer.
+    let by_ordinal = core::ptr::without_provenance::<c_char>(usize::from(export.ordinal));
+    // SAFETY: `lib` is a live module handle and an ordinal below 0x10000 is a
+    // valid name argument.
+    let addr = unsafe { GetProcAddress(lib, by_ordinal) };
+    assert!(!addr.is_null(), "GetProcAddress({})", export.label());
+    if let Some(name) = &export.name {
+        // SAFETY: `lib` is a live module handle and the name is NUL-terminated.
+        let by_name = unsafe { GetProcAddress(lib, name.as_ptr()) };
+        assert_eq!(by_name, addr, "{} by name and by ordinal", export.label());
+    }
     // SAFETY: an export of a loaded image points into its mapped, readable
     // code section, which holds at least the prologue's length past every
     // entry: the function itself or the padding that aligns the next one.

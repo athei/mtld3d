@@ -638,6 +638,7 @@ unix: unix-x64 unix-arm64
 windows-i686:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
+	$(call EXPORT_ORDINAL_GATE,$(OUT_i386)/d3d9.dll)
 	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -b i686-windows --dll $(OUT_i386)/mtld3d.dll
 
@@ -645,6 +646,7 @@ windows-x86_64:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
 	$(call MEM_ROUTINE_GATE,$(OUT_x64))
+	$(call EXPORT_ORDINAL_GATE,$(OUT_x64)/d3d9.dll)
 	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -b x86_64-windows --dll $(OUT_x64)/mtld3d.dll
 
@@ -777,6 +779,7 @@ windows-arm64x:
 	mkdir -p $(OUT_arm64x)
 	$(call arm64x_link,mtld3d,shim/mtld3d.def)
 	$(call arm64x_link,d3d9,d3d9/d3d9.def)
+	$(call EXPORT_ORDINAL_GATE,$(OUT_arm64x)/d3d9.dll)
 	$(WINEBUILD) --builtin $(OUT_arm64x)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_arm64x)/mtld3d.fake.dll -b aarch64-windows -marm64x --dll $(OUT_arm64x)/mtld3d.dll
 	$(call HYBRID_PLACEHOLDER_CHECK,$(OUT_arm64x)/mtld3d.fake.dll)
@@ -1075,6 +1078,37 @@ endef
 
 mem-routine-gate:
 	$(call MEM_ROUTINE_GATE,$(OUT_x64))
+
+# The check that `d3d9.dll` $(1) exports every entry of `windows/d3d9/d3d9.def`
+# at its ordinal, under its name or under none for a `NONAME` entry, in every
+# half of the image (both halves of an ARM64X one). A linker may drop an entry
+# of the `.def` without a word when it does not name the symbol the compiler
+# exports (the i686 link did, until build.rs gave it decorated names), which
+# leaves the export reachable by name at whatever ordinal the linker picked.
+# Exports the `.def` does not list (`DllMain`, the x86_64 memory routines) are
+# not checked. Every PE leg runs it on the image it links.
+define EXPORT_ORDINAL_GATE
+dll=$(1) ; tools=$(PRODUCTION_ASSERT_TOOLS) ; \
+table=$$($$tools/llvm-readobj --coff-exports $$dll) || { echo "export-ordinal-gate: cannot read the exports of $$dll" >&2; exit 1; } ; \
+halves=$$(printf '%s\n' "$$table" | grep -c '^ *Format: COFF-') ; \
+[ -n "$$table" ] && [ "$$halves" -ge 1 ] || { echo "export-ordinal-gate: no export table read from $$dll" >&2; exit 1; } ; \
+actual=$$(printf '%s\n' "$$table" | awk '/Ordinal:/ { ord = $$2; name = "-" } /Name:/ { if (NF > 1) name = $$2 } \
+	/RVA:/ { if ($$2 != "0x0") print ord, name }') ; \
+expected=$$(awk '/^EXPORTS/ { on = 1; next } on { sub(/;.*/, "") } on && NF == 1 { print "none", $$1 } \
+	on && NF >= 2 { ord = $$2; sub(/^@/, "", ord); print ord, ($$3 == "NONAME" ? "-" : $$1) }' windows/d3d9/d3d9.def) ; \
+[ -n "$$expected" ] || { echo "export-ordinal-gate: windows/d3d9/d3d9.def lists no export" >&2; exit 1; } ; \
+printf '%s\n' "$$expected" | while read -r ord name; do \
+	[ "$$ord" != none ] || { echo "export-ordinal-gate: windows/d3d9/d3d9.def gives $$name no ordinal" >&2; exit 1; } ; \
+	found=$$(printf '%s\n' "$$actual" | grep -c -x "$$ord $$name") ; \
+	[ "$$found" = "$$halves" ] || { echo "export-ordinal-gate: $$dll exports ordinal $$ord as $$name in $$found of its $$halves halves, as d3d9.def has it:" >&2; \
+		printf '%s\n' "$$actual" | grep -E "^$$ord |[ ]$$name$$" >&2; exit 1; } ; \
+done || exit 1
+endef
+
+export-ordinal-gate:
+	$(call EXPORT_ORDINAL_GATE,$(OUT_i386)/d3d9.dll)
+	$(call EXPORT_ORDINAL_GATE,$(OUT_x64)/d3d9.dll)
+	$(if $(ARM64X_LEG),$(call EXPORT_ORDINAL_GATE,$(OUT_arm64x)/d3d9.dll))
 
 # The probe every install leaf of the arm64 mode waits for, which make runs
 # once however many leaves an invocation takes.

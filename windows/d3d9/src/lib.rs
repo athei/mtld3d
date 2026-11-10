@@ -309,6 +309,15 @@ hookable_export! {
 }
 
 hookable_export! {
+    /// `Direct3D9ForceHybridEnumeration`: the unnamed export at ordinal 16; does nothing.
+    ///
+    /// Windows exports it by ordinal only, and `d3d9.def` marks it `NONAME`
+    /// likewise. Its name says it forces the enumeration of hybrid-graphics
+    /// adapters; there is one adapter here, so there is nothing to switch.
+    "Direct3D9ForceHybridEnumeration" => fn direct3d9_force_hybrid_enumeration(hybrid: u32) = force_hybrid_enumeration;
+}
+
+hookable_export! {
     /// `PSGPError`: an error report from a processor-specific vertex pipeline; ignored.
     "PSGPError" => fn psgp_error_export(vertices: *mut c_void, error: u32, value: u32) = psgp_error;
 }
@@ -414,6 +423,13 @@ extern "system" fn enable_maximized_windowed_mode_shim(_enable: u32) -> i32 {
         "Direct3D9EnableMaximizedWindowedModeShim: no shim to switch → 0"
     );
     0
+}
+
+extern "system" fn force_hybrid_enumeration(_hybrid: u32) {
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "Direct3D9ForceHybridEnumeration: one adapter, nothing to switch, no-op"
+    );
 }
 
 extern "system" fn psgp_error(_vertices: *mut c_void, _error: u32, _value: u32) {
