@@ -62,7 +62,10 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
-use mtld3d_core::{address_space::FreeSpace, crash_report::PanicLine};
+use mtld3d_core::{
+    address_space::FreeSpace,
+    crash_report::{MEM_COMMIT, PanicLine, image_contains, is_execute_fault},
+};
 use mtld3d_shared::crumb;
 
 // NTSTATUS codes the handler filters on.
@@ -101,6 +104,16 @@ static FOREIGN_REPORTS: AtomicU32 = AtomicU32::new(0);
 /// Some programs probe with deliberate access violations, and every one
 /// of those would otherwise cost a module lookup and a crumb dump.
 const FOREIGN_REPORT_LIMIT: u32 = 4;
+
+/// Byte offset of `Esp` in the i386 `CONTEXT`.
+#[cfg(target_arch = "x86")]
+const CONTEXT_STACK_POINTER: usize = 0xc4;
+/// Byte offset of `Rsp` in the x64 `CONTEXT`, the layout ARM64EC code is handed too.
+#[cfg(any(target_arch = "x86_64", target_arch = "arm64ec"))]
+const CONTEXT_STACK_POINTER: usize = 0x98;
+/// Byte offset of `Lr` in the ARM64 `CONTEXT`.
+#[cfg(target_arch = "aarch64")]
+const CONTEXT_LINK_REGISTER: usize = 0xf8;
 
 /// `MEMORY_BASIC_INFORMATION`, one region of the address space.
 #[repr(C)]
@@ -167,7 +180,6 @@ fn walk_regions(mut visit: impl FnMut(usize, &MemoryBasicInformation)) {
     }
 }
 
-const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_IMAGE: u32 = 0x100_0000;
 const MEM_MAPPED: u32 = 0x4_0000;
@@ -475,7 +487,19 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
         }
         crumb::dump_recent(32);
     } else if possibly_fatal {
-        report_foreign_fault(code, addr);
+        // SAFETY: rec non-null per check.
+        let n_params = unsafe { (*rec).n_params };
+        let fault_address = if n_params >= 2 {
+            // SAFETY: rec non-null per check; the record carries this parameter.
+            unsafe { (*rec).information[1] }
+        } else {
+            0
+        };
+        let execute = code == STATUS_ACCESS_VIOLATION
+            && is_execute_fault(n_params, fault_address, addr as usize);
+        // SAFETY: ep non-null per check.
+        let context = unsafe { (*ep).context };
+        report_foreign_fault(code, addr, execute, context);
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -487,36 +511,22 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
 /// first few faults get the owning module's path and our most recent API
 /// crumbs, which is usually enough to tell "the game dereferenced what we
 /// returned" from "unrelated".
-fn report_foreign_fault(code: u32, addr: *mut c_void) {
+///
+/// An execute fault (`execute`) at an address no module holds, a call or
+/// jump through a null or stale pointer, names no module, and the line then
+/// also names the caller: `caller=` with the address it would return to and
+/// `caller_module=` and `caller_base=` with the module holding that. A data
+/// fault in code no module holds (a hook trampoline, unpacked protector
+/// code) gets no caller fields, since the top of its stack is no return
+/// address.
+fn report_foreign_fault(code: u32, addr: *mut c_void, execute: bool, context: *mut c_void) {
     if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
         return;
     }
-    // The lookup and the file name each take Wine's loader lock for the
-    // walk of the module list (`RtlPcToFileHeader` and `LdrGetDllFullName`
-    // enter `loader_section` in `dlls/ntdll/loader.c`). The lock is a critical
-    // section, so a fault on the thread that holds it re-enters it, and the
-    // report costs this only for the first few foreign faults. The handle is
-    // borrowed: without UNCHANGED_REFCOUNT every report would add a reference
-    // the faulting module never loses.
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: kernel32 export; `addr` is only used as a lookup key.
-    let found = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            addr.cast::<u8>(),
-            &raw mut module,
-        )
-    };
-    // The wide form: the ANSI one converts through a buffer it allocates on
-    // the process heap.
+    let module = module_holding(addr as usize);
     let mut path = [0u16; 260];
-    let path_len = if found == 0 || module.is_null() {
-        0
-    } else {
-        // SAFETY: kernel32 export writing at most `path.len()` UTF-16 units.
-        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), 260) }
-    };
-    let mut buf = [0u8; 1024];
+    // Room for two module paths of `path`'s length.
+    let mut buf = [0u8; 2048];
     let mut pos = 0;
     push(
         &mut buf,
@@ -526,20 +536,168 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     push_hex(&mut buf, &mut pos, u64::from(code));
     push(&mut buf, &mut pos, b" addr=");
     push_hex(&mut buf, &mut pos, addr as usize as u64);
-    push(&mut buf, &mut pos, b" module=");
-    if path_len == 0 {
-        push(&mut buf, &mut pos, b"?");
-    } else {
-        let n = (path_len as usize).min(path.len());
-        push_utf16(&mut buf, &mut pos, &path[..n]);
-        push(&mut buf, &mut pos, b" base=");
-        push_hex(&mut buf, &mut pos, module as usize as u64);
+    push_module(
+        &mut buf,
+        &mut pos,
+        &mut path,
+        module,
+        b" module=",
+        b" base=",
+    );
+    if execute && module.is_none() {
+        push(&mut buf, &mut pos, b" caller=");
+        match caller_address(context) {
+            Some(caller) => {
+                push_hex(&mut buf, &mut pos, caller as u64);
+                push_module(
+                    &mut buf,
+                    &mut pos,
+                    &mut path,
+                    module_holding(caller),
+                    b" caller_module=",
+                    b" caller_base=",
+                );
+            }
+            None => push(&mut buf, &mut pos, b"?"),
+        }
     }
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     // A first chance: the fault may be handled, so the line opens no log.
     crate::log_sink::write_fault(&buf[..pos]);
     crumb::dump_recent(16);
+}
+
+/// The module whose image holds `addr`, or `None` when no image does.
+///
+/// `GetModuleHandleEx` answers a null address with the main executable, so a
+/// null address is ruled out first. For any other address the loader bounds
+/// it against each module's extent itself (`LdrFindEntryForAddress`), so the
+/// module's own headers, which a protector may have wiped, are not read.
+///
+/// The lookup takes Wine's loader lock for the walk of the module list
+/// (`RtlPcToFileHeader` enters `loader_section` in `dlls/ntdll/loader.c`).
+/// The lock is a critical section, so a fault on the thread that holds it
+/// re-enters it, and the report costs this only for the first few foreign
+/// faults. The handle is borrowed: without `UNCHANGED_REFCOUNT` every report
+/// would add a reference the faulting module never loses.
+fn module_holding(addr: usize) -> Option<*mut c_void> {
+    if addr == 0 {
+        return None;
+    }
+    let mut module: *mut c_void = core::ptr::null_mut();
+    // SAFETY: kernel32 export; `addr` is only used as a lookup key.
+    let found = unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const u8,
+            &raw mut module,
+        )
+    };
+    (found != 0 && !module.is_null()).then_some(module)
+}
+
+/// Append `label` and the path of `module`, then `base_label` and its base, or `label` and `?`.
+///
+/// `path` is the scratch the file name is read into. The wide form, since
+/// the ANSI one converts through a buffer it allocates on the process heap;
+/// it takes the loader lock as [`module_holding`] does.
+fn push_module(
+    buf: &mut [u8],
+    pos: &mut usize,
+    path: &mut [u16; 260],
+    module: Option<*mut c_void>,
+    label: &[u8],
+    base_label: &[u8],
+) {
+    let path_len = module.map_or(0, |module| {
+        // SAFETY: kernel32 export writing at most `path.len()` UTF-16 units.
+        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), 260) }
+    });
+    push(buf, pos, label);
+    let Some(module) = module.filter(|_| path_len != 0) else {
+        push(buf, pos, b"?");
+        return;
+    };
+    let n = (path_len as usize).min(path.len());
+    push_utf16(buf, pos, &path[..n]);
+    push(buf, pos, base_label);
+    push_hex(buf, pos, module as usize as u64);
+}
+
+/// Where the code that reached the faulting pc returns to, from the faulting thread's context.
+///
+/// On x86 the word at the top of the stack: a call leaves its return address
+/// there, and so does the call into a stub that jumps on through a table (a
+/// proxy DLL's `jmp [slot]` with a null slot). `None` when the stack pointer
+/// does not point at readable memory.
+///
+/// On ARM64EC this is right for an emulated x64 caller. A `blr` through a
+/// null pointer from native ARM64EC code leaves its return address in `Lr`
+/// (offset 0x120 of the x64-layout context), not at `[Sp]`, so that case
+/// reports whatever word the stack holds.
+#[cfg(not(target_arch = "aarch64"))]
+fn caller_address(context: *mut c_void) -> Option<usize> {
+    read_stack_word(context_register(context, CONTEXT_STACK_POINTER)?)
+}
+
+/// Where the code that reached the faulting pc returns to, from the faulting thread's context.
+///
+/// On ARM64 the link register, which a branch with link sets.
+#[cfg(target_arch = "aarch64")]
+const fn caller_address(context: *mut c_void) -> Option<usize> {
+    context_register(context, CONTEXT_LINK_REGISTER)
+}
+
+/// The pointer-sized register at byte `offset` of the `CONTEXT` the handler was given.
+const fn context_register(context: *mut c_void, offset: usize) -> Option<usize> {
+    if context.is_null() {
+        return None;
+    }
+    let register = context
+        .cast::<u8>()
+        .wrapping_add(offset)
+        .cast::<[u8; size_of::<usize>()]>();
+    // SAFETY: the system hands the handler a whole `CONTEXT` of this
+    // architecture, which holds a pointer-sized register at `offset`.
+    Some(usize::from_ne_bytes(unsafe { register.read() }))
+}
+
+/// The word at `addr` on the faulting thread's stack, or `None` when it cannot be read.
+///
+/// The stack pointer of a faulting thread may be anything, so the region
+/// that holds it has to be committed and readable before the read.
+#[cfg(not(target_arch = "aarch64"))]
+fn read_stack_word(addr: usize) -> Option<usize> {
+    let mut info = MemoryBasicInformation {
+        base_address: core::ptr::null_mut(),
+        allocation_base: core::ptr::null_mut(),
+        allocation_protect: 0,
+        region_size: 0,
+        state: 0,
+        protect: 0,
+        kind: 0,
+    };
+    // SAFETY: kernel32 export filling a struct of the size passed; `addr` is
+    // only used as a query key.
+    let got = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &raw mut info,
+            size_of::<MemoryBasicInformation>(),
+        )
+    };
+    let region = mtld3d_core::crash_report::QueriedRegion::new(
+        info.base_address as usize,
+        info.region_size,
+        info.state,
+        info.protect,
+    );
+    if got == 0 || !mtld3d_core::crash_report::readable_span(&region, addr, size_of::<usize>()) {
+        return None;
+    }
+    // SAFETY: the word lies in committed, readable memory, per the query above.
+    Some(unsafe { (addr as *const usize).read_unaligned() })
 }
 
 /// Append the free address space so a crash line carries it.
@@ -566,7 +724,7 @@ fn fault_in_our_dll(addr: *mut c_void) -> bool {
     let Some(size) = (unsafe { mtld3d_shared::identity::image_size(base) }) else {
         return false;
     };
-    (addr as usize).wrapping_sub(base) < size
+    image_contains(base, size, addr as usize)
 }
 
 /// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.

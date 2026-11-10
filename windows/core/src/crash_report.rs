@@ -25,6 +25,12 @@
 //! [`PanicLine`] is the line std's default panic hook prints to stderr,
 //! which a game a launcher spawned has nowhere to show, formatted for the
 //! process's log without allocating.
+//!
+//! [`is_execute_fault`] and [`readable_span`] are the checks `d3d9.dll`'s
+//! exception handler makes before it names the caller of a fault at an
+//! address no module holds: whether the fault was the instruction fetch,
+//! and whether the faulting thread's stack pointer can be read.
+//! [`image_contains`] is its test for a pc inside its own image.
 
 use core::{fmt::Write, panic::Location};
 
@@ -48,6 +54,19 @@ const PANIC_LINE_CAPACITY: usize = 2048;
 
 /// What ends a [`PanicLine`] whose message did not fit, in place of the line break.
 const PANIC_LINE_TRUNCATED: &str = " [truncated]\n";
+
+/// `MEMORY_BASIC_INFORMATION.State` of a committed region.
+pub const MEM_COMMIT: u32 = 0x1000;
+
+/// `PAGE_GUARD`: the first touch of the page raises an exception.
+const PAGE_GUARD: u32 = 0x100;
+
+/// The base protections that allow a read.
+///
+/// `PAGE_READONLY`, `PAGE_READWRITE`, `PAGE_WRITECOPY`, `PAGE_EXECUTE_READ`,
+/// `PAGE_EXECUTE_READWRITE` and `PAGE_EXECUTE_WRITECOPY`; `PAGE_NOACCESS` and
+/// `PAGE_EXECUTE` are left out.
+const PAGE_READABLE: u32 = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
 
 /// What the process's log sink knows when a crash report arrives.
 pub enum SinkState {
@@ -251,6 +270,67 @@ impl PanicLine {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.buf[..self.len]
+    }
+}
+
+/// One region of a PE process's address space, as `VirtualQuery` describes it.
+pub struct QueriedRegion {
+    base: usize,
+    size: usize,
+    state: u32,
+    protect: u32,
+}
+
+impl QueriedRegion {
+    /// The region of `size` bytes at `base`, with its `State` and `Protect` fields.
+    #[must_use]
+    pub const fn new(base: usize, size: usize, state: u32, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            state,
+            protect,
+        }
+    }
+}
+
+/// Whether an access violation at `pc` was the fetch of the instruction there.
+///
+/// `fault_address` is `ExceptionInformation[1]`, the address the access
+/// failed on, valid when the record carries at least two parameters. It
+/// equals the pc only when the fetch itself faulted; a data access from the
+/// same pc names the data's address.
+#[must_use]
+pub const fn is_execute_fault(n_params: u32, fault_address: usize, pc: usize) -> bool {
+    n_params >= 2 && fault_address == pc
+}
+
+/// Whether `addr` lies in the image of `size` bytes loaded at `base`.
+///
+/// A null `base` holds nothing, and neither does an address below it.
+#[must_use]
+pub const fn image_contains(base: usize, size: usize, addr: usize) -> bool {
+    base != 0 && addr.wrapping_sub(base) < size
+}
+
+/// Whether the `len` bytes at `addr` lie in `region` and can be read without a fault.
+///
+/// The region has to be committed, with a protection that allows a read and
+/// no guard page, which raises an exception on the first touch.
+#[must_use]
+pub const fn readable_span(region: &QueriedRegion, addr: usize, len: usize) -> bool {
+    if region.state != MEM_COMMIT
+        || region.protect & PAGE_GUARD != 0
+        || region.protect & PAGE_READABLE == 0
+    {
+        return false;
+    }
+    let Some(offset) = addr.checked_sub(region.base) else {
+        return false;
+    };
+    match offset.checked_add(len) {
+        Some(end) => end <= region.size,
+        None => false,
     }
 }
 

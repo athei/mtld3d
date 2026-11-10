@@ -10,11 +10,17 @@
 //! `__TEXT` maps no file offset 0. The panic-line tests pin std's wording,
 //! the stand-in for a payload that is not a string, the cut of a message
 //! too long for the buffer, and that a finished line takes no more text.
+//! The last tests pin an image's extent, that a stack word is read only from
+//! committed, readable memory it lies wholly inside, and that only a fault on
+//! the pc itself counts as an execute fault.
 
 use super::*;
 
 /// `LC_UUID`, a load command that is not a segment.
 const LC_UUID: u32 = 0x1b;
+
+/// `PAGE_READWRITE`, the protection of a thread's stack.
+const PAGE_READWRITE: u32 = 0x04;
 
 /// One `LC_SEGMENT_64` as the linker writes it: name, addresses, file extent.
 struct Segment {
@@ -386,4 +392,75 @@ fn a_finished_panic_line_takes_no_more_text() {
     assert!(!line.implements_write());
     let cursor = &WriteProbe::<LineCursor<'_>>(core::marker::PhantomData);
     assert!(cursor.implements_write());
+}
+
+#[test]
+fn an_image_holds_only_the_addresses_inside_its_extent() {
+    let (exe_base, exe_size) = (0x40_0000, 0x1_0000);
+    assert!(!image_contains(exe_base, exe_size, 0));
+    assert!(image_contains(exe_base, exe_size, exe_base));
+    assert!(image_contains(exe_base, exe_size, exe_base + exe_size - 1));
+    assert!(!image_contains(exe_base, exe_size, exe_base + exe_size));
+    assert!(!image_contains(exe_base, exe_size, exe_base - 1));
+    assert!(!image_contains(0, usize::MAX, 0));
+}
+
+/// A committed stack region of two pages at `0x10_0000` with protection `protect`.
+const fn stack_region(protect: u32) -> QueriedRegion {
+    QueriedRegion::new(0x10_0000, 0x2000, MEM_COMMIT, protect)
+}
+
+#[test]
+fn a_stack_word_reads_only_from_committed_readable_memory() {
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_EXECUTE: u32 = 0x10;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const MEM_RESERVE: u32 = 0x2000;
+    let word = size_of::<usize>();
+    assert!(readable_span(
+        &stack_region(PAGE_READWRITE),
+        0x10_0ff0,
+        word
+    ));
+    assert!(readable_span(
+        &stack_region(PAGE_EXECUTE_READ),
+        0x10_0ff0,
+        word
+    ));
+    assert!(!readable_span(
+        &stack_region(PAGE_NOACCESS),
+        0x10_0ff0,
+        word
+    ));
+    assert!(!readable_span(&stack_region(PAGE_EXECUTE), 0x10_0ff0, word));
+    assert!(!readable_span(
+        &stack_region(PAGE_READWRITE | PAGE_GUARD),
+        0x10_0ff0,
+        word
+    ));
+    let reserved = QueriedRegion::new(0x10_0000, 0x2000, MEM_RESERVE, PAGE_READWRITE);
+    assert!(!readable_span(&reserved, 0x10_0ff0, word));
+}
+
+#[test]
+fn a_stack_word_has_to_lie_wholly_inside_the_region() {
+    let region = stack_region(PAGE_READWRITE);
+    assert!(readable_span(&region, 0x10_0000, 4));
+    assert!(readable_span(&region, 0x10_1ffc, 4));
+    assert!(!readable_span(&region, 0x10_1ffd, 4));
+    assert!(!readable_span(&region, 0x0f_fffc, 4));
+    assert!(!readable_span(&region, usize::MAX - 1, 4));
+    // A span past the top of the address space, from a region at zero.
+    let whole = QueriedRegion::new(0, usize::MAX, MEM_COMMIT, PAGE_READWRITE);
+    assert!(!readable_span(&whole, usize::MAX - 1, 4));
+}
+
+#[test]
+fn only_a_fault_on_the_pc_itself_is_an_execute_fault() {
+    // A jump to null: the fetch at 0 faulted.
+    assert!(is_execute_fault(2, 0, 0));
+    // A data read of null from code at a private address.
+    assert!(!is_execute_fault(2, 0, 0x1234_5000));
+    // A record without the address parameter says nothing.
+    assert!(!is_execute_fault(0, 0, 0));
 }
