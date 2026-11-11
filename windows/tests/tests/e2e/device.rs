@@ -1818,6 +1818,15 @@ pub fn running_as(child_name: &str) -> bool {
         .is_some_and(|name| name == child_name)
 }
 
+/// Where a workload child puts a shown window, one place per process.
+///
+/// The windows of two suites running at once then do not cover each other,
+/// and a window that covers nothing of another keeps displaying.
+pub fn per_process_window_origin() -> (i32, i32) {
+    let slot = i32::try_from(std::process::id() % 32).expect("below 32");
+    (64 + (slot % 8) * 96, 64 + (slot / 8) * 96)
+}
+
 /// The log filter a workload child runs under unless it needs more: unix-side info records.
 const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 

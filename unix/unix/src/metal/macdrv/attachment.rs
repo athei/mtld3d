@@ -162,8 +162,10 @@ pub struct Attachment {
     color_space: ColorSpacePolicy,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
     ///
-    /// Written on the main thread, compared against the notification's own
-    /// live object, never dereferenced. `0` while the view has no window.
+    /// Written on the main thread, at attach and by every reconciliation that
+    /// finds the view in another window (Wine moves a client view when its
+    /// window is reparented), compared against the notification's own live
+    /// object, never dereferenced. `0` while the view has no window.
     window: AtomicUsize,
     /// Whether the layer currently carries the EDR configuration.
     ///
@@ -175,11 +177,12 @@ pub struct Attachment {
     hdr_active: AtomicBool,
     /// Whether the window is fully occluded (covered or minimised).
     ///
-    /// Seeded at attach and updated by the occlusion observer, both on the
-    /// main thread; read by `submit_frame` per present to skip the
-    /// `nextDrawable` acquire while nothing reaches the screen. Relaxed is
-    /// enough: a one-frame lag at the transition is harmless and bounded by
-    /// the retained `allowsNextDrawableTimeout` safety valve.
+    /// Seeded from the window whenever the window pointer is written
+    /// ([`Attachment::follow_window`]), and updated by the occlusion
+    /// observer, all on the main thread; read by `submit_frame` per present
+    /// to skip the `nextDrawable` acquire while nothing reaches the screen.
+    /// Relaxed is enough: a one-frame lag at the transition is harmless and
+    /// bounded by the retained `allowsNextDrawableTimeout` safety valve.
     window_occluded: AtomicBool,
     /// Live EDR headroom as `f32::to_bits`, published by the main thread.
     ///
@@ -369,8 +372,15 @@ impl Attachment {
         self.window.load(Ordering::Relaxed)
     }
 
-    pub fn set_window(&self, window: usize) {
+    /// Point the record at `window`, the view's window now, and seed its occlusion.
+    ///
+    /// The two go together: the observer only reports changes, so a window
+    /// the record starts watching is read once here. `0` is no window, which
+    /// a caller pairs with not occluded so that no present is suppressed on
+    /// a guess. **Main thread only**, like the observer that writes them too.
+    pub fn follow_window(&self, window: usize, occluded: bool) {
         self.window.store(window, Ordering::Relaxed);
+        self.window_occluded.store(occluded, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -874,11 +884,23 @@ pub fn request_cursor_kick_all() {
 /// `1.0` until the first refresh lands, which is still correct for the HDR
 /// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve.
 pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
+    count_present(att);
+    att.headroom()
+}
+
+/// Count one present, and queue the record's main-thread reconciliation when it is due.
+///
+/// Every present counts, whether it reaches a drawable or is skipped because
+/// the window is occluded: the reconciliation is also what re-reads the
+/// view's window, and a view Wine moved out of an occluded window would
+/// otherwise never be found in the shown one. Never touches `AppKit`, and
+/// queues through the asynchronous door, so the presenting thread may call
+/// it with no lock held.
+pub fn count_present(att: &Arc<Attachment>) {
     if att.begin_headroom_refresh() {
         let att = Arc::clone(att);
         super::run_on_main_thread_async(move || super::refresh_attachment_on_main(&att));
     }
-    att.headroom()
 }
 
 #[cfg(test)]

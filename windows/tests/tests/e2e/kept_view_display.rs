@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use mtld3d_tests::{Harness, HarnessConfig, set_window_pos};
 use mtld3d_types::{D3D_OK, D3DPRESENT_INTERVAL_IMMEDIATE};
 
-use crate::device::{logged_lines, run_in_private_log_child, running_as};
+use crate::device::{
+    logged_lines, per_process_window_origin, run_in_private_log_child, running_as,
+};
 
 /// The name the workload child runs under.
 const CHILD_NAME: &str = "kept-view-display.exe";
@@ -75,14 +77,8 @@ fn shown_window() -> Harness {
         config_entries: FRAME_CAP_ENTRY,
         ..HarnessConfig::default()
     });
-    let slot = i32::try_from(std::process::id() % 32).expect("below 32");
-    set_window_pos(
-        h.hwnd(),
-        64 + (slot % 8) * 96,
-        64 + (slot / 8) * 96,
-        640,
-        480,
-    );
+    let (x, y) = per_process_window_origin();
+    set_window_pos(h.hwnd(), x, y, 640, 480);
     h.make_topmost();
     h
 }

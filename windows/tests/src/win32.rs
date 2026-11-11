@@ -81,6 +81,8 @@ unsafe extern "system" {
     fn SetPropA(hwnd: usize, name: *const c_char, data: usize) -> i32;
     fn GetPropA(hwnd: usize, name: *const c_char) -> usize;
     fn RemovePropA(hwnd: usize, name: *const c_char) -> usize;
+    fn SetParent(hwnd: usize, parent: usize) -> usize;
+    fn ShowWindow(hwnd: usize, cmd: i32) -> i32;
 }
 
 // `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
@@ -458,6 +460,8 @@ const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 /// `WS_POPUP` — no frame; what a fullscreen device window becomes.
 pub const WS_POPUP: u32 = 0x8000_0000;
+/// `WS_CHILD`: a window inside its parent's client area.
+pub const WS_CHILD: u32 = 0x4000_0000;
 /// `WS_CAPTION` — title bar; dropped for a fullscreen device window.
 pub const WS_CAPTION: u32 = 0x00C0_0000;
 /// `WS_EX_TOPMOST` — above every non-topmost window.
@@ -564,8 +568,6 @@ pub fn create_styled_window(
     visible: bool,
     window_style: &WindowStyle,
 ) -> usize {
-    const WS_CHILD: u32 = 0x4000_0000;
-
     register_class();
     // SAFETY: Win32 thunk; null module name returns the current process handle.
     let instance = unsafe { GetModuleHandleA(core::ptr::null()) };
@@ -970,10 +972,40 @@ pub fn harness_window_proc() -> usize {
 }
 
 /// `GetWindowLongA` — one of a window's `GWL_*` longs, as a bit mask.
+#[must_use]
 pub fn window_long(hwnd: usize, index: i32) -> u32 {
     // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
     // index is one of the documented constants.
     unsafe { GetWindowLongA(hwnd, index) }.cast_unsigned()
+}
+
+/// `SetWindowLongA`: replace one of a window's `GWL_*` longs with the bit mask `value`.
+pub fn set_window_long(hwnd: usize, index: i32, value: u32) {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is one of the documented constants. The previous value it
+    // returns is not needed.
+    unsafe { SetWindowLongA(hwnd, index, value.cast_signed()) };
+}
+
+/// `SetParent`: make `hwnd` a child of `parent`.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for two windows this process created means
+/// one of them is already destroyed or `parent` is a descendant of `hwnd`.
+pub fn set_parent(hwnd: usize, parent: usize) {
+    // SAFETY: Win32 thunk; both handles are windows this process created.
+    let previous = unsafe { SetParent(hwnd, parent) };
+    assert_ne!(previous, 0, "SetParent({hwnd:#x}, {parent:#x}) failed");
+}
+
+/// `ShowWindow`: show `hwnd` without activating it, or hide it.
+pub fn show_window(hwnd: usize, visible: bool) {
+    const SW_HIDE: i32 = 0;
+    const SW_SHOWNA: i32 = 8;
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created. The
+    // return value is the previous visibility, not a failure.
+    unsafe { ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE }) };
 }
 
 /// `GetClientRect` — a window's client area, origin (0, 0).
@@ -1480,6 +1512,11 @@ pub fn activation() -> Activation {
 /// A window a background process shows opens behind the active application's
 /// windows, which can leave it fully covered; a topmost one stays above them
 /// while its process is inactive.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
 pub fn make_topmost(hwnd: usize) {
     const HWND_TOPMOST: usize = usize::MAX;
     const SWP_NOSIZE: u32 = 0x0001;
