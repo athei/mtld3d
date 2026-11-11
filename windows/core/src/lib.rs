@@ -87,6 +87,7 @@ pub mod shader_constants;
 pub mod shader_create;
 pub mod shader_key;
 pub mod shader_prewarm;
+pub mod shared_texture;
 pub mod snapshot;
 pub mod staging_coverage;
 pub mod startup_work;

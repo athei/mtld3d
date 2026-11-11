@@ -36,6 +36,7 @@ mod cursor_resize;
 mod d3d9ex;
 mod d3d9ex_reset;
 mod d3d9ex_resources;
+mod d3d9ex_shared_texture;
 mod d3dperf;
 mod device;
 mod draw;

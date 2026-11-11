@@ -98,6 +98,7 @@ fn batch_creation_keeps_views_and_ordered_clears_after_pool_drain() {
         for (descriptor, view) in descriptors.iter().zip(&mut views) {
             assert!(autoreleasepool(|_| super::create_textures(
                 &device,
+                None,
                 core::slice::from_ref(descriptor),
                 core::slice::from_mut(view),
                 &mut clears,
@@ -132,7 +133,13 @@ fn batch_creation_keeps_views_and_ordered_clears_after_pool_drain() {
             assert_eq!(read_first_pixel(&queue, texture, 0, 0), [0, 0, 255, 255]);
         }
         assert_eq!(committed.status(), MTLCommandBufferStatus::Completed);
-        assert!(super::create_textures(&device, &[], &mut [], &mut clears));
+        assert!(super::create_textures(
+            &device,
+            None,
+            &[],
+            &mut [],
+            &mut clears
+        ));
         assert!(clears.commit(queue_handle, TRANSPARENT_BLACK).is_none());
     });
 }

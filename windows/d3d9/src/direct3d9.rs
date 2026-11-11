@@ -1156,35 +1156,17 @@ const unsafe fn display_mode_ex_field(mode: *const c_void, offset: usize) -> u32
 
 /// Read the adapter LUID the driver reports, or allocate one when it reports none.
 fn read_adapter_luid() -> (u32, i32) {
-    let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
-        device_name: [0; 32],
-        adapter: 0,
-        adapter_luid: LUID {
-            low_part: 0,
-            high_part: 0,
-        },
-        vid_pn_source_id: 0,
-    };
-    for (slot, unit) in open
-        .device_name
-        .iter_mut()
-        .zip(PRIMARY_DISPLAY_NAME.encode_utf16())
-    {
-        *slot = unit;
-    }
-    // SAFETY: gdi32 export; `open` is a live, initialised struct of the
-    // documented layout whose name is NUL-terminated (the array is zeroed past it).
-    let status = unsafe { D3DKMTOpenAdapterFromGdiDisplayName(&raw mut open) };
-    if status == 0 {
-        let close = D3dkmtCloseAdapter {
-            adapter: open.adapter,
-        };
-        // SAFETY: gdi32 export; `close` names the adapter handle just opened.
-        unsafe { D3DKMTCloseAdapter(&raw const close) };
-        if open.adapter_luid.low_part != 0 || open.adapter_luid.high_part != 0 {
-            return (open.adapter_luid.low_part, open.adapter_luid.high_part);
+    let opened = open_primary_kmt_adapter();
+    let status = match opened {
+        Ok(adapter) => {
+            close_kmt_adapter(adapter.handle);
+            if adapter.luid_low != 0 || adapter.luid_high != 0 {
+                return (adapter.luid_low, adapter.luid_high);
+            }
+            0
         }
-    }
+        Err(status) => status,
+    };
     let mut allocated = LUID {
         low_part: 0,
         high_part: 0,
@@ -1651,6 +1633,56 @@ struct D3dkmtOpenAdapterFromGdiDisplayName {
 #[repr(C)]
 struct D3dkmtCloseAdapter {
     adapter: u32,
+}
+
+/// The D3DKMT adapter of the primary display, as an open hands it out.
+pub struct KmtAdapter {
+    /// The adapter handle, which the caller closes or keeps.
+    pub handle: u32,
+    pub luid_low: u32,
+    pub luid_high: i32,
+}
+
+/// Open the D3DKMT adapter of the primary display.
+///
+/// # Errors
+///
+/// The `NTSTATUS` of the open when the display driver hands no adapter out.
+pub fn open_primary_kmt_adapter() -> Result<KmtAdapter, u32> {
+    let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
+        device_name: [0; 32],
+        adapter: 0,
+        adapter_luid: LUID {
+            low_part: 0,
+            high_part: 0,
+        },
+        vid_pn_source_id: 0,
+    };
+    for (slot, unit) in open
+        .device_name
+        .iter_mut()
+        .zip(PRIMARY_DISPLAY_NAME.encode_utf16())
+    {
+        *slot = unit;
+    }
+    // SAFETY: gdi32 export; `open` is a live, initialised struct of the
+    // documented layout whose name is NUL-terminated (the array is zeroed past it).
+    let status = unsafe { D3DKMTOpenAdapterFromGdiDisplayName(&raw mut open) };
+    if status != 0 {
+        return Err(status);
+    }
+    Ok(KmtAdapter {
+        handle: open.adapter,
+        luid_low: open.adapter_luid.low_part,
+        luid_high: open.adapter_luid.high_part,
+    })
+}
+
+/// Close a D3DKMT adapter an open handed out.
+pub fn close_kmt_adapter(adapter: u32) {
+    let close = D3dkmtCloseAdapter { adapter };
+    // SAFETY: gdi32 export; `close` names an adapter handle the caller opened.
+    unsafe { D3DKMTCloseAdapter(&raw const close) };
 }
 
 /// Client-area pixel dimensions of `hwnd`, or `None` when the call fails or the rect is empty.

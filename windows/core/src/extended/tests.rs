@@ -108,9 +108,14 @@ fn buffers_outside_the_default_pool_take_no_user_memory() {
 }
 
 #[test]
-fn a_shared_default_pool_resource_is_not_available() {
+fn a_shared_default_pool_resource_is_a_texture_or_not_available() {
+    for levels in [0, 1, 4] {
+        assert_eq!(
+            shared_handle_verdict(&CreateKind::Texture { levels }, D3DPOOL_DEFAULT, true, true),
+            SharedHandleVerdict::Shared
+        );
+    }
     for kind in [
-        CreateKind::Texture { levels: 1 },
         CreateKind::CubeTexture,
         CreateKind::VolumeTexture,
         CreateKind::VertexBuffer,

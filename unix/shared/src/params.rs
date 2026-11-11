@@ -3,8 +3,8 @@ use super::{
     mtl::{
         BufferKind, ClientSurfaceRequest, ColorSpacePolicy, CursorOverlayFlags, DestroyKind,
         DeviceCapsFlags, LoadAction, PixelFormat, PresentDebugFlags, PresentWaitPolicy,
-        SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
-        VertexStepFunction,
+        SharedTextureOp, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle, TextureUsage,
+        VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -721,6 +721,60 @@ pub struct CreateColorTargetParams {
 
 impl Thunk for CreateColorTargetParams {
     const CODE: u32 = Thunks::CreateColorTarget as u32;
+}
+
+/// Bytes of [`SharedTextureParams::name`]: a bootstrap service name and its terminator.
+///
+/// The record behind a shared handle carries the name in 54 bytes; two more
+/// keep the field a multiple of eight.
+pub const SHARED_TEXTURE_NAME_LEN: usize = 56;
+
+/// Create, open or forget the Metal texture behind a D3D9 shared texture.
+///
+/// A texture two Direct3D runtimes share is one `MTLTexture` storage both
+/// wrap (`newSharedTextureWithDescriptor:`), named between them by the Mach
+/// port of its `MTLSharedTextureHandle`, registered with the bootstrap server
+/// under `name`. `CreateTexture` has to answer with a handle or a failure, so
+/// this thunk makes the texture inside that call and parks it on the device
+/// record under `tex_id`; the encoder adopts it when the texture's creation
+/// reaches it (`TextureCreateFlags::SHARED`).
+#[repr(C, align(8))]
+pub struct SharedTextureParams {
+    pub device_handle: MetalHandle<MTLDeviceKind>, // in
+    /// The device whose record parks the texture until its encoder adopts it.
+    pub record_handle: DeviceRecordHandle, // in
+    /// The mtld3d texture id the parked texture is filed under.
+    pub tex_id: u64, // in
+    pub op: SharedTextureOp,                       // in
+    /// `Create`: the extent to allocate. `Open`: the extent the caller expects.
+    pub width: u32, // in
+    pub height: u32,                               // in
+    /// `Create`: the format to allocate. `Open`: the format the caller expects.
+    pub pixel_format: PixelFormat, // in
+    /// The usage of the D3D9 texture, which an opened texture has to allow.
+    pub usage: TextureUsage, // in
+    pub pad0: u32,
+    /// The NUL-terminated service name: out for `Create`, in for `Open`.
+    pub name: [u8; SHARED_TEXTURE_NAME_LEN], // in/out
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<SharedTextureParams>() == 104);
+    assert!(core::mem::align_of::<SharedTextureParams>() == 8);
+    assert!(core::mem::offset_of!(SharedTextureParams, device_handle) == 0);
+    assert!(core::mem::offset_of!(SharedTextureParams, record_handle) == 8);
+    assert!(core::mem::offset_of!(SharedTextureParams, tex_id) == 16);
+    assert!(core::mem::offset_of!(SharedTextureParams, op) == 24);
+    assert!(core::mem::offset_of!(SharedTextureParams, width) == 28);
+    assert!(core::mem::offset_of!(SharedTextureParams, height) == 32);
+    assert!(core::mem::offset_of!(SharedTextureParams, pixel_format) == 36);
+    assert!(core::mem::offset_of!(SharedTextureParams, usage) == 40);
+    assert!(core::mem::offset_of!(SharedTextureParams, pad0) == 44);
+    assert!(core::mem::offset_of!(SharedTextureParams, name) == 48);
+};
+
+impl Thunk for SharedTextureParams {
+    const CODE: u32 = Thunks::SharedTexture as u32;
 }
 
 /// One native texture creation description.

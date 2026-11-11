@@ -121,7 +121,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   `IDirect3DDevice9Ex` whose swap chain is an `IDirect3DSwapChain9Ex`. An
   extended device refuses `D3DPOOL_MANAGED`, takes a `pSharedHandle` on a
   single-level system-memory texture or offscreen plain surface as user
-  memory, reports `WHQLLevel` 1 and a `GetAvailableTextureMem` that does not
+  memory and on a default-pool texture as a share (below), reports
+  `WHQLLevel` 1 and a `GetAvailableTextureMem` that does not
   shrink, and accepts the FLIPEX and OVERLAY swap effects and up to 30 back
   buffers: they pass validation, and the device presents through one back
   buffer as it does for the other swap effects. Its `Reset` and `ResetEx`
@@ -140,6 +141,18 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   device take `D3DPOOL_MANAGED_EX` (pool 6) as `D3DPOOL_MANAGED`, and an
   extended device, which refuses `D3DPOOL_MANAGED`, accepts it; such a
   resource reports `D3DPOOL_MANAGED`.
+- D3D9Ex shared textures. `CreateTexture` on an extended device's default
+  pool with a `pSharedHandle` shares a single-level A8R8G8B8 or X8R8G8B8
+  texture, with no usage or `D3DUSAGE_RENDERTARGET`: a slot holding null
+  receives the handle of a new shared texture, and a slot holding a handle
+  opens the texture it names. The handle is a D3DKMT global handle whose
+  runtime data names the Mach port of a shared Metal texture, which is what
+  DXMT, the Direct3D 11 of an arm64 Wine, hands out from
+  `IDXGIResource::GetSharedHandle` and takes in
+  `ID3D11Device::OpenSharedResource`, so a texture either runtime creates
+  the other opens, as a game does that draws its interface in Direct3D 11
+  and composites it in D3D9Ex. Both runtimes use one storage and nothing
+  copies. What is not there is under "Not implemented yet".
 - Every named export of Windows' `d3d9.dll` apart from the 9On12
   factories, so a proxy `d3d9.dll` that forwards each name through the
   address it resolved forwards to null only for those two. `DebugSetMute`,
@@ -229,9 +242,23 @@ unless its entry says otherwise.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
-- D3D9Ex shared resources: a `pSharedHandle` on a default-pool create of an
-  extended device answers `D3DERR_NOTAVAILABLE`, and `Caps2` leaves
-  `CANSHARERESOURCE` off. The `D3DFMT_D32_LOCKABLE` and `D3DFMT_S8_LOCKABLE`
+- D3D9Ex shared resources other than a 2D texture: a `pSharedHandle` on a
+  default-pool cube or volume texture, buffer, render target, depth-stencil
+  or offscreen plain surface of an extended device answers
+  `D3DERR_NOTAVAILABLE`, and so does a shared texture with a mip chain, a
+  usage other than `D3DUSAGE_RENDERTARGET`, or a format other than A8R8G8B8
+  and X8R8G8B8. `Caps2` leaves `CANSHARERESOURCE` off, since the bit
+  promises every kind. A shared texture has four limits of its own. Only a
+  handle whose runtime data is the record DXMT writes opens; one another
+  Direct3D runtime made answers `D3DERR_NOTAVAILABLE`, and an NT handle
+  `D3DERR_INVALIDCALL`. The handle of a texture created here names it only
+  until the creating device releases the texture, where D3D9 keeps a shared
+  resource alive for as long as anything has it open; a texture opened
+  before that keeps its storage. A keyed mutex the record names is not
+  acquired, warned once. And nothing orders the two runtimes' work beyond
+  the order they submit it in, so a reader that needs a frame complete has
+  the writer wait for its own event query first.
+  The `D3DFMT_D32_LOCKABLE` and `D3DFMT_S8_LOCKABLE`
   depth formats are refused on extended devices as on plain ones, as DXVK
   refuses both on every device.
 - SM3 relative addressing of anything but the float constants: an input

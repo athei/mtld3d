@@ -507,6 +507,18 @@ pub enum DestroyKind {
     ComputePipeline = 7,
 }
 
+/// What a `SharedTexture` thunk does with the texture id it names.
+#[repr(u32)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum SharedTextureOp {
+    /// Allocate a shared texture, register its Mach port and return the name.
+    Create = 0,
+    /// Look the named Mach port up and wrap the texture behind it.
+    Open = 1,
+    /// Release the parked texture of an id the encoder never adopted.
+    Forget = 2,
+}
+
 /// `MTLTextureSwizzle` wire encoding for per-channel texture-view swizzles.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
@@ -743,6 +755,16 @@ bitflags! {
         /// as black: an effect target composited in full but only ever drawn
         /// into in part must not carry another resource's content.
         const CLEAR_ON_CREATE = 1 << 3;
+        /// The texture's storage is the one the `SharedTexture` thunk made or opened.
+        ///
+        /// Set for a `D3DPOOL_DEFAULT` texture an extended device created or
+        /// opened through a `pSharedHandle`. Its `MTLTexture` already exists,
+        /// parked on the device record under the texture's id, because the
+        /// handle had to be answered inside `CreateTexture`. The encoder
+        /// adopts that object instead of allocating one, never clears it and
+        /// never replaces it with a new version, since another Direct3D
+        /// runtime draws into the same storage.
+        const SHARED = 1 << 4;
     }
 }
 

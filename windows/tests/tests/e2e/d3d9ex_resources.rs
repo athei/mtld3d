@@ -7,10 +7,10 @@
 //! written. A `pSharedHandle` on a single-level
 //! system-memory texture or offscreen plain surface is user memory, copied
 //! into the level once at its row pitch; any other shape is an invalid call,
-//! a system-memory buffer takes none, and a shared default-pool resource is
-//! not available. A plain device refuses every shared handle with
-//! `E_NOTIMPL`. The extended surface creates take only the restriction
-//! usages, the texture memory figure does not shrink, the frame latency is
+//! a system-memory buffer takes none, and a shared default-pool resource
+//! other than a 2D texture is not available. A plain device refuses every
+//! shared handle with `E_NOTIMPL`. The extended surface creates take only the
+//! restriction usages, the texture memory figure does not shrink, the frame latency is
 //! stored and reported, and Reset takes FLIPEX and 30 back buffers. Source's
 //! upload path, `UpdateSurface` from system memory into a default-pool DXT
 //! texture and a cube face, works on it, and so do the extended extras:
@@ -36,7 +36,7 @@ use mtld3d_types::{
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
 
-fn extended() -> Harness {
+pub fn extended() -> Harness {
     Harness::create(&HarnessConfig {
         factory: Factory::Extended,
         ..HarnessConfig::default()
@@ -44,7 +44,7 @@ fn extended() -> Harness {
 }
 
 /// Draw `texture` over the whole back buffer and read its centre.
-fn sample_center(h: &Harness, texture: &Texture<'_>) -> u32 {
+pub fn sample_center(h: &Harness, texture: &Texture<'_>) -> u32 {
     const W: u32 = 0xFFFF_FFFF;
     let quad = [
         (-1.0, 1.0, 0.0, 0.0),
@@ -381,16 +381,24 @@ fn a_plain_device_refuses_every_shared_handle_with_e_notimpl() {
 }
 
 #[test]
-fn a_shared_default_pool_resource_is_not_available_on_an_extended_device() {
+fn a_shared_default_pool_resource_other_than_a_texture_is_not_available() {
     let h = extended();
     let mut slot: *mut c_void = core::ptr::null_mut();
     // SAFETY: the slot holds null, a request to share, so nothing is read through it.
     let handle = &unsafe { SharedHandle::to(&mut slot) };
+    // The texture create comes first and shares (`d3d9ex_shared_texture.rs`
+    // has its rules); the creates after it find its handle in the slot, which
+    // none of them reads.
     for (index, answer) in shared_creates(&h, D3DPOOL_DEFAULT, handle)
         .into_iter()
         .enumerate()
     {
-        assert_eq!(answer, (D3DERR_NOTAVAILABLE, true), "create {index}");
+        let expected = if index == 0 {
+            (D3D_OK, false)
+        } else {
+            (D3DERR_NOTAVAILABLE, true)
+        };
+        assert_eq!(answer, expected, "create {index}");
     }
     for (index, answer) in shared_target_creates(&h, handle).into_iter().enumerate() {
         assert_eq!(answer, (D3DERR_NOTAVAILABLE, true), "target create {index}");

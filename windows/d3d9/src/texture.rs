@@ -188,6 +188,8 @@ pub struct TextureInner {
     metal_pixel_format: PixelFormat,
     /// Packed boolean attributes — see [`TextureFlags`].
     flags: TextureFlags,
+    /// The D3DKMT resource behind the handle a shared create handed out, 0 for every other texture.
+    shared_resource: u32,
     swizzle: Option<[Swizzle; 4]>,
     /// Metal usage bits for the backing texture.
     ///
@@ -2339,6 +2341,14 @@ impl TextureInner {
         true
     }
 
+    /// Record the D3DKMT resource a shared create made for this texture.
+    ///
+    /// The texture's final release destroys it, which retires the handle
+    /// the application was given.
+    pub const fn set_shared_resource(&mut self, resource: u32) {
+        self.shared_resource = resource;
+    }
+
     /// Drop the link to the owning `DeviceInner` because the device is being released.
     ///
     /// Called by `device_release` rc==0 for every entry in `live_textures`.
@@ -2444,6 +2454,10 @@ impl TextureInner {
                 flags.set(
                     mtld3d_shared::mtl::TextureCreateFlags::TYPE_CUBE,
                     self.flags.contains(TextureFlags::CUBE),
+                );
+                flags.set(
+                    mtld3d_shared::mtl::TextureCreateFlags::SHARED,
+                    self.flags.contains(TextureFlags::SHARED),
                 );
                 flags
             },
@@ -3537,6 +3551,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         d3d_format: info.d3d_format,
         metal_pixel_format: info.metal_pixel_format,
         flags,
+        shared_resource: 0,
         swizzle: info.swizzle,
         usage_flags: info.usage_flags,
         state_block_refs: 0,
@@ -3825,6 +3840,23 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
         log::debug!(
             target: crate::LOG_TARGET,
             "target texture destroyed: {texture_id:?} ptr={this:p}"
+        );
+    }
+
+    // A shared texture gives back its share whether or not its device is
+    // still there: the D3DKMT resource behind the handle it was created
+    // with, and, while the device lives, the storage no encoder adopted.
+    if ti.flags.contains(TextureFlags::SHARED) {
+        let record_handle = if dev_inner_raw == 0 {
+            mtld3d_shared::record_handle::DeviceRecordHandle::NULL
+        } else {
+            DeviceInner::from_ptr(dev_inner_raw).record_handle()
+        };
+        crate::shared_texture::release(
+            ti.device_handle,
+            record_handle,
+            texture_id.raw(),
+            ti.shared_resource,
         );
     }
 
