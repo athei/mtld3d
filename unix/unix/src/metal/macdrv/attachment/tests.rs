@@ -23,7 +23,9 @@
 //! only the newest one is asked to show its surface again when Wine hides its
 //! client view. They pin, too, when a window that reads visible counts as
 //! displaying nothing: after a run of undisplayed paced presents, until the
-//! next displayed one.
+//! next displayed one. And they pin that a record following its view into
+//! another window takes that window's occlusion in place of the old one's,
+//! and that a view in no window clears both the window and the occlusion.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -267,12 +269,11 @@ fn derived_state_is_per_record() {
     let a = register(view_a, view_a + 8, &latches(AttachFlags::empty(), 1, None));
     let b = register(view_b, view_b + 8, &latches(AttachFlags::empty(), 1, None));
     a.set_hdr_active(true);
-    a.set_window_occluded(true);
+    a.follow_window(view_a + 0xF00, true);
     a.set_headroom(2.5);
     a.set_last_logged_headroom(2.5);
     a.set_min_present_duration(1.0 / 120.0);
     a.set_backing_scale(2);
-    a.set_window(view_a + 0xF00);
     a.set_pacing_bits(pack_pacing(&PresentPacing {
         vsync_requested: false,
         max_fps: 0,
@@ -307,6 +308,49 @@ fn derived_state_is_per_record() {
 
     unregister(view_a);
     unregister(view_b);
+}
+
+#[test]
+fn following_a_shown_window_clears_the_old_windows_occlusion() {
+    let view = test_address_block();
+    let (old, new) = (view + 0xA00, view + 0xB00);
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
+
+    att.follow_window(old, false);
+    att.set_window_occluded(true);
+    assert!(
+        att.window_occluded(),
+        "the old window's observer covered it"
+    );
+    att.follow_window(new, false);
+    assert_eq!(
+        att.window(),
+        new,
+        "the record watches the window the view is in now"
+    );
+    assert!(
+        !att.window_occluded(),
+        "the shown window's state replaces the old window's"
+    );
+
+    unregister(view);
+}
+
+#[test]
+fn following_into_no_window_clears_the_pointer_and_the_occlusion() {
+    let view = test_address_block();
+    let att = register(view, view + 8, &latches(AttachFlags::empty(), 1, None));
+
+    att.follow_window(view + 0xA00, true);
+    assert!(att.window_occluded());
+    att.follow_window(0, false);
+    assert_eq!(att.window(), 0, "no window to match notifications against");
+    assert!(
+        !att.window_occluded(),
+        "a view in no window never suppresses a present"
+    );
+
+    unregister(view);
 }
 
 #[test]

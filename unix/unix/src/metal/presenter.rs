@@ -925,13 +925,19 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         return true;
     }
     // Read again after the hold: a window shown meanwhile takes this present.
-    if attachment.as_ref().is_some_and(|att| att.window_occluded()) && !state.present_occluded {
+    if let Some(att) = attachment.as_ref().filter(|att| att.window_occluded())
+        && !state.present_occluded
+    {
         // Window fully occluded: the compositor is not recycling drawables,
         // so `nextDrawable` would block its full timeout for nothing that
         // reaches the screen. The render work committed already; the frame
         // is simply not shown. `debug.presentOccluded` presents anyway, so
         // the test suite, whose windows stay hidden, runs this path.
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
+        // The skipped present still counts towards the reconciliation that
+        // re-reads the view's window: Wine may have moved the view out of
+        // the occluded window into a shown one. No lock is held here.
+        attachment::count_present(att);
         drop_occluded(state, seq);
         return true;
     }

@@ -187,42 +187,80 @@ pub fn declare_latency_critical_activity() {
 /// recycling its drawables, so `nextDrawable` would block its full
 /// `allowsNextDrawableTimeout` for nothing on screen and back-pressure the
 /// whole pipeline up to the guest's render loop. Records the window pointer
-/// on `att` and seeds its occlusion from the current state, then installs
-/// the (process-lifetime) observer once. The client view the metal view sits
-/// in gets a watch of its own ([`client_view_watch::watch`]), which asks the
-/// device to have Wine show its surface again when Wine hides it. Runs the
-/// `AppKit` work on the main thread: `NSView`/`NSWindow` access and the
-/// notification center are main-thread affairs, mirroring
+/// on `att` and seeds its occlusion from the current state
+/// ([`follow_view_window`], which every reconciliation runs again), and
+/// installs the (process-lifetime) observers once. The client view the metal
+/// view sits in gets a watch of its own ([`client_view_watch::watch`]), which
+/// asks the device to have Wine show its surface again when Wine hides it.
+/// Runs the `AppKit` work on the main thread: `NSView`/`NSWindow` access and
+/// the notification center are main-thread affairs, mirroring
 /// [`configure_metal_layer`]'s posture. The record is registered before this
 /// runs, so the observers can already find it.
 fn install_window_tracking(att: &Arc<Attachment>) {
-    use objc2_app_kit::NSWindowOcclusionState;
-
     let att = Arc::clone(att);
     run_on_main_thread_sync(move || {
         let mtm = MainThreadMarker::new().expect("install_window_tracking runs on the main thread");
-        let view = attachment::retain_view(&att, mtm);
-        if let Some(view) = &view {
-            client_view_watch::watch(&att, view, mtm);
+        if let Some(view) = attachment::retain_view(&att, mtm) {
+            client_view_watch::watch(&att, &view, mtm);
+            follow_view_window(&att, &view);
         }
-        let window = view.and_then(|view| view.window());
-        let Some(window) = window else {
-            // No host window yet: assume visible so a present is never
-            // wrongly suppressed; the observer corrects it on the first
-            // state change.
-            att.set_window(0);
-            att.set_window_occluded(false);
-            return;
-        };
-        att.set_window(Retained::as_ptr(&window) as usize);
-        let occluded = !window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::Visible);
-        att.set_window_occluded(occluded);
+        // Installed whether or not the view has a window yet: a reconciliation
+        // points the record at the window the view gets later, and the
+        // observer has to be there to match it from then on.
         install_occlusion_observer_once();
         install_screen_params_filter(mtm);
         cursor_overlay::install_pointer_watch(mtm);
     });
+}
+
+/// Point `att` at the window `view` is in now, and seed its occlusion. **Main thread only.**
+///
+/// The window is not fixed at attach: Wine's Mac driver moves a client view,
+/// and the metal view in it, into another Cocoa window when the device
+/// window becomes a child (its own Cocoa window is destroyed) or moves to
+/// another toplevel. The occlusion observer matches notifications by the
+/// window the record holds, so a record left on the old window would miss
+/// every change of the new one. A view in no window clears the pointer and
+/// counts as not occluded, so a present is never suppressed on a guess; the
+/// next reconciliation that finds a window seeds it. The same window keeps
+/// the value the observer last wrote.
+fn follow_view_window(att: &Attachment, view: &objc2_app_kit::NSView) {
+    use objc2_app_kit::NSWindowOcclusionState;
+
+    let window = view.window();
+    let current = window
+        .as_ref()
+        .map_or(0, |window| Retained::as_ptr(window) as usize);
+    let stored = att.window();
+    let Some(current) = window_change(stored, current) else {
+        return;
+    };
+    let occluded = window.as_ref().is_some_and(|window| {
+        !window
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible)
+    });
+    att.follow_window(current, occluded);
+    info!(
+        target: LOG_TARGET,
+        "present: metal view {:#x} of window {:#x} follows Cocoa window {current:#x}, was \
+         {stored:#x} (occluded {occluded})",
+        att.view(),
+        att.hwnd(),
+    );
+}
+
+/// The window a record has to follow its view into, `None` while it holds that window already.
+///
+/// `stored` is the window address the record holds and `current` the one the
+/// view sits in now, `0` for none. Compared by address, as
+/// [`kept_view_is_in_window`] compares a kept view's window.
+const fn window_change(stored: usize, current: usize) -> Option<usize> {
+    if stored == current {
+        None
+    } else {
+        Some(current)
+    }
 }
 
 /// Count of `NSApplicationDidChangeScreenParametersNotification` deliveries.
@@ -2349,10 +2387,11 @@ fn refresh_all_on_main() {
 /// the top. Logs the drift line here too, for the same reason, since naming
 /// the screen means walking to it again.
 ///
-/// The walk ends on whichever screen the window is on *now*, so it is also
-/// where everything the display decides is reconciled against that screen
-/// for this record: the layer's own configuration
-/// ([`follow_screen_layer_mode`]), the present throttle
+/// The walk starts from whichever window the view is in *now*, which the
+/// record follows ([`follow_view_window`]), and ends on whichever screen that
+/// window is on now, so it is also where everything the display decides is
+/// reconciled against that screen for this record: the layer's own
+/// configuration ([`follow_screen_layer_mode`]), the present throttle
 /// ([`follow_screen_present_throttle`]), the backing scale the PE side
 /// consumes ([`follow_layer_backing_scale`]) and the window layers a covering
 /// metal view hides ([`clear_covered_window_layers`]). A record that was
@@ -2370,6 +2409,7 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     // the recurring main-thread pass, so it is where the install is retried;
     // once it has landed the retry is one relaxed load.
     install_screen_params_filter(mtm);
+    follow_view_window(att, &view_obj);
     let screen = view_obj
         .window()
         .and_then(|w| w.screen())

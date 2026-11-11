@@ -11,6 +11,12 @@
 //! reconciliation with the panel unchanged, so both directions of that flip
 //! and the user cap that holds through it are pinned there too.
 //!
+//! `window_change` decides whether a reconciliation re-points a record at
+//! the window its view sits in now, which Wine changes when it reparents the
+//! device window. The tests pin a move between windows, a view that left its
+//! window, a view found in its first one, and the case that keeps the
+//! occlusion the observer last wrote.
+//!
 //! `screen_params_filter_step` decides what one attempt to take
 //! `NSApplicationDidChangeScreenParametersNotification` over from Wine does.
 //! The tests pin all three outcomes, and in particular that an attempt made
@@ -79,7 +85,7 @@ use super::{
     KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
     ScreenParamsFilterStep, backing_scale_change, backing_scale_from, first_null_required_entry,
     layer_mode_change, layer_mode_for, min_present_duration_change, pick_orphan, rect_covers,
-    run_through_wine, screen_params_filter_step,
+    run_through_wine, screen_params_filter_step, window_change,
 };
 use crate::metal::layer::{PresentPacing, min_present_duration};
 
@@ -318,6 +324,27 @@ fn staying_on_one_display_never_republishes_the_scale() {
 fn moving_between_displays_of_different_scale_republishes() {
     assert_eq!(backing_scale_change(2, 1.0), Some(1));
     assert_eq!(backing_scale_change(1, 2.0), Some(2));
+}
+
+#[test]
+fn a_view_moved_into_another_window_repoints_the_record() {
+    assert_eq!(window_change(0xA000, 0xB000), Some(0xB000));
+}
+
+#[test]
+fn a_view_that_left_its_window_clears_the_record() {
+    assert_eq!(window_change(0xA000, 0), Some(0));
+}
+
+#[test]
+fn a_view_found_in_its_first_window_points_the_record_at_it() {
+    assert_eq!(window_change(0, 0xA000), Some(0xA000));
+}
+
+#[test]
+fn a_view_still_in_its_window_keeps_the_observers_state() {
+    assert_eq!(window_change(0xA000, 0xA000), None);
+    assert_eq!(window_change(0, 0), None);
 }
 
 #[test]
