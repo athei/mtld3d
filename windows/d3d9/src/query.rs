@@ -316,7 +316,11 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
             // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
             // live `DeviceInner` and is kept alive by the device.
             let dev = unsafe { &*inner.device_inner };
-            inner.end_seq.store(dev.current_seq(), Ordering::Release);
+            let seq = mtld3d_core::query_fence::event_end_seq(
+                dev.current_seq(),
+                dev.recorded_since_swap(),
+            );
+            inner.end_seq.store(seq, Ordering::Release);
         }
         return D3D_OK;
     }
