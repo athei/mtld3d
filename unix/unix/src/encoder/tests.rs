@@ -241,16 +241,35 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     use super::{FramePayload, SUBMIT_PAYLOAD_CAP};
 
     const FRAMES: usize = 48;
-    const WARM_FRAMES: usize = 8;
+    // Each frame up to the one after the last payload's creation records into a fresh
+    // arena: the encoder's own, then one per payload.
+    const WARM_FRAMES: usize = SUBMIT_PAYLOAD_CAP as usize + 1;
     let (work_tx, work_rx) = mpsc::sync_channel::<FramePayload>(1);
     let (return_tx, return_rx) = mpsc::channel::<FramePayload>();
+    // The encoder creates a payload only when none has come back, so a later one
+    // would otherwise appear whenever the submit thread first lags, and bring a cold
+    // arena into a late frame. Holding the first payload until the last one exists
+    // makes them all enter in the first frames. That works up to a cap of 3: the held
+    // payload and the one in the channel's slot leave room for one more creation
+    // before a send blocks.
+    const {
+        assert!(
+            SUBMIT_PAYLOAD_CAP <= 3,
+            "above 3, the third payload's send blocks before the held first one is released"
+        );
+    }
+    let (release_tx, release_rx) = mpsc::channel::<()>();
     // Stands in for the submit thread: it reads a payload and hands the whole of it back.
     let submit = std::thread::spawn(move || {
+        let mut hold = Some(release_rx);
         while let Ok(payload) = work_rx.recv() {
             assert!(
                 payload.scratch.bytes_used() > 0,
                 "the frame's snapshots rode along"
             );
+            if let Some(release) = hold.take() {
+                release.recv().unwrap();
+            }
             if return_tx.send(payload).is_err() {
                 break;
             }
@@ -261,6 +280,7 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     let mut pass_state = PassState::new();
     let mut pool: Vec<FramePayload> = Vec::new();
     let mut created = 0_u32;
+    let mut release = Some(release_tx);
     let mut seen = BTreeSet::new();
     let snapshot = vec![0x5a_u8; 30 * 1024];
     for frame in 0..FRAMES {
@@ -297,6 +317,13 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
                 returned
             }
         });
+        // Released before the send: with the first payload held and another in the
+        // channel's one slot, the send would wait on the submit thread.
+        if created == SUBMIT_PAYLOAD_CAP
+            && let Some(release) = release.take()
+        {
+            release.send(()).unwrap();
+        }
         payload.adopt_frame_buffers(&mut live, &mut blits);
         work_tx.send(payload).unwrap();
     }
@@ -306,9 +333,10 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
         returned.clear(&mut pass_state);
         pool.push(returned);
     }
-    // The encoder's arena and at most two payloads' arenas exist, each warmed to two chunks.
+    // The encoder's arena and every payload's arena exist, each warmed to two chunks.
     let arenas = pool.iter().map(|payload| &payload.scratch).chain([&live]);
     let chunk_total = arenas.map(ScratchArena::chunk_count).sum::<u32>();
+    assert_eq!(created, SUBMIT_PAYLOAD_CAP);
     assert_eq!(pool.len(), usize::try_from(created).unwrap());
     assert_eq!(chunk_total, 2 * (created + 1));
     assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
