@@ -203,6 +203,25 @@ pub struct Mtld3dConfig {
     /// every frame and the real fence serialises its CPU and GPU work. File
     /// key: `query.eventImmediate`.
     pub query_event_immediate: bool,
+    /// Keep occlusion culling without a per-frame GPU wait.
+    ///
+    /// The open frame is handed to the GPU early, at the first colour
+    /// render-target change after an occlusion `Issue(END)`, so the queries
+    /// retire while the rest of the frame is still recorded. A pending, ended
+    /// query read with FLUSH then answers its real count when its submit has
+    /// retired, after at most `query.occlusionWaitUs` of polling per presented
+    /// frame; otherwise the permissive `u32::MAX` ("visible"), never a count
+    /// that is not the retired result of that exact issue. No GPU wait, no
+    /// `S_FALSE` spin. Default: `false`.
+    /// File key: `query.occlusionEarlySubmit`.
+    pub query_occlusion_early_submit: bool,
+    /// Per-presented-frame polling budget, in microseconds, for `query.occlusionEarlySubmit`.
+    ///
+    /// Bounds how long the API thread yields while an occlusion read waits
+    /// for its early submit to retire; `0` never waits. Capped at
+    /// [`MAX_OCCLUSION_WAIT_US`]. Default: `500`. File key:
+    /// `query.occlusionWaitUs`.
+    pub query_occlusion_wait_us: u32,
     /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
     ///
     /// D3D9-era drivers commonly backed all equal-size depth-stencil
@@ -412,6 +431,8 @@ impl Default for Mtld3dConfig {
             present_occluded: false,
             query_flush_immediate: false,
             query_event_immediate: false,
+            query_occlusion_early_submit: false,
+            query_occlusion_wait_us: DEFAULT_OCCLUSION_WAIT_US,
             depth_alias_same_size: false,
             buffer_ignore_lock_bounds: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
@@ -585,6 +606,12 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: query.occlusionEarlySubmit = {} (wait budget {} us/frame)",
+        cfg.query_occlusion_early_submit,
+        cfg.query_occlusion_wait_us
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: depth.aliasSameSize = {}", cfg.depth_alias_same_size
     );
     info!(
@@ -694,6 +721,12 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.presentOccluded" => assign_bool(source, key, value, &mut cfg.present_occluded),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "query.eventImmediate" => assign_bool(source, key, value, &mut cfg.query_event_immediate),
+        "query.occlusionEarlySubmit" => {
+            assign_bool(source, key, value, &mut cfg.query_occlusion_early_submit);
+        }
+        "query.occlusionWaitUs" => {
+            assign_occlusion_wait_us(source, value, &mut cfg.query_occlusion_wait_us);
+        }
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "buffer.ignoreLockBounds" => {
             assign_bool(source, key, value, &mut cfg.buffer_ignore_lock_bounds);
@@ -931,6 +964,24 @@ fn parse_hex_list(value: &str) -> Vec<u64> {
         })
         .collect()
 }
+
+fn assign_occlusion_wait_us(source: &str, value: &str, slot: &mut u32) {
+    if let Ok(us) = value.parse::<u32>() {
+        *slot = us.min(MAX_OCCLUSION_WAIT_US);
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'query.occlusionWaitUs = {value}' is not a microsecond count → kept {}",
+            *slot
+        );
+    }
+}
+
+/// Default `query.occlusionWaitUs`: a small fraction of a 60 Hz frame.
+pub const DEFAULT_OCCLUSION_WAIT_US: u32 = 500;
+
+/// Upper bound of `query.occlusionWaitUs`, so the read can never turn back into a frame-long wait.
+pub const MAX_OCCLUSION_WAIT_US: u32 = 4000;
 
 fn unquote(value: &str) -> &str {
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {

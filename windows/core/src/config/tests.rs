@@ -248,6 +248,33 @@ fn query_event_immediate_round_trips_true() {
 }
 
 #[test]
+fn query_occlusion_early_submit_defaults_off_and_parses() {
+    let cfg = parse(None, "", None);
+    assert!(!cfg.query_occlusion_early_submit);
+    assert_eq!(
+        cfg.query_occlusion_wait_us,
+        crate::config::DEFAULT_OCCLUSION_WAIT_US
+    );
+    let cfg = parse(
+        None,
+        "query.occlusionEarlySubmit = true\nquery.occlusionWaitUs = 250\n",
+        None,
+    );
+    assert!(cfg.query_occlusion_early_submit);
+    assert_eq!(cfg.query_occlusion_wait_us, 250);
+    let cfg = parse(None, "query.occlusionWaitUs = 999999\n", None);
+    assert_eq!(
+        cfg.query_occlusion_wait_us,
+        crate::config::MAX_OCCLUSION_WAIT_US
+    );
+    let cfg = parse(None, "query.occlusionWaitUs = soon\n", None);
+    assert_eq!(
+        cfg.query_occlusion_wait_us,
+        crate::config::DEFAULT_OCCLUSION_WAIT_US
+    );
+}
+
+#[test]
 fn depth_alias_same_size_defaults_off_and_round_trips() {
     let cfg = parse(None, "", None);
     assert!(!cfg.depth_alias_same_size);

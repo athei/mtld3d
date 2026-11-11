@@ -374,6 +374,7 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         // *open* query has none however far the GPU has got).
         let generation = core.mark_end_requested();
         inner.end_seq.store(dev.current_seq(), Ordering::Release);
+        dev.note_occlusion_end();
         dev.push_control(crate::device::EndVisibilityOp { core, generation });
     }
     dev.encoder_status().map_or_else(|hr| hr, |()| D3D_OK)
@@ -495,6 +496,67 @@ extern "system" fn query_get_data(
                         // `Self::new` from a live `DeviceInner` and is kept
                         // alive by the device.
                         let dev = unsafe { &*device_inner_ptr };
+                        if dev.config().query_occlusion_early_submit && core.end_requested() {
+                            // `query.occlusionEarlySubmit`.
+                            // The counting draws normally went to the GPU
+                            // early, at the target change after them. If
+                            // their submit retired (polling at most the
+                            // frame's small budget), fold the result in;
+                            // that intake runs on the encoder thread after
+                            // the frames handed to it, with no GPU wait
+                            // because the seq has already retired. The
+                            // answer is the real count only when the core
+                            // reports `Issued`, which it does only for the
+                            // generation issued last; anything else answers
+                            // "visible" rather than a stale or zero count.
+                            // SAFETY: as above; the device outlives the query.
+                            let dev = unsafe { &mut *inner.device_inner };
+                            let end_seq = inner.end_seq.load(Ordering::Acquire);
+                            {
+                                let _wait = mtld3d_core::perf::CycleAddTimer::start(
+                                    dev.perf_mut().query_wait_cycles_ptr(),
+                                );
+                                if mtld3d_core::query_fence::end_in_recording_frame(
+                                    end_seq,
+                                    dev.current_seq(),
+                                ) && let Err(hr) = dev.flush_current_frame_async()
+                                {
+                                    return hr;
+                                }
+                                if core.status() != QueryStatus::Issued
+                                    && dev.early_occlusion_retired(end_seq)
+                                    && dev.early_occlusion_intake_due(end_seq)
+                                {
+                                    if let Err(hr) = dev.hurry_presentation() {
+                                        return hr;
+                                    }
+                                    if let Err(hr) = dev.encoder_intake_visibility_for(end_seq) {
+                                        return hr;
+                                    }
+                                }
+                            }
+                            let issued = core.status() == QueryStatus::Issued;
+                            let value = mtld3d_core::query_fence::early_occlusion_answer(
+                                issued,
+                                if issued { core.get_u64() } else { 0 },
+                            );
+                            dev.note_early_occlusion_read(issued);
+                            dump_event(&|| {
+                                format!(
+                                    "Query({this:?}) GetData(FLUSH) → early-submit, {} {value}",
+                                    if issued {
+                                        "count"
+                                    } else {
+                                        "not retired, visible"
+                                    }
+                                )
+                            });
+                            if has_output {
+                                // SAFETY: as above, non-null `data`, `size >= 1`.
+                                unsafe { write_occlusion(data, size, value) };
+                            }
+                            return D3D_OK;
+                        }
                         if dev.config().query_flush_immediate {
                             // Returning at once can save API-thread time
                             // for a game that uses FLUSH polls only to
