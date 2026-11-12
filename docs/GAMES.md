@@ -27,6 +27,7 @@ the reason for each one.
 | Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
 | The Elder Scrolls IV: Oblivion | Options work with the `oblivion` profile, 32-bit; hangs after a save loads, with or without the profile |
+| Fallout 3 | New Game starts with the `fallout3` profile, 32-bit |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |
@@ -50,6 +51,10 @@ not set that flag as the prefix default with `/ve`.
 Play NosTale in a window. Its fullscreen mode keeps a windowed device and
 changes the display mode. Under `EmulateModeset` on a prefix above 96 DPI,
 its window then comes out larger than the screen.
+
+Fallout 3 in a window keeps the cursor inside it, because the game opens its
+DirectInput mouse in exclusive mode. `bBackground Mouse=1` under `[Controls]`
+in `FalloutPrefs.ini` frees it.
 
 ## Reporting a game
 
