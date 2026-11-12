@@ -15,6 +15,28 @@ const OBLIVION: [(&str, &str); 3] = [
     ("OriginalFilename", "Oblivion.exe"),
 ];
 
+/// The string table of the shipped `Fallout3.exe`.
+const FALLOUT3: [(&str, &str); 7] = [
+    ("CompanyName", "Bethesda Softworks"),
+    ("FileDescription", "Fallout3"),
+    ("FileVersion", "1.7.0.3"),
+    ("InternalName", "Fallout3"),
+    ("OriginalFilename", "Fallout3.exe"),
+    ("ProductName", "Fallout 3"),
+    ("ProductVersion", "1.7.0.3"),
+];
+
+/// The string table of the shipped `FalloutLauncher.exe`.
+const FALLOUT3_LAUNCHER: [(&str, &str); 7] = [
+    ("CompanyName", "Bethesda Softworks"),
+    ("FileDescription", "Fallout 3 Launcher"),
+    ("FileVersion", "1.1.12.000"),
+    ("InternalName", "Fallout3Launcher"),
+    ("OriginalFilename", "FalloutLauncher.exe"),
+    ("ProductName", "Fallout 3 Launcher"),
+    ("ProductVersion", "1.1.12.000"),
+];
+
 /// Encode string entries the way a real `VS_VERSIONINFO` holds them.
 ///
 /// Each entry is preceded by its three header words (`wLength`,
@@ -84,6 +106,54 @@ fn the_oblivion_profile_needs_both_its_company_and_its_product() {
 }
 
 #[test]
+fn the_fallout3_profile_matches_the_game_and_its_launcher() {
+    assert_eq!(parse(None, "", None).adapter_spoof, AdapterSpoof::None);
+    for (exe, fields) in [
+        ("Fallout3.exe", &FALLOUT3),
+        ("FalloutLauncher.exe", &FALLOUT3_LAUNCHER),
+        // The name is matched case-insensitively: a launcher may spell it either way.
+        ("FALLOUT3.EXE", &FALLOUT3),
+        ("FALLOUTLAUNCHER.EXE", &FALLOUT3_LAUNCHER),
+    ] {
+        let id = AppIdentity::new(exe.to_owned(), Some(&blob(fields)));
+        let profile = lookup(&id).expect("the fallout3 profile matches");
+        assert_eq!(profile.name(), "fallout3", "{exe}");
+        // A typo in the settings string would keep the stock `Driver` string,
+        // and New Game would crash.
+        assert_eq!(
+            parse(Some(profile), "", None).adapter_spoof,
+            AdapterSpoof::Nvidia,
+            "{exe}"
+        );
+    }
+    // A same-named binary from anyone else must not pick it up.
+    let impostor = AppIdentity::new("Fallout3.exe".to_owned(), None);
+    assert!(lookup(&impostor).is_none());
+}
+
+#[test]
+fn the_fallout3_profile_needs_both_its_company_and_its_product() {
+    for exe in ["Fallout3.exe", "FalloutLauncher.exe"] {
+        for (company, product) in [
+            ("Somebody Else", "Fallout 3"),
+            ("Bethesda Softworks", "Somebody Else's Game"),
+        ] {
+            let other = blob(&[("CompanyName", company), ("ProductName", product)]);
+            let id = AppIdentity::new(exe.to_owned(), Some(&other));
+            assert!(lookup(&id).is_none(), "{exe}: {company}, {product}");
+        }
+    }
+}
+
+#[test]
+fn the_fallout3_profile_leaves_other_bethesda_tools_alone() {
+    // Only the two listed names match: an editor carrying the game's own
+    // strings keeps the stock identity.
+    let id = AppIdentity::new("GECK.exe".to_owned(), Some(&blob(&FALLOUT3)));
+    assert!(lookup(&id).is_none());
+}
+
+#[test]
 fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answers() {
     for version in ["Version 1.12", "Version 3.3"] {
         let blob = blob(&[
@@ -143,7 +213,12 @@ fn an_unprofiled_game_resolves_to_nothing() {
 fn every_profile_is_uniquely_named_and_pins_a_version_field() {
     for profile in PROFILES {
         assert!(!profile.name.is_empty(), "a profile has no name");
-        assert!(!profile.exe.is_empty(), "{} has no exe", profile.name);
+        assert!(!profile.exes.is_empty(), "{} has no exe", profile.name);
+        assert!(
+            profile.exes.iter().all(|exe| !exe.is_empty()),
+            "{} lists an empty exe",
+            profile.name
+        );
         assert!(
             profile.company.is_some()
                 || profile.product.is_some()
@@ -173,14 +248,16 @@ fn no_two_profiles_can_match_the_same_application() {
         if let Some(original) = profile.original_filename {
             entries.push(("OriginalFilename", original));
         }
-        let id = AppIdentity::new(profile.exe.to_owned(), Some(&blob(&entries)));
-        for (j, other) in PROFILES.iter().enumerate() {
-            assert!(
-                i == j || !other.matches(&id),
-                "{} and {} both match one application",
-                profile.name,
-                other.name
-            );
+        for exe in profile.exes {
+            let id = AppIdentity::new((*exe).to_owned(), Some(&blob(&entries)));
+            for (j, other) in PROFILES.iter().enumerate() {
+                assert!(
+                    i == j || !other.matches(&id),
+                    "{} and {} both match {exe}",
+                    profile.name,
+                    other.name
+                );
+            }
         }
     }
 }
@@ -233,7 +310,7 @@ fn the_oblivion_profile_resolves_to_the_nvidia_identity() {
 /// A profile that sets two unrelated options, for the precedence cases.
 const PROBE: AppProfile = AppProfile {
     name: "probe",
-    exe: "probe.exe",
+    exes: &["probe.exe"],
     company: Some("Probe"),
     product: None,
     original_filename: None,

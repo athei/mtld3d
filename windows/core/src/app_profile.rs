@@ -3,7 +3,8 @@
 //! A few games need an option set no user should have to discover: an adapter
 //! identity their engine branches on, a capability they must not be told about,
 //! an era-driver behaviour their renderer was written against. A profile carries
-//! those values for one executable so the game runs correctly out of the box.
+//! those values for the executables of one game, its launcher included where
+//! the launcher loads D3D9 too, so the game runs correctly out of the box.
 //!
 //! A profile is the weakest configuration layer. `mtld3d.conf` and
 //! `MTLD3D_CONFIG` both beat it key by key, so a user can take one option back
@@ -25,6 +26,39 @@ use super::LOG_TARGET;
 /// Every entry pins at least one version-resource field, so a rule can never
 /// fire on a same-named program from someone else.
 static PROFILES: &[AppProfile] = &[
+    // Fallout 3.
+    //
+    // Its renderer turns "3.0 Lighting" on only for an adapter whose `Driver`
+    // string starts with `ati` or `nv`, and only when
+    // `PS20Caps.NumInstructionSlots` is above 255; the game counts the slots
+    // as 96 when `PS20Caps.NumTemps` is under 32. The layer reports 512 and
+    // 32, so a caps change past either threshold turns the flag off again.
+    // The game creates its type 0x1d shader properties whether the flag is on
+    // or not, and the shader lookup for that type returns null while it is
+    // off, which the game dereferences: New Game crashes without an `ati` or
+    // `nv` prefix.
+    //
+    // Either prefix sets the flag, and each runs a multi-GPU probe. The `ati`
+    // one calls `AtiQueryMgpuCount` in the `atimgpud.dll` the game ships, so
+    // it always runs. The `nv` one goes through NVAPI (`nvapi_QueryInterface`
+    // in `nvapi.dll`) and has no effect when the DLL is absent, so the
+    // identity is NVIDIA's. With it the game also probes the `ATOC` format
+    // and, when transparency multisampling is on, draws its alpha-tested
+    // geometry with alpha-to-coverage instead, which the layer implements.
+    //
+    // `Fallout3.exe` exits into `FalloutLauncher.exe` whenever the
+    // `sD3DDevice` that `FalloutPrefs.ini` holds differs from adapter 0's
+    // `Description`, and the launcher writes that key from its own D3D9
+    // adapter, so both executables need the same identity or each sends the
+    // player back to the other.
+    AppProfile {
+        name: "fallout3",
+        exes: &["Fallout3.exe", "FalloutLauncher.exe"],
+        company: Some("Bethesda Softworks"),
+        product: Some("Fallout 3"),
+        original_filename: None,
+        settings: "adapter.spoof=nvidia",
+    },
     // Grand Theft Auto IV.
     //
     // Its renderer branches on the reported adapter vendor, and the ATI
@@ -40,7 +74,7 @@ static PROFILES: &[AppProfile] = &[
     // allocation.
     AppProfile {
         name: "gta-iv",
-        exe: "GTAIV.exe",
+        exes: &["GTAIV.exe"],
         company: Some("Rockstar Games"),
         product: Some("Grand Theft Auto IV"),
         original_filename: None,
@@ -54,7 +88,7 @@ static PROFILES: &[AppProfile] = &[
     // nothing.
     AppProfile {
         name: "halo2",
-        exe: "halo2.exe",
+        exes: &["halo2.exe"],
         company: Some("Microsoft Corporation"),
         product: Some("Halo 2 for Windows Vista"),
         original_filename: Some("Halo2.exe"),
@@ -79,7 +113,7 @@ static PROFILES: &[AppProfile] = &[
     // `ATIMGPUD.dll` the game ships, so it always runs.
     AppProfile {
         name: "oblivion",
-        exe: "Oblivion.exe",
+        exes: &["Oblivion.exe"],
         company: Some("Bethesda Softworks"),
         product: Some("TES4: Oblivion"),
         original_filename: None,
@@ -113,7 +147,7 @@ static PROFILES: &[AppProfile] = &[
     // at most 32; the refresh rates of each kept size do not add buttons.
     AppProfile {
         name: "wow",
-        exe: "WoW.exe",
+        exes: &["WoW.exe"],
         company: Some("Blizzard Entertainment"),
         product: Some("World of Warcraft"),
         original_filename: None,
@@ -128,7 +162,7 @@ static PROFILES: &[AppProfile] = &[
 /// every present and future key is available to one without new code.
 pub struct AppProfile {
     name: &'static str,
-    exe: &'static str,
+    exes: &'static [&'static str],
     company: Option<&'static str>,
     product: Option<&'static str>,
     original_filename: Option<&'static str>,
@@ -150,11 +184,13 @@ impl AppProfile {
 
     /// Whether this profile applies to `id`.
     ///
-    /// The executable name has to match, case-insensitively. Each version field
-    /// the profile pins is an additional case-insensitive substring test, so
-    /// `Rockstar Games` also matches a `CompanyName` of `Rockstar Games, Inc.`.
+    /// The executable name has to equal one of the profile's names,
+    /// case-insensitively. Each version field the profile pins is an additional
+    /// case-insensitive substring test, so `Rockstar Games` also matches a
+    /// `CompanyName` of `Rockstar Games, Inc.`. The pins hold for every listed
+    /// executable alike.
     fn matches(&self, id: &AppIdentity) -> bool {
-        id.exe.eq_ignore_ascii_case(self.exe)
+        self.exes.iter().any(|exe| id.exe.eq_ignore_ascii_case(exe))
             && field_matches(self.company, &id.company)
             && field_matches(self.product, &id.product)
             && field_matches(self.original_filename, &id.original_filename)
