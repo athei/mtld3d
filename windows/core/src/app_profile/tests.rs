@@ -37,6 +37,20 @@ const FALLOUT3_LAUNCHER: [(&str, &str); 7] = [
     ("ProductVersion", "1.1.12.000"),
 ];
 
+/// The three fields read out of the shipped `FalloutNV.exe`.
+const FALLOUTNV: [(&str, &str); 3] = [
+    ("CompanyName", "Bethesda Softworks"),
+    ("ProductName", "Fallout: New Vegas"),
+    ("OriginalFilename", "FalloutNV.exe"),
+];
+
+/// The three fields read out of the shipped `FalloutNVLauncher.exe`.
+const FALLOUTNV_LAUNCHER: [(&str, &str); 3] = [
+    ("CompanyName", "Bethesda Softworks, Obsidian Entertainment"),
+    ("ProductName", "Fallout New Vegas Launcher"),
+    ("OriginalFilename", "FalloutNVLauncher.exe"),
+];
+
 /// Encode string entries the way a real `VS_VERSIONINFO` holds them.
 ///
 /// Each entry is preceded by its three header words (`wLength`,
@@ -150,6 +164,56 @@ fn the_fallout3_profile_leaves_other_bethesda_tools_alone() {
     // Only the two listed names match: an editor carrying the game's own
     // strings keeps the stock identity.
     let id = AppIdentity::new("GECK.exe".to_owned(), Some(&blob(&FALLOUT3)));
+    assert!(lookup(&id).is_none());
+}
+
+#[test]
+fn the_falloutnv_profile_matches_the_game_and_its_launcher() {
+    assert_eq!(parse(None, "", None).adapter_spoof, AdapterSpoof::None);
+    for (exe, fields) in [
+        ("FalloutNV.exe", &FALLOUTNV),
+        ("FalloutNVLauncher.exe", &FALLOUTNV_LAUNCHER),
+        // The name is matched case-insensitively: a launcher may spell it either way.
+        ("FALLOUTNV.EXE", &FALLOUTNV),
+        ("FALLOUTNVLAUNCHER.EXE", &FALLOUTNV_LAUNCHER),
+    ] {
+        let id = AppIdentity::new(exe.to_owned(), Some(&blob(fields)));
+        let profile = lookup(&id).expect("the falloutnv profile matches");
+        assert_eq!(profile.name(), "falloutnv", "{exe}");
+        // A typo in the settings string would keep the stock `Driver` string,
+        // and New Game would crash.
+        assert_eq!(
+            parse(Some(profile), "", None).adapter_spoof,
+            AdapterSpoof::Nvidia,
+            "{exe}"
+        );
+    }
+    // A same-named binary from anyone else must not pick it up.
+    for exe in ["FalloutNV.exe", "FalloutNVLauncher.exe"] {
+        let impostor = AppIdentity::new(exe.to_owned(), None);
+        assert!(lookup(&impostor).is_none(), "{exe}");
+    }
+}
+
+#[test]
+fn the_falloutnv_profile_needs_both_its_company_and_its_product() {
+    for exe in ["FalloutNV.exe", "FalloutNVLauncher.exe"] {
+        for (company, product) in [
+            ("Somebody Else", "Fallout: New Vegas"),
+            ("Bethesda Softworks", "Somebody Else's Game"),
+        ] {
+            let other = blob(&[("CompanyName", company), ("ProductName", product)]);
+            let id = AppIdentity::new(exe.to_owned(), Some(&other));
+            assert!(lookup(&id).is_none(), "{exe}: {company}, {product}");
+        }
+    }
+}
+
+#[test]
+fn the_falloutnv_profile_leaves_other_bethesda_tools_alone() {
+    // Only the two listed names match: an editor carrying the game's own
+    // strings keeps the stock identity.
+    let id = AppIdentity::new("GECK.exe".to_owned(), Some(&blob(&FALLOUTNV)));
     assert!(lookup(&id).is_none());
 }
 

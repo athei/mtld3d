@@ -59,6 +59,20 @@ static PROFILES: &[AppProfile] = &[
         original_filename: None,
         settings: "adapter.spoof=nvidia",
     },
+    // Fallout: New Vegas.
+    //
+    // New Game crashes after the intro video unless the adapter reports an
+    // NVIDIA identity. The launcher gets the same identity on the assumption
+    // that New Vegas keeps the `sD3DDevice` check the `fallout3` entry
+    // describes, so neither executable sends the player back to the other.
+    AppProfile {
+        name: "falloutnv",
+        exes: &["FalloutNV.exe", "FalloutNVLauncher.exe"],
+        company: Some("Bethesda Softworks"),
+        product: Some("New Vegas"),
+        original_filename: None,
+        settings: "adapter.spoof=nvidia",
+    },
     // Grand Theft Auto IV.
     //
     // Its renderer branches on the reported adapter vendor, and the ATI
@@ -230,7 +244,9 @@ impl AppIdentity {
 ///
 /// Logs the outcome either way: which profile took effect and the options it
 /// sets, or that none did. Both answers are the first thing to establish when a
-/// game behaves differently than its options say it should.
+/// game behaves differently than its options say it should. A miss also logs
+/// the image's company and product, so a new profile can be keyed from a
+/// user's log.
 #[must_use]
 pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
     let profile = PROFILES.iter().find(|p| p.matches(id));
@@ -240,7 +256,11 @@ pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
             "app profile: {} matched {} ({}, {}): {}",
             p.name, id.exe, id.company, id.product, p.settings
         ),
-        None => info!(target: LOG_TARGET, "app profile: none for {}", id.exe),
+        None => info!(
+            target: LOG_TARGET,
+            "app profile: none for {} ({:?}, {:?})",
+            id.exe, id.company, id.product
+        ),
     }
     profile
 }
