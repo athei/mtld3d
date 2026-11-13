@@ -7522,6 +7522,7 @@ fn bind_upload_destination(s: &mut PassState) {
     s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
 }
 
+/// Push an ordered upload pass that covers the whole 6x2 upload destination.
 fn push_ordered_whole_level_upload(s: &mut PassState) {
     s.push_upload_pass_with_order::<true>(
         &UploadPassTarget {
@@ -7545,20 +7546,33 @@ fn ordered_whole_level_upload_takes_the_clear_before_it() {
     s.clear_color(1, 2, 3, 4);
     s.end_current_pass("before upload");
     push_ordered_whole_level_upload(&mut s);
-    apply_submit_rules(&mut s);
-    assert_eq!(s.passes().len(), 1, "the clear-only pass is coalesced away");
+    assert_eq!(s.passes().len(), 2);
+    let upload_commands = s.passes()[1].commands().as_ptr();
+    let cleared = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 1, "Rule E folds the clear-only pass away");
     let upload = &s.passes()[0];
     assert_eq!(upload.color_texture(), upload_destination());
     assert_eq!(
-        upload.color_load(),
-        ColorLoad::Clear {
-            r: 1,
-            g: 2,
-            b: 3,
-            a: 4
-        }
+        upload.commands().as_ptr(),
+        upload_commands,
+        "the pass left is the upload's own"
     );
-    assert_eq!(upload.color_store(), StoreAction::Store);
+    assert_eq!(upload.commands().len(), 2, "the upload's viewport and draw");
+    assert_eq!(upload.color_load(), cleared);
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(
+        s.passes()[0].color_load(),
+        cleared,
+        "Rule K keeps the clear"
+    );
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
 }
 
 /// An application pass Rule J joins onto an ordered whole-level upload keeps the upload's discard.
