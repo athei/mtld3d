@@ -7440,6 +7440,82 @@ fn ordered_upload_keeps_application_passes_and_blits_in_sequence() {
     assert_eq!(s.passes()[2].color_texture(), backbuffer());
 }
 
+fn upload_destination() -> MetalHandle<MTLTextureKind> {
+    tex(0x9200)
+}
+
+/// Upload `rect` of a 6x2 texture a later pass samples, then run the submit rules.
+fn upload_of_a_sampled_texture<const ORDERED: bool>(rect: (u32, u32, u32, u32)) -> PassState {
+    let destination = upload_destination();
+    let mut s = fresh();
+    if ORDERED {
+        s.emit_command(dummy_draw());
+        s.end_current_pass("before upload");
+    }
+    s.push_upload_pass_with_order::<ORDERED>(
+        &UploadPassTarget {
+            texture: destination,
+            subresource: (0, 0),
+            size: (6, 2),
+            format: BB_FORMAT,
+            rect,
+        },
+        &[dummy_draw()],
+        Vec::new(),
+    );
+    s.emit_command(Command::set_fragment_texture(destination.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("after upload");
+    apply_submit_rules(&mut s);
+    let uploads: Vec<_> = s
+        .passes()
+        .iter()
+        .filter(|pass| pass.color_texture() == destination)
+        .collect();
+    assert_eq!(uploads.len(), 1, "one pass renders into the destination");
+    assert_eq!(
+        uploads[0].color_store(),
+        StoreAction::Store,
+        "the sampling pass reads what the upload stores"
+    );
+    s
+}
+
+fn upload_load(s: &PassState) -> ColorLoad {
+    s.passes()
+        .iter()
+        .find(|pass| pass.color_texture() == upload_destination())
+        .expect("the upload pass survives the rules")
+        .color_load()
+}
+
+/// A whole-level upload discards its load under Rule K, though its texture is sampled.
+#[test]
+fn whole_level_upload_of_a_sampled_texture_loads_dont_care() {
+    let s = upload_of_a_sampled_texture::<false>((0, 0, 6, 2));
+    assert_eq!(s.upload_pass_count(), 1);
+    assert_eq!(upload_load(&s), ColorLoad::DontCare);
+}
+
+/// An ordered whole-level upload discards its load under Rule K, though its texture is sampled.
+#[test]
+fn ordered_whole_level_upload_of_a_sampled_texture_loads_dont_care() {
+    let s = upload_of_a_sampled_texture::<true>((0, 0, 6, 2));
+    assert_eq!(s.upload_pass_count(), 0);
+    assert_eq!(upload_load(&s), ColorLoad::DontCare);
+}
+
+/// An upload of part of a level loads the texels outside its rect.
+#[test]
+fn partial_upload_of_a_sampled_texture_loads() {
+    for rect in [(2, 1, 2, 1), (0, 0, 6, 1), (0, 0, 5, 2)] {
+        let s = upload_of_a_sampled_texture::<false>(rect);
+        assert_eq!(upload_load(&s), ColorLoad::Load, "{rect:?}");
+        let s = upload_of_a_sampled_texture::<true>(rect);
+        assert_eq!(upload_load(&s), ColorLoad::Load, "ordered {rect:?}");
+    }
+}
+
 // ── Rule I: clears overwritten before a read ──
 
 fn resz_intz() -> MetalHandle<MTLTextureKind> {

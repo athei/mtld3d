@@ -288,10 +288,12 @@ const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
 ///
 /// A pass opened through [`PassState::open_pass_for_covering_draw`] starts
 /// with a draw its caller knows writes every pixel and sample of render target
-/// 0, the `StretchRect` render quad over a whole destination level, so
-/// nothing the pass would load survives that draw. The pass still opens with
-/// `Load`, and every other rule reasons over that `Load` as before; once they
-/// have run, a covered pass that still loads discards instead. Not a
+/// 0, the `StretchRect` render quad over a whole destination level, and so
+/// does an upload pass whose rect covers the whole level
+/// ([`PassState::push_upload_pass_with_order`]); nothing the pass would load
+/// survives that draw. The pass still opens with `Load`, and every other rule
+/// reasons over that `Load` as before; once they have run, a covered pass that
+/// still loads discards instead. Not a
 /// divergence: the load it removes is one no pixel of the result reads. Flip
 /// to `false` if a covering caller turns out to leave part of the attachment
 /// unwritten.
@@ -1529,8 +1531,10 @@ bitflags::bitflags! {
         /// The first draw of the pass writes every pixel and sample of render target 0.
         ///
         /// Set by [`PassState::open_pass_for_covering_draw`] on the pass it
-        /// opens, and read by Rule K. A pass joined onto another by Rule J
-        /// leaves it behind, since its draws then follow the other pass's.
+        /// opens and by [`PassState::push_upload_pass_with_order`] on an upload
+        /// pass whose rect covers the whole level, and read by Rule K. A pass
+        /// joined onto another by Rule J leaves it behind, since its draws then
+        /// follow the other pass's.
         const FIRST_DRAW_COVERS = 1 << 1;
     }
 }
@@ -3980,8 +3984,13 @@ impl PassState {
     /// An unordered upload lands at the head of the frame, where the blit uploads it
     /// replaces already land: a draw earlier in the frame that sampled the
     /// destination is served by the encoder's texture rename, exactly as
-    /// before. The load action discards only when `rect` covers the whole
-    /// mip, which the quad then fully overwrites.
+    /// before.
+    ///
+    /// The pass opens with `Load`. When `rect` covers the whole mip, the quad
+    /// writes every texel, so the pass carries `FIRST_DRAW_COVERS` and Rule K
+    /// discards the load after the other rules have run. A pass opened with
+    /// `DontCare` would get its `Load` back from Rule A's correction, because
+    /// the upload puts its texture in the sampled set.
     ///
     /// The destination is also entered into the read/write model the
     /// load/store rules reason over: `blit_written_rts` so a later pass loads
@@ -3996,10 +4005,10 @@ impl PassState {
     ) {
         let (x, y, w, h) = target.rect;
         let covers = x == 0 && y == 0 && w == target.size.0 && h == target.size.1;
-        let color_load = if ENABLE_FIRST_USE_DONTCARE && covers {
-            ColorLoad::DontCare
+        let color_flags = if covers {
+            PassColorFlags::WRITES_OBSERVED | PassColorFlags::FIRST_DRAW_COVERS
         } else {
-            ColorLoad::Load
+            PassColorFlags::WRITES_OBSERVED
         };
         let (slice, level) = target.subresource;
         let subresource = slice | (level << 16);
@@ -4023,7 +4032,7 @@ impl PassState {
             color_subresource: subresource,
             color_size: target.size,
             color_format: target.format,
-            color_load,
+            color_load: ColorLoad::Load,
             color_store: StoreAction::Store,
             depth_texture: MetalHandle::NULL,
             depth_level: 0,
@@ -4040,7 +4049,7 @@ impl PassState {
             depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
-            color_flags: PassColorFlags::WRITES_OBSERVED,
+            color_flags,
             color_clear_quad_ranges: Vec::new(),
             extra_color: [PassColorAttachment::NONE; 3],
         };
@@ -4064,7 +4073,7 @@ impl PassState {
             trace!(
                 target: TRACE_TARGET,
                 "upload-pass idx={} color={:#x} slice={slice} level={level} \
-                 size={}x{} rect={x},{y}+{w}x{h} load={color_load:?}",
+                 size={}x{} rect={x},{y}+{w}x{h} load=Load covers={covers}",
                 pass_index,
                 target.texture,
                 target.size.0,
@@ -5546,10 +5555,11 @@ impl PassState {
 
     /// Rule K: discard the load of render target 0 under a first draw that covers it.
     ///
-    /// Acts on the passes [`Self::open_pass_for_covering_draw`] marked whose
-    /// render target 0 still loads. A `Clear` Rule E folded into such a pass
-    /// stays, since a clear load costs no more than a discard, and a pass
-    /// Rule J joined onto the one before it is no longer one of them. Runs
+    /// Acts on the passes [`Self::open_pass_for_covering_draw`] and
+    /// [`Self::push_upload_pass_with_order`] marked whose render target 0
+    /// still loads. A `Clear` Rule E folded into such a pass stays, since a
+    /// clear load costs no more than a discard, and a pass Rule J joined onto
+    /// the one before it is no longer one of them. Runs
     /// after every other rule, which therefore all reasoned over the `Load`:
     /// a covered pass that discarded from the start would stop Rule E from
     /// folding a clear into it and Rule J from joining it onto the pass before,
