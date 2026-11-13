@@ -28,6 +28,7 @@ the reason for each one.
 | Halo 2 | Renders, `halo2` profile |
 | The Elder Scrolls IV: Oblivion | Options work with the `oblivion` profile, 32-bit; hangs after a save loads, with or without the profile |
 | Fallout 3 | New Game starts with the `fallout3` profile, 32-bit |
+| Fallout: New Vegas | New Game starts with the `falloutnv` profile, 32-bit |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |
