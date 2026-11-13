@@ -293,10 +293,9 @@ const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
 /// ([`PassState::push_upload_pass_with_order`]); nothing the pass would load
 /// survives that draw. The pass still opens with `Load`, and every other rule
 /// reasons over that `Load` as before; once they have run, a covered pass that
-/// still loads discards instead. Not a
-/// divergence: the load it removes is one no pixel of the result reads. Flip
-/// to `false` if a covering caller turns out to leave part of the attachment
-/// unwritten.
+/// still loads discards instead. Not a divergence: the load it removes is one
+/// no pixel of the result reads. Flip to `false` if a covering caller turns
+/// out to leave part of the attachment unwritten.
 const ENABLE_COVERED_COLOR_DONTCARE: bool = true;
 
 /// The blend factor, as a `D3DCOLOR`, that a fresh Metal render encoder blends with.
@@ -5559,12 +5558,12 @@ impl PassState {
     /// [`Self::push_upload_pass_with_order`] marked whose render target 0
     /// still loads. A `Clear` Rule E folded into such a pass stays, since a
     /// clear load costs no more than a discard, and a pass Rule J joined onto
-    /// the one before it is no longer one of them. Runs
-    /// after every other rule, which therefore all reasoned over the `Load`:
-    /// a covered pass that discarded from the start would stop Rule E from
-    /// folding a clear into it and Rule J from joining it onto the pass before,
-    /// and Rule A's correction would put the load back whenever anything
-    /// samples the attachment, though no pixel of the result reads it.
+    /// the one before it is no longer one of them. Runs after every other
+    /// rule, which therefore all reasoned over the `Load`: a covered pass that
+    /// discarded from the start would stop Rule E from folding a clear into it
+    /// and Rule J from joining it onto the pass before, and Rule A's
+    /// correction would put the load back whenever anything samples the
+    /// attachment, though no pixel of the result reads it.
     pub fn discard_covered_color_loads(&mut self) {
         if !ENABLE_COVERED_COLOR_DONTCARE {
             return;

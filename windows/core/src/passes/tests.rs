@@ -7516,6 +7516,77 @@ fn partial_upload_of_a_sampled_texture_loads() {
     }
 }
 
+/// Bind the 6x2 upload destination as render target 0, with no depth attachment.
+fn bind_upload_destination(s: &mut PassState) {
+    s.set_color_render_target(upload_destination(), 6, 2, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+}
+
+fn push_ordered_whole_level_upload(s: &mut PassState) {
+    s.push_upload_pass_with_order::<true>(
+        &UploadPassTarget {
+            texture: upload_destination(),
+            subresource: (0, 0),
+            size: (6, 2),
+            format: BB_FORMAT,
+            rect: (0, 0, 6, 2),
+        },
+        &[dummy_draw()],
+        Vec::new(),
+    );
+}
+
+/// A colour clear right before an ordered whole-level upload folds into the upload's load.
+#[test]
+fn ordered_whole_level_upload_takes_the_clear_before_it() {
+    let mut s = fresh();
+    bind_upload_destination(&mut s);
+    s.ensure_pass_open();
+    s.clear_color(1, 2, 3, 4);
+    s.end_current_pass("before upload");
+    push_ordered_whole_level_upload(&mut s);
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 1, "the clear-only pass is coalesced away");
+    let upload = &s.passes()[0];
+    assert_eq!(upload.color_texture(), upload_destination());
+    assert_eq!(
+        upload.color_load(),
+        ColorLoad::Clear {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 4
+        }
+    );
+    assert_eq!(upload.color_store(), StoreAction::Store);
+}
+
+/// An application pass Rule J joins onto an ordered whole-level upload keeps the upload's discard.
+#[test]
+fn ordered_whole_level_upload_joined_by_the_pass_after_it_loads_dont_care() {
+    let mut s = fresh();
+    push_ordered_whole_level_upload(&mut s);
+    bind_upload_destination(&mut s);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("after upload");
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 1, "Rule J joins the two passes");
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+/// An ordered whole-level upload Rule J joins onto the pass before it loads what that pass drew.
+#[test]
+fn ordered_whole_level_upload_joined_onto_the_pass_before_it_loads() {
+    let mut s = fresh();
+    bind_upload_destination(&mut s);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("before upload");
+    push_ordered_whole_level_upload(&mut s);
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 1, "Rule J joins the two passes");
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
 // ── Rule I: clears overwritten before a read ──
 
 fn resz_intz() -> MetalHandle<MTLTextureKind> {

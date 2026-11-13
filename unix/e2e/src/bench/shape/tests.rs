@@ -274,7 +274,8 @@ fn an_upload_pass_goes_in_front_and_the_close_finds_the_open_pass() {
     let lines = [
         "pass-open  idx=0 color=0x1 srgb=0x0 depth=0x0 size=8x8 color_load=Load \
          depth_load=DontCare viewport=0,0+8x8 extra=0x0",
-        "upload-pass idx=0 color=0x9 slice=0 level=0 size=256x256 rect=0,0+256x256 load=DontCare",
+        "upload-pass idx=0 color=0x9 slice=0 level=0 size=256x256 rect=0,0+256x256 \
+         load=Load covers=true",
         "pass-close idx=1 caller=submit color=0x1 depth=0x0 cmds=4 draws=1",
         "pass-coalesce drop idx=0 (clear-only) → fold into idx=1 color=0x1 depth=0x0",
         "pass-open  idx=0 color=0x1 srgb=0x0 depth=0x0 size=8x8 color_load=Load \
@@ -283,7 +284,7 @@ fn an_upload_pass_goes_in_front_and_the_close_finds_the_open_pass() {
     let frame = frame_of(&trace(&lines)).unwrap();
     assert_eq!(frame.passes[0].kind, "upload");
     assert_eq!(frame.passes[0].color, "C1");
-    assert_eq!(frame.passes[0].color_load, "dontcare");
+    assert_eq!(frame.passes[0].color_load, "load");
     assert_eq!(frame.passes[0].fate, "coalesced into #1");
     assert_eq!(frame.passes[1].close, "submit");
     assert_eq!(frame.passes[1].draws, "1");
