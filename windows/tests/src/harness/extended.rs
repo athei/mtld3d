@@ -515,6 +515,23 @@ impl Harness {
         pool: u32,
         shared_handle: &SharedHandle<'_>,
     ) -> (i32, Option<Texture<'_>>) {
+        self.try_create_texture_shared_usage(size, levels, 0, format, pool, shared_handle)
+    }
+
+    /// `CreateTexture` with a usage and a `pSharedHandle`, returning the hr and the texture.
+    ///
+    /// On an extended device's default pool the handle's slot holds the
+    /// handle of a shared texture to open; a slot holding null is refused.
+    #[must_use]
+    pub fn try_create_texture_shared_usage(
+        &self,
+        size: (u32, u32),
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+        shared_handle: &SharedHandle<'_>,
+    ) -> (i32, Option<Texture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -523,7 +540,7 @@ impl Harness {
                 size.0,
                 size.1,
                 levels,
-                0,
+                usage,
                 format,
                 pool,
                 &raw mut out,

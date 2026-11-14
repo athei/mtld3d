@@ -7,8 +7,8 @@
 //! written. A `pSharedHandle` on a single-level
 //! system-memory texture or offscreen plain surface is user memory, copied
 //! into the level once at its row pitch; any other shape is an invalid call,
-//! a system-memory buffer takes none, and a shared default-pool resource is
-//! not available. A plain device refuses every shared handle with
+//! a system-memory buffer takes none, and a new shared default-pool resource
+//! is not available. A plain device refuses every shared handle with
 //! `E_NOTIMPL`. The extended surface creates take only the restriction
 //! usages, the texture memory figure does not shrink, the frame latency is
 //! stored and reported, and Reset takes FLIPEX and 30 back buffers. Source's
@@ -36,7 +36,7 @@ use mtld3d_types::{
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
 
-fn extended() -> Harness {
+pub fn extended() -> Harness {
     Harness::create(&HarnessConfig {
         factory: Factory::Extended,
         ..HarnessConfig::default()
@@ -44,7 +44,7 @@ fn extended() -> Harness {
 }
 
 /// Draw `texture` over the whole back buffer and read its centre.
-fn sample_center(h: &Harness, texture: &Texture<'_>) -> u32 {
+pub fn sample_center(h: &Harness, texture: &Texture<'_>) -> u32 {
     const W: u32 = 0xFFFF_FFFF;
     let quad = [
         (-1.0, 1.0, 0.0, 0.0),

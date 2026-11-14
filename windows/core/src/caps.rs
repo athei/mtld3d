@@ -94,9 +94,9 @@ const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 /// ignored to match: the ramp is applied exactly as the application wrote it,
 /// with no correction for the display's own response.
 ///
-/// `CANSHARERESOURCE` stays off: a shared resource is asked for with a
-/// non-NULL `pSharedHandle`, which every create rejects with `E_NOTIMPL`
-/// because the device is not an extended one.
+/// `CANSHARERESOURCE` stays off: the bit promises a `pSharedHandle` on every
+/// kind of resource, while a plain device rejects each with `E_NOTIMPL` and
+/// an extended one only opens a single-level 2D texture of two formats.
 const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::DYNAMICTEXTURES)
     .union(Caps2::FULLSCREENGAMMA)

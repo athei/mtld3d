@@ -24,6 +24,7 @@ mod presenter;
 mod record;
 mod sampler;
 mod shader;
+mod shared_texture;
 pub mod submission;
 mod texture;
 mod transient;
@@ -49,6 +50,7 @@ pub use presenter::{set_wait_policy, wait_for_present_idle};
 pub use record::DeviceRecord;
 pub use sampler::{create_sampler_state, destroy_sampler_state};
 pub use shader::{compile_shader_library, destroy_function, destroy_library};
+pub use shared_texture::serve as serve_shared_texture;
 pub use texture::{
     OPAQUE_BLACK, TRANSPARENT_BLACK, TextureClearBatch, clear_new_color_textures,
     create_backbuffer, create_color_target, create_depth_stencil_state, create_depth_texture,

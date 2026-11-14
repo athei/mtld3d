@@ -4114,7 +4114,9 @@ fn shared_handle_gate(
     use mtld3d_core::extended::{SharedHandleVerdict, shared_handle_verdict};
     let extended = device_is_extended(this);
     match shared_handle_verdict(kind, pool, !shared_handle.is_null(), extended) {
-        SharedHandleVerdict::Proceed => Ok(None),
+        // `CreateTexture` asks `create_shares` first and opens the share
+        // itself; no user memory either way.
+        SharedHandleVerdict::Proceed | SharedHandleVerdict::Shared => Ok(None),
         SharedHandleVerdict::UserMemory => {
             // SAFETY: an extended device's user-memory contract: `shared_handle`
             // is non-null (the verdict says so) and points to the application's
@@ -4142,6 +4144,26 @@ fn shared_handle_gate(
             Err(refusal.hresult())
         }
     }
+}
+
+/// Whether a `CreateTexture` with these arguments shares its texture.
+///
+/// True for an extended device's `D3DPOOL_DEFAULT` 2D texture given a
+/// `pSharedHandle`, which is then a slot holding the handle to open. A slot
+/// holding null asks for a new shared texture, which the create refuses.
+fn create_shares(
+    this: *mut c_void,
+    kind: &mtld3d_core::extended::CreateKind,
+    pool: u32,
+    shared_handle: *mut c_void,
+) -> bool {
+    use mtld3d_core::extended::{SharedHandleVerdict, shared_handle_verdict};
+    shared_handle_verdict(
+        kind,
+        pool,
+        !shared_handle.is_null(),
+        device_is_extended(this),
+    ) == SharedHandleVerdict::Shared
 }
 
 /// The pool a create in `pool` makes its resource in, `None` when the device refuses it.
@@ -6459,7 +6481,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     }
     // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
-    // extended one reads it as user memory or a shared resource.
+    // extended one reads it as user memory or, in the default pool, as the
+    // slot of a shared texture's handle.
     let kind = if offscreen_plain {
         mtld3d_core::extended::CreateKind::OffscreenPlain
     } else {
@@ -6472,6 +6495,33 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
             return hr;
         }
     };
+    let shared = create_shares(this, &kind, pool, shared_handle);
+    let shared_slot = if shared {
+        // SAFETY: an extended device's shared-resource contract:
+        // `shared_handle` is non-null (`create_shares` says so) and points to
+        // the application's `HANDLE` slot; alignment is not assumed.
+        unsafe { ValueIn::<*mut c_void>::read_opt(shared_handle.cast_const().cast()) }
+            .map_or(0, <*mut c_void>::addr)
+    } else {
+        0
+    };
+    if shared
+        && let Some(refusal) =
+            mtld3d_core::shared_texture::create_refusal(shared_slot, levels, usage, format)
+    {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: (u64::from(shared_slot == 0) << 48)
+                | (u64::from(format) << 40)
+                | (u64::from(levels.min(0xff)) << 32)
+                | u64::from(usage),
+            "reject CreateTexture({width}x{height}, levels={levels}, usage={usage:#x}, \
+             format={format}) with a pSharedHandle holding {shared_slot:#x} → NOTAVAILABLE: {}",
+            refusal.reason()
+        );
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
+    }
     let Some(pool) = create_pool(this, &kind, pool, "CreateTexture") else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -6753,17 +6803,43 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     obj.inner()
         .perf_mut()
         .add_texture_pool_outcomes(pool_hits, pool_misses);
+    let texture_id = TextureId::new_unique();
+    // The share is settled before the texture exists: its storage is opened
+    // now, parked on the unix side under the texture's id, and the creation
+    // queued below has the encoder adopt it. A failure here is the create's
+    // failure, which is what tells an application to try its other way of
+    // sharing.
+    if shared {
+        let request = crate::shared_texture::ShareRequest {
+            device_handle: obj.inner().device_handle,
+            record_handle: obj.inner().record_handle(),
+            texture_id,
+            width,
+            height,
+            pixel_format: fmt.metal_pixel_format(),
+            usage: usage_flags,
+        };
+        if let Err(hr) = crate::shared_texture::open(&request, shared_slot) {
+            null_out(texture);
+            return hr;
+        }
+    }
     let mut flags = TextureFlags::empty();
     flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
     flags.set(TextureFlags::OFFSCREEN_PLAIN, offscreen_plain);
+    flags.set(TextureFlags::SHARED, shared);
     // A render target the game created at the reported back-buffer size is its
     // main view and shares the back buffer's scale. A texture it uploads pixels
-    // into never does: its staging layout is keyed to the reported size.
-    let render_scale =
+    // into never does: its staging layout is keyed to the reported size. Nor
+    // does a shared one, whose storage has the extent both runtimes agreed on.
+    let render_scale = if shared {
+        mtld3d_core::render_scale::RenderScale::IDENTITY
+    } else {
         obj.inner()
-            .scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0);
+            .scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0)
+    };
     let tex = Direct3DTexture9::new(TextureCreateInfo {
-        texture_id: TextureId::new_unique(),
+        texture_id,
         device_handle: obj.inner().device_handle,
         device_inner: obj.inner as u64,
         width,

@@ -24,6 +24,7 @@ the reason for each one.
 | Need for Speed: Most Wanted (2005) | Plays, with the Widescreen Fix and ExtraOptions |
 | Need for Speed: Carbon | Plays, with the Widescreen Fix |
 | NosTale | Plays, 32-bit, windowed and DPI-unaware |
+| RaceRoom Racing Experience | Plays, 64-bit, with DXMT as its Direct3D 11 |
 | Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
 | The Elder Scrolls IV: Oblivion | Options work with the `oblivion` profile, 32-bit; hangs after a save loads, with or without the profile |
@@ -38,6 +39,13 @@ Half-Life 2 and Team Fortress 2 call `Direct3DCreate9Ex`. Since v0.13.0
 device, and both rows were verified on it. `-nod3d9ex` on the command line
 keeps them on plain D3D9. Every other game in the table that was checked
 creates a plain device.
+
+RaceRoom Racing Experience creates a D3D9Ex device for the scene and a
+Direct3D 11 device in the same process for its interface and the in-car
+displays, and composites those into the scene through shared textures. It
+needs a release with D3D9Ex shared textures, which v0.15.3 does not have,
+and DXMT as the Direct3D 11 runtime; without either, the interface and the
+displays stay blank while the scene renders.
 
 NosTale needs v0.13.0 or later. Before it, its characters drew with other
 sprites' images.
