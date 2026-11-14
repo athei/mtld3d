@@ -3,7 +3,7 @@
 //! An extended D3D9 device shares textures with Direct3D 11 through handles, so a test of
 //! that needs the other runtime in the same process. This is the least of it:
 //! a hardware device, a shared BGRA render-target texture and its handle,
-//! `OpenSharedResource`, and a clear. `d3d11.dll` is loaded by name rather
+//! and a clear. `d3d11.dll` is loaded by name rather
 //! than imported, so a Wine without it still runs the suite, and every method
 //! is called through its vtable slot, which the Direct3D 11 ABI fixes.
 
@@ -14,10 +14,6 @@ use mtld3d_types::{
     D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION, DXGI_FORMAT_B8G8R8A8_UNORM,
 };
 
-/// `IID_ID3D11Texture2D`, `6f15aaf2-d208-4e89-9ab4-489535d34f9c`.
-const IID_TEXTURE2D: [u8; 16] = [
-    0xf2, 0xaa, 0x15, 0x6f, 0x08, 0xd2, 0x89, 0x4e, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c,
-];
 /// `IID_IDXGIResource`, `035f3ab4-482e-4e50-b41f-8a7f8bd8960b`.
 const IID_DXGI_RESOURCE: [u8; 16] = [
     0xb4, 0x3a, 0x5f, 0x03, 0x2e, 0x48, 0x50, 0x4e, 0xb4, 0x1f, 0x8a, 0x7f, 0x8b, 0xd8, 0x96, 0x0b,
@@ -29,7 +25,6 @@ mod slot {
     pub const RELEASE: usize = 2;
     pub const DEVICE_CREATE_TEXTURE2D: usize = 5;
     pub const DEVICE_CREATE_RENDER_TARGET_VIEW: usize = 9;
-    pub const DEVICE_OPEN_SHARED_RESOURCE: usize = 28;
     pub const CONTEXT_CLEAR_RENDER_TARGET_VIEW: usize = 50;
     pub const CONTEXT_FLUSH: usize = 111;
     pub const DXGI_RESOURCE_GET_SHARED_HANDLE: usize = 8;
@@ -48,7 +43,7 @@ pub struct D3d11Device {
     context: *mut c_void,
 }
 
-/// An `ID3D11Texture2D` the device created or opened.
+/// An `ID3D11Texture2D` the device created.
 pub struct D3d11Texture {
     texture: *mut c_void,
 }
@@ -182,36 +177,6 @@ impl D3d11Device {
         let hr = unsafe { get(resource, &raw mut handle) };
         release(resource);
         (hr >= 0 && handle != 0).then_some((texture, handle))
-    }
-
-    /// `OpenSharedResource` of `handle` as a 2D texture, `None` when it refuses.
-    #[must_use]
-    pub fn open_shared_texture(&self, handle: usize) -> Option<D3d11Texture> {
-        let mut texture = core::ptr::null_mut();
-        // SAFETY: slot 28 of a live `ID3D11Device` is `OpenSharedResource`.
-        let entry = unsafe { vtbl_entry(self.device, slot::DEVICE_OPEN_SHARED_RESOURCE) };
-        // SAFETY: the entry has `OpenSharedResource`'s signature.
-        let open = unsafe {
-            core::mem::transmute::<
-                *const c_void,
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    usize,
-                    *const [u8; 16],
-                    *mut *mut c_void,
-                ) -> i32,
-            >(entry)
-        };
-        // SAFETY: a live device, a live interface id and a writable out slot.
-        let hr = unsafe {
-            open(
-                self.device,
-                handle,
-                core::ptr::from_ref(&IID_TEXTURE2D),
-                &raw mut texture,
-            )
-        };
-        (hr >= 0 && !texture.is_null()).then_some(D3d11Texture { texture })
     }
 
     /// Clear `texture` to `rgba` through a render-target view and flush the context.

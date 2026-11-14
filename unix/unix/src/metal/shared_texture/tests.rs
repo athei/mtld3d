@@ -1,14 +1,101 @@
-use mtld3d_core::shared_texture::SERVICE_NAME_PREFIX;
+use std::io::Write as _;
+
+use objc2::runtime::NSObjectProtocol;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
     MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLLoadAction, MTLOrigin,
-    MTLRenderPassDescriptor, MTLResourceOptions, MTLSize, MTLStoreAction,
+    MTLRenderPassDescriptor, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTextureDescriptor,
 };
 
 use super::*;
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 200;
+
+unsafe extern "C" {
+    /// Register `port` under `name`; exported by libSystem, absent from the SDK headers.
+    fn bootstrap_register2(
+        bootstrap: mach_port_t,
+        name: *const c_char,
+        port: mach_port_t,
+        flags: c_int,
+    ) -> kern_return_t;
+}
+
+/// The method the runtime that creates a shared texture names it with.
+///
+/// # Safety
+///
+/// Implemented for `MTLSharedTextureHandle` alone, whose instances answer
+/// this selector with this signature where they answer it at all.
+unsafe trait PublishedHandle: ClassType + Sized {
+    extern_methods!(
+        /// A send right that names the handle's texture to any task that receives it.
+        ///
+        /// # Safety
+        ///
+        /// The handle responds to `createMachPort`.
+        #[unsafe(method(createMachPort))]
+        #[unsafe(method_family = none)]
+        unsafe fn create_mach_port(&self) -> mach_port_t;
+    );
+}
+
+// SAFETY: the trait's contract names this class.
+unsafe impl PublishedHandle for MTLSharedTextureHandle {}
+
+/// Play the other runtime's part: allocate a shared texture and register its port.
+///
+/// The calls a Direct3D 11 runtime makes for a `D3D11_RESOURCE_MISC_SHARED`
+/// texture, which this layer only ever opens. Returns the texture and the
+/// NUL-terminated service name its port resolves under, which carries the
+/// test process and `serial`, a number each test picks for itself.
+fn publish(
+    device: &ProtocolObject<dyn MTLDevice>,
+    serial: u32,
+) -> (
+    Retained<ProtocolObject<dyn MTLTexture>>,
+    [u8; SERVICE_NAME_LEN],
+) {
+    // SAFETY: objc2 typed binding; class-method constructor returning a fresh
+    // autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            usize::try_from(WIDTH).expect("u32 fits usize"),
+            usize::try_from(HEIGHT).expect("u32 fits usize"),
+            false,
+        )
+    };
+    desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+    desc.setStorageMode(MTLStorageMode::Private);
+    let texture = device
+        .newSharedTextureWithDescriptor(&desc)
+        .expect("a shared texture");
+    let handle = texture
+        .newSharedTextureHandle()
+        .expect("a shared texture handle");
+    assert!(
+        handle.respondsToSelector(Sel::register(c"createMachPort")),
+        "this macOS's MTLSharedTextureHandle has no createMachPort"
+    );
+    // SAFETY: the handle responds to the selector, asserted above.
+    let port = unsafe { handle.create_mach_port() };
+    assert_ne!(port, 0, "createMachPort");
+    let mut name = [0; SERVICE_NAME_LEN];
+    let mut text = &mut name[..SERVICE_NAME_LEN - 1];
+    write!(text, "MTLD3D_test_{:08x}_{serial:08x}", std::process::id())
+        .expect("the name fits its field");
+    let bootstrap = bootstrap_port().expect("a bootstrap port");
+    // SAFETY: `name` is NUL-terminated within its field and both ports are
+    // live send rights of this task.
+    let kr = unsafe { bootstrap_register2(bootstrap, name.as_ptr().cast(), port, 0) };
+    deallocate(bootstrap);
+    deallocate(port);
+    assert_eq!(kr, 0, "bootstrap_register2");
+    (texture, name)
+}
 
 fn request(tex_id: u64, width: u32, usage: TextureUsage) -> ShareRequest {
     ShareRequest {
@@ -93,30 +180,19 @@ fn first_texel(
     texel
 }
 
-/// A created texture opens by its registered name as the same storage, in both directions.
+/// A texture another runtime published opens by its name as the same storage.
 ///
-/// `create` runs the Metal and bootstrap calls the other runtime's allocation
-/// runs, `open` is what a D3D9 open of that runtime's handle runs, and what
-/// one command queue renders into either texture the other queue reads from
-/// the other texture.
+/// `publish` runs the Metal and bootstrap calls the other runtime's
+/// allocation runs, `open` is what a D3D9 open of that runtime's handle runs,
+/// and what one command queue renders into either texture the other queue
+/// reads from the other texture.
 #[test]
-fn a_created_texture_opens_by_name_as_the_same_storage() {
+fn a_published_texture_opens_by_name_as_the_same_storage() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         return;
     };
     let parked = ParkedTextures::new();
-    let name = create(
-        &device,
-        &parked,
-        &request(0x7001, WIDTH, TextureUsage::RENDER_TARGET),
-    )
-    .expect("the shared texture is created and registered");
-    assert!(name_str(&name).starts_with(SERVICE_NAME_PREFIX));
-    let created = parked.take(0x7001).expect("create parks the texture");
-    assert!(
-        parked.take(0x7001).is_none(),
-        "a parked texture is taken once"
-    );
+    let (created, name) = publish(&device, 0x70);
 
     assert!(open(
         &device,
@@ -125,6 +201,10 @@ fn a_created_texture_opens_by_name_as_the_same_storage() {
         &name
     ));
     let opened = parked.take(0x7002).expect("open parks the texture");
+    assert!(
+        parked.take(0x7002).is_none(),
+        "a parked texture is taken once"
+    );
     assert_eq!(
         (opened.width(), opened.height()),
         (
@@ -157,13 +237,7 @@ fn an_open_refuses_another_extent_and_an_unknown_name() {
         return;
     };
     let parked = ParkedTextures::new();
-    let name = create(
-        &device,
-        &parked,
-        &request(0x7101, WIDTH, TextureUsage::empty()),
-    )
-    .expect("the shared texture is created and registered");
-    let _created = parked.take(0x7101).expect("create parks the texture");
+    let (_created, name) = publish(&device, 0x71);
 
     assert!(!open(
         &device,
@@ -177,7 +251,7 @@ fn an_open_refuses_another_extent_and_an_unknown_name() {
     );
 
     let mut unknown = [0u8; SERVICE_NAME_LEN];
-    unknown[..22].copy_from_slice(b"MTLD3D_shared_missing_");
+    unknown[..20].copy_from_slice(b"MTLD3D_test_missing_");
     assert!(!open(
         &device,
         &parked,
@@ -200,12 +274,13 @@ fn a_forgotten_texture_is_no_longer_parked() {
         return;
     };
     let parked = ParkedTextures::new();
-    create(
+    let (_created, name) = publish(&device, 0x72);
+    assert!(open(
         &device,
         &parked,
         &request(0x7201, WIDTH, TextureUsage::empty()),
-    )
-    .expect("the shared texture is created and registered");
+        &name
+    ));
     parked.forget(0x7201);
     assert!(parked.take(0x7201).is_none());
     // Forgetting an id that was never parked, or twice, changes nothing.
@@ -219,23 +294,20 @@ fn a_record_that_drops_releases_what_is_still_parked() {
         return;
     };
     let parked = ParkedTextures::new();
-    let name = create(
-        &device,
-        &parked,
-        &request(0x7301, WIDTH, TextureUsage::empty()),
-    )
-    .expect("the shared texture is created and registered");
-    assert!(open(
-        &device,
-        &parked,
-        &request(0x7302, WIDTH, TextureUsage::empty()),
-        &name
-    ));
+    let (created, name) = publish(&device, 0x73);
+    for tex_id in [0x7301, 0x7302] {
+        assert!(open(
+            &device,
+            &parked,
+            &request(tex_id, WIDTH, TextureUsage::empty()),
+            &name
+        ));
+    }
     let opened = parked.take(0x7302).expect("open parks the texture");
-    // The texture `create` parked goes with the table; the storage lives on
-    // through the opened wrapper, which still reads back.
+    // The texture left parked goes with the table; the storage lives on
+    // through the other wrappers, which still read back.
     drop(parked);
     let queue = device.newCommandQueue().expect("a queue");
-    clear(&queue, &opened, 0x80);
+    clear(&queue, &created, 0x80);
     assert_eq!(first_texel(&device, &queue, &opened), [0x80; 4]);
 }

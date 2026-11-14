@@ -4114,7 +4114,7 @@ fn shared_handle_gate(
     use mtld3d_core::extended::{SharedHandleVerdict, shared_handle_verdict};
     let extended = device_is_extended(this);
     match shared_handle_verdict(kind, pool, !shared_handle.is_null(), extended) {
-        // `CreateTexture` asks `create_shares` first and serves the share
+        // `CreateTexture` asks `create_shares` first and opens the share
         // itself; no user memory either way.
         SharedHandleVerdict::Proceed | SharedHandleVerdict::Shared => Ok(None),
         SharedHandleVerdict::UserMemory => {
@@ -4149,8 +4149,8 @@ fn shared_handle_gate(
 /// Whether a `CreateTexture` with these arguments shares its texture.
 ///
 /// True for an extended device's `D3DPOOL_DEFAULT` 2D texture given a
-/// `pSharedHandle`, which is then a slot holding the handle to open, or null
-/// to have a new shared texture's handle written there.
+/// `pSharedHandle`, which is then a slot holding the handle to open. A slot
+/// holding null asks for a new shared texture, which the create refuses.
 fn create_shares(
     this: *mut c_void,
     kind: &mtld3d_core::extended::CreateKind,
@@ -6496,14 +6496,27 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         }
     };
     let shared = create_shares(this, &kind, pool, shared_handle);
+    let shared_slot = if shared {
+        // SAFETY: an extended device's shared-resource contract:
+        // `shared_handle` is non-null (`create_shares` says so) and points to
+        // the application's `HANDLE` slot; alignment is not assumed.
+        unsafe { ValueIn::<*mut c_void>::read_opt(shared_handle.cast_const().cast()) }
+            .map_or(0, <*mut c_void>::addr)
+    } else {
+        0
+    };
     if shared
-        && let Some(refusal) = mtld3d_core::shared_texture::create_refusal(levels, usage, format)
+        && let Some(refusal) =
+            mtld3d_core::shared_texture::create_refusal(shared_slot, levels, usage, format)
     {
         mtld3d_shared::log_once_warn_by!(
             target: LOG_TARGET,
-            key: (u64::from(format) << 40) | (u64::from(levels.min(0xff)) << 32) | u64::from(usage),
+            key: (u64::from(shared_slot == 0) << 48)
+                | (u64::from(format) << 40)
+                | (u64::from(levels.min(0xff)) << 32)
+                | u64::from(usage),
             "reject CreateTexture({width}x{height}, levels={levels}, usage={usage:#x}, \
-             format={format}) with a pSharedHandle → NOTAVAILABLE: {}",
+             format={format}) with a pSharedHandle holding {shared_slot:#x} → NOTAVAILABLE: {}",
             refusal.reason()
         );
         null_out(texture);
@@ -6792,11 +6805,10 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         .add_texture_pool_outcomes(pool_hits, pool_misses);
     let texture_id = TextureId::new_unique();
     // The share is settled before the texture exists: its storage is opened
-    // or created now, parked on the unix side under the texture's id, and the
-    // creation queued below has the encoder adopt it. A failure here is the
-    // create's failure, which is what tells an application to try its other
-    // way of sharing.
-    let mut created_share = None;
+    // now, parked on the unix side under the texture's id, and the creation
+    // queued below has the encoder adopt it. A failure here is the create's
+    // failure, which is what tells an application to try its other way of
+    // sharing.
     if shared {
         let request = crate::shared_texture::ShareRequest {
             device_handle: obj.inner().device_handle,
@@ -6804,26 +6816,12 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
             texture_id,
             width,
             height,
-            d3d_format: format,
             pixel_format: fmt.metal_pixel_format(),
             usage: usage_flags,
         };
-        // SAFETY: an extended device's shared-resource contract:
-        // `shared_handle` is non-null (`create_shares` says so) and points to
-        // the application's `HANDLE` slot; alignment is not assumed.
-        let slot = unsafe { ValueIn::<*mut c_void>::read_opt(shared_handle.cast_const().cast()) }
-            .map_or(0, <*mut c_void>::addr);
-        let outcome = if slot == 0 {
-            crate::shared_texture::create(&request).map(Some)
-        } else {
-            crate::shared_texture::open(&request, slot).map(|()| None)
-        };
-        match outcome {
-            Ok(created) => created_share = created,
-            Err(hr) => {
-                null_out(texture);
-                return hr;
-            }
+        if let Err(hr) = crate::shared_texture::open(&request, shared_slot) {
+            null_out(texture);
+            return hr;
         }
     }
     let mut flags = TextureFlags::empty();
@@ -6840,7 +6838,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         obj.inner()
             .scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0)
     };
-    let mut tex = Direct3DTexture9::new(TextureCreateInfo {
+    let tex = Direct3DTexture9::new(TextureCreateInfo {
         texture_id,
         device_handle: obj.inner().device_handle,
         device_inner: obj.inner as u64,
@@ -6866,10 +6864,6 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         mip_bytes_per_row,
     });
 
-    if let Some(created) = &created_share {
-        tex.inner_mut().set_shared_resource(created.resource);
-    }
-
     push_texture_warmups(obj.inner(), tex.inner());
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
@@ -6888,15 +6882,6 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     }
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
-    if let Some(created) = created_share {
-        let handle = core::ptr::without_provenance_mut::<c_void>(
-            usize::try_from(created.handle).expect("u32 fits usize"),
-        );
-        // SAFETY: the application's `HANDLE` slot, non-null for a shared
-        // create, which this create read a null handle from above; alignment
-        // is not assumed.
-        unsafe { OutPtr::write_opt(shared_handle.cast::<*mut c_void>(), handle) };
-    }
     0 // S_OK
 }
 

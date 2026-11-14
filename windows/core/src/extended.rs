@@ -61,9 +61,9 @@ pub enum SharedHandleVerdict {
     UserMemory,
     /// The handle shares a `D3DPOOL_DEFAULT` texture with another runtime.
     ///
-    /// An extended device's `CreateTexture` reads `*pSharedHandle`: null
-    /// creates a shared texture and writes its handle there, anything else
-    /// is the handle of a texture to open.
+    /// An extended device's `CreateTexture` reads `*pSharedHandle`: a handle
+    /// there names the texture to open, and null asks for a new shared
+    /// texture, which the create refuses.
     Shared,
     /// The create fails with the refusal's code.
     Refuse(SharedRefusal),
@@ -114,7 +114,7 @@ impl SharedRefusal {
 /// refuses any other with `E_NOTIMPL`. An extended device reads it as user
 /// memory for a single-level `D3DPOOL_SYSTEMMEM` 2D texture or offscreen plain
 /// surface, as a shared resource for `D3DPOOL_DEFAULT`, which a 2D texture
-/// takes and every other kind refuses with `D3DERR_NOTAVAILABLE`,
+/// opens and every other kind refuses with `D3DERR_NOTAVAILABLE`,
 /// and as an invalid call for every other pool; a vertex or index buffer
 /// outside the default pool answers `D3DERR_NOTAVAILABLE` instead.
 #[must_use]

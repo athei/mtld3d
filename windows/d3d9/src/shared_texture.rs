@@ -1,15 +1,12 @@
 //! Shared `D3DPOOL_DEFAULT` textures: the D3DKMT side of a `pSharedHandle`.
 //!
-//! An extended device's `CreateTexture` shares its texture with a Direct3D 11
-//! device of the same process through a handle (`mtld3d_core::shared_texture`
+//! An extended device's `CreateTexture` opens a texture a Direct3D 11 device
+//! of the same process shares through a handle (`mtld3d_core::shared_texture`
 //! has the rules and the record). This module makes the win32u calls behind
 //! it:
 //!
 //! - [`open`] reads the record of the D3DKMT resource a handle names and has
 //!   the unix side wrap the Metal texture the record's service name leads to.
-//! - [`create`] has the unix side allocate a shared Metal texture, then
-//!   publishes a record for it as a new shared D3DKMT resource, whose global
-//!   handle is the one the application receives.
 //! - [`release`] gives back what a shared texture holds outside itself.
 //!
 //! Nothing synchronises the two runtimes' command queues beyond what Metal
@@ -25,9 +22,7 @@ use std::sync::LazyLock;
 use log::{info, warn};
 use mtld3d_core::{
     ids::TextureId,
-    shared_texture::{
-        RECORD_LEN, SERVICE_NAME_LEN, SharedTextureRecord, dxgi_format, global_handle,
-    },
+    shared_texture::{RECORD_LEN, SERVICE_NAME_LEN, SharedTextureRecord, global_handle},
 };
 use mtld3d_shared::{
     MetalHandle, SHARED_TEXTURE_NAME_LEN, SharedTextureParams,
@@ -35,23 +30,9 @@ use mtld3d_shared::{
     mtl_handle::MTLDeviceKind,
     record_handle::DeviceRecordHandle,
 };
-use mtld3d_types::{
-    D3DKMT_CREATEALLOCATION_CREATE_RESOURCE, D3DKMT_CREATEALLOCATION_CREATE_SHARED,
-    D3DKMT_CREATEALLOCATION_EXISTING_SYS_MEM, D3DKMT_CREATEALLOCATION_STANDARD_ALLOCATION,
-    D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP, LUID,
-};
+use mtld3d_types::LUID;
 
 use crate::{D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, LOG_TARGET, unix_call::unix_call};
-
-/// The flags a legacy shared resource is created with.
-///
-/// A resource rather than a bare allocation, shared through a global handle,
-/// as a standard allocation over existing system memory: the one shape
-/// win32u creates without a driver behind it.
-const CREATE_SHARED_RESOURCE_FLAGS: u32 = D3DKMT_CREATEALLOCATION_CREATE_RESOURCE
-    | D3DKMT_CREATEALLOCATION_CREATE_SHARED
-    | D3DKMT_CREATEALLOCATION_EXISTING_SYS_MEM
-    | D3DKMT_CREATEALLOCATION_STANDARD_ALLOCATION;
 
 const _: () = assert!(SHARED_TEXTURE_NAME_LEN >= SERVICE_NAME_LEN);
 
@@ -62,27 +43,17 @@ unsafe extern "system" {
     fn D3DKMTQueryResourceInfo(desc: *mut D3dkmtQueryResourceInfo) -> u32;
     fn D3DKMTOpenResource2(desc: *mut D3dkmtOpenResource) -> u32;
     fn D3DKMTDestroyAllocation(desc: *const D3dkmtDestroyAllocation) -> u32;
-    fn D3DKMTCreateAllocation2(desc: *mut D3dkmtCreateAllocation) -> u32;
 }
 
-/// The texture a shared create asks for, and the device it asks on.
+/// The texture a create that opens a share asks for, and the device it asks on.
 pub struct ShareRequest {
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub record_handle: DeviceRecordHandle,
     pub texture_id: TextureId,
     pub width: u32,
     pub height: u32,
-    pub d3d_format: u32,
     pub pixel_format: PixelFormat,
     pub usage: TextureUsage,
-}
-
-/// What a shared create hands back.
-pub struct CreatedShare {
-    /// The D3DKMT global handle the application receives.
-    pub handle: u32,
-    /// The local resource handle the texture keeps and gives back at release.
-    pub resource: u32,
 }
 
 /// Open the texture behind `slot`, the value the application's handle slot holds.
@@ -127,7 +98,7 @@ pub fn open(request: &ShareRequest, slot: usize) -> Result<(), i32> {
     }
     let mut name = [0; SHARED_TEXTURE_NAME_LEN];
     name[..SERVICE_NAME_LEN].copy_from_slice(record.service_name());
-    if thunk(SharedTextureOp::Open, request, name).is_none() {
+    if !open_metal_texture(request, name) {
         warn!(target: LOG_TARGET,
             "CreateTexture: the Metal texture behind shared handle {global:#x} could not be \
              opened (mtld3d::unix says why) → INVALIDCALL");
@@ -140,73 +111,35 @@ pub fn open(request: &ShareRequest, slot: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// Create a shared texture and the D3DKMT global handle that names it.
-///
-/// On success the texture's storage is parked on the unix side under the
-/// request's texture id, and the handle opens with
-/// `ID3D11Device::OpenSharedResource` as a texture that is both a render
-/// target and a shader resource.
-///
-/// # Errors
-///
-/// `D3DERR_NOTAVAILABLE`, the HRESULT of the create, when the format is not
-/// shared, the Metal texture cannot be made, or win32u creates no resource.
-pub fn create(request: &ShareRequest) -> Result<CreatedShare, i32> {
-    let tex_id = request.texture_id.raw();
-    let (width, height) = (request.width, request.height);
-    let Some(format) = dxgi_format(request.d3d_format) else {
-        warn!(target: LOG_TARGET,
-            "CreateTexture: D3D format {} has no shared counterpart → NOTAVAILABLE",
-            request.d3d_format);
-        return Err(D3DERR_NOTAVAILABLE);
-    };
-    let Some(device) = kmt_device() else {
-        return Err(D3DERR_NOTAVAILABLE);
-    };
-    let Some(name) = thunk(
-        SharedTextureOp::Create,
-        request,
-        [0; SHARED_TEXTURE_NAME_LEN],
-    ) else {
-        warn!(target: LOG_TARGET,
-            "CreateTexture: the shared Metal texture could not be created (mtld3d::unix says \
-             why) → NOTAVAILABLE");
-        return Err(D3DERR_NOTAVAILABLE);
-    };
-    let mut service_name = [0; SERVICE_NAME_LEN];
-    service_name.copy_from_slice(&name[..SERVICE_NAME_LEN]);
-    let record = SharedTextureRecord::for_created_texture(service_name, width, height, format);
-    let Some(created) = publish_record(device, &record) else {
-        forget(request.device_handle, request.record_handle, tex_id);
-        return Err(D3DERR_NOTAVAILABLE);
-    };
-    info!(target: LOG_TARGET,
-        "CreateTexture: created shared texture {tex_id:#x} ({width}x{height}, DXGI format \
-         {format}) as shared handle {:#x}", created.handle);
-    Ok(created)
-}
-
 /// Give back what a shared texture holds outside the texture itself.
 ///
-/// Called once, at the texture's final release or for a create that failed
-/// after its share was made: the D3DKMT resource of a texture created here
-/// (`resource`, 0 for an opened one), which retires the handle the
-/// application was given, and the storage the encoder never adopted. A null
-/// `record_handle` is a texture whose device is gone, and with it the record
-/// that parked the storage.
+/// Called once, at the final release of a texture whose device still lives:
+/// the storage the encoder never adopted. A device that is gone took its
+/// record, and with it whatever was parked, along.
 pub fn release(
     device_handle: MetalHandle<MTLDeviceKind>,
     record_handle: DeviceRecordHandle,
     tex_id: u64,
-    resource: u32,
 ) {
-    if !record_handle.is_null() {
-        forget(device_handle, record_handle, tex_id);
-    }
-    if resource != 0
-        && let Some(device) = kmt_device()
-    {
-        destroy_resource(device, resource);
+    let mut params = SharedTextureParams {
+        device_handle,
+        record_handle,
+        tex_id,
+        op: SharedTextureOp::Forget,
+        width: 0,
+        height: 0,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        usage: TextureUsage::empty(),
+        pad0: 0,
+        name: [0; SHARED_TEXTURE_NAME_LEN],
+    };
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "shared textures: the unix side did not release the storage parked for texture \
+             {tex_id:#x} (status {status:#x})"
+        );
     }
 }
 
@@ -278,45 +211,6 @@ struct D3dkmtDestroyAllocation {
     allocation_count: u32,
 }
 
-/// Win32 `D3DDDI_ALLOCATIONINFO2`, its tail kept as opaque zeroes.
-///
-/// A standard allocation over an existing heap reads `system_mem` and gets
-/// `allocation` written back; the tail only has to be there.
-#[repr(C)]
-struct D3dddiAllocationInfo2 {
-    allocation: u32,
-    system_mem: *const c_void,
-    private_driver_data: *mut c_void,
-    private_driver_data_size: u32,
-    vid_pn_source_id: u32,
-    flags: u32,
-    tail: [u64; 8],
-}
-
-/// Win32 `D3DKMT_CREATESTANDARDALLOCATION`.
-#[repr(C)]
-struct D3dkmtCreateStandardAllocation {
-    kind: u32,
-    existing_heap_size: usize,
-    flags: u32,
-}
-
-/// Win32 `D3DKMT_CREATEALLOCATION`.
-#[repr(C)]
-struct D3dkmtCreateAllocation {
-    device: u32,
-    resource: u32,
-    global_share: u32,
-    private_runtime_data: *const c_void,
-    private_runtime_data_size: u32,
-    standard_allocation: *mut D3dkmtCreateStandardAllocation,
-    private_driver_data_size: u32,
-    num_allocations: u32,
-    allocation_info: *mut D3dddiAllocationInfo2,
-    flags: u32,
-    private_runtime_resource_handle: *mut c_void,
-}
-
 /// The process's D3DKMT device, `None` when win32u gives none.
 ///
 /// Every D3DKMT resource call names a device, and win32u only checks that
@@ -327,9 +221,8 @@ fn kmt_device() -> Option<u32> {
     ///
     /// The resource is process-wide and latched once: a D3DKMT device is a
     /// handle win32u gives the process, not state of a D3D9 device, and one
-    /// serves every shared create of every device. It and its adapter stay
-    /// open for the life of the process, since a texture created shared may
-    /// be released after the device that created it.
+    /// serves every shared open of every device. It and its adapter stay
+    /// open for the life of the process.
     static DEVICE: LazyLock<u32> = LazyLock::new(open_kmt_device);
     (*DEVICE != 0).then_some(*DEVICE)
 }
@@ -355,7 +248,7 @@ fn open_kmt_device() -> u32 {
             if luid_status != 0 || by_luid.adapter == 0 {
                 warn!(target: LOG_TARGET,
                     "shared textures: no D3DKMT adapter opens (by display name: status {:#x}, \
-                     by LUID: status {luid_status:#x}); no shared handle can be created or opened",
+                     by LUID: status {luid_status:#x}); no shared handle can be opened",
                     opened.err().unwrap_or(0));
                 return 0;
             }
@@ -378,7 +271,7 @@ fn open_kmt_device() -> u32 {
     if status != 0 || create.device == 0 {
         warn!(target: LOG_TARGET,
             "shared textures: D3DKMTCreateDevice failed (status {status:#x}); no shared handle \
-             can be created or opened");
+             can be opened");
         return 0;
     }
     info!(target: LOG_TARGET,
@@ -452,58 +345,6 @@ fn query_record(device: u32, global: u32) -> Result<SharedTextureRecord, i32> {
     Ok(SharedTextureRecord::from_bytes(&bytes))
 }
 
-/// Create a shared D3DKMT resource whose runtime data is `record`.
-///
-/// `None` when win32u creates no resource or hands no global handle out, logged.
-fn publish_record(device: u32, record: &SharedTextureRecord) -> Option<CreatedShare> {
-    let bytes = record.to_bytes();
-    let system_mem = 0u64;
-    let mut allocation = D3dddiAllocationInfo2 {
-        allocation: 0,
-        // win32u only requires the pointer to be non-null for a standard
-        // allocation over an existing heap; nothing is read through it.
-        system_mem: (&raw const system_mem).cast(),
-        private_driver_data: core::ptr::null_mut(),
-        private_driver_data_size: 0,
-        vid_pn_source_id: 0,
-        flags: 0,
-        tail: [0; 8],
-    };
-    let mut standard = D3dkmtCreateStandardAllocation {
-        kind: D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP,
-        existing_heap_size: 0,
-        flags: 0,
-    };
-    let mut create = D3dkmtCreateAllocation {
-        device,
-        resource: 0,
-        global_share: 0,
-        private_runtime_data: bytes.as_ptr().cast(),
-        private_runtime_data_size: u32::try_from(RECORD_LEN).expect("the record length fits u32"),
-        standard_allocation: &raw mut standard,
-        private_driver_data_size: 0,
-        num_allocations: 1,
-        allocation_info: &raw mut allocation,
-        flags: CREATE_SHARED_RESOURCE_FLAGS,
-        private_runtime_resource_handle: core::ptr::null_mut(),
-    };
-    // SAFETY: gdi32 export; every pointer of `create` names a live local.
-    let status = unsafe { D3DKMTCreateAllocation2(&raw mut create) };
-    if status != 0 || create.global_share == 0 {
-        warn!(target: LOG_TARGET,
-            "CreateTexture: D3DKMTCreateAllocation2 gave no shared handle (status {status:#x}, \
-             global {:#x}) → NOTAVAILABLE", create.global_share);
-        if status == 0 {
-            destroy_resource(device, create.resource);
-        }
-        return None;
-    }
-    Some(CreatedShare {
-        handle: create.global_share,
-        resource: create.resource,
-    })
-}
-
 fn destroy_resource(device: u32, resource: u32) {
     if resource == 0 {
         return;
@@ -514,8 +355,8 @@ fn destroy_resource(device: u32, resource: u32) {
         allocation_list: core::ptr::null(),
         allocation_count: 0,
     };
-    // SAFETY: gdi32 export; `destroy` names a resource this module opened or
-    // created on `device`.
+    // SAFETY: gdi32 export; `destroy` names a resource this module opened on
+    // `device`.
     let status = unsafe { D3DKMTDestroyAllocation(&raw const destroy) };
     if status != 0 {
         mtld3d_shared::log_once_warn!(
@@ -526,17 +367,13 @@ fn destroy_resource(device: u32, resource: u32) {
     }
 }
 
-/// Run one `SharedTexture` thunk; the name it leaves, `None` when it failed.
-fn thunk(
-    op: SharedTextureOp,
-    request: &ShareRequest,
-    name: [u8; SHARED_TEXTURE_NAME_LEN],
-) -> Option<[u8; SHARED_TEXTURE_NAME_LEN]> {
+/// Have the unix side open the Metal texture registered under `name`; whether it did.
+fn open_metal_texture(request: &ShareRequest, name: [u8; SHARED_TEXTURE_NAME_LEN]) -> bool {
     let mut params = SharedTextureParams {
         device_handle: request.device_handle,
         record_handle: request.record_handle,
         tex_id: request.texture_id.raw(),
-        op,
+        op: SharedTextureOp::Open,
         width: request.width,
         height: request.height,
         pixel_format: request.pixel_format,
@@ -544,33 +381,5 @@ fn thunk(
         pad0: 0,
         name,
     };
-    (unix_call(&mut params) == 0).then_some(params.name)
-}
-
-/// Have the unix side release the storage parked under `tex_id`, if any.
-fn forget(
-    device_handle: MetalHandle<MTLDeviceKind>,
-    record_handle: DeviceRecordHandle,
-    tex_id: u64,
-) {
-    let mut params = SharedTextureParams {
-        device_handle,
-        record_handle,
-        tex_id,
-        op: SharedTextureOp::Forget,
-        width: 0,
-        height: 0,
-        pixel_format: PixelFormat::Bgra8Unorm,
-        usage: TextureUsage::empty(),
-        pad0: 0,
-        name: [0; SHARED_TEXTURE_NAME_LEN],
-    };
-    let status = unix_call(&mut params);
-    if status != 0 {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "shared textures: the unix side did not release the storage parked for texture \
-             {tex_id:#x} (status {status:#x})"
-        );
-    }
+    unix_call(&mut params) == 0
 }

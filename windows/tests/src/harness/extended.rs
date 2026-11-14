@@ -520,9 +520,8 @@ impl Harness {
 
     /// `CreateTexture` with a usage and a `pSharedHandle`, returning the hr and the texture.
     ///
-    /// On an extended device's default pool the handle's slot holds null to
-    /// create a shared texture, whose handle the call writes there, or the
-    /// handle of a shared texture to open.
+    /// On an extended device's default pool the handle's slot holds the
+    /// handle of a shared texture to open; a slot holding null is refused.
     #[must_use]
     pub fn try_create_texture_shared_usage(
         &self,

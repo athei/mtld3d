@@ -908,8 +908,8 @@ pub fn create_textures(
 /// The views of a shared texture, over the storage its `CreateTexture` parked.
 ///
 /// The storage is the one another Direct3D runtime draws into or samples: the
-/// `SharedTexture` thunk made or opened it and parked it under the texture's
-/// id. It is adopted once. A second create of the same id, or a create with
+/// `SharedTexture` thunk opened it and parked it under the texture's id. It
+/// is adopted once. A second create of the same id, or a create with
 /// no device record to look in, finds nothing and fails like a refused
 /// allocation, which the caller logs.
 fn adopt_shared_texture(
@@ -963,7 +963,7 @@ pub fn create_texture(
 
 /// The views of the texture `desc` describes, over `storage` when the caller brings it.
 ///
-/// `storage` is the texture a shared create already made or opened
+/// `storage` is the texture a shared create already opened
 /// ([`adopt_shared_texture`]); without it the texture is allocated here.
 fn create_texture_over(
     device: &ProtocolObject<dyn MTLDevice>,

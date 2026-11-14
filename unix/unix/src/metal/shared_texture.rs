@@ -8,36 +8,31 @@
 //! the bootstrap server under a unique service name. The name travels in the
 //! private runtime data of the D3DKMT resource whose global handle the
 //! application passes around (`mtld3d_core::shared_texture`). This module is
-//! the Metal half of that protocol, in both directions:
+//! the Metal half of opening such a texture: [`open`] takes the service name
+//! of a texture the other runtime allocated, looks the port up and wraps the
+//! same storage in an `MTLTexture` of this runtime.
 //!
-//! - [`open`] takes the service name of a texture the other runtime
-//!   allocated, looks the port up and wraps the same storage in an
-//!   `MTLTexture` of this runtime.
-//! - [`create`] allocates the storage here and registers its port, for a
-//!   texture the other runtime imports with `OpenSharedResource`.
+//! The texture exists before `CreateTexture` returns, because the call has
+//! to answer with a texture or a failure, while every other texture of this
+//! layer is created by the encoder when its creation record arrives. So the
+//! texture waits in the device record's [`ParkedTextures`] under its mtld3d
+//! texture id, and the encoder adopts it there when a descriptor carries
+//! `TextureCreateFlags::SHARED`.
 //!
-//! Either way the texture exists before `CreateTexture` returns, because the
-//! call has to answer with a handle or a failure, while every other texture
-//! of this layer is created by the encoder when its creation record arrives.
-//! So the texture waits in the device record's [`ParkedTextures`] under its
-//! mtld3d texture id, and the encoder adopts it there when a descriptor
-//! carries `TextureCreateFlags::SHARED`.
-//!
-//! `initWithMachPort:` and `createMachPort` are not in Metal's headers: they
-//! are how a shared texture handle crosses to a runtime that shares no
-//! `NSXPCConnection` with this one, and the selectors the other runtime uses.
-//! [`MachPortHandle`] declares them, and both are probed with
-//! `respondsToSelector:` before use, so a macOS without them refuses the
-//! share instead of raising.
+//! `initWithMachPort:` is not in Metal's headers: it is how a shared texture
+//! handle crosses to a runtime that shares no `NSXPCConnection` with this
+//! one, and the counterpart of the selector the other runtime makes the port
+//! with. [`MachPortHandle`] declares it, and it is probed with
+//! `respondsToSelector:` before use, so a macOS without it refuses the share
+//! instead of raising.
 
 use std::{
     ffi::{CStr, c_char, c_int},
     sync::{Mutex, PoisonError},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use libc::{kern_return_t, mach_port_t};
-use mtld3d_core::shared_texture::{SERVICE_NAME_LEN, service_name};
+use mtld3d_core::shared_texture::SERVICE_NAME_LEN;
 use mtld3d_shared::{
     MetalHandle, SHARED_TEXTURE_NAME_LEN, SharedTextureParams,
     mtl::{PixelFormat, SharedTextureOp, TextureUsage},
@@ -46,12 +41,11 @@ use mtld3d_shared::{
 use objc2::{
     AnyThread, ClassType, extern_methods,
     rc::{Allocated, Retained},
-    runtime::{NSObjectProtocol, ProtocolObject, Sel},
+    runtime::{ProtocolObject, Sel},
 };
-use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLDevice, MTLPixelFormat, MTLResource, MTLSharedTextureHandle, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLDevice, MTLPixelFormat, MTLResource, MTLSharedTextureHandle, MTLTexture, MTLTextureType,
+    MTLTextureUsage,
 };
 
 use super::{
@@ -78,13 +72,6 @@ unsafe extern "C" {
         bootstrap: mach_port_t,
         name: *const c_char,
         port: *mut mach_port_t,
-    ) -> kern_return_t;
-    /// Register `port` under `name`; exported by libSystem, absent from the SDK headers.
-    fn bootstrap_register2(
-        bootstrap: mach_port_t,
-        name: *const c_char,
-        port: mach_port_t,
-        flags: c_int,
     ) -> kern_return_t;
 }
 
@@ -163,38 +150,33 @@ impl Drop for ParkedTextures {
 
 /// Serve one `SharedTexture` thunk for the device whose record owns `parked`.
 ///
-/// `false` is the thunk's failure: the create or open made no texture, and
-/// its reason is already in the log.
-pub fn serve(parked: &ParkedTextures, params: &mut SharedTextureParams) -> bool {
-    if params.op == SharedTextureOp::Forget {
-        parked.forget(params.tex_id);
-        return true;
+/// `false` is the thunk's failure: the open made no texture, and its reason
+/// is already in the log.
+pub fn serve(parked: &ParkedTextures, params: &SharedTextureParams) -> bool {
+    match params.op {
+        SharedTextureOp::Forget => {
+            parked.forget(params.tex_id);
+            true
+        }
+        SharedTextureOp::Open => {
+            let Some(device) = params.device_handle.into_retained() else {
+                log::error!(target: LOG_TARGET,
+                    "shared texture {:#x}: the thunk names no Metal device", params.tex_id);
+                return false;
+            };
+            let mut name = [0; SERVICE_NAME_LEN];
+            name.copy_from_slice(&params.name[..SERVICE_NAME_LEN]);
+            open(&device, parked, &ShareRequest::of(params), &name)
+        }
     }
-    let Some(device) = params.device_handle.into_retained() else {
-        log::error!(target: LOG_TARGET,
-            "shared texture {:#x}: the thunk names no Metal device", params.tex_id);
-        return false;
-    };
-    let request = ShareRequest::of(params);
-    if params.op == SharedTextureOp::Open {
-        let mut name = [0; SERVICE_NAME_LEN];
-        name.copy_from_slice(&params.name[..SERVICE_NAME_LEN]);
-        return open(&device, parked, &request, &name);
-    }
-    let Some(name) = create(&device, parked, &request) else {
-        return false;
-    };
-    params.name = [0; SHARED_TEXTURE_NAME_LEN];
-    params.name[..SERVICE_NAME_LEN].copy_from_slice(&name);
-    true
 }
 
-/// The Mach-port methods of `MTLSharedTextureHandle`, which Metal's headers leave out.
+/// The Mach-port initializer of `MTLSharedTextureHandle`, which Metal's headers leave out.
 ///
 /// # Safety
 ///
 /// Implemented for `MTLSharedTextureHandle` alone, whose instances answer
-/// these selectors with these signatures where they answer them at all.
+/// this selector with this signature where they answer it at all.
 unsafe trait MachPortHandle: ClassType + Sized {
     extern_methods!(
         /// The handle of the shared texture `port` names, `None` when it names none.
@@ -209,22 +191,13 @@ unsafe trait MachPortHandle: ClassType + Sized {
             this: Allocated<Self>,
             port: mach_port_t,
         ) -> Option<Retained<Self>>;
-
-        /// A send right that names the handle's texture to any task that receives it.
-        ///
-        /// # Safety
-        ///
-        /// The handle responds to `createMachPort`.
-        #[unsafe(method(createMachPort))]
-        #[unsafe(method_family = none)]
-        unsafe fn create_mach_port(&self) -> mach_port_t;
     );
 }
 
 // SAFETY: the trait's contract names this class.
 unsafe impl MachPortHandle for MTLSharedTextureHandle {}
 
-/// The texture a create or an open is asked for.
+/// The texture an open is asked for.
 struct ShareRequest {
     tex_id: u64,
     width: u32,
@@ -244,90 +217,6 @@ impl ShareRequest {
             usage: params.usage,
         }
     }
-}
-
-/// Allocate a shared texture, register its port and park it under the request's id.
-///
-/// Returns the NUL-terminated service name the port is registered under.
-fn create(
-    device: &ProtocolObject<dyn MTLDevice>,
-    parked: &ParkedTextures,
-    request: &ShareRequest,
-) -> Option<[u8; SERVICE_NAME_LEN]> {
-    let ShareRequest {
-        tex_id,
-        width,
-        height,
-        pixel_format,
-        ..
-    } = *request;
-    // SAFETY: objc2 typed binding; class-method constructor returning a fresh
-    // autoreleased descriptor.
-    let desc = unsafe {
-        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            mtl_pixel_format(pixel_format),
-            usize::try_from(width).expect("u32 fits usize"),
-            usize::try_from(height).expect("u32 fits usize"),
-            false,
-        )
-    };
-    // A render target that is also sampled, whatever the D3D9 usage: that is
-    // how the record describes the texture to the runtime that opens it.
-    desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
-    desc.setStorageMode(MTLStorageMode::Private);
-    let Some(texture) = device.newSharedTextureWithDescriptor(&desc) else {
-        log::error!(target: LOG_TARGET,
-            "shared texture {tex_id:#x}: newSharedTextureWithDescriptor returned nil for \
-             {width}x{height} {pixel_format:?}");
-        return None;
-    };
-    texture.setLabel(Some(&NSString::from_str(&format!(
-        "mtld3d-shared-{tex_id:#x}"
-    ))));
-    let Some(handle) = texture.newSharedTextureHandle() else {
-        log::error!(target: LOG_TARGET,
-            "shared texture {tex_id:#x}: newSharedTextureHandle returned nil");
-        return None;
-    };
-    if !handle.respondsToSelector(Sel::register(c"createMachPort")) {
-        log::error!(target: LOG_TARGET,
-            "shared texture {tex_id:#x}: this macOS's MTLSharedTextureHandle has no \
-             createMachPort, so the texture cannot be named to another runtime");
-        return None;
-    }
-    // SAFETY: the handle responds to the selector, probed above.
-    let port = unsafe { handle.create_mach_port() };
-    if port == 0 {
-        log::error!(target: LOG_TARGET, "shared texture {tex_id:#x}: createMachPort returned 0");
-        return None;
-    }
-    let ticks = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| u64::try_from(since.as_micros()).unwrap_or(0));
-    let name = service_name(std::process::id(), tex_id, ticks);
-    let Some(bootstrap) = bootstrap_port() else {
-        log::error!(target: LOG_TARGET, "shared texture {tex_id:#x}: no bootstrap port");
-        deallocate(port);
-        return None;
-    };
-    // SAFETY: `name` is NUL-terminated (`service_name` guarantees it) and
-    // both ports are live send rights of this task.
-    let kr = unsafe { bootstrap_register2(bootstrap, name.as_ptr().cast(), port, 0) };
-    deallocate(bootstrap);
-    // The bootstrap server holds a right of its own from here on, which is
-    // what keeps the name resolving; this task's copy is not needed again.
-    deallocate(port);
-    if kr != 0 {
-        log::error!(target: LOG_TARGET,
-            "shared texture {tex_id:#x}: bootstrap_register2 failed ({kr:#x})");
-        return None;
-    }
-    log::info!(target: LOG_TARGET,
-        "shared texture {tex_id:#x}: created {width}x{height} {pixel_format:?} as {:?} \
-         (registry id {:#x})",
-        name_str(&name), device.registryID());
-    parked.park(tex_id, texture);
-    Some(name)
 }
 
 /// Wrap the shared texture registered under `name` and park it under the request's id.
@@ -450,13 +339,6 @@ fn deallocate(port: mach_port_t) {
             "shared texture: mach_port_deallocate failed ({kr:#x}); one port right stays held"
         );
     }
-}
-
-fn name_str(name: &[u8; SERVICE_NAME_LEN]) -> &str {
-    CStr::from_bytes_until_nul(name)
-        .ok()
-        .and_then(|name| name.to_str().ok())
-        .unwrap_or("?")
 }
 
 #[cfg(test)]

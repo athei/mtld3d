@@ -1,18 +1,18 @@
 //! Shared `D3DPOOL_DEFAULT` textures of an extended device.
 //!
 //! `CreateTexture` with a `pSharedHandle` on an extended device's default
-//! pool shares the texture: a slot holding null receives the handle of a new
-//! shared texture, and a slot holding a handle opens the texture it names.
-//! Two extended devices stand in for the two runtimes that share: what one
-//! renders into the texture it created, the other samples and reads back
-//! through the texture it opened, and the other way round. Where the Wine's
-//! Direct3D 11 is DXMT, the same holds between an extended device and a
-//! Direct3D 11 device, in both directions. The shapes no shared texture has
-//! are refused, and so is a slot that names no shared texture.
+//! pool opens the shared texture whose handle the slot holds. A slot holding
+//! null asks for a new shared texture, which is not available, and so are the
+//! shapes no shared texture has; a slot that names no shared resource is an
+//! invalid call. Where the Wine's Direct3D 11 is DXMT, the runtime whose
+//! handles this layer opens, a Direct3D 11 device creates the textures to
+//! open: what it draws an extended device samples and reads back through the
+//! texture it opened. Elsewhere those tests say on stdout that they did not
+//! run.
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{D3d11Device, Harness, SharedHandle, Texture};
+use mtld3d_tests::{D3d11Device, D3d11Texture, Harness, SharedHandle, Texture};
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_X8R8G8B8, D3DKMT_GLOBAL_HANDLE_MASK, D3DLOCK_READONLY,
@@ -25,27 +25,8 @@ const SIZE: u32 = 64;
 const RED: u32 = 0xFFFF_0000;
 const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
-/// Whether `value` is a D3DKMT global handle: 32 bits wide with one of its two top bits set.
-fn is_global_handle(value: usize) -> bool {
-    u32::try_from(value).is_ok_and(|handle| handle & D3DKMT_GLOBAL_HANDLE_MASK != 0)
-}
-
-/// Create a shared texture on `h`, returning it and the handle the create wrote.
-fn create_shared(h: &Harness, usage: u32, format: u32) -> (Texture<'_>, *mut c_void) {
-    let mut slot: *mut c_void = core::ptr::null_mut();
-    let (hr, texture) = {
-        // SAFETY: the slot holds null, a request to share, so nothing is read through it.
-        let handle = unsafe { SharedHandle::to(&mut slot) };
-        h.try_create_texture_shared_usage((SIZE, SIZE), 1, usage, format, D3DPOOL_DEFAULT, &handle)
-    };
-    assert_eq!(hr, D3D_OK, "a shared create");
-    let texture = texture.expect("a shared create hands out a texture");
-    assert!(
-        is_global_handle(slot.addr()),
-        "the create writes a D3DKMT global handle, got {slot:p}"
-    );
-    (texture, slot)
-}
+/// A global handle value no resource was created with.
+const UNKNOWN_HANDLE: usize = 0x7fff_fff0;
 
 /// `CreateTexture` on `h` with a slot that holds `handle`.
 fn try_open(
@@ -63,7 +44,7 @@ fn try_open(
         let shared = unsafe { SharedHandle::to(&mut slot) };
         h.try_create_texture_shared_usage(size, levels, usage, format, D3DPOOL_DEFAULT, &shared)
     };
-    assert_eq!(slot, handle, "an open leaves the handle in its slot");
+    assert_eq!(slot, handle, "the create leaves the slot as it was");
     answer
 }
 
@@ -75,10 +56,6 @@ fn open_shared(h: &Harness, usage: u32, format: u32, handle: *mut c_void) -> Tex
 }
 
 /// The centre texel of `texture`'s level, read back through `h`.
-///
-/// The read-back waits for the device's submitted work, so everything `h`
-/// rendered into the texture before it has finished on the GPU when this
-/// returns, which is what orders it before the other device's commands.
 fn read_back(h: &Harness, texture: &Texture<'_>) -> u32 {
     let level = texture.surface_level(0);
     let sysmem = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
@@ -124,115 +101,69 @@ fn sample_until(h: &Harness, texture: &Texture<'_>, color: u32) -> u32 {
     seen
 }
 
-/// What one device renders into a texture it created, another reads through the one it opened.
-#[test]
-fn a_render_target_created_on_one_device_opens_on_another_as_the_same_pixels() {
-    let producer = extended();
-    let consumer = extended();
-    let (created, handle) = create_shared(&producer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-    let opened = open_shared(&consumer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, handle);
-
-    fill(&producer, &created, RED);
-    assert_eq!(
-        read_back(&consumer, &opened),
-        RED,
-        "the opener reads back what the creator rendered"
-    );
-    assert_eq!(
-        sample_center(&consumer, &opened),
-        RED,
-        "the opener samples what the creator rendered"
-    );
-
-    fill(&consumer, &opened, BLUE);
-    assert_eq!(
-        read_back(&producer, &created),
-        BLUE,
-        "the creator reads back what the opener rendered"
-    );
-    assert_eq!(
-        sample_center(&producer, &created),
-        BLUE,
-        "the creator samples what the opener rendered"
-    );
+/// The process's Direct3D 11 device when it is DXMT's, with a note when it is not.
+fn dxmt_device() -> Option<D3d11Device> {
+    let Some(device) = D3d11Device::create() else {
+        println!("[e2e] no Direct3D 11 hardware device here; the shared open is not run");
+        return None;
+    };
+    if !device.is_dxmt() {
+        println!("[e2e] the Direct3D 11 here is not DXMT; the shared open is not run");
+        return None;
+    }
+    Some(device)
 }
 
-/// A texture created without a usage is still the storage another device renders into.
-#[test]
-fn a_plain_shared_texture_samples_what_the_opening_device_rendered() {
-    let owner = extended();
-    let painter = extended();
-    let (created, handle) = create_shared(&owner, 0, D3DFMT_X8R8G8B8);
-    let opened = open_shared(&painter, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, handle);
-
-    fill(&painter, &opened, GREEN);
-    assert_eq!(sample_center(&owner, &created), GREEN);
-    fill(&painter, &opened, RED);
-    assert_eq!(
-        sample_center(&owner, &created),
-        RED,
-        "a second frame of the other device reaches the same texture"
+/// A shared Direct3D 11 render target of `SIZE` and the handle `GetSharedHandle` gives for it.
+fn shared_d3d11_texture(d3d11: &D3d11Device) -> (D3d11Texture, *mut c_void) {
+    let (texture, handle) = d3d11
+        .create_shared_texture(SIZE, SIZE)
+        .expect("a Direct3D 11 shared texture and its handle");
+    assert!(
+        u32::try_from(handle).is_ok_and(|handle| handle & D3DKMT_GLOBAL_HANDLE_MASK != 0),
+        "GetSharedHandle hands out a D3DKMT global handle, got {handle:#x}"
     );
+    (texture, core::ptr::without_provenance_mut::<c_void>(handle))
 }
 
-/// Several opens of one handle are one storage.
+/// A slot holding null asks for a new shared texture, which only the other runtime creates.
 #[test]
-fn one_handle_opens_more_than_once() {
-    let producer = extended();
-    let consumer = extended();
-    let (created, handle) = create_shared(&producer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-    let first = open_shared(&consumer, 0, D3DFMT_A8R8G8B8, handle);
-    let second = open_shared(&consumer, 0, D3DFMT_A8R8G8B8, handle);
-
-    fill(&producer, &created, BLUE);
-    assert_eq!(sample_center(&consumer, &first), BLUE, "the first open");
-    assert_eq!(sample_center(&consumer, &second), BLUE, "the second open");
-}
-
-/// A texture released before any frame carried it leaves its device working.
-#[test]
-fn a_shared_texture_released_before_its_first_frame_leaves_the_device_working() {
+fn a_null_handle_slot_is_not_available() {
     let h = extended();
-    let consumer = extended();
-    let (created, handle) = create_shared(&h, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-    let opened = open_shared(&consumer, 0, D3DFMT_A8R8G8B8, handle);
-    drop(opened);
-    drop(created);
+    for (levels, usage, format, what) in [
+        (1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, "a render target"),
+        (1, 0, D3DFMT_X8R8G8B8, "a plain texture"),
+        (0, 0, D3DFMT_A8R8G8B8, "a full mip chain"),
+        (1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, "a dynamic texture"),
+        (1, 0, D3DFMT_L8, "L8"),
+    ] {
+        let (hr, texture) = try_open(
+            &h,
+            (SIZE, SIZE),
+            levels,
+            usage,
+            format,
+            core::ptr::null_mut(),
+        );
+        assert_eq!(
+            (hr, texture.is_none()),
+            (D3DERR_NOTAVAILABLE, true),
+            "{what}"
+        );
+    }
     h.render_once(GREEN, |_| {});
-    assert_eq!(h.read_pixel(1, 1), GREEN);
-    consumer.render_once(BLUE, |_| {});
-    assert_eq!(consumer.read_pixel(1, 1), BLUE);
+    assert_eq!(
+        h.read_pixel(1, 1),
+        GREEN,
+        "the device renders after the refusals"
+    );
 }
 
-/// The creator's release retires the handle; a texture opened before it keeps its storage.
+/// The shapes no shared texture has are refused before the handle is looked at.
 #[test]
-fn a_handle_stops_opening_once_its_creator_released_the_texture() {
-    let producer = extended();
-    let consumer = extended();
-    let (created, handle) = create_shared(&producer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-    let opened = open_shared(&consumer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, handle);
-    fill(&producer, &created, RED);
-    drop(created);
-
-    let (hr, late) = try_open(&consumer, (SIZE, SIZE), 1, 0, D3DFMT_A8R8G8B8, handle);
-    assert_eq!(
-        (hr, late.is_none()),
-        (D3DERR_INVALIDCALL, true),
-        "an open after the creator's release"
-    );
-    assert_eq!(
-        sample_center(&consumer, &opened),
-        RED,
-        "the opened texture keeps what was rendered"
-    );
-    fill(&consumer, &opened, GREEN);
-    assert_eq!(sample_center(&consumer, &opened), GREEN);
-}
-
-/// The shapes no shared texture has are refused before anything is shared.
-#[test]
-fn a_shared_create_of_another_shape_is_not_available() {
+fn an_open_of_another_shape_is_not_available() {
     let h = extended();
+    let handle = core::ptr::without_provenance_mut::<c_void>(UNKNOWN_HANDLE);
     for (levels, usage, format, what) in [
         (0, 0, D3DFMT_A8R8G8B8, "a full mip chain"),
         (3, 0, D3DFMT_A8R8G8B8, "three levels"),
@@ -246,95 +177,51 @@ fn a_shared_create_of_another_shape_is_not_available() {
             "A16B16G16R16F",
         ),
     ] {
-        let mut slot: *mut c_void = core::ptr::null_mut();
-        let (hr, texture) = {
-            // SAFETY: the slot holds null, so nothing is read through it.
-            let handle = unsafe { SharedHandle::to(&mut slot) };
-            h.try_create_texture_shared_usage(
-                (SIZE, SIZE),
-                levels,
-                usage,
-                format,
-                D3DPOOL_DEFAULT,
-                &handle,
-            )
-        };
+        let (hr, texture) = try_open(&h, (SIZE, SIZE), levels, usage, format, handle);
         assert_eq!(
             (hr, texture.is_none()),
             (D3DERR_NOTAVAILABLE, true),
             "{what}"
         );
-        assert!(slot.is_null(), "{what}: a refused create writes no handle");
     }
 }
 
-/// A slot that names no shared texture of the requested shape is an invalid call.
+/// A slot that names no shared resource is an invalid call.
 #[test]
-fn an_open_of_no_shared_texture_is_an_invalid_call() {
-    let producer = extended();
-    let consumer = extended();
-    let (created, handle) = create_shared(&producer, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-
+fn an_open_of_no_shared_resource_is_an_invalid_call() {
+    let h = extended();
     for (stray, what) in [
         (0x1f4_usize, "an NT handle value"),
         (0x3fff_fff0, "a value with neither top bit"),
         (
-            0x7fff_fff0,
+            UNKNOWN_HANDLE,
             "a global handle value nothing was created with",
         ),
     ] {
         let stray = core::ptr::without_provenance_mut::<c_void>(stray);
-        let (hr, texture) = try_open(&consumer, (SIZE, SIZE), 1, 0, D3DFMT_A8R8G8B8, stray);
+        let (hr, texture) = try_open(&h, (SIZE, SIZE), 1, 0, D3DFMT_A8R8G8B8, stray);
         assert_eq!(
             (hr, texture.is_none()),
             (D3DERR_INVALIDCALL, true),
             "{what}"
         );
     }
-
-    let (hr, texture) = try_open(&consumer, (SIZE / 2, SIZE), 1, 0, D3DFMT_A8R8G8B8, handle);
+    h.render_once(BLUE, |_| {});
     assert_eq!(
-        (hr, texture.is_none()),
-        (D3DERR_INVALIDCALL, true),
-        "another extent than the shared texture's"
+        h.read_pixel(1, 1),
+        BLUE,
+        "the device renders after the refusals"
     );
-    let (hr, texture) = try_open(&consumer, (SIZE, SIZE), 2, 0, D3DFMT_A8R8G8B8, handle);
-    assert_eq!(
-        (hr, texture.is_none()),
-        (D3DERR_NOTAVAILABLE, true),
-        "two levels"
-    );
-    let (hr, texture) = try_open(&consumer, (SIZE, SIZE), 1, 0, D3DFMT_L8, handle);
-    assert_eq!(
-        (hr, texture.is_none()),
-        (D3DERR_NOTAVAILABLE, true),
-        "a format that is not shared"
-    );
-
-    // The refusals left the handle as it was.
-    let opened = open_shared(&consumer, 0, D3DFMT_A8R8G8B8, handle);
-    fill(&producer, &created, BLUE);
-    assert_eq!(sample_center(&consumer, &opened), BLUE);
 }
 
 /// A Direct3D 11 texture's legacy handle opens on an extended device as the same pixels.
-///
-/// Runs where the Wine's Direct3D 11 is DXMT, the runtime whose shared
-/// handles this layer opens, and says so on stdout where it is not.
 #[test]
 fn a_direct3d_11_shared_texture_opens_on_an_extended_device() {
     let h = extended();
     let Some(d3d11) = dxmt_device() else {
         return;
     };
-    let (texture, handle) = d3d11
-        .create_shared_texture(SIZE, SIZE)
-        .expect("a Direct3D 11 shared texture and its handle");
-    assert!(
-        is_global_handle(handle),
-        "GetSharedHandle hands out a D3DKMT global handle, got {handle:#x}"
-    );
-    let handle = core::ptr::without_provenance_mut::<c_void>(handle);
+    let (texture, handle) = shared_d3d11_texture(&d3d11);
     let opened = open_shared(&h, 0, D3DFMT_A8R8G8B8, handle);
 
     assert!(
@@ -353,40 +240,122 @@ fn a_direct3d_11_shared_texture_opens_on_an_extended_device() {
     );
 }
 
-/// A texture an extended device created shared opens with `OpenSharedResource`.
-///
-/// Runs where the Wine's Direct3D 11 is DXMT, as the test above.
+/// A texture opened as a render target is drawn into and read back by the extended device too.
 #[test]
-fn a_shared_texture_of_an_extended_device_opens_in_direct3d_11() {
+fn an_opened_render_target_takes_what_either_runtime_draws() {
     let h = extended();
     let Some(d3d11) = dxmt_device() else {
         return;
     };
-    let (created, handle) = create_shared(&h, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8);
-    let opened = d3d11
-        .open_shared_texture(handle.addr())
-        .expect("OpenSharedResource takes the handle CreateTexture wrote");
+    let (texture, handle) = shared_d3d11_texture(&d3d11);
+    let opened = open_shared(&h, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, handle);
 
+    fill(&h, &opened, GREEN);
+    assert_eq!(sample_center(&h, &opened), GREEN, "what the device drew");
     assert!(
-        d3d11.clear(&opened, [0.0, 1.0, 0.0, 1.0]),
-        "a render-target view of the opened texture"
+        d3d11.clear(&texture, [1.0, 0.0, 0.0, 1.0]),
+        "a render-target view"
     );
     assert_eq!(
-        sample_until(&h, &created, GREEN),
+        sample_until(&h, &opened, RED),
+        RED,
+        "what Direct3D 11 drew over it"
+    );
+    assert_eq!(read_back(&h, &opened), RED, "the same, read back");
+}
+
+/// Several opens of one handle, on one device and on another, are one storage.
+#[test]
+fn one_handle_opens_more_than_once() {
+    let first_device = extended();
+    let second_device = extended();
+    let Some(d3d11) = dxmt_device() else {
+        return;
+    };
+    let (texture, handle) = shared_d3d11_texture(&d3d11);
+    let first = open_shared(&first_device, 0, D3DFMT_A8R8G8B8, handle);
+    let second = open_shared(&first_device, 0, D3DFMT_X8R8G8B8, handle);
+    let painter = open_shared(
+        &second_device,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        handle,
+    );
+
+    assert!(
+        d3d11.clear(&texture, [0.0, 0.0, 1.0, 1.0]),
+        "a render-target view"
+    );
+    assert_eq!(
+        sample_until(&first_device, &first, BLUE),
+        BLUE,
+        "the first open"
+    );
+    assert_eq!(
+        sample_until(&first_device, &second, BLUE),
+        BLUE,
+        "the second open"
+    );
+    // The other device's read-back in `fill` has its clear finished on the
+    // GPU before the first device samples.
+    fill(&second_device, &painter, GREEN);
+    assert_eq!(
+        sample_center(&first_device, &first),
         GREEN,
-        "what Direct3D 11 drew"
+        "what another extended device rendered through its own open"
     );
 }
 
-/// The process's Direct3D 11 device when it is DXMT's, with a note when it is not.
-fn dxmt_device() -> Option<D3d11Device> {
-    let Some(device) = D3d11Device::create() else {
-        println!("[e2e] no Direct3D 11 hardware device here; the cross-API share is not run");
-        return None;
+/// An open released before any frame carried it leaves its device working.
+#[test]
+fn an_opened_texture_released_before_its_first_frame_leaves_the_device_working() {
+    let h = extended();
+    let Some(d3d11) = dxmt_device() else {
+        return;
     };
-    if !device.is_dxmt() {
-        println!("[e2e] the Direct3D 11 here is not DXMT; the cross-API share is not run");
-        return None;
+    let (texture, handle) = shared_d3d11_texture(&d3d11);
+    drop(open_shared(
+        &h,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        handle,
+    ));
+    h.render_once(GREEN, |_| {});
+    assert_eq!(h.read_pixel(1, 1), GREEN);
+
+    // The handle still opens, and the open sees what is drawn after it.
+    let opened = open_shared(&h, 0, D3DFMT_A8R8G8B8, handle);
+    assert!(
+        d3d11.clear(&texture, [1.0, 0.0, 0.0, 1.0]),
+        "a render-target view"
+    );
+    assert_eq!(sample_until(&h, &opened, RED), RED);
+}
+
+/// An open at another extent than the shared texture's is an invalid call.
+#[test]
+fn an_open_at_another_extent_is_an_invalid_call() {
+    let h = extended();
+    let Some(d3d11) = dxmt_device() else {
+        return;
+    };
+    let (texture, handle) = shared_d3d11_texture(&d3d11);
+    for size in [(SIZE / 2, SIZE), (SIZE, SIZE * 2)] {
+        let (hr, opened) = try_open(&h, size, 1, 0, D3DFMT_A8R8G8B8, handle);
+        assert_eq!(
+            (hr, opened.is_none()),
+            (D3DERR_INVALIDCALL, true),
+            "{}x{}",
+            size.0,
+            size.1
+        );
     }
-    Some(device)
+
+    // The refusals left the handle as it was.
+    let opened = open_shared(&h, 0, D3DFMT_A8R8G8B8, handle);
+    assert!(
+        d3d11.clear(&texture, [0.0, 1.0, 0.0, 1.0]),
+        "a render-target view"
+    );
+    assert_eq!(sample_until(&h, &opened, GREEN), GREEN);
 }

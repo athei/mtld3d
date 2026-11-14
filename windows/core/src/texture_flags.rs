@@ -58,8 +58,8 @@ bitflags::bitflags! {
         const CPU_ONLY = 1 << 6;
         /// Shared with another Direct3D runtime through a `pSharedHandle`.
         ///
-        /// The Metal texture is the shared one the `SharedTexture` thunk made
-        /// or opened at creation; the encoder adopts it instead of allocating
+        /// The Metal texture is the shared one the `SharedTexture` thunk
+        /// opened at creation; the encoder adopts it instead of allocating
         /// (`TextureCreateFlags::SHARED`), and the texture's final release
         /// gives back what the share holds.
         const SHARED = 1 << 7;

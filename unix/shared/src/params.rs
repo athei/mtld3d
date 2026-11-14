@@ -729,13 +729,13 @@ impl Thunk for CreateColorTargetParams {
 /// keep the field a multiple of eight.
 pub const SHARED_TEXTURE_NAME_LEN: usize = 56;
 
-/// Create, open or forget the Metal texture behind a D3D9 shared texture.
+/// Open or forget the Metal texture behind a D3D9 shared texture.
 ///
 /// A texture two Direct3D runtimes share is one `MTLTexture` storage both
-/// wrap (`newSharedTextureWithDescriptor:`), named between them by the Mach
-/// port of its `MTLSharedTextureHandle`, registered with the bootstrap server
-/// under `name`. `CreateTexture` has to answer with a handle or a failure, so
-/// this thunk makes the texture inside that call and parks it on the device
+/// wrap, which the runtime that created it names by the Mach port of its
+/// `MTLSharedTextureHandle`, registered with the bootstrap server under
+/// `name`. `CreateTexture` has to answer with a texture or a failure, so
+/// this thunk opens the texture inside that call and parks it on the device
 /// record under `tex_id`; the encoder adopts it when the texture's creation
 /// reaches it (`TextureCreateFlags::SHARED`).
 #[repr(C, align(8))]
@@ -746,16 +746,16 @@ pub struct SharedTextureParams {
     /// The mtld3d texture id the parked texture is filed under.
     pub tex_id: u64, // in
     pub op: SharedTextureOp,                       // in
-    /// `Create`: the extent to allocate. `Open`: the extent the caller expects.
+    /// The extent the opened texture has to have.
     pub width: u32, // in
     pub height: u32,                               // in
-    /// `Create`: the format to allocate. `Open`: the format the caller expects.
+    /// The format the opened texture has to have.
     pub pixel_format: PixelFormat, // in
     /// The usage of the D3D9 texture, which an opened texture has to allow.
     pub usage: TextureUsage, // in
     pub pad0: u32,
-    /// The NUL-terminated service name: out for `Create`, in for `Open`.
-    pub name: [u8; SHARED_TEXTURE_NAME_LEN], // in/out
+    /// The NUL-terminated service name of the texture to open.
+    pub name: [u8; SHARED_TEXTURE_NAME_LEN], // in
 }
 
 const _: () = {

@@ -96,7 +96,7 @@ const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 ///
 /// `CANSHARERESOURCE` stays off: the bit promises a `pSharedHandle` on every
 /// kind of resource, while a plain device rejects each with `E_NOTIMPL` and
-/// an extended one shares a single-level 2D texture of two formats only.
+/// an extended one only opens a single-level 2D texture of two formats.
 const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::DYNAMICTEXTURES)
     .union(Caps2::FULLSCREENGAMMA)
