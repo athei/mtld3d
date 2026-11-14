@@ -50,6 +50,7 @@ impl WireValue for Mtld3dConfig {
         self.adapter_spoof.write_wire(writer)?;
         self.df_formats.write_wire(writer)?;
         self.max_resolutions.write_wire(writer)?;
+        self.texture_zero_on_create.write_wire(writer)?;
         Ok(())
     }
 
@@ -87,6 +88,7 @@ impl WireValue for Mtld3dConfig {
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,
             df_formats: <bool>::read_wire(reader)?,
             max_resolutions: <u32>::read_wire(reader)?,
+            texture_zero_on_create: <bool>::read_wire(reader)?,
         })
     }
 }

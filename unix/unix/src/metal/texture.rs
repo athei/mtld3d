@@ -292,12 +292,27 @@ pub fn clear_new_color_textures(
 /// Dropping an uncommitted batch releases those retains without submitting work.
 pub struct TextureClearBatch {
     textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// Sampled textures awaiting their `texture.zeroOnCreate` fill.
+    zero: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// The zero buffer those fills read, kept across commits.
+    zero_source: zero_fill::ZeroSource,
+    /// Band scratch for the fills, kept for its capacity.
+    zero_bands: Vec<zero_fill::Band>,
 }
 
 impl TextureClearBatch {
     pub const fn new() -> Self {
         Self {
             textures: Vec::new(),
+            zero: Vec::new(),
+            zero_source: zero_fill::ZeroSource::new(),
+            zero_bands: Vec::new(),
+        }
+    }
+
+    fn retain_zero(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if let Some(texture) = handle.into_retained() {
+            self.zero.push(texture);
         }
     }
 
@@ -316,10 +331,11 @@ impl TextureClearBatch {
         queue_handle: MetalHandle<MTLCommandQueueKind>,
         clear_color: MTLClearColor,
     ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        let textures = self.textures.drain(..);
-        if textures.len() == 0 {
+        if self.textures.is_empty() && self.zero.is_empty() {
             return None;
         }
+        let textures = self.textures.drain(..);
+        let zero = core::mem::take(&mut self.zero);
         let Some(queue) = queue_handle.into_retained() else {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
@@ -341,6 +357,10 @@ impl TextureClearBatch {
         for texture in textures {
             clear_one_texture(&cmd_buf, &texture, clear_color);
         }
+        zero_fill::encode(&cmd_buf, &zero, &mut self.zero_source, &mut self.zero_bands);
+        // Keep the vector's capacity for the next batch.
+        self.zero = zero;
+        self.zero.clear();
         diagnostics::observe_initialization(&cmd_buf);
         cmd_buf.commit();
         Some(cmd_buf)
@@ -880,6 +900,8 @@ pub fn create_textures(
             *slot = created;
             if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
                 clears.retain(slot.linear);
+            } else if desc.flags.contains(TextureCreateFlags::ZERO_ON_CREATE) {
+                clears.retain_zero(slot.linear);
             }
         } else {
             *slot = TextureViews::EMPTY;
@@ -1372,6 +1394,19 @@ pub const fn is_resolvable_color_format(fmt: PixelFormat) -> bool {
 ///
 /// Used by `create_texture` to route shadow-map textures into the depth
 /// attachment + sampleable usage path.
+/// Whether a texture created with `usage` in `format` gets the `texture.zeroOnCreate` fill.
+///
+/// `usage` is the application's own, before the upload pass adds the
+/// render-target bit: a render target is cleared instead
+/// ([`TextureCreateFlags::CLEAR_ON_CREATE`]), and depth contents are left
+/// undefined as D3D9 leaves them.
+#[must_use]
+pub const fn zero_on_create(enabled: bool, usage: TextureUsage, format: PixelFormat) -> bool {
+    enabled
+        && !usage.intersects(TextureUsage::RENDER_TARGET.union(TextureUsage::DEPTH_STENCIL))
+        && !is_depth_pixel_format(format)
+}
+
 pub const fn is_depth_pixel_format(fmt: PixelFormat) -> bool {
     matches!(
         fmt,
@@ -1428,6 +1463,8 @@ fn extent_is_creatable(site: &'static str, width: u32, height: u32, depth: u32) 
     }
     fits
 }
+
+mod zero_fill;
 
 #[cfg(test)]
 mod tests;

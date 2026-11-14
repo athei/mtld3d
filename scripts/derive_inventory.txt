@@ -81,6 +81,8 @@ unix/unix/src/metal/present.rs GammaStage Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/presenter.rs PresenterFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/submission.rs RetirementCounter Clone,Copy
+unix/unix/src/metal/texture/zero_fill.rs Band Clone,Copy,Debug,PartialEq,Eq
+unix/unix/src/metal/texture/zero_fill.rs Shape Clone,Copy,Debug,PartialEq,Eq
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/async_compile.rs ClearPlanes Clone,Copy,Debug,Default,PartialEq,Eq

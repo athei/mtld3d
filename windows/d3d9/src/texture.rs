@@ -3363,8 +3363,9 @@ impl TextureInner {
 /// staging — the game writes the dirty rect before any GPU read, and
 /// the blit upload only copies the dirty sub-rect, so untouched bytes
 /// are never observed. On an initial Draw-before-Lock, the freshly-
-/// created `MTLTexture` is the GPU-visible surface and is zeroed by
-/// Metal; the staging `PageBox` is only read when an upload blit fires,
+/// created `MTLTexture` is the GPU-visible surface; Metal leaves it
+/// undefined, and `texture.zeroOnCreate` (on by default) zeroes it on
+/// the native side. The staging `PageBox` is only read when an upload blit fires,
 /// which requires a prior Lock write. A box popped from the page-box
 /// pool carries another texture's stale bytes under exactly that
 /// contract, so it is interchangeable with a fresh allocation.
@@ -5878,6 +5879,43 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
     mtld3d_shared::log_once_trace_by!(
         target: TEX_TRACE_TARGET, key: texture_id.raw(),
         "tex {texture_id:#x} flush dirty levels={dirty_count}"
+    );
+    report_unwritten_levels(ti);
+}
+
+/// Log, once per texture, a sampled texture some of whose levels no upload has reached.
+///
+/// Such a level samples what the `MTLTexture` was created with: black under
+/// `texture.zeroOnCreate`, another resource's bytes without it (rainbow
+/// blocks on a compressed format). Render targets and depth textures are
+/// drawn by the GPU and are not reported. Runs on the flush path only, after
+/// the levels just written were scheduled, so the per-draw bind pays nothing.
+fn report_unwritten_levels(ti: &TextureInner) {
+    if ti.d3d_usage & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
+        != 0
+        || ti.flags.contains(TextureFlags::DEPTH_FORMAT)
+    {
+        return;
+    }
+    let unwritten = mtld3d_core::texture_staging::unwritten_sampled_levels(
+        &ti.was_uploaded,
+        ti.lod,
+        ti.autogen_mipmap(),
+    );
+    if unwritten == 0 {
+        return;
+    }
+    let texture_id = ti.texture_id;
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: texture_id.raw(),
+        "tex {texture_id:#x} ({}x{} format {:#x} pool {} levels {} lod {}) is sampled with levels          {unwritten:#b} never uploaded; they read what the GPU texture was created with",
+        ti.mip_widths.first().copied().unwrap_or(0),
+        ti.mip_heights.first().copied().unwrap_or(0),
+        ti.d3d_format,
+        ti.d3d_pool,
+        ti.levels,
+        ti.lod,
     );
 }
 

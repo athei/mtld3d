@@ -743,6 +743,13 @@ bitflags! {
         /// as black: an effect target composited in full but only ever drawn
         /// into in part must not carry another resource's content.
         const CLEAR_ON_CREATE = 1 << 3;
+        /// Zero every subresource of a sampled texture before its first use.
+        ///
+        /// Set for a texture that is neither a render target nor depth while
+        /// `texture.zeroOnCreate` is on: its pixels arrive by upload, and a
+        /// level no upload reaches must read black, as D3D9's zeroed managed
+        /// copy does, not another resource's bytes.
+        const ZERO_ON_CREATE = 1 << 4;
     }
 }
 

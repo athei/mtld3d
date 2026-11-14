@@ -409,6 +409,26 @@ pub const fn staging_lazy_class(pool: u32, usage: u32, flags: TextureFlags, dept
         && depth <= 1
 }
 
+/// The levels a sampling bind can read that no upload has ever reached (bit N = level N).
+///
+/// `was_uploaded` holds one flag per level, `lod` is the texture's `SetLOD`
+/// (the most detailed level a sampler may use) and `autogen` says the GPU
+/// generates every level below the top one. A level in the answer reads
+/// whatever the `MTLTexture` was created with: black with
+/// `texture.zeroOnCreate`, undefined without it. Levels past 32 are not
+/// reported; no D3D9 texture has that many.
+#[must_use]
+pub fn unwritten_sampled_levels(was_uploaded: &[bool], lod: u32, autogen: bool) -> u32 {
+    let mut mask = 0;
+    for (level, &uploaded) in (0u32..32).zip(was_uploaded) {
+        let generated = autogen && level > 0;
+        if !uploaded && !generated && level >= lod {
+            mask |= 1 << level;
+        }
+    }
+    mask
+}
+
 /// Byte offset into a mip's staging Box for the start of the locked rect.
 ///
 /// `pitch` is `mip_bytes_per_row` — for compressed formats this is

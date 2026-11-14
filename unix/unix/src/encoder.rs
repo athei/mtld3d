@@ -1913,6 +1913,14 @@ impl FrameEncoder {
             usage_flags.contains(TextureUsage::RENDER_TARGET)
                 && !usage_flags.contains(TextureUsage::DEPTH_STENCIL),
         );
+        flags.set(
+            TextureCreateFlags::ZERO_ON_CREATE,
+            crate::metal::zero_on_create(
+                self.config.texture_zero_on_create,
+                usage_flags,
+                info.pixel_format(),
+            ),
+        );
         if mtld3d_core::upload_pass::needs_render_target(
             info.d3d_format(),
             info.pixel_format(),
