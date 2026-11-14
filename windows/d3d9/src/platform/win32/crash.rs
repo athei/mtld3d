@@ -344,9 +344,9 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         // A panic ends the process: its report may open the early log, with
         // the lines queued since load ahead of it.
-        crate::log_sink::forward_parked();
+        super::log_sink::forward_parked();
         write_panic_line(info);
-        crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
+        super::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
         crumb::dump_recent(32);
         emit_image_bases();
         // Chain to the default hook, which prints the same report to stderr
@@ -379,7 +379,7 @@ fn write_panic_line(info: &std::panic::PanicHookInfo<'_>) {
         info.location(),
         info.payload_as_str(),
     );
-    crate::log_sink::write_crash(line.bytes());
+    super::log_sink::write_crash(line.bytes());
 }
 
 /// The calling thread's Win32 description as UTF-8 in `buf`, or `<unnamed>` when it has none.
@@ -445,7 +445,7 @@ fn emit_image_bases() {
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] d3d9.dll base=");
     push_hex(&mut buf, &mut pos, our as usize as u64);
     push(&mut buf, &mut pos, b"\n");
-    crate::log_sink::write_crash(&buf[..pos]);
+    super::log_sink::write_crash(&buf[..pos]);
 }
 
 extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
@@ -481,9 +481,9 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
     if always_fatal || (possibly_fatal && fault_in_our_dll(addr)) {
         let line = fatal_line(code, addr);
         if always_fatal {
-            crate::log_sink::write_crash(line.bytes());
+            super::log_sink::write_crash(line.bytes());
         } else {
-            crate::log_sink::write_fault(line.bytes());
+            super::log_sink::write_fault(line.bytes());
         }
         crumb::dump_recent(32);
     } else if possibly_fatal {
@@ -564,7 +564,7 @@ fn report_foreign_fault(code: u32, addr: *mut c_void, execute: bool, context: *m
     push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     // A first chance: the fault may be handled, so the line opens no log.
-    crate::log_sink::write_fault(&buf[..pos]);
+    super::log_sink::write_fault(&buf[..pos]);
     crumb::dump_recent(16);
 }
 

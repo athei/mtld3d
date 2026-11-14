@@ -54,7 +54,7 @@ static IMPORTS: PatchedImports<HOOKS> = PatchedImports::empty();
 /// then would get.
 static SERVED_INDICES: LazyLock<Vec<u32>> = LazyLock::new(|| {
     let max = crate::config::max_resolutions();
-    let modes = crate::fullscreen::enumerate_display_modes();
+    let modes = super::fullscreen::enumerate_display_modes();
     let indices = served_mode_indices(
         modes.iter().map(|mode| (mode.width, mode.height)),
         &crate::direct3d9::served_sizes_for(max),

@@ -60,7 +60,8 @@ PE_JOIN_EXEMPT='^windows/tests/|/tests(\.rs$|/)'
 # thread, which a thunk holding the lock sends synchronous messages to.
 API_LOCK_FILES='windows/d3d9/src/device.rs
 windows/d3d9/src/device/extended.rs
-windows/d3d9/src/cursor.rs
+windows/d3d9/src/device/cursor.rs
+windows/d3d9/src/platform/win32/cursor.rs
 windows/d3d9/src/texture.rs
 windows/d3d9/src/surface.rs
 windows/d3d9/src/vertex_buffer.rs
@@ -78,7 +79,7 @@ API_LOCK_EXEMPT='cursor_wnd_proc'
 # `mtld3d_shared::ffi_boundary`. The vectored exception handler is the one
 # `extern "system" fn` whose pointers come from the system instead.
 APP_POINTER_DIR=windows/d3d9/src
-APP_POINTER_EXEMPT='windows/d3d9/src/crash.rs'
+APP_POINTER_EXEMPT='windows/d3d9/src/platform/win32/crash.rs'
 APP_POINTER_INPTR="InPtr(Mut)?(::)?<('[a-z_]+, *)?(mtld3d_types::)?(D3D|Guid|LUID)"
 APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it with ValueIn, write it with OutPtr'
 

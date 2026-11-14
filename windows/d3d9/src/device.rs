@@ -18,6 +18,7 @@ pub use mtld3d_core::encoder_data::{
     UploadTextureOpFlags,
 };
 
+pub mod cursor;
 mod extended;
 mod frame_dump;
 mod mem_watch;
@@ -106,7 +107,6 @@ use super::{
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
-    cursor::{self, CursorState},
     direct3d9::{depth_format_has_stencil, is_depth_stencil_format},
     draw::{
         DepthScissorFlags, DepthStencilFlags, DrawOp, IndexSource, PsSource, RenderStateSnapshot,
@@ -120,6 +120,7 @@ use super::{
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
     pixel_shader::Direct3DPixelShader9,
+    platform::cursor::CursorState,
     shader_bindings::{
         BOOL_CONSTANT_COUNT, CONSTANT_ROWS, INT_CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT,
         ShaderBindings,
@@ -416,7 +417,7 @@ pub struct DeviceInner {
     ///
     /// `Some` exactly while the device is fullscreen. Restored (and cleared)
     /// by a windowed `Reset` or by device destruction.
-    fullscreen: Option<crate::fullscreen::SavedWindow>,
+    fullscreen: Option<crate::platform::fullscreen::SavedWindow>,
     backbuffer_width: u32,
     backbuffer_height: u32,
     /// Fraction of the logical back buffer that is actually rasterized.
@@ -3141,7 +3142,7 @@ impl DeviceInner {
     pub fn fullscreen_window(&self) -> Option<*mut c_void> {
         self.fullscreen
             .as_ref()
-            .map(crate::fullscreen::SavedWindow::window)
+            .map(crate::platform::fullscreen::SavedWindow::window)
     }
 
     /// Take `hwnd` fullscreen: set `mode`, then borderless, covering the monitor.
@@ -3158,7 +3159,11 @@ impl DeviceInner {
         hwnd: *mut c_void,
         mode: Option<mtld3d_core::display_mode::ModeRequest>,
     ) {
-        self.fullscreen = Some(crate::fullscreen::enter(hwnd, self.manages_window(), mode));
+        self.fullscreen = Some(crate::platform::fullscreen::enter(
+            hwnd,
+            self.manages_window(),
+            mode,
+        ));
     }
 
     /// `true` unless the app took window management over itself.
@@ -3175,7 +3180,7 @@ impl DeviceInner {
     /// transition, this only carries it out.
     pub fn update_fullscreen(&mut self, mode: Option<mtld3d_core::display_mode::ModeRequest>) {
         if let Some(saved) = self.fullscreen.as_mut() {
-            crate::fullscreen::update(saved, mode);
+            crate::platform::fullscreen::update(saved, mode);
         }
     }
 
@@ -3186,7 +3191,7 @@ impl DeviceInner {
     /// device is no longer fullscreen.
     pub fn reactivate_fullscreen(&mut self) {
         if let Some(saved) = self.fullscreen.as_mut() {
-            crate::fullscreen::reactivate(saved);
+            crate::platform::fullscreen::reactivate(saved);
         }
     }
 
@@ -3194,27 +3199,27 @@ impl DeviceInner {
     ///
     /// The deferred half of the cursor subclass's `WM_SIZE` handling: runs
     /// when the posted re-assert message is processed, which is native
-    /// D3D9's cadence. Bounded by the guard in `fullscreen::reassert_cover`;
+    /// D3D9's cadence. Bounded by the guard in `platform::fullscreen::reassert_cover`;
     /// a no-op when the device is no longer fullscreen.
     pub fn reassert_fullscreen_cover(&mut self, new_width: u32, new_height: u32) {
         if let Some(saved) = self.fullscreen.as_mut() {
-            crate::fullscreen::reassert_cover(saved, (new_width, new_height));
+            crate::platform::fullscreen::reassert_cover(saved, (new_width, new_height));
         }
     }
 
     /// Give the window back. No-op unless the device is fullscreen.
     pub fn leave_fullscreen(&mut self, reason: &mtld3d_core::fullscreen_log::LeaveReason) {
         if let Some(saved) = self.fullscreen.take() {
-            crate::fullscreen::leave(&saved, self.leave_kind(), reason);
+            crate::platform::fullscreen::leave(&saved, self.leave_kind(), reason);
         }
     }
 
     /// How leaving fullscreen puts this device's window back.
-    pub const fn leave_kind(&self) -> crate::fullscreen::LeaveKind {
+    pub const fn leave_kind(&self) -> crate::platform::fullscreen::LeaveKind {
         if self.is_extended() {
-            crate::fullscreen::LeaveKind::Extended
+            crate::platform::fullscreen::LeaveKind::Extended
         } else {
-            crate::fullscreen::LeaveKind::Plain
+            crate::platform::fullscreen::LeaveKind::Plain
         }
     }
 
@@ -3499,13 +3504,13 @@ pub struct DeviceCreateInfo {
     ///
     /// Created before the attach that hands their addresses over, owned by
     /// the device's cursor state from here on.
-    pub display_sinks: Box<crate::cursor::DisplaySinks>,
+    pub display_sinks: Box<crate::device::cursor::DisplaySinks>,
     /// Window state saved before a fullscreen `CreateDevice` took the window over.
     ///
     /// `None` for a windowed device. The device holds it for as long as it
-    /// stays fullscreen and hands it back to `fullscreen::leave` on the way
+    /// stays fullscreen and hands it back to `platform::fullscreen::leave` on the way
     /// out (a windowed `Reset`, or device destruction).
-    pub fullscreen: Option<crate::fullscreen::SavedWindow>,
+    pub fullscreen: Option<crate::platform::fullscreen::SavedWindow>,
     /// The configuration of the creating `IDirect3D9`.
     pub config: Arc<Mtld3dConfig>,
     /// The flags the device starts with: `DeviceFlags::EXTENDED` for an extended device.
@@ -5742,7 +5747,7 @@ fn resolve_reset_window_mode(
         && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0)
         && let Some(saved) = dev.fullscreen.as_ref()
     {
-        let accepted = crate::fullscreen::try_leave(saved, dev.leave_kind(), || {
+        let accepted = crate::platform::fullscreen::try_leave(saved, dev.leave_kind(), || {
             crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
             pp.back_buffer_width != 0 && pp.back_buffer_height != 0
         });
@@ -5795,7 +5800,7 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
         } else {
             dev.creation_focus_window as *mut c_void
         };
-        crate::fullscreen::activate_focus_window(focus);
+        crate::platform::fullscreen::activate_focus_window(focus);
     }
     dev.enter_fullscreen(target, mode);
 }

@@ -80,6 +80,8 @@ use mtld3d_core::{
 };
 use rustc_hash::FxHashMap;
 
+use crate::direct3d9::DisplayModeInfo;
+
 /// Sub-target shared with the display-enumeration probes in `direct3d9`.
 const LOG_TARGET: &str = "mtld3d::d3d9::display";
 
@@ -189,17 +191,6 @@ const DPI_AWARENESS_UNAWARE: i32 = 0;
 /// end is a bug this cap turns into a truncated list rather than a hang.
 const MAX_ENUMERATED_MODES: u32 = 4096;
 
-/// One display mode as `EnumDisplaySettingsW` reports it.
-///
-/// `refresh_hz` may be 0 when the driver doesn't report one.
-#[derive(Clone, Copy)]
-pub struct DisplayModeInfo {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_hz: u32,
-    pub bits_per_pel: u32,
-}
-
 impl DisplayModeInfo {
     const fn from_devmode(dm: &DevModeW) -> Self {
         Self {
@@ -299,7 +290,7 @@ pub fn enumerate_display_modes() -> Vec<DisplayModeInfo> {
 pub fn system_dpi() -> u32 {
     // SAFETY: `GetCurrentProcess` takes no arguments and returns the
     // current-process pseudo-handle.
-    let process = unsafe { crate::GetCurrentProcess() };
+    let process = unsafe { super::GetCurrentProcess() };
     // SAFETY: `process` is the current-process pseudo-handle, the one
     // process the call answers for.
     let dpi = unsafe { GetSystemDpiForProcess(process) };

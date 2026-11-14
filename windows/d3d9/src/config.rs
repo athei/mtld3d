@@ -13,20 +13,15 @@
 //! anything; the interface owns the result and hands it to each device it
 //! creates.
 
-use std::{ffi::c_void, path::PathBuf, ptr};
+use std::path::PathBuf;
 
 use log::info;
 use mtld3d_core::{
     app_profile::{AppIdentity, AppProfile},
     config::{Mtld3dConfig, log_options, parse},
 };
-use mtld3d_shared::identity::version_blob;
 
 use crate::LOG_TARGET;
-
-unsafe extern "system" {
-    fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
-}
 
 /// Resolve the configuration for a new `IDirect3D9`.
 ///
@@ -69,13 +64,7 @@ fn resolve() -> Mtld3dConfig {
 fn app_profile() -> Option<&'static AppProfile> {
     let exe = std::env::current_exe().ok()?;
     let name = exe.file_name()?.to_string_lossy().into_owned();
-    // A null module name asks for the main image, which is the executable the
-    // profile matches on rather than this DLL.
-    // SAFETY: the call takes a null name and returns the main image's handle.
-    let main = unsafe { GetModuleHandleA(ptr::null()) };
-    // SAFETY: `main` is a handle the loader owns, so the image behind it is
-    // mapped for the life of the process.
-    let blob = unsafe { version_blob(main) };
+    let blob = crate::platform::main_image_version_blob();
     mtld3d_core::app_profile::lookup(&AppIdentity::new(name, blob.as_deref()))
 }
 

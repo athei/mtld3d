@@ -131,7 +131,7 @@ impl EncoderThread {
         let cache_path = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|parent| parent.join("mtld3d_shaders.bin")))
-            .and_then(|path| crate::wine_path::unix_path(&path));
+            .and_then(|path| crate::platform::unix_path(&path));
         if config.shader_cache_enable && cache_path.is_none() {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "encoder: cannot translate game shader cache path");
         }

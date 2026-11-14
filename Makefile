@@ -667,7 +667,7 @@ windows-x86_64:
 # which LLD supplies the constructor list `libmingw32.a` reads. The one symbol
 # of MSVC's static CRT that remains (the `type_info` vtable), and the
 # thread-exit teardown of snmalloc that MSVC's CRT runs and llvm-mingw's does
-# not, are in `windows/d3d9/src/arm64_crt.rs`. `kernel32` precedes `mincore`,
+# not, are in `windows/d3d9/src/platform/win32/arm64_crt.rs`. `kernel32` precedes `mincore`,
 # so what both define is imported from `KERNEL32.dll` as the x86 DLLs import
 # it, and only what `kernel32` lacks (`WaitOnAddress`, `VirtualAlloc2FromApp`)
 # comes from the API sets. `ntdll` is Wine's own import library rather than
@@ -2378,7 +2378,7 @@ clippy-pe-x86_64:
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
 
 # The two halves of the ARM64X build, linted for the code only they compile
-# (`windows/d3d9/src/arm64_crt.rs`) and for the `cfg` arms the x86 targets never
+# (`windows/d3d9/src/platform/win32/arm64_crt.rs`) and for the `cfg` arms the x86 targets never
 # take, in the windows workspace and in `unix/shared` (its ARM64EC clock), the
 # way `clippy-pe-i686` reaches the latter, and the e2e tests as the native
 # ARM64 leg builds them, as `clippy-pe-x86_64` lints the x86_64 ones.

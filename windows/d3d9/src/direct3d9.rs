@@ -47,7 +47,6 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, LOG_TARGET,
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
-    fullscreen::Rect,
     null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
@@ -81,7 +80,18 @@ const ADAPTER_FORMATS: &[u32] = &[D3DFMT_X8R8G8B8, D3DFMT_R5G6B5];
 const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
 
 /// The GDI name of the primary display, the one adapter 0 drives.
-const PRIMARY_DISPLAY_NAME: &str = "\\\\.\\DISPLAY1";
+pub const PRIMARY_DISPLAY_NAME: &str = "\\\\.\\DISPLAY1";
+
+/// One display mode as the platform reports it.
+///
+/// `refresh_hz` may be 0 when the driver doesn't report one.
+#[derive(Clone, Copy)]
+pub struct DisplayModeInfo {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+    pub bits_per_pel: u32,
+}
 
 /// The adapter display-mode format (`D3DFMT_*`) — the format `GetAdapterDisplayMode` reports.
 ///
@@ -99,7 +109,7 @@ pub fn adapter_display_format() -> u32 {
 /// is advertised at; a failed query falls back to the table's desktop entry.
 pub fn current_adapter_display_mode() -> D3DDISPLAYMODE {
     let desktop = ADAPTER_MODES.desktop;
-    crate::fullscreen::current_display_mode().map_or(desktop, |mode| D3DDISPLAYMODE {
+    crate::platform::current_display_mode().map_or(desktop, |mode| D3DDISPLAYMODE {
         width: mode.width,
         height: mode.height,
         refresh_rate: effective_refresh(mode.refresh_hz, desktop.refresh_rate),
@@ -169,7 +179,7 @@ fn build_adapter_modes() -> AdapterModes {
     // by the Retina factor on displays where the two scale differently (a CI
     // runner's virtual display), splitting `GetAdapterDisplayMode` from the
     // monitor rect.
-    let host = crate::fullscreen::current_display_mode();
+    let host = crate::platform::current_display_mode();
     let host_w = host.map_or(1920, |mode| mode.width);
     let host_h = host.map_or(1080, |mode| mode.height);
     let host_hz = effective_refresh(host.map_or(0, |mode| mode.refresh_hz), 60);
@@ -177,7 +187,7 @@ fn build_adapter_modes() -> AdapterModes {
 
     // Win32 lists every size once per colour depth; the desktop's depth is
     // the one a game gets, so the others only repeat sizes.
-    let enumerated = crate::fullscreen::enumerate_display_modes();
+    let enumerated = crate::platform::enumerate_display_modes();
     let candidates = enumerated
         .iter()
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
@@ -189,7 +199,7 @@ fn build_adapter_modes() -> AdapterModes {
     // term does not fit. Those builds cannot be told apart from here, so the
     // sizes are left out on every Wine: a fullscreen request for one follows
     // the window rather than setting the mode.
-    let dpi = crate::fullscreen::system_dpi();
+    let dpi = crate::platform::system_dpi();
     let unscalable = drop_unscalable_sizes(&mut settable, physical, dpi);
     if !unscalable.is_empty() {
         mtld3d_shared::log_once_info!(
@@ -342,7 +352,7 @@ impl Drop for Direct3D9Inner {
     fn drop(&mut self) {
         // The last interface retires the logging thread and waits for it, so
         // a `FreeLibrary` that follows this `Release` finds no thread of ours.
-        crate::log_sink::release();
+        crate::platform::release_logger();
     }
 }
 
@@ -1044,7 +1054,7 @@ extern "system" fn d3d9_get_adapter_luid(_this: *mut c_void, adapter: u32, luid:
     /// driver gives the primary display's adapter, or, where the driver hands
     /// none back, one the system allocates for the process, which stays the
     /// same for every later call.
-    static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(read_adapter_luid);
+    static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(crate::platform::adapter_luid);
     if adapter != 0 || luid.is_null() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -1152,53 +1162,6 @@ const unsafe fn display_mode_ex_field(mode: *const c_void, offset: usize) -> u32
     let field = mode.cast::<u8>().wrapping_add(offset);
     // SAFETY: the caller's contract puts a readable `u32` at `field`; alignment is not assumed.
     unsafe { field.cast::<u32>().read_unaligned() }
-}
-
-/// Read the adapter LUID the driver reports, or allocate one when it reports none.
-fn read_adapter_luid() -> (u32, i32) {
-    let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
-        device_name: [0; 32],
-        adapter: 0,
-        adapter_luid: LUID {
-            low_part: 0,
-            high_part: 0,
-        },
-        vid_pn_source_id: 0,
-    };
-    for (slot, unit) in open
-        .device_name
-        .iter_mut()
-        .zip(PRIMARY_DISPLAY_NAME.encode_utf16())
-    {
-        *slot = unit;
-    }
-    // SAFETY: gdi32 export; `open` is a live, initialised struct of the
-    // documented layout whose name is NUL-terminated (the array is zeroed past it).
-    let status = unsafe { D3DKMTOpenAdapterFromGdiDisplayName(&raw mut open) };
-    if status == 0 {
-        let close = D3dkmtCloseAdapter {
-            adapter: open.adapter,
-        };
-        // SAFETY: gdi32 export; `close` names the adapter handle just opened.
-        unsafe { D3DKMTCloseAdapter(&raw const close) };
-        if open.adapter_luid.low_part != 0 || open.adapter_luid.high_part != 0 {
-            return (open.adapter_luid.low_part, open.adapter_luid.high_part);
-        }
-    }
-    let mut allocated = LUID {
-        low_part: 0,
-        high_part: 0,
-    };
-    // SAFETY: advapi32 export; `allocated` is a writable `LUID`.
-    let ok = unsafe { AllocateLocallyUniqueId(&raw mut allocated) };
-    mtld3d_shared::log_once_info!(
-        target: LOG_TARGET,
-        "GetAdapterLUID: the display driver reports no LUID for {PRIMARY_DISPLAY_NAME} \
-         (status {status:#x}); the adapter is named by a LUID allocated for the process \
-         (allocated={})",
-        ok != 0
-    );
-    (allocated.low_part, allocated.high_part)
 }
 
 extern "system" fn d3d9_check_device_type(
@@ -1619,79 +1582,7 @@ extern "system" fn d3d9_get_adapter_monitor(_this: *mut c_void, _adapter: u32) -
     // Single-adapter model: the primary display's monitor. GetMonitorInfo on
     // the result reports MONITORINFOF_PRIMARY, as the D3D9 spec requires for
     // adapter 0.
-    crate::fullscreen::primary_monitor()
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
-}
-
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn D3DKMTOpenAdapterFromGdiDisplayName(desc: *mut D3dkmtOpenAdapterFromGdiDisplayName) -> u32;
-    fn D3DKMTCloseAdapter(desc: *const D3dkmtCloseAdapter) -> u32;
-}
-
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn AllocateLocallyUniqueId(luid: *mut LUID) -> i32;
-}
-
-/// Win32 `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME`: a GDI display name in, its adapter out.
-#[repr(C)]
-struct D3dkmtOpenAdapterFromGdiDisplayName {
-    device_name: [u16; 32],
-    adapter: u32,
-    adapter_luid: LUID,
-    vid_pn_source_id: u32,
-}
-
-/// Win32 `D3DKMT_CLOSEADAPTER`: the adapter handle an open handed out.
-#[repr(C)]
-struct D3dkmtCloseAdapter {
-    adapter: u32,
-}
-
-/// Client-area pixel dimensions of `hwnd`, or `None` when the call fails or the rect is empty.
-///
-/// The single `GetClientRect` boundary is concentrated here so the call site
-/// stays unsafe-free. A null window is the caller's own case (no window to
-/// read) and passes silently; the two other ways to `None`, a window user32
-/// cannot read and a window with no client area, are warned about once per
-/// window, since either leaves the requested size standing where the caller
-/// expected the window's.
-fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
-    if hwnd.is_null() {
-        return None;
-    }
-    let window = hwnd as usize as u64;
-    let mut rect = Rect::EMPTY;
-    // SAFETY: GetClientRect accepts any HWND and writes a RECT through the
-    // out pointer; `rect` is an owned local, so non-null + aligned + writable
-    // holds. A bad HWND yields a zero return, handled below.
-    let ok = unsafe { GetClientRect(hwnd, &raw mut rect) };
-    if ok == 0 {
-        mtld3d_shared::log_once_warn_by!(
-            target: LOG_TARGET,
-            key: window,
-            "GetClientRect({window:#x}) failed: the window is gone or not this process's; the \
-             requested back-buffer size stands",
-        );
-        return None;
-    }
-    let w = u32::try_from(rect.width()).unwrap_or(0);
-    let h = u32::try_from(rect.height()).unwrap_or(0);
-    if w == 0 || h == 0 {
-        mtld3d_shared::log_once_warn_by!(
-            target: LOG_TARGET,
-            key: window,
-            "window {window:#x} has an empty client area ({w}x{h}); the requested back-buffer \
-             size stands",
-        );
-        return None;
-    }
-    Some((w, h))
+    crate::platform::primary_monitor()
 }
 
 /// `true` when `width`x`height` is a mode a fullscreen device may set.
@@ -1744,10 +1635,10 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 /// `EMPTY_CLIENT_BACK_BUFFER_EXTENT`.
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
     if pp.windowed == 0 {
-        crate::fullscreen::warn_if_dpi_scaled(hwnd as *mut c_void);
+        crate::platform::warn_if_dpi_scaled(hwnd as *mut c_void);
         // Callers reject a zero-dimension fullscreen request before the window
         // moves, so the request is always concrete here.
-        let client = client_rect_dims(hwnd as *mut c_void);
+        let client = crate::platform::client_size(hwnd as *mut c_void);
         if is_settable_mode(pp.back_buffer_width, pp.back_buffer_height) {
             // With the mode set the client rect is the request. It reads
             // otherwise when user32 refused the mode and the window covers
@@ -1785,10 +1676,10 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
         pp.back_buffer_height = client_h;
         return;
     }
-    let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void) else {
+    let Some((client_w, client_h)) = crate::platform::client_size(hwnd as *mut c_void) else {
         return;
     };
-    if crate::fullscreen::is_maximized(hwnd as *mut c_void) {
+    if crate::platform::is_maximized(hwnd as *mut c_void) {
         if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
@@ -1902,9 +1793,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         present_params,
         device,
     } = args;
-    if !crate::USED.swap(true, Ordering::Relaxed) {
-        crate::pin_image();
-    }
+    crate::platform::note_create_device();
 
     if adapter != 0 || device.is_null() {
         return D3DERR_INVALIDCALL;
@@ -2025,8 +1914,8 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         } else {
             focus_window
         };
-        crate::fullscreen::activate_focus_window(focus);
-        crate::fullscreen::enter(hwnd as *mut c_void, manage_window, mode)
+        crate::platform::fullscreen::activate_focus_window(focus);
+        crate::platform::fullscreen::enter(hwnd as *mut c_void, manage_window, mode)
     });
 
     // Resolve the logical backbuffer size against the window now that its
@@ -2045,7 +1934,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
 
     // The words the unix side publishes into for this device, boxed so their
     // addresses hold for the device's lifetime; owned by its cursor state.
-    let display_sinks = Box::new(crate::cursor::DisplaySinks::new());
+    let display_sinks = Box::new(crate::device::cursor::DisplaySinks::new());
     let layer_params = attach_metal_layer(hwnd, cq_params.device_handle, &pp, cfg, &display_sinks);
 
     // A still-zero dimension here (no usable client rect, or a fullscreen
@@ -2283,7 +2172,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
             "CreateDevice: D3DCREATE_MULTITHREADED, device entry points serialised"
         );
     }
-    crate::fpu::apply_device_control_word(behavior_flags);
+    crate::platform::apply_device_control_word(behavior_flags);
     info!(target: LOG_TARGET, "CreateDevice succeeded (extended={extended})");
     D3D_OK
 }
@@ -2300,7 +2189,7 @@ pub fn attach_metal_layer(
     device_handle: MetalHandle<MTLDeviceKind>,
     pp: &D3DPRESENT_PARAMETERS,
     cfg: &Mtld3dConfig,
-    sinks: &crate::cursor::DisplaySinks,
+    sinks: &crate::device::cursor::DisplaySinks,
 ) -> AttachMetalLayerParams {
     let pacing = crate::device::resolve_layer_pacing(pp, cfg);
     let mut layer_params = AttachMetalLayerParams {
@@ -2428,7 +2317,7 @@ fn present_gate_unix_path(cfg: &Mtld3dConfig) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
     let dos = exe_dir.join(&cfg.present_gate_file);
-    let Some(unix) = crate::wine_path::unix_path(&dos) else {
+    let Some(unix) = crate::platform::unix_path(&dos) else {
         warn!(
             target: LOG_TARGET,
             "debug.presentGateFile = {}: no unix path, the presenter is not gated",
@@ -2477,13 +2366,13 @@ fn resolve_render_scale(
 /// anything, so every later failure has to undo it. Otherwise a rejected
 /// device leaves the game's window stripped of its decoration and pinned over
 /// the monitor.
-fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
+fn restore_from_fullscreen(saved: Option<&crate::platform::fullscreen::SavedWindow>) {
     // A create that fails puts the window back where it was, whatever kind of
     // device it was creating: nothing it did should outlive it.
     if let Some(saved) = saved {
-        crate::fullscreen::leave(
+        crate::platform::fullscreen::leave(
             saved,
-            crate::fullscreen::LeaveKind::Plain,
+            crate::platform::fullscreen::LeaveKind::Plain,
             &mtld3d_core::fullscreen_log::LeaveReason::FailedCreate,
         );
     }

@@ -117,7 +117,7 @@ CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -fno-omit-frame-pointer -idi
 # allocator's per-thread teardown off C++ `thread_local` destructors, which
 # llvm-mingw registers through a `__tlregdtor` that never runs them: snmalloc
 # then exports `_malloc_thread_cleanup` for the platform to call at thread
-# exit, and `windows/d3d9/src/arm64_crt.rs` calls it from a TLS callback.
+# exit, and `windows/d3d9/src/platform/win32/arm64_crt.rs` calls it from a TLS callback.
 # `ARM64_SYSREG` is the Windows SDK macro snmalloc's ARM layer reads its cycle
 # counter with; the SDK defines it in `arm64intr.h`, which clang's own header
 # of that name shadows.

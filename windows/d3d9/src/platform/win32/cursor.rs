@@ -16,11 +16,7 @@
 //! visibility, and the Win32 cursor this module realizes is a blank HCURSOR, so
 //! the `WindowServer` cursor plane never toggles on our account.
 
-use core::{
-    ffi::c_void,
-    ptr::null_mut,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use core::{ffi::c_void, ptr::null_mut};
 use std::{
     hash::Hasher,
     sync::{LazyLock, Mutex},
@@ -30,36 +26,25 @@ use std::{
 use log::{Level, debug, error, info, log_enabled, trace, warn};
 use mtld3d_core::{
     cursor::{BitmapLayout, reconcile_upload},
-    perf::DeviceSubCategory,
     window_subclass::WindowSubclasses,
 };
 use mtld3d_shared::{
-    InPtr, MetalHandle, PresentClientSurfaceParams, SetCursorOverlayParams,
+    MetalHandle, PresentClientSurfaceParams, SetCursorOverlayParams,
     bounded_cache::BoundedCache,
     mtl::{CURSOR_SPRITE_CACHE_ENTRIES, ClientSurfaceRequest, CursorOverlayFlags},
     mtl_handle::NSViewKind,
 };
-use mtld3d_types::{
-    CURSOR_SHOWING, CURSORINFO, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO,
-    IDirect3DSurface9Vtbl, POINT,
-};
+use mtld3d_types::{CURSOR_SHOWING, CURSORINFO, D3DSURFACE_DESC, ICONINFO, POINT};
 use xxhash_rust::xxh3::Xxh3;
 
-use super::{
-    D3D_OK, D3DERR_INVALIDCALL,
-    device::{DeviceInner, Direct3DDevice9, device_api_lock, device_timer},
-    fullscreen::set_window_long_ptr,
+use super::fullscreen::set_window_long_ptr;
+use crate::{
+    device::{
+        DeviceInner,
+        cursor::{DisplaySinks, LOG_TARGET},
+    },
     unix_call::unix_call,
 };
-
-/// Cursor-specific log sub-target.
-///
-/// Inherits filtering from any broader `mtld3d::d3d9` or `mtld3d` selector by
-/// `env_logger`'s `::`-prefix matching, so `RUST_LOG=mtld3d::d3d9=warn` still
-/// catches the `warn!`s below. The dedicated target lets us crank trace
-/// separately:
-///   `RUST_LOG=mtld3d::d3d9::cursor=trace`
-const LOG_TARGET: &str = "mtld3d::d3d9::cursor";
 
 // ── Win32 FFI ──
 
@@ -339,114 +324,6 @@ static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
     LazyLock::new(|| Mutex::new(WindowSubclasses::default()));
 
 // ── CursorState ──
-
-/// The three words the unix side writes into from its main thread, at a stable address.
-///
-/// `AttachMetalLayer` hands the unix side the addresses, and the record it
-/// keeps for the device's view writes through them outside any thunk: the
-/// backing scale at attach and whenever the display-follow reconciliation
-/// derives another, the cursor kick when the pointer comes back from another
-/// process, the client surface request at attach and when Wine hides the
-/// device's client view. The window procedure sets the request too, when the
-/// window's client area may have moved. The box is created before the attach
-/// and owned by the device's `CursorState`, so the addresses hold for the
-/// device's lifetime. Ordering against teardown is what makes that enough:
-/// device release issues `DestroyCommandQueue` while the inner box is still
-/// alive, that thunk unregisters the record under the unix registry lock,
-/// every unix write into a sink runs under the same lock with a liveness
-/// check, and the inner box drops only after the thunk has returned. So a
-/// write lands before the record is gone or not at all.
-pub struct DisplaySinks {
-    /// Wine's retina factor for the layer (2 in retina mode, else 1); `0` until published.
-    backing_scale: AtomicU32,
-    /// Set by the unix side to ask for a cursor re-apply; taken back to zero here.
-    ///
-    /// A system tool that borrows the pointer (the screenshot crosshair)
-    /// leaves its own cursor on screen, and Wine re-applies its cursor only
-    /// on a handle change. The cursor module takes the flag at the next
-    /// `WM_SETCURSOR` or `ShowCursor(TRUE)` and answers it with the
-    /// null-then-set kick.
-    cursor_kick: AtomicU32,
-    /// The `ClientSurfaceRequest` bits asked since the last `Present` took them.
-    ///
-    /// Some Wines hide the client view a device presents through whenever
-    /// they flush the window surface, and leave its frame where it was when
-    /// the window resizes, counting on winemac's `nextDrawable` override to
-    /// put both right; the layer presents without it. The attach sets
-    /// `ATTACHED` here too, so the device's first submitted frame tells Wine
-    /// it has drawn. The next `Present` that submits a frame takes the bits
-    /// and sends `PresentClientSurface`, which has Wine show the surface
-    /// again, sized to the client area.
-    client_surface_request: AtomicU32,
-}
-
-impl DisplaySinks {
-    pub const fn new() -> Self {
-        Self {
-            backing_scale: AtomicU32::new(0),
-            cursor_kick: AtomicU32::new(0),
-            client_surface_request: AtomicU32::new(0),
-        }
-    }
-
-    /// The address `AttachMetalLayerParams::client_surface_request_ptr` carries.
-    pub fn client_surface_request_ptr(&self) -> u64 {
-        (&raw const self.client_surface_request) as u64
-    }
-
-    /// Ask the next `Present` to have Wine show the client surface again, for `reason`.
-    pub fn request_client_surface(&self, reason: ClientSurfaceRequest) {
-        self.client_surface_request
-            .fetch_or(reason.bits(), Ordering::Release);
-    }
-
-    /// Take the client surface request, empty when nothing asked since the last take.
-    ///
-    /// One relaxed load on a frame nothing asked on, which is every frame but
-    /// the first after an attach and the ones after a resize or a hidden
-    /// client view; the swap that takes the bits pairs its `Acquire` with the
-    /// writers' `Release`.
-    pub fn take_client_surface_request(&self) -> ClientSurfaceRequest {
-        if self.client_surface_request.load(Ordering::Relaxed) == 0 {
-            return ClientSurfaceRequest::empty();
-        }
-        ClientSurfaceRequest::from_bits_truncate(
-            self.client_surface_request.swap(0, Ordering::AcqRel),
-        )
-    }
-
-    /// The address `AttachMetalLayerParams::backing_scale_ptr` carries.
-    pub fn backing_scale_ptr(&self) -> u64 {
-        (&raw const self.backing_scale) as u64
-    }
-
-    /// The address `AttachMetalLayerParams::cursor_kick_ptr` carries.
-    pub fn cursor_kick_ptr(&self) -> u64 {
-        (&raw const self.cursor_kick) as u64
-    }
-
-    /// Wine's retina factor as last published, or `None` before attach published one.
-    pub fn display_backing_scale(&self) -> Option<u32> {
-        match self.backing_scale.load(Ordering::Relaxed) {
-            0 => None,
-            scale => Some(scale),
-        }
-    }
-
-    /// Take the pending cursor re-apply request, if the unix side left one.
-    ///
-    /// `Acquire` pairs with the unix side's `Release` store; the flag is the
-    /// whole message, so nothing else is read behind it.
-    pub fn take_cursor_kick(&self) -> bool {
-        self.cursor_kick.swap(0, Ordering::AcqRel) != 0
-    }
-}
-
-impl Default for DisplaySinks {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 bitflags::bitflags! {
     /// Packed boolean state for `CursorState`.
@@ -1230,323 +1107,263 @@ impl CursorState {
     pub const fn sinks(&self) -> &DisplaySinks {
         &self.sinks
     }
-}
 
-// ── Vtable entry points ──
-
-pub extern "system" fn device_set_cursor_properties(
-    this: *mut c_void,
-    x_hotspot: u32,
-    y_hotspot: u32,
-    cursor_bitmap: *mut c_void,
-) -> i32 {
-    let _api = device_api_lock(this);
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
-    if cursor_bitmap.is_null() {
-        warn!(target: LOG_TARGET, "reject SetCursorProperties(null bitmap) → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
-        return D3DERR_INVALIDCALL;
-    };
-    let dev = obj.inner();
-
-    // SAFETY: `cursor_bitmap` is a valid SurfaceHead via the D3D9 ABI;
-    // its `vtbl` field is a non-null pointer to a static vtable.
-    let surf_head = unsafe { &*(cursor_bitmap as *const SurfaceHead) };
-    // SAFETY: same invariant — vtbl pointer is static.
-    let surf_vtbl = unsafe { &*surf_head.vtbl };
-    let mut desc = D3DSURFACE_DESC {
-        format: 0,
-        resource_type: 0,
-        usage: 0,
-        pool: 0,
-        multi_sample_type: 0,
-        multi_sample_quality: 0,
-        width: 0,
-        height: 0,
-    };
-    // SAFETY: calling the just-loaded `get_desc` thunk through
-    // `surf_vtbl`; `cursor_bitmap` is the IDirect3DSurface9 `this` per
-    // D3D9 ABI and `desc` is a writable local.
-    if unsafe { (surf_vtbl.get_desc)(cursor_bitmap, &raw mut desc) } != 0 {
-        warn!(target: LOG_TARGET, "reject SetCursorProperties: surface GetDesc failed");
-        return D3DERR_INVALIDCALL;
-    }
-    let width = desc.width;
-    let height = desc.height;
-    let layout = BitmapLayout {
-        width,
-        height,
-        x_hotspot,
-        y_hotspot,
-    };
-    let mode = crate::direct3d9::current_adapter_display_mode();
-    if !layout.valid(
-        desc.format,
-        (mode.width, mode.height),
-        dev.cursor_mut().scale,
-    ) {
-        warn!(
-            target: LOG_TARGET,
-            "reject SetCursorProperties: invalid format, extent or scaled bitmap/hotspot \
-             (format={} {width}x{height} hotspot={x_hotspot},{y_hotspot})",
-            desc.format,
-        );
-        return D3DERR_INVALIDCALL;
+    /// The upscale factor a cursor bitmap is checked and built at.
+    pub const fn scale(&self) -> u32 {
+        self.scale
     }
 
-    let mut locked = D3DLOCKED_RECT {
-        pitch: 0,
-        bits: null_mut(),
-    };
-    // SAFETY: calling the just-loaded `lock_rect` thunk through
-    // `surf_vtbl`; `cursor_bitmap` is the IDirect3DSurface9 `this` per
-    // D3D9 ABI, `locked` is a writable local, and a null rect locks
-    // the entire surface.
-    if unsafe {
-        (surf_vtbl.lock_rect)(
-            cursor_bitmap,
-            &raw mut locked,
-            core::ptr::null(),
-            D3DLOCK_READONLY,
-        )
-    } != 0
-    {
-        warn!(target: LOG_TARGET, "reject SetCursorProperties: surface LockRect failed");
-        return D3DERR_INVALIDCALL;
-    }
-
-    let Some(pitch) = layout.row_pitch(locked.bits as usize, locked.pitch) else {
-        warn!(target: LOG_TARGET, "reject SetCursorProperties: invalid locked pointer or pitch");
-        // SAFETY: this surface was successfully locked above; no pixels were read.
-        unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
-        return D3DERR_INVALIDCALL;
-    };
-    let src = locked.bits as *const u8;
-    let cur = dev.cursor_mut();
-    let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch, cur.scale);
-    let prev_hash = cur.hash;
-    let (handle, outcome) = if cur.software() {
-        // The overlay draws the bitmap; the Win32 cursor only has to be blank.
-        // Building the blank can fail the same way `build_hcursor` can, and
-        // is reported the same way.
-        let Some(blank) = cur.blank_handle() else {
-            warn!(
-                target: LOG_TARGET,
-                "reject SetCursorProperties: blank HCURSOR failed (hash={hash:#018x} {width}x{height})",
-            );
-            // SAFETY: calling the just-loaded `unlock_rect` thunk through
-            // `surf_vtbl`; paired with the `lock_rect` call above.
-            unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
-            return D3DERR_INVALIDCALL;
-        };
-        let outcome = if hash == prev_hash {
-            "unchanged"
-        } else if cur.uploaded.contains(&hash) {
-            "sprite-known"
-        } else {
-            "sprite-upload"
-        };
-        (blank, outcome)
-    } else if hash == prev_hash {
-        (cur.handle, "unchanged")
-    } else if let Some(h) = cur.cache.get(&hash).copied() {
-        (h, "cache-hit")
-    } else {
-        let Some(h) = build_hcursor(width, height, pitch, src, x_hotspot, y_hotspot, cur.scale)
-        else {
-            warn!(
-                target: LOG_TARGET,
-                "reject SetCursorProperties: build_hcursor failed (hash={hash:#018x} {width}x{height} scale={})",
-                cur.scale,
-            );
-            // SAFETY: calling the just-loaded `unlock_rect` thunk through
-            // `surf_vtbl`; paired with the `lock_rect` call above.
-            unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
-            return D3DERR_INVALIDCALL;
-        };
-        cur.remember_handle(hash, h);
-        (h, "built-fresh")
-    };
-
-    // Keep the pixels: the backing scale can change under a running session
-    // when the window moves to another display, and rebuilding the pointer at
-    // the new factor needs the bitmap the unlock below hands back to the
-    // guest. Only on a new bitmap, so a game re-setting the same cursor every
-    // frame pays nothing.
-    if hash != prev_hash {
-        cur.source = Some(CursorSource {
+    /// Pick the HCURSOR for a locked `SetCursorProperties` bitmap, while the surface is locked.
+    ///
+    /// `src` and `pitch` are the locked rows `layout` describes. `None` when
+    /// the cursor cannot be built, which the caller answers with
+    /// `D3DERR_INVALIDCALL` after unlocking.
+    pub fn select_bitmap(
+        &mut self,
+        layout: &BitmapLayout,
+        src: *const u8,
+        pitch: usize,
+    ) -> Option<SelectedBitmap> {
+        let &BitmapLayout {
             width,
             height,
             x_hotspot,
             y_hotspot,
-            pixels: tight_copy(width, height, pitch, src),
-        });
+        } = layout;
+        let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch, self.scale);
+        let prev_hash = self.hash;
+        let (handle, outcome) = if self.software() {
+            // The overlay draws the bitmap; the Win32 cursor only has to be blank.
+            // Building the blank can fail the same way `build_hcursor` can, and
+            // is reported the same way.
+            let Some(blank) = self.blank_handle() else {
+                warn!(
+                    target: LOG_TARGET,
+                    "reject SetCursorProperties: blank HCURSOR failed (hash={hash:#018x} {width}x{height})",
+                );
+                return None;
+            };
+            let outcome = if hash == prev_hash {
+                "unchanged"
+            } else if self.uploaded.contains(&hash) {
+                "sprite-known"
+            } else {
+                "sprite-upload"
+            };
+            (blank, outcome)
+        } else if hash == prev_hash {
+            (self.handle, "unchanged")
+        } else if let Some(h) = self.cache.get(&hash).copied() {
+            (h, "cache-hit")
+        } else {
+            let Some(h) =
+                build_hcursor(width, height, pitch, src, x_hotspot, y_hotspot, self.scale)
+            else {
+                warn!(
+                    target: LOG_TARGET,
+                    "reject SetCursorProperties: build_hcursor failed (hash={hash:#018x} {width}x{height} scale={})",
+                    self.scale,
+                );
+                return None;
+            };
+            self.remember_handle(hash, h);
+            (h, "built-fresh")
+        };
+
+        // Keep the pixels: the backing scale can change under a running session
+        // when the window moves to another display, and rebuilding the pointer at
+        // the new factor needs the bitmap the unlock below hands back to the
+        // guest. Only on a new bitmap, so a game re-setting the same cursor every
+        // frame pays nothing.
+        if hash != prev_hash {
+            self.source = Some(CursorSource {
+                width,
+                height,
+                x_hotspot,
+                y_hotspot,
+                pixels: tight_copy(width, height, pitch, src),
+            });
+        }
+        Some(SelectedBitmap {
+            hash,
+            prev_hash,
+            handle,
+            outcome,
+        })
     }
 
-    // SAFETY: calling the just-loaded `unlock_rect` thunk through
-    // `surf_vtbl`; paired with the `lock_rect` call above.
-    unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
-
-    cur.hash = hash;
-    cur.handle = handle;
-    let visible = cur.visible();
-    // Software mode: the overlay gets the new sprite (or just its hash) and the
-    // current visibility. The blank Win32 cursor is unchanged by a cursor
-    // change and already in place from the last show, so it is realized here
-    // only when no cursor was set before.
-    cur.push_overlay_state();
-    // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
-    // While hidden the game owns the win32 cursor — pushing null here clobbers
-    // the cursor the game's own wndproc set (WoW's login screen never calls
-    // ShowCursor(TRUE); its glove is the game's own cursor).
-    // `set_cursor_us` is 0 when nothing was realized.
-    let set_cursor_us = if visible && (!cur.software() || prev_hash == 0) {
-        timed_set_cursor(handle)
-    } else {
-        0
-    };
-    cur.charge_call_us(set_cursor_us);
-    debug!(
-        target: LOG_TARGET,
-        "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} set_cursor_us={set_cursor_us} cache_entries={} tid={}",
-        desc.format, desc.pool, cur.cache.len(), current_thread_id(),
-    );
-    D3D_OK
-}
-
-pub extern "system" fn device_set_cursor_position(this: *mut c_void, x: i32, y: i32, _flags: u32) {
-    let _api = device_api_lock(this);
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // The pre-check earns its keep: a `SetCursorPos` to the current position
-    // still queues a `WM_MOUSEMOVE`, so skipping it keeps the game's message
-    // queue quiet. Its cost is the idle `GetCursorPos` main-thread hop
-    // described on `timed_set_cursor`, hence the timing.
-    let started = Instant::now();
-    let current = get_cursor_pos();
-    let get_us = elapsed_us(started);
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
-        return;
-    };
-    let cur = obj.inner().cursor_mut();
-    let suppress = current.is_some_and(|p| p.x == x && p.y == y);
-    if suppress {
-        cur.charge_call_us(get_us);
-        debug!(target: LOG_TARGET, "SetCursorPosition: noop ({x},{y}) get_us={get_us}");
-        return;
-    }
-    let started = Instant::now();
-    set_cursor_pos(x, y);
-    let set_us = elapsed_us(started);
-    cur.charge_call_us(get_us + set_us);
-    if let Some(p) = current {
+    /// Make the bitmap [`Self::select_bitmap`] picked the current cursor, after the unlock.
+    pub fn realize_bitmap(
+        &mut self,
+        selected: &SelectedBitmap,
+        layout: &BitmapLayout,
+        desc: &D3DSURFACE_DESC,
+    ) {
+        let &SelectedBitmap {
+            hash,
+            prev_hash,
+            handle,
+            outcome,
+        } = selected;
+        let &BitmapLayout {
+            width,
+            height,
+            x_hotspot,
+            y_hotspot,
+        } = layout;
+        self.hash = hash;
+        self.handle = handle;
+        let visible = self.visible();
+        // Software mode: the overlay gets the new sprite (or just its hash) and the
+        // current visibility. The blank Win32 cursor is unchanged by a cursor
+        // change and already in place from the last show, so it is realized here
+        // only when no cursor was set before.
+        self.push_overlay_state();
+        // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
+        // While hidden the game owns the win32 cursor — pushing null here clobbers
+        // the cursor the game's own wndproc set (WoW's login screen never calls
+        // ShowCursor(TRUE); its glove is the game's own cursor).
+        // `set_cursor_us` is 0 when nothing was realized.
+        let set_cursor_us = if visible && (!self.software() || prev_hash == 0) {
+            timed_set_cursor(handle)
+        } else {
+            0
+        };
+        self.charge_call_us(set_cursor_us);
         debug!(
             target: LOG_TARGET,
-            "SetCursorPosition: ({},{}) → ({x},{y}) dx={} dy={} get_us={get_us} set_us={set_us}",
-            p.x, p.y, x - p.x, y - p.y,
-        );
-    } else {
-        debug!(
-            target: LOG_TARGET,
-            "SetCursorPosition: → ({x},{y}) got_current=none get_us={get_us} set_us={set_us}",
+            "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} set_cursor_us={set_cursor_us} cache_entries={} tid={}",
+            desc.format, desc.pool, self.cache.len(), current_thread_id(),
         );
     }
-}
 
-pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
-    let _api = device_api_lock(this);
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
-        return D3DERR_INVALIDCALL;
-    };
-    let cur = obj.inner().cursor_mut();
-    let prev = cur.visible();
-    let next = show != 0;
-    if !next && cur.hide_suppressed_in_resize() {
-        debug!(
-            target: LOG_TARGET,
-            "ShowCursor(show=0) suppressed: issued inside the dispatch a resize arrived in tid={}",
-            current_thread_id(),
-        );
-        cur.push_overlay_state();
-        return i32::from(prev);
-    }
-    // D3D9 changes the cursor visibility only once a cursor image has been set
-    // via SetCursorProperties (handle non-null); with no cursor surface,
-    // ShowCursor is a pure read of the (unchanged) previous visibility.
-    if cur.handle.is_null() {
-        trace!(
-            target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} (no cursor surface set; no-op)",
-        );
-        return i32::from(prev);
-    }
-    if next {
-        cur.set_hide_suppressed_in_resize(false);
-        // A pointer that came back from another process while the cursor was
-        // hidden: the game's cursor was not on screen to kick then, so the
-        // show pushes null first and Wine re-applies on the handle change.
-        if cur.take_cursor_kick() {
-            set_cursor(null_mut());
+    /// `SetCursorPosition`: move the pointer to `(x, y)` unless it is already there.
+    pub fn set_position(&mut self, x: i32, y: i32) {
+        // The pre-check earns its keep: a `SetCursorPos` to the current position
+        // still queues a `WM_MOUSEMOVE`, so skipping it keeps the game's message
+        // queue quiet. Its cost is the idle `GetCursorPos` main-thread hop
+        // described on `timed_set_cursor`, hence the timing.
+        let started = Instant::now();
+        let current = get_cursor_pos();
+        let get_us = elapsed_us(started);
+        let suppress = current.is_some_and(|p| p.x == x && p.y == y);
+        if suppress {
+            self.charge_call_us(get_us);
+            debug!(target: LOG_TARGET, "SetCursorPosition: noop ({x},{y}) get_us={get_us}");
+            return;
+        }
+        let started = Instant::now();
+        set_cursor_pos(x, y);
+        let set_us = elapsed_us(started);
+        self.charge_call_us(get_us + set_us);
+        if let Some(p) = current {
+            debug!(
+                target: LOG_TARGET,
+                "SetCursorPosition: ({},{}) → ({x},{y}) dx={} dy={} get_us={get_us} set_us={set_us}",
+                p.x, p.y, x - p.x, y - p.y,
+            );
+        } else {
+            debug!(
+                target: LOG_TARGET,
+                "SetCursorPosition: → ({x},{y}) got_current=none get_us={get_us} set_us={set_us}",
+            );
         }
     }
-    cur.set_visible(next);
-    // Realize on EVERY call, not only on transitions: a transition-gated
-    // SetCursor leaves wine's cursor state stale whenever a latch-suppressed
-    // hide ate the transition — the game then believes the cursor visible
-    // while wine still holds the hidden state until its next full hide/show
-    // cycle.
-    //
-    // What this does NOT recover from is a pointer image replaced *below*
-    // wine: wine's `set_cursor` server request only notifies its display
-    // driver when the handle changes (`prev_cursor != new_cursor`), so
-    // re-pushing the handle wine already holds is dropped before it reaches
-    // the driver. Only a different handle, the null-then-handle kick in the
-    // WM_SETCURSOR branch below, or the pointer re-entering the window gets
-    // through.
-    //
-    // Software mode keeps the Win32 cursor blank in both directions: a show
-    // re-asserts the blank (the same recovery role, the game may have set its
-    // own cursor meanwhile), a hide pushes nothing, so the WindowServer cursor
-    // plane never toggles on our account. The overlay gets the visibility.
-    let handle = if next || cur.software() {
-        cur.handle
-    } else {
-        null_mut()
-    };
-    let set_cursor_us = if next || !cur.software() {
-        timed_set_cursor(handle)
-    } else {
-        0
-    };
-    cur.charge_call_us(set_cursor_us);
-    // The hardware path sends visibility on transitions only, beside the
-    // SetCursor it already makes; software mode sends every call, coalesced
-    // on the unix side.
-    if cur.software() || prev != next {
-        cur.push_overlay_state();
+
+    /// `ShowCursor`: set the visibility to `show`, returning the previous one.
+    pub fn show(&mut self, show: i32) -> i32 {
+        let prev = self.visible();
+        let next = show != 0;
+        if !next && self.hide_suppressed_in_resize() {
+            debug!(
+                target: LOG_TARGET,
+                "ShowCursor(show=0) suppressed: issued inside the dispatch a resize arrived in tid={}",
+                current_thread_id(),
+            );
+            self.push_overlay_state();
+            return i32::from(prev);
+        }
+        // D3D9 changes the cursor visibility only once a cursor image has been set
+        // via SetCursorProperties (handle non-null); with no cursor surface,
+        // ShowCursor is a pure read of the (unchanged) previous visibility.
+        if self.handle.is_null() {
+            trace!(
+                target: LOG_TARGET,
+                "ShowCursor(show={show}) → prev={prev} (no cursor surface set; no-op)",
+            );
+            return i32::from(prev);
+        }
+        if next {
+            self.set_hide_suppressed_in_resize(false);
+            // A pointer that came back from another process while the cursor was
+            // hidden: the game's cursor was not on screen to kick then, so the
+            // show pushes null first and Wine re-applies on the handle change.
+            if self.take_cursor_kick() {
+                set_cursor(null_mut());
+            }
+        }
+        self.set_visible(next);
+        // Realize on EVERY call, not only on transitions: a transition-gated
+        // SetCursor leaves wine's cursor state stale whenever a latch-suppressed
+        // hide ate the transition — the game then believes the cursor visible
+        // while wine still holds the hidden state until its next full hide/show
+        // cycle.
+        //
+        // What this does NOT recover from is a pointer image replaced *below*
+        // wine: wine's `set_cursor` server request only notifies its display
+        // driver when the handle changes (`prev_cursor != new_cursor`), so
+        // re-pushing the handle wine already holds is dropped before it reaches
+        // the driver. Only a different handle, the null-then-handle kick in the
+        // WM_SETCURSOR branch below, or the pointer re-entering the window gets
+        // through.
+        //
+        // Software mode keeps the Win32 cursor blank in both directions: a show
+        // re-asserts the blank (the same recovery role, the game may have set its
+        // own cursor meanwhile), a hide pushes nothing, so the WindowServer cursor
+        // plane never toggles on our account. The overlay gets the visibility.
+        let handle = if next || self.software() {
+            self.handle
+        } else {
+            null_mut()
+        };
+        let set_cursor_us = if next || !self.software() {
+            timed_set_cursor(handle)
+        } else {
+            0
+        };
+        self.charge_call_us(set_cursor_us);
+        // The hardware path sends visibility on transitions only, beside the
+        // SetCursor it already makes; software mode sends every call, coalesced
+        // on the unix side.
+        if self.software() || prev != next {
+            self.push_overlay_state();
+        }
+        if prev != next {
+            self.probe.last_transition = Some((Instant::now(), next));
+        }
+        if prev == next {
+            trace!(
+                target: LOG_TARGET,
+                "ShowCursor(show={show}) → prev={prev} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (re-assert)",
+                current_thread_id(),
+            );
+        } else {
+            debug!(
+                target: LOG_TARGET,
+                "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (transition)",
+                current_thread_id(),
+            );
+        }
+        i32::from(prev)
     }
-    if prev != next {
-        cur.probe.last_transition = Some((Instant::now(), next));
-    }
-    if prev == next {
-        trace!(
-            target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (re-assert)",
-            current_thread_id(),
-        );
-    } else {
-        debug!(
-            target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (transition)",
-            current_thread_id(),
-        );
-    }
-    i32::from(prev)
+}
+
+/// The HCURSOR [`CursorState::select_bitmap`] picked, handed to [`CursorState::realize_bitmap`].
+pub struct SelectedBitmap {
+    hash: u64,
+    prev_hash: u64,
+    handle: *mut c_void,
+    outcome: &'static str,
 }
 
 // ── Window-proc subclass ──
@@ -1609,7 +1426,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // SAFETY: `flags_at` points at the `WINDOWPOS`'s `UINT` `flags`, read
         // unaligned since the pointer came through an integer.
         let flags = unsafe { flags_at.cast::<u32>().read_unaligned() };
-        crate::fullscreen::note_window_pos_changed(hwnd, flags);
+        super::fullscreen::note_window_pos_changed(hwnd, flags);
         // Win32's client rect is final by now, which a notification Cocoa
         // posts for its own resize is not: Wine applies that resize to the
         // window afterwards, on this thread. The next `Present` has Wine size
@@ -1638,7 +1455,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
     // does: a device filters the messages its own window management sends.
     // Games answer `WM_SIZE` by calling `Reset`, which would recurse into
     // the transition that sent it.
-    if crate::fullscreen::driving_window(hwnd) && msg != WM_DISPLAYCHANGE {
+    if super::fullscreen::driving_window(hwnd) && msg != WM_DISPLAYCHANGE {
         return def_window_proc(hwnd, msg, wp, lp);
     }
 
@@ -1731,7 +1548,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         if let Some(window) = fullscreen
             && wp == 0
         {
-            crate::fullscreen::deactivate(window);
+            super::fullscreen::deactivate(window);
         } else if fullscreen.is_some() {
             debug!(
                 target: LOG_TARGET,
@@ -1765,7 +1582,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for
         // the lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
-        if new_width != 0 && new_height != 0 && !crate::fullscreen::driving_window(hwnd) {
+        if new_width != 0 && new_height != 0 && !super::fullscreen::driving_window(hwnd) {
             if dev.fullscreen_window().is_some() {
                 post_message(hwnd, WM_APP_REASSERT_FULLSCREEN, 0, lp);
             } else {
@@ -1813,7 +1630,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         return 0;
     }
 
-    let _app_call = crate::fullscreen::app_procedure_call(hwnd);
+    let _app_call = super::fullscreen::app_procedure_call(hwnd);
     call_window_proc(original_wndproc, hwnd, msg, wp, lp)
 }
 
@@ -2297,12 +2114,4 @@ fn u8_to_u32_vec(src: &[u8]) -> Vec<u32> {
         out.push(u32::from_ne_bytes(*chunk));
     }
     out
-}
-
-/// Minimal layout for reading the surface's vtable pointer.
-///
-/// Avoids pulling the full `Direct3DSurface9` type into this module.
-#[repr(C)]
-struct SurfaceHead {
-    vtbl: *const IDirect3DSurface9Vtbl,
 }
