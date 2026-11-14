@@ -529,6 +529,7 @@ fn an_occluded_window_keeps_its_pace() {
             cursor_kick_sink: 0,
             client_surface_request_sink: 0,
             client_surface: 0,
+            present_options: mtld3d_shared::mtl::PresentOptions::empty(),
         },
     );
     let cap = 1.0 / 30.0;
@@ -568,6 +569,7 @@ fn the_presenter_paces_a_window_that_displays_nothing() {
             cursor_kick_sink: 0,
             client_surface_request_sink: 0,
             client_surface: 0,
+            present_options: mtld3d_shared::mtl::PresentOptions::empty(),
         },
     );
     let cap = Duration::from_secs_f64(1.0 / 30.0);

@@ -950,7 +950,16 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     // does not follow on its own, so without this the frames between the
     // resize and the guest's own reaction would be composited at the old
     // size, which means rescaled.
-    super::layer::sync_drawable_size(&layer);
+    // `present.nativeDrawable` caps it at the panel's pixels, once the main
+    // thread has published them.
+    let panel = attachment
+        .as_ref()
+        .filter(|att| {
+            att.present_options()
+                .contains(mtld3d_shared::mtl::PresentOptions::NATIVE_DRAWABLE)
+        })
+        .and_then(|att| att.panel_pixels());
+    super::layer::sync_drawable_size(&layer, panel);
     mtld3d_shared::crumb!("present:nextdraw", seq);
     let mut drawable_wait_ns: u64 = 0;
     let drawable = {

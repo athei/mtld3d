@@ -9,7 +9,7 @@
 use log::info;
 use mtld3d_shared::{
     log_once_warn,
-    mtl::{ColorSpacePolicy, SoftwareCursorPolicy},
+    mtl::{ColorSpacePolicy, PresentOptions, SoftwareCursorPolicy},
 };
 
 use crate::app_profile::AppProfile;
@@ -131,6 +131,16 @@ pub struct Mtld3dConfig {
     /// the unix side at device creation. File key: `cursor.software`
     /// (`auto` | `true` | `false`).
     pub cursor_software: SoftwareCursorPolicy,
+    /// Size a drawable that is larger than the display panel to the panel's pixels.
+    ///
+    /// In a scaled ("looks like") display mode the window's backing store has
+    /// more pixels than the panel, and the display downsamples every
+    /// composited frame. On, the drawable is shrunk (aspect kept) to fit the
+    /// panel's native pixel size, so `MetalFX` and the present passes write
+    /// only pixels the panel shows; the compositor scales the layer the rest
+    /// of the way. It never enlarges, so a non-retina layer or a panel-native
+    /// mode is unchanged. Default: `false`. File key: `present.nativeDrawable`.
+    pub present_native_drawable: bool,
     /// Use the persistent on-disk shader cache.
     ///
     /// Default: `true`. File key: `shaderCache.enable`.
@@ -389,6 +399,19 @@ impl CursorScale {
     }
 }
 
+impl Mtld3dConfig {
+    /// The present-path keys as the attach parameters carry them, one bit per key.
+    #[must_use]
+    pub fn present_options(&self) -> PresentOptions {
+        let mut options = PresentOptions::empty();
+        options.set(
+            PresentOptions::NATIVE_DRAWABLE,
+            self.present_native_drawable,
+        );
+        options
+    }
+}
+
 impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
@@ -403,6 +426,7 @@ impl Default for Mtld3dConfig {
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
             cursor_software: SoftwareCursorPolicy::Off,
+            present_native_drawable: false,
             shader_cache_enable: true,
             shader_async_compile: true,
             log_dir: String::new(),
@@ -552,6 +576,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: present.nativeDrawable = {}", cfg.present_native_drawable
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: shaderCache.enable = {}", cfg.shader_cache_enable
     );
     info!(
@@ -685,6 +713,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
         "cursor.software" => assign_cursor_software(source, value, &mut cfg.cursor_software),
+        "present.nativeDrawable" => {
+            assign_bool(source, key, value, &mut cfg.present_native_drawable);
+        }
         "shaderCache.enable" => assign_bool(source, key, value, &mut cfg.shader_cache_enable),
         "shader.asyncCompile" => assign_bool(source, key, value, &mut cfg.shader_async_compile),
         "log.dir" => value.clone_into(&mut cfg.log_dir),

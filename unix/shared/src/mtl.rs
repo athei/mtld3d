@@ -1019,5 +1019,26 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Present-path options a layer keeps for its lifetime, from `AttachMetalLayerParams`.
+    ///
+    /// Each bit is one `mtld3d.conf` key, all off by default; with none set the
+    /// present path is the one the release shipped.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct PresentOptions: u32 {
+        /// `present.nativeDrawable`: a drawable larger than the panel is sized to the panel.
+        ///
+        /// In a scaled display mode the window's backing store has more
+        /// pixels than the panel shows (2940x1912 on a 2560x1664 panel), and
+        /// the display scales the composited frame down. Sizing the drawable
+        /// to the panel's own pixel grid instead (aspect kept) spares present
+        /// writing pixels the display throws away; the compositor's own
+        /// scale of the layer takes the difference. Never enlarges, so a
+        /// non-retina layer or a panel-native mode is untouched.
+        const NATIVE_DRAWABLE = 1 << 0;
+    }
+}
+
 #[cfg(test)]
 mod tests;

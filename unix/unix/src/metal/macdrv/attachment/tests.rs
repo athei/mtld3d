@@ -71,6 +71,7 @@ fn latches(
         cursor_kick_sink,
         client_surface_request_sink: 0,
         client_surface: 0,
+        present_options: mtld3d_shared::mtl::PresentOptions::empty(),
     }
 }
 
@@ -216,6 +217,7 @@ fn each_record_seeds_its_own_defaults() {
             cursor_kick_sink: 0,
             client_surface_request_sink: 0,
             client_surface: 0,
+            present_options: mtld3d_shared::mtl::PresentOptions::empty(),
         },
     );
     assert_eq!(

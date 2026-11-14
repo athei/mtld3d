@@ -314,6 +314,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         cursor_kick_sink_ptr: params.cursor_kick_ptr,
         client_surface_request_sink_ptr: params.client_surface_request_ptr,
         software_cursor: params.software_cursor,
+        present_options: params.present_options,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
         params.view_handle = view;

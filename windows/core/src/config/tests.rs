@@ -678,3 +678,25 @@ fn df_formats_defaults_on_and_parses_off() {
     assert!(parse(None, "", None).df_formats);
     assert!(!parse(None, "caps.dfFormats = false\n", None).df_formats);
 }
+
+#[test]
+fn present_native_drawable_defaults_off_and_parses_both_values() {
+    assert!(
+        !parse(None, "", None).present_native_drawable,
+        "off by default"
+    );
+    assert!(parse(None, "present.nativeDrawable = true\n", None).present_native_drawable);
+    assert!(!parse(None, "present.nativeDrawable = false\n", None).present_native_drawable);
+    assert!(!parse(None, "present.nativeDrawable = yes\n", None).present_native_drawable);
+}
+
+#[test]
+fn present_options_carry_one_bit_per_key() {
+    use mtld3d_shared::mtl::PresentOptions;
+    assert_eq!(
+        Mtld3dConfig::default().present_options(),
+        PresentOptions::empty()
+    );
+    let cfg = parse(None, "present.nativeDrawable = true\n", None);
+    assert_eq!(cfg.present_options(), PresentOptions::NATIVE_DRAWABLE);
+}

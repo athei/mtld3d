@@ -93,3 +93,20 @@ fn the_widest_cap_survives_the_round_trip() {
     assert!(back.vsync_requested);
     assert_eq!(back.max_fps, u32::MAX);
 }
+
+/// `present.nativeDrawable`: an overhanging drawable shrinks to the panel, aspect kept.
+#[test]
+fn a_drawable_larger_than_the_panel_fits_it_and_nothing_else_moves() {
+    use super::fit_drawable_to_panel as fit;
+    // The built-in panel under a 1470x956 "looks like" mode, window fullscreen.
+    assert_eq!(fit((2944, 1915), Some((2560, 1664))), (2558, 1664));
+    assert_eq!(fit((2940, 1912), Some((2560, 1664))), (2559, 1664));
+    // Fits already: a panel-native mode, a non-retina layer, a small window.
+    assert_eq!(fit((2560, 1664), Some((2560, 1664))), (2560, 1664));
+    assert_eq!(fit((1472, 957), Some((2560, 1664))), (1472, 957));
+    // Overhanging one axis only still scales both.
+    assert_eq!(fit((2600, 1000), Some((2560, 1664))), (2560, 985));
+    // Unknown panel, or the key off, and degenerate sizes are left alone.
+    assert_eq!(fit((2944, 1915), None), (2944, 1915));
+    assert_eq!(fit((0, 1915), Some((2560, 1664))), (0, 1915));
+}

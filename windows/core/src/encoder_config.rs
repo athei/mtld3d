@@ -29,6 +29,7 @@ impl WireValue for Mtld3dConfig {
         self.color_space.write_wire(writer)?;
         self.cursor_scale.write_wire(writer)?;
         self.cursor_software.write_wire(writer)?;
+        self.present_native_drawable.write_wire(writer)?;
         self.shader_cache_enable.write_wire(writer)?;
         self.shader_async_compile.write_wire(writer)?;
         self.log_dir.write_wire(writer)?;
@@ -66,6 +67,7 @@ impl WireValue for Mtld3dConfig {
             color_space: <ColorSpacePolicy>::read_wire(reader)?,
             cursor_scale: <CursorScale>::read_wire(reader)?,
             cursor_software: <SoftwareCursorPolicy>::read_wire(reader)?,
+            present_native_drawable: <bool>::read_wire(reader)?,
             shader_cache_enable: <bool>::read_wire(reader)?,
             shader_async_compile: <bool>::read_wire(reader)?,
             log_dir: <String>::read_wire(reader)?,
