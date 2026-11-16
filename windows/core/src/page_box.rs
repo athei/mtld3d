@@ -473,6 +473,37 @@ impl PageBox {
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
+    /// Zero the first `logical_len` bytes, the ones a lock or an upload can reach, in one memset.
+    ///
+    /// The padding past them up to the page multiple is left as it is: no lock
+    /// pitch, upload or read back reaches it.
+    pub const fn zero_logical(&mut self) {
+        // SAFETY: the allocation spans `len >= logical_len` writable bytes, and
+        // `&mut self` makes the write exclusive under the constructor's access
+        // contract.
+        unsafe { self.ptr.as_ptr().write_bytes(0, self.logical_len) };
+    }
+
+    /// Zero the bytes past `row_bytes` in each of the first `rows` rows of `pitch` bytes.
+    ///
+    /// For a level a read back wrote row by row at a pitch wider than its
+    /// pixels: the rows keep the read back's bytes and only the padding
+    /// between them is zeroed. A no-op when the pitch has no padding.
+    pub fn zero_row_padding(&mut self, rows: usize, row_bytes: usize, pitch: usize) {
+        if pitch <= row_bytes {
+            return;
+        }
+        let logical_len = self.logical_len;
+        for row in self.as_mut_slice()[..logical_len]
+            .chunks_mut(pitch)
+            .take(rows)
+        {
+            if let Some(padding) = row.get_mut(row_bytes..) {
+                padding.fill(0);
+            }
+        }
+    }
+
     /// Padded length (page multiple).
     ///
     /// This is what the Metal `MTLBuffer` wrapper sees.

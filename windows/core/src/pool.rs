@@ -37,6 +37,19 @@ pub const fn is_runtime_managed(pool: u32) -> bool {
     pool == D3DPOOL_MANAGED
 }
 
+/// Whether a resource created in `pool` starts with a zeroed system-memory copy.
+///
+/// The runtime allocates the copy of a `D3DPOOL_MANAGED`, `D3DPOOL_SYSTEMMEM`
+/// or `D3DPOOL_SCRATCH` resource itself and hands it out zeroed, so a lock
+/// reads zero where the application has written nothing, and an upload of
+/// such a copy puts zero on the device. A `D3DPOOL_DEFAULT` resource has no
+/// runtime copy; its staging here only carries the writes the application
+/// makes, and its unwritten contents are undefined.
+#[must_use]
+pub const fn system_copy_starts_zeroed(pool: u32) -> bool {
+    matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SYSTEMMEM | D3DPOOL_SCRATCH)
+}
+
 /// Whether `usage` asks for something `pool` cannot give a texture.
 ///
 /// `D3DUSAGE_DYNAMIC` says the application rewrites the resource often enough

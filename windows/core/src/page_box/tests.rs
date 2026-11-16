@@ -175,6 +175,32 @@ fn zeroed_init_is_actually_zero() {
 }
 
 #[test]
+fn zero_logical_zeroes_the_logical_bytes_and_leaves_the_padding() {
+    let mut pb = PageBox::new_uninit(100);
+    pb.as_mut_slice().fill(0xAB);
+    pb.zero_logical();
+    let bytes = pb.as_slice();
+    assert!(bytes[..100].iter().all(|&byte| byte == 0));
+    assert!(bytes[100..].iter().all(|&byte| byte == 0xAB));
+}
+
+#[test]
+fn zero_row_padding_zeroes_only_the_bytes_past_each_row() {
+    let mut pb = PageBox::new_uninit(12);
+    pb.as_mut_slice().fill(0xAB);
+    pb.zero_row_padding(3, 3, 4);
+    assert_eq!(
+        &pb.as_slice()[..12],
+        &[
+            0xAB, 0xAB, 0xAB, 0, 0xAB, 0xAB, 0xAB, 0, 0xAB, 0xAB, 0xAB, 0
+        ]
+    );
+    // A pitch with no padding leaves every byte alone.
+    pb.zero_row_padding(3, 4, 4);
+    assert_eq!(pb.as_slice()[0], 0xAB);
+}
+
+#[test]
 fn drop_does_not_panic() {
     for _ in 0..16 {
         drop(PageBox::new_uninit(64 * 1024));

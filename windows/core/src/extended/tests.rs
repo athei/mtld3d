@@ -220,6 +220,19 @@ fn packed_rows_land_at_the_destination_pitch() {
 }
 
 #[test]
+fn the_padding_past_each_packed_row_reads_zero() {
+    let rows = PackedRows {
+        row_bytes: 3,
+        rows: 2,
+    };
+    let src = [1u8, 2, 3, 4, 5, 6];
+    // The level's bytes before the copy: another resource's, never zero.
+    let mut dst = [0xEEu8; 8];
+    assert!(copy_packed_rows(&src, &rows, &mut dst, 4));
+    assert_eq!(dst, [1, 2, 3, 0, 4, 5, 6, 0]);
+}
+
+#[test]
 fn a_short_side_copies_nothing() {
     let rows = PackedRows {
         row_bytes: 3,
