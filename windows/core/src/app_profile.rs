@@ -35,6 +35,12 @@ static PROFILES: &[AppProfile] = &[
     // With Apple's vendor id the game stops at start-up with its CSM error,
     // and with NVIDIA's it fails to initialise NVAPI; with AMD's it starts.
     //
+    // Loading a map, it writes through the pointer a `Lock` of a static
+    // write-only buffer returned after it has called `Unlock`. The layer
+    // frees that buffer's CPU copy at `Unlock`, so the write lands in freed
+    // memory and the process dies. `buffer.drawTimeUpload` keeps the copy and
+    // uploads it at the draw, so the late writes reach the GPU too.
+    //
     // `csgo.exe` carries no version resource, so the entry is pinned on the
     // Steam app id. The legacy build is its own app, 4465480, and the
     // `steam_appid.txt` it ships names 730, so either id can reach the game.
@@ -47,7 +53,7 @@ static PROFILES: &[AppProfile] = &[
         product: None,
         original_filename: None,
         steam_apps: &[4_465_480, 730],
-        settings: "adapter.spoof=amd",
+        settings: "adapter.spoof=amd;buffer.drawTimeUpload=true",
     },
     // Fallout 3.
     //

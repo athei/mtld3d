@@ -146,16 +146,18 @@ fn the_csgo_profile_needs_its_app_id_and_its_executable() {
 }
 
 #[test]
-fn the_csgo_profile_resolves_to_the_amd_identity() {
+fn the_csgo_profile_resolves_to_the_options_it_names() {
     let id = AppIdentity::new("csgo.exe".to_owned(), None, Some("4465480"));
     let profile = lookup(&id).expect("the csgo profile matches");
+    let stock = parse(None, "", None);
+    assert_eq!(stock.adapter_spoof, AdapterSpoof::None);
+    assert!(!stock.buffer_draw_time_upload);
     // A typo in the settings string would keep Apple's vendor id, which the
-    // game refuses at start-up.
-    assert_eq!(parse(None, "", None).adapter_spoof, AdapterSpoof::None);
-    assert_eq!(
-        parse(Some(profile), "", None).adapter_spoof,
-        AdapterSpoof::Amd
-    );
+    // game refuses at start-up, or free the buffer copies it writes after
+    // `Unlock`, which ends the process at the first map.
+    let cfg = parse(Some(profile), "", None);
+    assert_eq!(cfg.adapter_spoof, AdapterSpoof::Amd);
+    assert!(cfg.buffer_draw_time_upload);
 }
 
 #[test]
