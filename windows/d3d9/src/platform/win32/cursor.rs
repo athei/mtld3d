@@ -1118,7 +1118,12 @@ impl CursorState {
     /// `src` and `pitch` are the locked rows `layout` describes. `None` when
     /// the cursor cannot be built, which the caller answers with
     /// `D3DERR_INVALIDCALL` after unlocking.
-    pub fn select_bitmap(
+    ///
+    /// # Safety
+    ///
+    /// `src` points at `layout.height` rows `pitch` bytes apart, each holding
+    /// `layout.width` 4-byte pixels, readable for the duration of the call.
+    pub unsafe fn select_bitmap(
         &mut self,
         layout: &BitmapLayout,
         src: *const u8,

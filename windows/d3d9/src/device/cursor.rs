@@ -230,7 +230,10 @@ pub extern "system" fn device_set_cursor_properties(
     };
     let src = locked.bits as *const u8;
     let cur = dev.cursor_mut();
-    let selected = cur.select_bitmap(&layout, src, pitch);
+    // SAFETY: `src` is the surface `LockRect` locked above, whose extent
+    // `layout` holds, and `row_pitch` checked `pitch` against it; the lock
+    // holds until the unlock below.
+    let selected = unsafe { cur.select_bitmap(&layout, src, pitch) };
     // SAFETY: calling the just-loaded `unlock_rect` thunk through
     // `surf_vtbl`; paired with the `lock_rect` call above.
     unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
