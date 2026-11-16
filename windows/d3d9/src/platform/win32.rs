@@ -117,7 +117,7 @@ static ALLOCATOR: crumb_allocator::CrumbAllocator = crumb_allocator::CrumbAlloca
 /// probe-call it to verify the export resolves, then `FreeLibrary`, and that
 /// unload has to stay real. `CreateDevice` requires a real HWND and
 /// presentation parameters, so reaching it implies actual use.
-pub static USED: AtomicBool = AtomicBool::new(false);
+static USED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" {
     fn DisableThreadLibraryCalls(lib_module: *mut c_void) -> i32;
@@ -220,36 +220,6 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
     init_logger(instance);
     attach_process(instance);
     1
-}
-
-/// Keep this image loaded until the process ends, called once at the first `CreateDevice`.
-///
-/// A pinned module ignores `FreeLibrary`, so a launcher that creates a
-/// device, releases it and frees `d3d9.dll` keeps running with the image
-/// mapped, and the next `LoadLibrary` finds it already there. Unloading for
-/// real after a device existed would run the allocator's thread-local
-/// teardown on the caller's thread and leave process-wide registrations
-/// (window subclasses, notification observers, Metal completion handlers)
-/// pointing into unmapped code. The pin waits for a device rather than
-/// happening at load, because a load that only probes `Direct3DCreate9` and
-/// frees the library again has to unload for real.
-pub fn pin_image() {
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: kernel32 export; `USED` is a static of this image, so its
-    // address names the module, and `out` is a writable local.
-    let ok = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            (&raw const USED).cast::<u8>(),
-            &raw mut module,
-        )
-    };
-    if ok == 0 || module.is_null() {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "CreateDevice: GetModuleHandleEx could not pin d3d9.dll; a later FreeLibrary that unloads it ends the process"
-        );
-    }
 }
 
 // The exports of the d3d9 API. Each is an entry with a fixed prologue that hook
@@ -536,4 +506,34 @@ fn attach_process(instance: *mut c_void) {
     unsafe { DisableThreadLibraryCalls(instance) };
     mode_list_hook::install();
     exit_code_hook::install();
+}
+
+/// Keep this image loaded until the process ends, called once at the first `CreateDevice`.
+///
+/// A pinned module ignores `FreeLibrary`, so a launcher that creates a
+/// device, releases it and frees `d3d9.dll` keeps running with the image
+/// mapped, and the next `LoadLibrary` finds it already there. Unloading for
+/// real after a device existed would run the allocator's thread-local
+/// teardown on the caller's thread and leave process-wide registrations
+/// (window subclasses, notification observers, Metal completion handlers)
+/// pointing into unmapped code. The pin waits for a device rather than
+/// happening at load, because a load that only probes `Direct3DCreate9` and
+/// frees the library again has to unload for real.
+fn pin_image() {
+    let mut module: *mut c_void = core::ptr::null_mut();
+    // SAFETY: kernel32 export; `USED` is a static of this image, so its
+    // address names the module, and `out` is a writable local.
+    let ok = unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            (&raw const USED).cast::<u8>(),
+            &raw mut module,
+        )
+    };
+    if ok == 0 || module.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "CreateDevice: GetModuleHandleEx could not pin d3d9.dll; a later FreeLibrary that unloads it ends the process"
+        );
+    }
 }
