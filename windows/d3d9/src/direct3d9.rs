@@ -2411,11 +2411,6 @@ pub const fn resolve_cursor_scale(
     (scale, origin)
 }
 
-/// Resolve `render.scale` (`render_scale_percent`) against what the GPU can actually do.
-///
-/// `MetalFX` is the only thing that can resample a frame at present time, so a
-/// GPU without it has to render at exactly the presented size. Say so once
-/// rather than quietly ignoring the user's setting.
 /// The unix path of `debug.presentGateFile`, or `None` when there is no gate.
 ///
 /// Relative paths join the executable's directory, as the log directory
@@ -2443,6 +2438,11 @@ fn present_gate_unix_path(cfg: &Mtld3dConfig) -> Option<String> {
     Some(unix)
 }
 
+/// Resolve `render.scale` (`render_scale_percent`) against what the GPU can actually do.
+///
+/// `MetalFX` is the only thing that can resample a frame at present time, so a
+/// GPU without it has to render at exactly the presented size. Say so once
+/// rather than quietly ignoring the user's setting.
 fn resolve_render_scale(
     metalfx_available: bool,
     render_scale_percent: u32,

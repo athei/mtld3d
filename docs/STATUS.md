@@ -226,6 +226,14 @@ unless its entry says otherwise.
   texture query and only a `D3DPOOL_SCRATCH` texture creates. They remain
   offscreen plain surfaces, and a DEFAULT-pool one is a `StretchRect` source
   that decodes into any render target and 1:1 into a colour offscreen plain.
+- A write through a level-0 lock of a `D3DPOOL_MANAGED` texture that runs
+  on into the rest of its mip chain. Each level has its own staging
+  allocation, a lock hands out the locked level's, and an unlock dirties
+  only that level, so the lower levels never receive the data. Where the
+  chain is longer than level 0's allocation, which is padded to 16 KiB, the
+  write runs past it, so this one does not fail cleanly. The
+  `visual.c/test_mipmap_upload` site of Wine's tests fails on it; no title
+  run here needs it.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.

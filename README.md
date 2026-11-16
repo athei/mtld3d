@@ -5,8 +5,8 @@ Direct3D 9 for Wine on macOS, backed by Metal.
 mtld3d replaces Wine's `d3d9.dll`. The PE side implements the
 application-facing D3D9 API and records commands for the native Unix runtime,
 which translates them into Metal command buffers and submits them. The goal is
-the fastest Direct3D 9 implementation for Wine on macOS. Direct3D 8 on the
-same core is planned ([#788](https://github.com/athei/mtld3d/issues/788)).
+the fastest Direct3D 9 implementation for Wine on macOS. Direct3D 8 is not
+implemented ([#788](https://github.com/athei/mtld3d/issues/788)).
 Every other Direct3D version is a non-goal: D3D10 and later are already served
 on macOS by Apple's D3DMetal and by DXMT.
 
