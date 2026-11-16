@@ -292,6 +292,16 @@ platform_split() {
         function finding(line, what) {
             printf "%s:%d: %s in %s\n", FILENAME, line, what, text
         }
+        # Every cfg in `s`. One left open continues on the next lines.
+        function scan(s) {
+            while (match(s, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
+                cfg = substr(s, RSTART)
+                start = FNR
+                if (depth(closed(cfg)) != 0) { nest = 1; return }
+                if (names_platform(cfg)) finding(start, "platform cfg")
+                s = substr(cfg, length(closed(cfg)) + 1)
+            }
+        }
         FNR == 1 { nest = 0 }
         /^[ \t]*\/\// { next }
         nest > 0 {
@@ -299,6 +309,7 @@ platform_split() {
             if (depth(closed(cfg)) == 0) {
                 nest = 0
                 if (names_platform(cfg)) finding(start, "platform cfg")
+                scan(substr(cfg, length(closed(cfg)) + 1))
             }
             next
         }
@@ -307,13 +318,7 @@ platform_split() {
             if ($0 ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
             if ($0 ~ /#\[link\(/) finding(FNR, "#[link(")
             if ($0 ~ /os::windows/) finding(FNR, "os::windows")
-            if (match($0, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
-                cfg = substr($0, RSTART)
-                start = FNR
-                nest = depth(closed(cfg))
-                if (nest == 0 && names_platform(cfg))
-                    finding(start, "platform cfg")
-            }
+            scan($0)
         }
     ' "$@"
 }
