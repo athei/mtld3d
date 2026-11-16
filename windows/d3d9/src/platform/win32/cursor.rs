@@ -1178,7 +1178,7 @@ impl CursorState {
 
         // Keep the pixels: the backing scale can change under a running session
         // when the window moves to another display, and rebuilding the pointer at
-        // the new factor needs the bitmap the unlock below hands back to the
+        // the new factor needs the bitmap the caller's unlock hands back to the
         // guest. Only on a new bitmap, so a game re-setting the same cursor every
         // frame pays nothing.
         if hash != prev_hash {

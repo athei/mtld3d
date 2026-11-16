@@ -78,8 +78,8 @@ fn create_interface(extended: bool) -> *mut Direct3D9 {
     // The first entry point outside `DllMain`: the logging thread can start
     // here (DllMain runs under the loader lock and must not spawn threads).
     // It runs until the last interface is released, holding this image. Last,
-    // so the lines the interface's creation logged are among those `acquire`
-    // forwards before it returns.
+    // so the lines the interface's creation logged are among those
+    // `acquire_logger` forwards before it returns.
     platform::acquire_logger();
     interface
 }

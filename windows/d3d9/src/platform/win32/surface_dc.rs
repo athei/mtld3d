@@ -10,37 +10,6 @@ unsafe extern "system" {
     fn D3DKMTDestroyDCFromMemory(desc: *const D3DKMT_DESTROYDCFROMMEMORY) -> u32;
 }
 
-/// Win32 `D3DKMT_CREATEDCFROMMEMORY`: wraps an existing pixel store, no copy.
-///
-/// The pixel store is wrapped in a memory DC + DIB section. Unlike
-/// `CreateDIBSection`, the kernel side (`NtGdiDdDDICreateDCFromMemory`) leaves
-/// `biSizeImage` 0 and stores `biHeight` as `-Height` (top-down), which
-/// `GetObject` flips back to `+Height` — matching the `DIBSECTION` values GDI
-/// reports for such a DIB. `#[repr(C)]` matches the documented struct; `h_dc` /
-/// `h_bitmap` are filled by the call.
-// The field names mirror the canonical Win32 SDK names verbatim.
-#[repr(C)]
-struct D3DKMT_CREATEDCFROMMEMORY {
-    p_memory: *mut c_void,
-    format: u32,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    h_device_dc: *mut c_void,
-    p_color_table: *const c_void,
-    h_dc: *mut c_void,
-    h_bitmap: *mut c_void,
-}
-
-/// Win32 `D3DKMT_DESTROYDCFROMMEMORY`: the teardown counterpart.
-///
-/// Destroys the DC + DIB pair produced by [`D3DKMT_CREATEDCFROMMEMORY`].
-#[repr(C)]
-struct D3DKMT_DESTROYDCFROMMEMORY {
-    h_dc: *mut c_void,
-    h_bitmap: *mut c_void,
-}
-
 /// The pixel store and geometry a `GetDC` wraps.
 pub struct SurfaceDcSource {
     pub memory: *mut u8,
@@ -139,4 +108,35 @@ pub fn destroy_surface_dc(held: SurfaceDc) {
     // `D3DKMTCreateDCFromMemory` at `GetDC`; `&desc` is a live, aligned struct
     // read only for the duration of the call.
     unsafe { D3DKMTDestroyDCFromMemory(&raw const desc) };
+}
+
+/// Win32 `D3DKMT_CREATEDCFROMMEMORY`: wraps an existing pixel store, no copy.
+///
+/// The pixel store is wrapped in a memory DC + DIB section. Unlike
+/// `CreateDIBSection`, the kernel side (`NtGdiDdDDICreateDCFromMemory`) leaves
+/// `biSizeImage` 0 and stores `biHeight` as `-Height` (top-down), which
+/// `GetObject` flips back to `+Height` — matching the `DIBSECTION` values GDI
+/// reports for such a DIB. `#[repr(C)]` matches the documented struct; `h_dc` /
+/// `h_bitmap` are filled by the call.
+// The field names mirror the canonical Win32 SDK names verbatim.
+#[repr(C)]
+struct D3DKMT_CREATEDCFROMMEMORY {
+    p_memory: *mut c_void,
+    format: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    h_device_dc: *mut c_void,
+    p_color_table: *const c_void,
+    h_dc: *mut c_void,
+    h_bitmap: *mut c_void,
+}
+
+/// Win32 `D3DKMT_DESTROYDCFROMMEMORY`: the teardown counterpart.
+///
+/// Destroys the DC + DIB pair produced by [`D3DKMT_CREATEDCFROMMEMORY`].
+#[repr(C)]
+struct D3DKMT_DESTROYDCFROMMEMORY {
+    h_dc: *mut c_void,
+    h_bitmap: *mut c_void,
 }

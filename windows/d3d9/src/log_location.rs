@@ -44,25 +44,6 @@ pub fn open(cfg: &mtld3d_core::config::Mtld3dConfig) {
     unix_call(&mut params);
 }
 
-/// The log directory as a unix path plus the executable's stem, or why not.
-fn log_location(cfg: &mtld3d_core::config::Mtld3dConfig) -> Result<(String, String), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe() unavailable ({e})"))?;
-    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    let dir = if cfg.log_dir.is_empty() {
-        exe_dir.join(DEFAULT_DIR)
-    } else {
-        exe_dir.join(&cfg.log_dir)
-    };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {} ({e})", dir.display()))?;
-    let stem = exe.file_stem().map_or_else(
-        || String::from("mtld3d"),
-        |s| s.to_string_lossy().into_owned(),
-    );
-    let unix_dir = crate::platform::unix_path(&dir)
-        .ok_or_else(|| format!("no unix path for {}", dir.display()))?;
-    Ok((unix_dir, stem))
-}
-
 /// The default log location as a unix path, plus the executable's stem, or `None`.
 ///
 /// Derived at load, before `mtld3d.conf` is read, so `log.dir` plays no
@@ -81,4 +62,23 @@ pub fn early_location() -> Option<(String, String)> {
     );
     let separator = if unix_exe_dir.ends_with('/') { "" } else { "/" };
     Some((format!("{unix_exe_dir}{separator}{DEFAULT_DIR}"), stem))
+}
+
+/// The log directory as a unix path plus the executable's stem, or why not.
+fn log_location(cfg: &mtld3d_core::config::Mtld3dConfig) -> Result<(String, String), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe() unavailable ({e})"))?;
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let dir = if cfg.log_dir.is_empty() {
+        exe_dir.join(DEFAULT_DIR)
+    } else {
+        exe_dir.join(&cfg.log_dir)
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {} ({e})", dir.display()))?;
+    let stem = exe.file_stem().map_or_else(
+        || String::from("mtld3d"),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let unix_dir = crate::platform::unix_path(&dir)
+        .ok_or_else(|| format!("no unix path for {}", dir.display()))?;
+    Ok((unix_dir, stem))
 }

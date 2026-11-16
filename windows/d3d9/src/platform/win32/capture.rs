@@ -9,12 +9,6 @@ unsafe extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
-fn key_down(vkey: i32) -> bool {
-    // SAFETY: `GetAsyncKeyState` is a thread-safe Win32 syscall taking an
-    // `int vkey`; every caller passes a valid virtual-key constant.
-    unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
-}
-
 /// Whether the capture chord was pressed since the previous poll, by any device.
 ///
 /// True on the poll that sees P go down while Control and Shift are held and
@@ -28,4 +22,10 @@ pub fn capture_hotkey_pressed() -> bool {
     let down = key_down(CAPTURE_KEY);
     let was_down = CAPTURE_KEY_DOWN_LAST.swap(down, Ordering::Relaxed);
     capture_chord::chord_pressed(was_down, down, |modifier| key_down(modifier.virtual_key()))
+}
+
+fn key_down(vkey: i32) -> bool {
+    // SAFETY: `GetAsyncKeyState` is a thread-safe Win32 syscall taking an
+    // `int vkey`; every caller passes a valid virtual-key constant.
+    unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
 }

@@ -15,21 +15,6 @@ unsafe extern "system" {
     fn AllocateLocallyUniqueId(luid: *mut LUID) -> i32;
 }
 
-/// Win32 `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME`: a GDI display name in, its adapter out.
-#[repr(C)]
-struct D3dkmtOpenAdapterFromGdiDisplayName {
-    device_name: [u16; 32],
-    adapter: u32,
-    adapter_luid: LUID,
-    vid_pn_source_id: u32,
-}
-
-/// Win32 `D3DKMT_CLOSEADAPTER`: the adapter handle an open handed out.
-#[repr(C)]
-struct D3dkmtCloseAdapter {
-    adapter: u32,
-}
-
 /// Read the adapter LUID the driver reports, or allocate one when it reports none.
 pub fn adapter_luid() -> (u32, i32) {
     let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
@@ -75,4 +60,19 @@ pub fn adapter_luid() -> (u32, i32) {
         ok != 0
     );
     (allocated.low_part, allocated.high_part)
+}
+
+/// Win32 `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME`: a GDI display name in, its adapter out.
+#[repr(C)]
+struct D3dkmtOpenAdapterFromGdiDisplayName {
+    device_name: [u16; 32],
+    adapter: u32,
+    adapter_luid: LUID,
+    vid_pn_source_id: u32,
+}
+
+/// Win32 `D3DKMT_CLOSEADAPTER`: the adapter handle an open handed out.
+#[repr(C)]
+struct D3dkmtCloseAdapter {
+    adapter: u32,
 }
