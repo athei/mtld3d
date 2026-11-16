@@ -336,8 +336,8 @@ pub fn warn_if_dpi_scaled(hwnd: *mut c_void) {
     // answers `DPI_AWARENESS_INVALID`.
     let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
     // An invalid awareness comes from a null or dead window and passes
-    // silently here. `client_rect_dims` in `direct3d9` warns about the dead
-    // one; a null window is the caller's own case and is silent there too.
+    // silently here. `window::client_size` warns about the dead one; a null
+    // window is the caller's own case and is silent there too.
     if awareness != DPI_AWARENESS_UNAWARE {
         return;
     }

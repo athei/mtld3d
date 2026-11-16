@@ -1,8 +1,9 @@
 //! The D3D9 cursor: a hardware HCURSOR, or a blank one under the software overlay.
 //!
-//! Implements `D3D9Device::SetCursor*` / `ShowCursor` / `CursorWndProc` so
-//! games that rely on the Win32 cursor (hiding the OS pointer while they
-//! render their own sprite over it) actually get the behaviour they expect.
+//! It does the Win32 work of the `SetCursor*` / `ShowCursor` entry points in
+//! `device/cursor.rs`, and holds `cursor_wnd_proc`. Games that rely on the
+//! Win32 cursor (hiding the OS pointer while they render their own sprite over
+//! it) get the behaviour they expect.
 //!
 //! **Per-window back-pointers.** `CallWindowProcW` can't pass per-device user
 //! data through, so the subclass maps each window's `HWND` to its owning
