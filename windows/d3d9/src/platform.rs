@@ -16,9 +16,9 @@ pub use imp::{
     primary_monitor, release_logger, system_dpi, unix_path, warn_if_dpi_scaled,
 };
 
-/// The device's cursor.
+/// What the system realizes of the device's cursor.
 pub mod cursor {
-    pub use super::imp::cursor::CursorState;
+    pub use super::imp::cursor::{CursorImage, SystemCursor, current_thread_id};
 }
 
 /// A fullscreen device's window and display mode.

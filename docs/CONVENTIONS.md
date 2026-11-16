@@ -232,7 +232,7 @@ When extracting, derive `Copy`/`Clone` on the substruct only if the substruct is
 Composition is for reducing duplication or enforcing an invariant, not for cosmetic grouping. The four extant submodule structs on `DeviceInner` each earn their keep:
 
 - **`FfState`** — shared by the device, state-block save/restore, and tests; the state-block API can't be written without a typed snapshot.
-- **`CursorState`** — encapsulates WM_* subclass invariants the rest of `d3d9` shouldn't reach into.
+- **`CursorState`** — holds the D3D9 cursor rules and the overlay sync. Its one platform field, `SystemCursor`, encapsulates the WM_* subclass invariants the rest of `d3d9` shouldn't reach into.
 - **`StageBindings`** — owns the `[CachedComPtr; STAGE_COUNT]` array's refcount accounting plus per-(sampler, type_) latches; the slot-count-bounded loops live there.
 - **`ShaderBindings`** — pairs each stage's shader pointer with its constants array and `populated_rows` watermark.
 

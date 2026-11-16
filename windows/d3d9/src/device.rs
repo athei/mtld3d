@@ -107,6 +107,7 @@ use super::{
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
+    device::cursor::CursorState,
     direct3d9::{depth_format_has_stencil, is_depth_stencil_format},
     draw::{
         DepthScissorFlags, DepthStencilFlags, DrawOp, IndexSource, PsSource, RenderStateSnapshot,
@@ -120,7 +121,6 @@ use super::{
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
     pixel_shader::Direct3DPixelShader9,
-    platform::cursor::CursorState,
     shader_bindings::{
         BOOL_CONSTANT_COUNT, CONSTANT_ROWS, INT_CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT,
         ShaderBindings,

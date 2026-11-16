@@ -1,7 +1,8 @@
-//! The D3D9 cursor: a hardware HCURSOR, or a blank one under the software overlay.
+//! The Win32 side of the D3D9 cursor: a hardware HCURSOR, or a blank one under the overlay.
 //!
 //! It does the Win32 work of the `SetCursor*` / `ShowCursor` entry points in
-//! `device/cursor.rs`, and holds `cursor_wnd_proc`. Games that rely on the
+//! `device/cursor.rs`, whose `CursorState` keeps the D3D9 rules and holds a
+//! [`SystemCursor`], and holds `cursor_wnd_proc`. Games that rely on the
 //! Win32 cursor (hiding the OS pointer while they render their own sprite over
 //! it) get the behaviour they expect.
 //!
@@ -12,39 +13,25 @@
 //! is keyed by the window the message arrived on.
 //!
 //! **Software mode.** With `cursor.software` resolved on, the game's cursor is
-//! drawn by the unix side in an overlay window: `SetCursorProperties` ships the
-//! upscaled bitmap through the `SetCursorOverlay` thunk, `ShowCursor` ships the
-//! visibility, and the Win32 cursor this module realizes is a blank HCURSOR, so
-//! the `WindowServer` cursor plane never toggles on our account.
+//! drawn by the unix side in an overlay window, which `CursorState` feeds, and
+//! the Win32 cursor this module realizes is a blank HCURSOR, so the
+//! `WindowServer` cursor plane never toggles on our account.
 
-use core::{ffi::c_void, ptr::null_mut};
+use core::{ffi::c_void, fmt, ptr::null_mut};
 use std::{
-    hash::Hasher,
     sync::{LazyLock, Mutex},
     time::Instant,
 };
 
-use log::{Level, debug, error, info, log_enabled, trace, warn};
-use mtld3d_core::{
-    cursor::{BitmapLayout, reconcile_upload},
-    window_subclass::WindowSubclasses,
-};
-use mtld3d_shared::{
-    MetalHandle, PresentClientSurfaceParams, SetCursorOverlayParams,
-    bounded_cache::BoundedCache,
-    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, ClientSurfaceRequest, CursorOverlayFlags},
-    mtl_handle::NSViewKind,
-};
-use mtld3d_types::{CURSOR_SHOWING, CURSORINFO, D3DSURFACE_DESC, ICONINFO, POINT};
-use xxhash_rust::xxh3::Xxh3;
+use log::{Level, debug, error, log_enabled, trace, warn};
+use mtld3d_core::{cursor::BitmapLayout, window_subclass::WindowSubclasses};
+use mtld3d_shared::{bounded_cache::BoundedCache, mtl::CURSOR_SPRITE_CACHE_ENTRIES};
+use mtld3d_types::{CURSOR_SHOWING, CURSORINFO, ICONINFO, POINT};
 
 use super::fullscreen::set_window_long_ptr;
-use crate::{
-    device::{
-        DeviceInner,
-        cursor::{DisplaySinks, LOG_TARGET},
-    },
-    unix_call::unix_call,
+use crate::device::{
+    DeviceInner,
+    cursor::{LOG_TARGET, elapsed_us, scale_cursor_pixels},
 };
 
 // ── Win32 FFI ──
@@ -149,11 +136,6 @@ fn timed_set_cursor(handle: *mut c_void) -> u64 {
     elapsed_us(started)
 }
 
-/// Microseconds since `started`, saturating.
-fn elapsed_us(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
 fn set_cursor_pos(x: i32, y: i32) {
     // SAFETY: SetCursorPos accepts any i32 pair; failure (return 0) is a
     // game-side concern, not a memory-safety issue.
@@ -178,7 +160,7 @@ fn get_cursor_pos() -> Option<POINT> {
 /// thread's input is the cursor window's input. A game that drives
 /// `ShowCursor` / `SetCursorProperties` from a worker thread therefore
 /// updates nothing on screen, which is invisible without this id in the log.
-fn current_thread_id() -> u32 {
+pub fn current_thread_id() -> u32 {
     // SAFETY: GetCurrentThreadId takes no arguments and cannot fail.
     unsafe { GetCurrentThreadId() }
 }
@@ -310,8 +292,8 @@ const WM_APP_REACTIVATE_FULLSCREEN: u32 = 0x8000 + 0x03DA;
 /// The subclassed windows (`HWND` as `usize`), each with the `DeviceInner`s registered on it.
 ///
 /// Devices are held as raw pointers widened to `usize`. A device registers in
-/// `CursorState::install_subclass` during `CreateDevice` and a retarget, and
-/// leaves in `CursorState::uninstall_subclass` during release and a retarget.
+/// `SystemCursor::attach` during `CreateDevice` and a retarget, and leaves in
+/// `SystemCursor::detach` during release and a retarget.
 /// `cursor_wnd_proc` looks up its own `hwnd` here to find the device a message
 /// goes to and the procedure to forward to: `CallWindowProcW` can't pass
 /// per-device user data, and a window procedure has no key but the `HWND`.
@@ -324,45 +306,11 @@ const WM_APP_REACTIVATE_FULLSCREEN: u32 = 0x8000 + 0x03DA;
 static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
     LazyLock::new(|| Mutex::new(WindowSubclasses::default()));
 
-// ── CursorState ──
-
-bitflags::bitflags! {
-    /// Packed boolean state for `CursorState`.
-    ///
-    /// Four flags that the cursor module reads and writes together at the
-    /// WM_* edges; packing them into one byte means a `match` against them
-    /// fits in one comparison and the surrounding struct's tail padding
-    /// tightens.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct CursorFlags: u8 {
-        /// Game-requested visibility (ShowCursor / ShowCursor toggles).
-        const VISIBLE = 1 << 0;
-        /// Cursor handle or hash changed since the last paint.
-        ///
-        /// The next WM_SETCURSOR / paint cycle needs to re-realise.
-        const DIRTY = 1 << 1;
-        /// Set by a resize `WM_SIZE` until the message dispatch it arrived in returns.
-        ///
-        /// A game-issued `ShowCursor(FALSE)` is dropped while it is set, and
-        /// a `ShowCursor(TRUE)` clears it. Armed only while the cursor is
-        /// shown, so it never shows a cursor the game hid; the rule is
-        /// `mtld3d_core::cursor::resize_suppresses_hide`, and the dispatch is
-        /// counted by `mtld3d_core::window_subclass::WindowSubclasses`.
-        const HIDE_SUPPRESSED_IN_RESIZE = 1 << 2;
-        /// The unix-side overlay window draws the cursor.
-        ///
-        /// Fixed for the device's lifetime. `handle` is then the blank
-        /// HCURSOR, and every cursor change and show/hide also goes out
-        /// through `SetCursorOverlay`.
-        const SOFTWARE = 1 << 3;
-        /// Latest foreground Win32 cursor state, independent of the D3D cursor image.
-        const NATIVE_HIDDEN = 1 << 4;
-    }
-}
+// ── SystemCursor ──
 
 /// Frame-hitch attribution around cursor transitions.
 ///
-/// `CursorState::note_present` feeds it once per `Present`. It keeps a
+/// `SystemCursor::note_present` feeds it once per `Present`. It keeps a
 /// running typical Present-to-Present interval and, when one interval exceeds
 /// 1.5x of it by at least `HITCH_MIN_EXCESS_US`, logs a single debug line
 /// that ties the hitched frame to the
@@ -404,29 +352,34 @@ const HITCH_MIN_EXCESS_US: u64 = 3_000;
 /// Intervals above this are pauses (alt-tab, loading), not frame hitches.
 const HITCH_MAX_INTERVAL_US: u64 = 500_000;
 
-/// Cursor state owned by `DeviceInner` as a single field.
+/// A cursor image the platform built, opaque to shared code.
 ///
-/// Fields are private to this module — only code in `cursor.rs` reads or
-/// writes them, so cursor invariants don't leak into the rest of `d3d9`.
-pub struct CursorState {
+/// Formats with `{:p}` as the `HCURSOR` it wraps; null for no cursor.
+pub struct CursorImage(*mut c_void);
+
+impl fmt::Pointer for CursorImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.0, f)
+    }
+}
+
+/// The Win32 half of a device's cursor, one field of `CursorState`.
+///
+/// Fields are private to this module, so the Win32 cursor invariants stay
+/// here.
+pub struct SystemCursor {
     hwnd: *mut c_void,
-    /// The metal view the device attached, naming its unix-side attachment record.
-    ///
-    /// Every `SetCursorOverlay` carries it so the overlay follows this
-    /// device's window. Null for a headless device, which then sends no
-    /// overlay state at all.
-    view_handle: MetalHandle<NSViewKind>,
-    /// The words the unix side publishes the backing scale and the cursor kick into.
-    sinks: Box<DisplaySinks>,
     /// The HCURSOR realized while the D3D cursor is shown.
     ///
     /// The game's bitmap built by `build_hcursor` in hardware mode; the blank
     /// cursor in software mode, where the overlay window draws the bitmap.
     /// Null until the first accepted `SetCursorProperties`, which is also
-    /// what `ShowCursor` and the wndproc take as "no cursor surface set".
+    /// what the wndproc takes as "no cursor surface set".
     handle: *mut c_void,
-    flags: CursorFlags,
-    hash: u64,
+    /// Cursor handle or hash changed since the last paint.
+    ///
+    /// The next `WM_SETCURSOR` / paint cycle needs to re-realise.
+    dirty: bool,
     /// The HCURSORs built from the game's bitmaps (hardware mode), by content hash.
     ///
     /// Bounded: the least recently realized handle is destroyed when a new
@@ -437,252 +390,35 @@ pub struct CursorState {
     ///
     /// Destroyed by the next eviction that finds them out of use, or at release.
     retired: Vec<*mut c_void>,
-    /// Sprite hashes the unix overlay is expected to hold (software mode).
-    ///
-    /// Mirrors `cache` for the other mode: a hash in here goes out with no
-    /// pixels attached. Bounded alike; a stale entry costs one rejected
-    /// hash-only call, which is answered by sending the pixels.
-    uploaded: BoundedCache<u64, ()>,
     probe: HitchProbe,
-    /// Nearest-neighbor upscale factor applied to the cursor bitmap.
-    ///
-    /// Sourced from the display's `backingScaleFactor` at `CreateDevice`, and
-    /// re-sourced whenever the window lands on a display of another one, so a
-    /// retina Mac gets a proportionally-sized Win32 cursor (Wine's HCURSOR
-    /// path does not participate in the OS's retina upscale). `1` is the
-    /// identity fast path.
-    scale: u32,
-    /// The bitmap the game last handed `SetCursorProperties`.
-    ///
-    /// Kept so a backing-scale change can rebuild the pointer the game is
-    /// already showing. Without it the new factor would only reach the
-    /// display on the game's next cursor change, which for a title that sets
-    /// its pointer once is never. `None` until the first accepted call.
-    source: Option<CursorSource>,
 }
 
-/// A cursor bitmap in the shape `build_hcursor` consumes.
-///
-/// `pixels` is a tight BGRA copy of the locked surface, so the row pitch is
-/// `width * 4` and the buffer outlives the lock it came from.
-struct CursorSource {
-    width: u32,
-    height: u32,
-    x_hotspot: u32,
-    y_hotspot: u32,
-    pixels: Vec<u8>,
-}
-
-impl CursorSource {
-    const fn layout(&self) -> BitmapLayout {
-        BitmapLayout {
-            width: self.width,
-            height: self.height,
-            x_hotspot: self.x_hotspot,
-            y_hotspot: self.y_hotspot,
-        }
-    }
-}
-
-impl CursorState {
-    pub fn new(
-        hwnd: *mut c_void,
-        scale: u32,
-        software: bool,
-        view_handle: MetalHandle<NSViewKind>,
-        sinks: Box<DisplaySinks>,
-    ) -> Self {
-        // D3D9 starts the cursor hidden (ShowCursor reports FALSE until a
-        // cursor image is set and shown).
-        let mut flags = CursorFlags::DIRTY;
-        if software {
-            flags |= CursorFlags::SOFTWARE;
-        }
+impl SystemCursor {
+    pub const fn new(hwnd: *mut c_void) -> Self {
         Self {
             hwnd,
-            view_handle,
-            sinks,
             handle: null_mut(),
-            flags,
-            hash: 0,
+            dirty: true,
             cache: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
             retired: Vec::new(),
-            uploaded: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
             probe: HitchProbe::new(),
-            scale: scale.clamp(1, 8),
-            source: None,
         }
     }
 
-    /// Follow the backing scale the unix side last published for this device's window.
+    /// The device window the cursor follows.
+    pub const fn window(&self) -> *mut c_void {
+        self.hwnd
+    }
+
+    /// Follow another device window; the caller detaches from the old one first.
+    pub const fn set_window(&mut self, hwnd: *mut c_void) {
+        self.hwnd = hwnd;
+    }
+
+    /// Whether the foreground window's own cursor is hidden; `None` when it cannot be read.
     ///
-    /// Called once per `Present`: one relaxed load and a compare on an
-    /// unchanged value, which is every frame that stays put. The unix side
-    /// republishes whenever the window's display changes the factor, so the
-    /// cursor upscale follows the window between displays without a thunk.
-    pub fn follow_published_scale(&mut self, cursor_scale: mtld3d_core::config::CursorScale) {
-        if let Some(backing_scale) = self.sinks.display_backing_scale() {
-            let (scale, _origin) =
-                crate::direct3d9::resolve_cursor_scale(backing_scale, cursor_scale);
-            self.follow_scale(scale);
-        }
-    }
-
-    /// Take the pending cursor re-apply request, if the unix side left one for this device.
-    pub fn take_cursor_kick(&self) -> bool {
-        self.sinks.take_cursor_kick()
-    }
-
-    /// Have Wine show this device's client surface again, sized to the client area, if asked.
-    ///
-    /// Called once per `Present`, after the frame was handed to the encoder,
-    /// on the API thread, a Wine thread, which win32u's surface calls need. So
-    /// a request is taken only by a `Present` that submits a frame, and the
-    /// unix side reads the call as the device having drawn. A frame nothing
-    /// asked on pays one relaxed load; the device's first frame, and one
-    /// after the client view was hidden or the window's client area moved,
-    /// sends `PresentClientSurface`.
-    pub fn present_client_surface_if_asked(&self) {
-        if self.view_handle.is_null() {
-            return;
-        }
-        let reasons = self.sinks.take_client_surface_request();
-        if reasons.is_empty() {
-            return;
-        }
-        let mut params = PresentClientSurfaceParams {
-            view_handle: self.view_handle,
-            reasons,
-            pad0: 0,
-        };
-        let status = unix_call(&mut params);
-        if status != 0 {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "PresentClientSurface ({reasons:?}) failed (status={status:#x}); the client surface \
-                 stays as Wine left it",
-            );
-        }
-    }
-
-    /// Ask the next `Present` to show the client surface again: the client area may have moved.
-    pub fn request_client_surface(&self) {
-        self.sinks
-            .request_client_surface(ClientSurfaceRequest::CLIENT_AREA_CHANGED);
-    }
-
-    /// Re-scale the pointer after the window moved to a display of another backing scale.
-    ///
-    /// A no-op while the factor is unchanged, which is every frame of a
-    /// session that stays on one display. On a real change the bitmap the
-    /// game is currently showing is rebuilt at the new factor and re-realised
-    /// straight away, so the pointer resizes with the window rather than at
-    /// the game's next `SetCursorProperties`.
-    pub fn follow_scale(&mut self, scale: u32) {
-        let scale = scale.clamp(1, 8);
-        let previous = self.scale;
-        if scale == previous {
-            return;
-        }
-        if let Some(source) = &self.source
-            && source.layout().scaled(scale).is_none()
-        {
-            warn!(target: LOG_TARGET, "cursor scale: bitmap or hotspot overflows at {scale}x");
-            return;
-        }
-        self.scale = scale;
-        info!(
-            target: LOG_TARGET,
-            "cursor scale: {previous}x -> {scale}x (display backing scale changed)",
-        );
-        if self.software() {
-            self.resync_sprite();
-        } else {
-            self.rebuild_current();
-        }
-    }
-
-    /// Re-hash and re-ship the current sprite at the current scale (software mode).
-    ///
-    /// The overlay keys sprites by the same hash as the HCURSOR cache, scale
-    /// folded in, so a scale change is a new sprite to it: uploaded once, then
-    /// named by hash.
-    fn resync_sprite(&mut self) {
-        let Some(source) = self.source.as_ref() else {
-            return;
-        };
-        self.hash = hash_cursor(
-            source.x_hotspot,
-            source.y_hotspot,
-            source.width,
-            source.height,
-            source.pixels.as_ptr(),
-            source.width as usize * 4,
-            self.scale,
-        );
-        self.sync_sprite();
-    }
-
-    /// Ship the current sprite and visibility to the overlay (software mode).
-    ///
-    /// Pixels ride along only for a hash the overlay has not seen; every other
-    /// call is the hash and the visible flag. Nothing here touches Win32.
-    fn sync_sprite(&mut self) {
-        let hash = self.hash;
-        if hash == 0 {
-            return;
-        }
-        let flags = self.overlay_flags();
-        let Some(source) = self.source.as_ref() else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: no source for sprite retry");
-            return;
-        };
-        let accepted = reconcile_upload(self.uploaded.contains(&hash), |with_pixels| {
-            let sprite = with_pixels.then(|| upscale_sprite(source, self.scale));
-            send_overlay_state(self.view_handle, hash, flags, sprite.as_ref())
-        });
-        if accepted {
-            self.uploaded.insert(hash, ());
-        } else {
-            self.uploaded.remove(&hash);
-        }
-    }
-
-    /// Ship the current visibility to the unix side.
-    ///
-    /// Software mode names the sprite too; the hardware path sends visibility
-    /// alone, which the unix side's pointer watch needs to know whatever
-    /// draws the cursor.
-    fn push_overlay_state(&mut self) {
-        if self.software() && self.source.is_some() {
-            self.sync_sprite();
-        } else {
-            // Native visibility also belongs to games that draw their own cursor
-            // and never supply a D3D sprite.
-            send_overlay_state(
-                self.view_handle,
-                0,
-                self.overlay_flags() | CursorOverlayFlags::HARDWARE,
-                None,
-            );
-        }
-    }
-
-    /// The flags word `SetCursorOverlay` carries: the visibility once a cursor surface is set.
-    const fn overlay_flags(&self) -> CursorOverlayFlags {
-        let mut flags = if self.visible() && !self.handle.is_null() {
-            CursorOverlayFlags::VISIBLE
-        } else {
-            CursorOverlayFlags::empty()
-        };
-        if self.flags.contains(CursorFlags::NATIVE_HIDDEN) {
-            flags = flags.union(CursorOverlayFlags::NATIVE_HIDDEN);
-        }
-        flags
-    }
-
-    /// Publish the foreground window's native hide, even without a D3D cursor surface.
-    pub fn sync_native_visibility(&mut self) {
+    /// `false` while the device window is not the foreground window.
+    pub fn native_hidden(&self) -> Option<bool> {
         // SAFETY: GetForegroundWindow takes no arguments and returns an opaque HWND.
         let foreground = unsafe { GetForegroundWindow() };
         let hidden = if !self.hwnd.is_null() && foreground == self.hwnd {
@@ -696,85 +432,147 @@ impl CursorState {
             // SAFETY: initialized ABI-sized output with cb_size set as user32 requires.
             if unsafe { GetCursorInfo(&raw mut info) } == 0 {
                 mtld3d_shared::log_once_warn!(target: LOG_TARGET, "GetCursorInfo failed; native visibility unchanged");
-                return;
+                return None;
             }
             info.flags & CURSOR_SHOWING == 0 || info.cursor.is_null()
         } else {
             false
         };
-        if hidden != self.flags.contains(CursorFlags::NATIVE_HIDDEN) {
-            self.flags.set(CursorFlags::NATIVE_HIDDEN, hidden);
-            debug!(target: LOG_TARGET, "native cursor hidden={hidden} hwnd={:p}", self.hwnd);
-            self.push_overlay_state();
-        }
+        Some(hidden)
     }
 
-    const fn software(&self) -> bool {
-        self.flags.contains(CursorFlags::SOFTWARE)
-    }
-
-    /// The blank HCURSOR software mode realizes, built on first use.
+    /// The blank cursor software mode realizes, built on first use and made current.
     ///
     /// `None` when GDI refused to build it, which the caller reports the way a
     /// failed `build_hcursor` is reported.
-    fn blank_handle(&mut self) -> Option<*mut c_void> {
+    pub fn blank(&mut self) -> Option<CursorImage> {
         if self.handle.is_null() {
             self.handle = build_blank_hcursor()?;
         }
-        Some(self.handle)
+        Some(CursorImage(self.handle))
     }
 
-    /// Rebuild and re-realise the current pointer at the current scale.
+    /// Pick the image for the game's bitmap at `scale` (hardware mode), and its log outcome.
     ///
-    /// Keyed through the same cache as `SetCursorProperties`, whose key folds
-    /// the scale in, so moving back to the first display reuses the bitmap
-    /// built for it instead of building a third.
-    fn rebuild_current(&mut self) {
-        let Some(source) = self.source.take() else {
-            return;
-        };
-        let pitch = source.width as usize * 4;
-        let hash = hash_cursor(
-            source.x_hotspot,
-            source.y_hotspot,
-            source.width,
-            source.height,
-            source.pixels.as_ptr(),
-            pitch,
-            self.scale,
-        );
-        let handle = if let Some(h) = self.cache.get(&hash).copied() {
-            Some(h)
+    /// `unchanged` keeps the current image; otherwise the image cached under
+    /// `hash` is reused or a new one built. `None` when the build fails.
+    ///
+    /// # Safety
+    ///
+    /// `src` points at `layout.height` rows `pitch` bytes apart, each holding
+    /// `layout.width` 4-byte pixels, readable for the duration of the call.
+    pub unsafe fn select(
+        &mut self,
+        hash: u64,
+        unchanged: bool,
+        layout: &BitmapLayout,
+        src: *const u8,
+        pitch: usize,
+        scale: u32,
+    ) -> Option<(CursorImage, &'static str)> {
+        let &BitmapLayout {
+            width,
+            height,
+            x_hotspot,
+            y_hotspot,
+        } = layout;
+        if unchanged {
+            Some((CursorImage(self.handle), "unchanged"))
+        } else if let Some(h) = self.cache.get(&hash).copied() {
+            Some((CursorImage(h), "cache-hit"))
         } else {
-            let built = build_hcursor(
-                source.width,
-                source.height,
+            let Some(h) = build_hcursor(width, height, pitch, src, x_hotspot, y_hotspot, scale)
+            else {
+                warn!(
+                    target: LOG_TARGET,
+                    "reject SetCursorProperties: build_hcursor failed (hash={hash:#018x} {width}x{height} scale={scale})",
+                );
+                return None;
+            };
+            self.remember_handle(hash, h);
+            Some((CursorImage(h), "built-fresh"))
+        }
+    }
+
+    /// Rebuild the current pointer from its tight `pixels` at `scale`, realized while `visible`.
+    ///
+    /// Reuses the image cached under `hash`. `false` when the build fails,
+    /// which leaves the current image in place.
+    pub fn rebuild(
+        &mut self,
+        hash: u64,
+        layout: &BitmapLayout,
+        pixels: &[u8],
+        scale: u32,
+        visible: bool,
+    ) -> bool {
+        let pitch = layout.width as usize * 4;
+        let mut handle = self.cache.get(&hash).copied();
+        if handle.is_none() {
+            handle = build_hcursor(
+                layout.width,
+                layout.height,
                 pitch,
-                source.pixels.as_ptr(),
-                source.x_hotspot,
-                source.y_hotspot,
-                self.scale,
+                pixels.as_ptr(),
+                layout.x_hotspot,
+                layout.y_hotspot,
+                scale,
             );
-            if let Some(h) = built {
+            if let Some(h) = handle {
                 self.remember_handle(hash, h);
             }
-            built
-        };
-        self.source = Some(source);
+        }
         let Some(handle) = handle else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "cursor: build_hcursor failed while following a backing-scale change; \
-                 the pointer stays at its previous size",
-            );
-            return;
+            return false;
         };
-        self.hash = hash;
         self.handle = handle;
-        if self.visible() {
+        if visible {
             let us = timed_set_cursor(handle);
             self.charge_call_us(us);
         }
+        true
+    }
+
+    /// Make `image` the current one, without realizing it.
+    pub const fn set_image(&mut self, image: &CursorImage) {
+        self.handle = image.0;
+    }
+
+    /// The current image when `shown`, no cursor otherwise.
+    pub const fn image(&self, shown: bool) -> CursorImage {
+        CursorImage(if shown { self.handle } else { null_mut() })
+    }
+
+    /// Realize `image` on screen, returning the microseconds the call took.
+    pub fn apply(&mut self, image: &CursorImage) -> u64 {
+        let us = timed_set_cursor(image.0);
+        self.charge_call_us(us);
+        us
+    }
+
+    /// Realize no cursor, so the next realize reaches the display as a change.
+    pub fn kick() {
+        set_cursor(null_mut());
+    }
+
+    /// Re-assert the cursor after a resize, when `reassert` says the device owns it.
+    ///
+    /// Marks the cursor dirty, so the next `WM_SETCURSOR` runs the
+    /// null-then-set kick, and re-asserts the HCURSOR, since a drag resize
+    /// leaves macOS's resize cursor on screen until something replaces it. A
+    /// hidden hardware cursor is not re-asserted: while it is hidden the game
+    /// owns the Win32 cursor. The software blank is, as `ShowCursor` keeps it
+    /// selected in both states.
+    pub fn note_resize(&mut self, reassert: bool) {
+        self.dirty = true;
+        if !self.handle.is_null() && reassert {
+            set_cursor(self.handle);
+        }
+    }
+
+    /// The number of images the cache holds.
+    pub const fn cache_len(&self) -> usize {
+        self.cache.len()
     }
 
     /// Keep a built HCURSOR under its hash, destroying what the bound pushes out.
@@ -800,6 +598,11 @@ impl CursorState {
             }
             false
         });
+    }
+
+    /// Record a `ShowCursor` transition to `shown` for the hitch probe.
+    pub fn note_transition(&mut self, shown: bool) {
+        self.probe.last_transition = Some((Instant::now(), shown));
     }
 
     /// Fold one `Present` into the hitch probe; see `HitchProbe`.
@@ -864,80 +667,9 @@ impl CursorState {
         self.probe.calls_us_since_present = self.probe.calls_us_since_present.saturating_add(us);
     }
 
-    const fn visible(&self) -> bool {
-        self.flags.contains(CursorFlags::VISIBLE)
-    }
-
-    const fn set_visible(&mut self, on: bool) {
-        if on {
-            self.flags = self.flags.union(CursorFlags::VISIBLE);
-        } else {
-            self.flags = self.flags.difference(CursorFlags::VISIBLE);
-        }
-    }
-
-    const fn dirty(&self) -> bool {
-        self.flags.contains(CursorFlags::DIRTY)
-    }
-
-    const fn set_dirty(&mut self, on: bool) {
-        if on {
-            self.flags = self.flags.union(CursorFlags::DIRTY);
-        } else {
-            self.flags = self.flags.difference(CursorFlags::DIRTY);
-        }
-    }
-
-    const fn hide_suppressed_in_resize(&self) -> bool {
-        self.flags.contains(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE)
-    }
-
-    const fn set_hide_suppressed_in_resize(&mut self, on: bool) {
-        if on {
-            self.flags = self.flags.union(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE);
-        } else {
-            self.flags = self
-                .flags
-                .difference(CursorFlags::HIDE_SUPPRESSED_IN_RESIZE);
-        }
-    }
-
-    /// Answer a `WM_SIZE` of `size_type` before the game's window procedure sees it.
-    ///
-    /// Arms the hide suppression when `mtld3d_core::cursor::resize_suppresses_hide`
-    /// says so and returns whether it did; the caller holds the window's
-    /// message dispatch, whose end disarms it ([`Self::end_resize_dispatch`]).
-    ///
-    /// Also marks the cursor dirty, so the next `WM_SETCURSOR` runs the
-    /// null-then-set kick, and re-asserts the HCURSOR, since a drag resize
-    /// leaves macOS's resize cursor on screen until something replaces it. A
-    /// hidden hardware cursor is not re-asserted: while it is hidden the game
-    /// owns the Win32 cursor. The software blank is, as `ShowCursor` keeps it
-    /// selected in both states.
-    fn enter_resize(&mut self, size_type: usize) -> bool {
-        let suppress = mtld3d_core::cursor::resize_suppresses_hide(size_type, self.visible());
-        if suppress {
-            self.set_hide_suppressed_in_resize(true);
-        }
-        self.set_dirty(true);
-        if !self.handle.is_null() && (self.visible() || self.software()) {
-            set_cursor(self.handle);
-        }
-        self.push_overlay_state();
-        suppress
-    }
-
-    /// Disarm the hide suppression: the message dispatch a resize arrived in has returned.
-    ///
-    /// Returns whether it was still armed; a `ShowCursor(TRUE)` inside the
-    /// dispatch may have disarmed it already.
-    const fn end_resize_dispatch(&mut self) -> bool {
-        let armed = self.hide_suppressed_in_resize();
-        self.set_hide_suppressed_in_resize(false);
-        armed
-    }
-
     /// Subclass the game's hwnd so `WM_SETCURSOR` / `WM_ACTIVATE` route through `cursor_wnd_proc`.
+    ///
+    /// `scale` only reaches the log line.
     ///
     /// Registers `dev_ptr` in `DEVICE_INSTANCES` under this window's `HWND`, so
     /// the subclass can resolve the device from the window a message arrived
@@ -945,7 +677,7 @@ impl CursorState {
     /// joining a window another live device already subclasses shares that
     /// hook, and messages keep going to the first device until it leaves.
     /// No-op if `hwnd` was never captured or `dev_ptr` is null.
-    pub fn install_subclass(&self, dev_ptr: *mut DeviceInner) {
+    pub fn attach(&self, dev_ptr: *mut DeviceInner, scale: u32) {
         if self.hwnd.is_null() || dev_ptr.is_null() {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -977,7 +709,7 @@ impl CursorState {
             "install_subclass: hwnd={:p} dev={:p} installed={installed} prev_wndproc={prev_wndproc:#x} scale={} window_tid={} caller_tid={}",
             self.hwnd,
             dev_ptr,
-            self.scale,
+            scale,
             window_thread_id(self.hwnd),
             current_thread_id(),
         );
@@ -987,7 +719,7 @@ impl CursorState {
     ///
     /// Call from the device-release path before freeing `DeviceInner`, and
     /// before a retarget moves the device to another window.
-    pub fn uninstall_subclass(&self, dev_ptr: *mut DeviceInner) {
+    pub fn detach(&self, dev_ptr: *mut DeviceInner) {
         let restored = DEVICE_INSTANCES
             .lock()
             .expect("device-instances mutex poisoned")
@@ -1006,18 +738,19 @@ impl CursorState {
 
     /// Destroy every HCURSOR this device built.
     ///
-    /// Call from the device-release path after `uninstall_subclass`, so no
+    /// Call from the device-release path after `detach`, so no
     /// window message realizes one of them again. The handles are the
     /// device's alone: `CreateIconIndirect` copies the bitmaps, and user32
     /// frees a cursor even while it is the thread's current one, which
     /// would leave the thread pointing at a freed handle. So when the thread
-    /// cursor is one of ours, replace it before freeing it. A hidden software
-    /// cursor leaves its blank handle selected, so replace that with null to
-    /// preserve the hide. Otherwise restore the window's class cursor, or the
-    /// system arrow when the class has none or the window is already gone.
+    /// cursor is one of ours, replace it before freeing it. `keep_hidden`
+    /// names a hidden software cursor, which leaves its blank handle selected,
+    /// so null replaces it to preserve the hide. Otherwise restore the
+    /// window's class cursor, or the system arrow when the class has none or
+    /// the window is already gone.
     /// Once the replacement has happened every refused `DestroyCursor` is a
     /// real failure, and is reported as one.
-    pub fn destroy_handles(&mut self) {
+    pub fn destroy_images(&mut self, keep_hidden: bool) {
         let mut handles: Vec<*mut c_void> = self
             .cache
             .drain()
@@ -1033,7 +766,7 @@ impl CursorState {
         }
         let thread_cursor = get_cursor();
         let restored = if handles.contains(&thread_cursor) {
-            let preserve_hide = self.software() && !self.visible();
+            let preserve_hide = keep_hidden;
             let mut replacement = if self.hwnd.is_null() {
                 null_mut()
             } else {
@@ -1064,182 +797,6 @@ impl CursorState {
             "destroy_handles: hwnd={:p} destroyed={} failed={failed} thread_cursor={thread_cursor:p} restored={restored:p}",
             self.hwnd,
             handles.len() - failed,
-        );
-    }
-
-    /// Move the subclass and the overlay's view onto another device window.
-    ///
-    /// A `Reset` naming a different `hDeviceWindow` moves the presentation
-    /// surface onto that window, and the messages the cursor rides move with
-    /// it. The device leaves the old window before it joins the new one, so a
-    /// message arriving between the two finds no device rather than the wrong
-    /// one, and a new window another device already subclasses is joined
-    /// rather than hooked a second time. The realized `HCURSOR`, both sprite
-    /// caches and the visibility latches carry over: `Reset` re-specifies the
-    /// swap chain, not the cursor the application set. The resize hide
-    /// suppression does not: it belongs to a message dispatch on the window
-    /// the device leaves, whose end would no longer find the device there.
-    ///
-    /// `view_handle` names the view the new window's attach produced, null
-    /// when it produced none. The overlay state is re-sent against it because
-    /// the record the previous state named is gone; the sprites themselves are
-    /// content-addressed on the unix side and outlive the detach, so the
-    /// uploaded set stays valid.
-    pub fn retarget(
-        &mut self,
-        hwnd: *mut c_void,
-        view_handle: MetalHandle<NSViewKind>,
-        dev_ptr: *mut DeviceInner,
-    ) {
-        self.uninstall_subclass(dev_ptr);
-        self.set_hide_suppressed_in_resize(false);
-        self.hwnd = hwnd;
-        self.view_handle = view_handle;
-        self.install_subclass(dev_ptr);
-        self.push_overlay_state();
-    }
-
-    /// The words the unix side publishes into for this device.
-    ///
-    /// The attach that a device-window retarget issues hands their addresses
-    /// over again, and they are the same box: the device owns it for its
-    /// lifetime, so the address the new attachment record holds is the one
-    /// the cursor still reads.
-    pub const fn sinks(&self) -> &DisplaySinks {
-        &self.sinks
-    }
-
-    /// The upscale factor a cursor bitmap is checked and built at.
-    pub const fn scale(&self) -> u32 {
-        self.scale
-    }
-
-    /// Pick the HCURSOR for a locked `SetCursorProperties` bitmap, while the surface is locked.
-    ///
-    /// `src` and `pitch` are the locked rows `layout` describes. `None` when
-    /// the cursor cannot be built, which the caller answers with
-    /// `D3DERR_INVALIDCALL` after unlocking.
-    ///
-    /// # Safety
-    ///
-    /// `src` points at `layout.height` rows `pitch` bytes apart, each holding
-    /// `layout.width` 4-byte pixels, readable for the duration of the call.
-    pub unsafe fn select_bitmap(
-        &mut self,
-        layout: &BitmapLayout,
-        src: *const u8,
-        pitch: usize,
-    ) -> Option<SelectedBitmap> {
-        let &BitmapLayout {
-            width,
-            height,
-            x_hotspot,
-            y_hotspot,
-        } = layout;
-        let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch, self.scale);
-        let prev_hash = self.hash;
-        let (handle, outcome) = if self.software() {
-            // The overlay draws the bitmap; the Win32 cursor only has to be blank.
-            // Building the blank can fail the same way `build_hcursor` can, and
-            // is reported the same way.
-            let Some(blank) = self.blank_handle() else {
-                warn!(
-                    target: LOG_TARGET,
-                    "reject SetCursorProperties: blank HCURSOR failed (hash={hash:#018x} {width}x{height})",
-                );
-                return None;
-            };
-            let outcome = if hash == prev_hash {
-                "unchanged"
-            } else if self.uploaded.contains(&hash) {
-                "sprite-known"
-            } else {
-                "sprite-upload"
-            };
-            (blank, outcome)
-        } else if hash == prev_hash {
-            (self.handle, "unchanged")
-        } else if let Some(h) = self.cache.get(&hash).copied() {
-            (h, "cache-hit")
-        } else {
-            let Some(h) =
-                build_hcursor(width, height, pitch, src, x_hotspot, y_hotspot, self.scale)
-            else {
-                warn!(
-                    target: LOG_TARGET,
-                    "reject SetCursorProperties: build_hcursor failed (hash={hash:#018x} {width}x{height} scale={})",
-                    self.scale,
-                );
-                return None;
-            };
-            self.remember_handle(hash, h);
-            (h, "built-fresh")
-        };
-
-        // Keep the pixels: the backing scale can change under a running session
-        // when the window moves to another display, and rebuilding the pointer at
-        // the new factor needs the bitmap the caller's unlock hands back to the
-        // guest. Only on a new bitmap, so a game re-setting the same cursor every
-        // frame pays nothing.
-        if hash != prev_hash {
-            self.source = Some(CursorSource {
-                width,
-                height,
-                x_hotspot,
-                y_hotspot,
-                pixels: tight_copy(width, height, pitch, src),
-            });
-        }
-        Some(SelectedBitmap {
-            hash,
-            prev_hash,
-            handle,
-            outcome,
-        })
-    }
-
-    /// Make the bitmap [`Self::select_bitmap`] picked the current cursor, after the unlock.
-    pub fn realize_bitmap(
-        &mut self,
-        selected: &SelectedBitmap,
-        layout: &BitmapLayout,
-        desc: &D3DSURFACE_DESC,
-    ) {
-        let &SelectedBitmap {
-            hash,
-            prev_hash,
-            handle,
-            outcome,
-        } = selected;
-        let &BitmapLayout {
-            width,
-            height,
-            x_hotspot,
-            y_hotspot,
-        } = layout;
-        self.hash = hash;
-        self.handle = handle;
-        let visible = self.visible();
-        // Software mode: the overlay gets the new sprite (or just its hash) and the
-        // current visibility. The blank Win32 cursor is unchanged by a cursor
-        // change and already in place from the last show, so it is realized here
-        // only when no cursor was set before.
-        self.push_overlay_state();
-        // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
-        // While hidden the game owns the win32 cursor — pushing null here clobbers
-        // the cursor the game's own wndproc set (WoW's login screen never calls
-        // ShowCursor(TRUE); its glove is the game's own cursor).
-        // `set_cursor_us` is 0 when nothing was realized.
-        let set_cursor_us = if visible && (!self.software() || prev_hash == 0) {
-            timed_set_cursor(handle)
-        } else {
-            0
-        };
-        self.charge_call_us(set_cursor_us);
-        debug!(
-            target: LOG_TARGET,
-            "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} set_cursor_us={set_cursor_us} cache_entries={} tid={}",
-            desc.format, desc.pool, self.cache.len(), current_thread_id(),
         );
     }
 
@@ -1275,101 +832,6 @@ impl CursorState {
             );
         }
     }
-
-    /// `ShowCursor`: set the visibility to `show`, returning the previous one.
-    pub fn show(&mut self, show: i32) -> i32 {
-        let prev = self.visible();
-        let next = show != 0;
-        if !next && self.hide_suppressed_in_resize() {
-            debug!(
-                target: LOG_TARGET,
-                "ShowCursor(show=0) suppressed: issued inside the dispatch a resize arrived in tid={}",
-                current_thread_id(),
-            );
-            self.push_overlay_state();
-            return i32::from(prev);
-        }
-        // D3D9 changes the cursor visibility only once a cursor image has been set
-        // via SetCursorProperties (handle non-null); with no cursor surface,
-        // ShowCursor is a pure read of the (unchanged) previous visibility.
-        if self.handle.is_null() {
-            trace!(
-                target: LOG_TARGET,
-                "ShowCursor(show={show}) → prev={prev} (no cursor surface set; no-op)",
-            );
-            return i32::from(prev);
-        }
-        if next {
-            self.set_hide_suppressed_in_resize(false);
-            // A pointer that came back from another process while the cursor was
-            // hidden: the game's cursor was not on screen to kick then, so the
-            // show pushes null first and Wine re-applies on the handle change.
-            if self.take_cursor_kick() {
-                set_cursor(null_mut());
-            }
-        }
-        self.set_visible(next);
-        // Realize on EVERY call, not only on transitions: a transition-gated
-        // SetCursor leaves wine's cursor state stale whenever a latch-suppressed
-        // hide ate the transition — the game then believes the cursor visible
-        // while wine still holds the hidden state until its next full hide/show
-        // cycle.
-        //
-        // What this does NOT recover from is a pointer image replaced *below*
-        // wine: wine's `set_cursor` server request only notifies its display
-        // driver when the handle changes (`prev_cursor != new_cursor`), so
-        // re-pushing the handle wine already holds is dropped before it reaches
-        // the driver. Only a different handle, the null-then-handle kick in the
-        // WM_SETCURSOR branch below, or the pointer re-entering the window gets
-        // through.
-        //
-        // Software mode keeps the Win32 cursor blank in both directions: a show
-        // re-asserts the blank (the same recovery role, the game may have set its
-        // own cursor meanwhile), a hide pushes nothing, so the WindowServer cursor
-        // plane never toggles on our account. The overlay gets the visibility.
-        let handle = if next || self.software() {
-            self.handle
-        } else {
-            null_mut()
-        };
-        let set_cursor_us = if next || !self.software() {
-            timed_set_cursor(handle)
-        } else {
-            0
-        };
-        self.charge_call_us(set_cursor_us);
-        // The hardware path sends visibility on transitions only, beside the
-        // SetCursor it already makes; software mode sends every call, coalesced
-        // on the unix side.
-        if self.software() || prev != next {
-            self.push_overlay_state();
-        }
-        if prev != next {
-            self.probe.last_transition = Some((Instant::now(), next));
-        }
-        if prev == next {
-            trace!(
-                target: LOG_TARGET,
-                "ShowCursor(show={show}) → prev={prev} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (re-assert)",
-                current_thread_id(),
-            );
-        } else {
-            debug!(
-                target: LOG_TARGET,
-                "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (transition)",
-                current_thread_id(),
-            );
-        }
-        i32::from(prev)
-    }
-}
-
-/// The HCURSOR [`CursorState::select_bitmap`] picked, handed to [`CursorState::realize_bitmap`].
-pub struct SelectedBitmap {
-    hash: u64,
-    prev_hash: u64,
-    handle: *mut c_void,
-    outcome: &'static str,
 }
 
 // ── Window-proc subclass ──
@@ -1471,7 +933,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // by `uninstall_subclass`, which runs before the device is freed.
         let cur = unsafe { (*dev_ptr).cursor_mut() };
         let hit_test = lp.cast_unsigned() & 0xFFFF;
-        if hit_test == HTCLIENT && !cur.handle.is_null() && cur.visible() {
+        if hit_test == HTCLIENT && !cur.system().handle.is_null() && cur.visible() {
             // We own the win32 cursor ONLY while the D3D cursor is
             // visible. Consuming then takes over DefWindowProc's duty: the
             // displayed cursor is whatever the last SetCursor call pushed, and
@@ -1486,31 +948,32 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // Taken unconditionally: a kick left behind an already dirty
             // pass would fire again on the next, correct pass.
             let kicked = cur.take_cursor_kick();
-            let was_dirty = cur.dirty() || kicked;
+            let sys = cur.system_mut();
+            let was_dirty = sys.dirty || kicked;
             let started = Instant::now();
             if was_dirty {
-                cur.set_dirty(false);
+                sys.dirty = false;
                 // Null-then-set forces macdrv to drop a lingering native
                 // cursor (e.g. macOS's resize cursor after a drag).
                 set_cursor(null_mut());
             }
-            set_cursor(cur.handle);
+            set_cursor(sys.handle);
             let set_cursor_us = elapsed_us(started);
-            cur.charge_call_us(set_cursor_us);
-            cur.probe.setcursor_msgs_since_present =
-                cur.probe.setcursor_msgs_since_present.saturating_add(1);
+            sys.charge_call_us(set_cursor_us);
+            sys.probe.setcursor_msgs_since_present =
+                sys.probe.setcursor_msgs_since_present.saturating_add(1);
             if was_dirty {
                 debug!(
                     target: LOG_TARGET,
                     "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=true → re-asserted handle={:p} set_cursor_us={set_cursor_us} tid={} → consumed",
-                    cur.handle,
+                    sys.handle,
                     current_thread_id(),
                 );
             } else if log_enabled!(target: LOG_TARGET, Level::Trace) {
                 trace!(
                     target: LOG_TARGET,
                     "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=false handle={:p} set_cursor_us={set_cursor_us} tid={} → consumed",
-                    cur.handle,
+                    sys.handle,
                     current_thread_id(),
                 );
             }
@@ -1520,7 +983,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             trace!(
                 target: LOG_TARGET,
                 "wndproc WM_SETCURSOR: hit_test={hit_test:#x} visible={} handle={:p} tid={} → forwarded",
-                cur.visible(), cur.handle, current_thread_id(),
+                cur.visible(), cur.system().handle, current_thread_id(),
             );
         }
     } else if msg == WM_ACTIVATE {
@@ -1530,12 +993,12 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         let activate_state = u32::try_from(wp & 0xFFFF).expect("16-bit value fits u32");
         let activating = activate_state != WA_INACTIVE;
         if activating {
-            cur.set_dirty(true);
+            cur.system_mut().dirty = true;
         }
         debug!(
             target: LOG_TARGET,
             "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={} tid={}",
-            cur.dirty(), current_thread_id(),
+            cur.system().dirty, current_thread_id(),
         );
     } else if msg == WM_ACTIVATEAPP {
         // The D3D9 fullscreen mode contract, both halves. Deactivation puts
@@ -1609,7 +1072,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             target: LOG_TARGET,
             "wndproc WM_SIZE: type={wp} {new_width}x{new_height} → game hides suppressed until \
              this dispatch returns={suppress} visible={} handle={:p} tid={}",
-            cur.visible(), cur.handle, current_thread_id(),
+            cur.visible(), cur.system().handle, current_thread_id(),
         );
     } else if msg == WM_APP_REASSERT_FULLSCREEN {
         // Deferred half of the WM_SIZE branch above. Our own message, so it
@@ -1685,178 +1148,6 @@ impl Drop for HookCall {
 }
 
 // ── Helpers ──
-
-/// Content-hash over hotspot + dimensions + pixel bytes.
-///
-/// Used as the cursor cache key inside `SetCursorProperties`. xxh3 is the
-/// content hash for byte buffers throughout the tree (see `ProgramId`); the
-/// value is the whole identity of the cursor, so it needs real avalanche, not
-/// a map hasher.
-///
-/// The upscale factor is part of that identity: the same bitmap on displays
-/// of different backing scale produces different HCURSORs, and one key for
-/// both would serve the wrong-sized one out of the cache.
-fn hash_cursor(
-    x_hotspot: u32,
-    y_hotspot: u32,
-    width: u32,
-    height: u32,
-    src: *const u8,
-    pitch: usize,
-    scale: u32,
-) -> u64 {
-    let mut h = Xxh3::new();
-    h.write_u32(x_hotspot);
-    h.write_u32(y_hotspot);
-    h.write_u32(width);
-    h.write_u32(height);
-    h.write_u32(scale);
-    let row_bytes = (width as usize) * 4;
-    for y in 0..height as usize {
-        // SAFETY: caller-validated `src + y*pitch` stays within the bitmap.
-        let row_ptr = unsafe { src.add(y * pitch) };
-        // SAFETY: `row_ptr..row_ptr + row_bytes` lies in the same allocation.
-        let row = unsafe { core::slice::from_raw_parts(row_ptr, row_bytes) };
-        h.write(row);
-    }
-    // `0` is the wire's "no sprite"; fold the one-in-2^64 collision away.
-    match h.finish() {
-        0 => 1,
-        hash => hash,
-    }
-}
-
-/// Copy a locked BGRA cursor surface into a tight `width * 4`-pitch buffer.
-///
-/// The caller validates that `src` covers `height` rows of at least
-/// `width * 4` readable bytes, `pitch` apart, which is what
-/// `D3DLOCKED_RECT` describes for the locked region.
-fn tight_copy(width: u32, height: u32, pitch: usize, src: *const u8) -> Vec<u8> {
-    let row_bytes = width as usize * 4;
-    let mut out = vec![0u8; row_bytes * height as usize];
-    for y in 0..height as usize {
-        // SAFETY: caller-validated `src + y*pitch` stays within the bitmap.
-        let row_ptr = unsafe { src.add(y * pitch) };
-        // SAFETY: `row_ptr..row_ptr + row_bytes` lies in the same allocation.
-        let row = unsafe { core::slice::from_raw_parts(row_ptr, row_bytes) };
-        out[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(row);
-    }
-    out
-}
-
-/// A cursor bitmap in the shape the overlay window consumes.
-///
-/// Tight BGRA rows at `scale` pixels per point, hotspot in those pixels.
-struct SpriteUpload {
-    width: u32,
-    height: u32,
-    x_hotspot: u32,
-    y_hotspot: u32,
-    scale: u32,
-    pixels: Vec<u8>,
-}
-
-/// Upscale the game's bitmap for the overlay the way `build_hcursor` does for the HCURSOR.
-///
-/// Same dispatch (`scale_cursor_pixels`), same hotspot rule, so the software
-/// cursor is the hardware cursor's sprite drawn by a different compositor.
-fn upscale_sprite(source: &CursorSource, scale: u32) -> SpriteUpload {
-    let scale = scale.clamp(1, 8);
-    let scaled = source
-        .layout()
-        .scaled(scale)
-        .expect("validated cursor scale");
-    let src_pixels = u8_to_u32_vec(&source.pixels);
-    // Same rule as the hardware path: a bitmap with no alpha anywhere is an
-    // opaque cursor (there its AND mask keeps every pixel); the overlay
-    // blends premultiplied, so those pixels get an opaque alpha instead.
-    let any_alpha = src_pixels.iter().any(|&px| (px >> 24) != 0);
-    let (sw, sh, mut pixels, path) = scale_cursor_pixels(
-        scale as usize,
-        source.width as usize,
-        source.height as usize,
-        src_pixels,
-    );
-    if !any_alpha {
-        for px in &mut pixels {
-            *px |= 0xFF00_0000;
-        }
-    }
-    trace!(
-        target: LOG_TARGET,
-        "upscale_sprite: {}x{} → {sw}x{sh} path={path} any_alpha={any_alpha}",
-        source.width, source.height,
-    );
-    SpriteUpload {
-        width: u32::try_from(sw).expect("upscaled cursor width fits u32"),
-        height: u32::try_from(sh).expect("upscaled cursor height fits u32"),
-        x_hotspot: scaled.x_hotspot,
-        y_hotspot: scaled.y_hotspot,
-        scale,
-        pixels: u32_to_u8_vec(&pixels),
-    }
-}
-
-/// One `SetCursorOverlay` call: the wanted sprite and visibility, pixels attached or not.
-///
-/// Returns whether the unix side accepted it. The pixel buffer only has to
-/// outlive the call: the unix side copies what it keeps. A device with no
-/// metal view (headless) has no attachment record for the overlay to follow,
-/// so nothing is sent and the call reports as not accepted.
-fn send_overlay_state(
-    view_handle: MetalHandle<NSViewKind>,
-    hash: u64,
-    flags: CursorOverlayFlags,
-    sprite: Option<&SpriteUpload>,
-) -> bool {
-    if view_handle.is_null() {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "SetCursorOverlay: no metal view attached (headless device), overlay state not sent",
-        );
-        return false;
-    }
-    let started = Instant::now();
-    let mut params = SetCursorOverlayParams {
-        hash,
-        pixels_ptr: 0,
-        pixels_len: 0,
-        width: 0,
-        height: 0,
-        x_hotspot: 0,
-        y_hotspot: 0,
-        scale: 0,
-        flags,
-        pad0: 0,
-        view_handle,
-    };
-    if let Some(s) = sprite {
-        params.pixels_ptr = s.pixels.as_ptr() as u64;
-        params.pixels_len =
-            u32::try_from(s.pixels.len()).expect("a cursor sprite is far below 4 GiB");
-        params.width = s.width;
-        params.height = s.height;
-        params.x_hotspot = s.x_hotspot;
-        params.y_hotspot = s.y_hotspot;
-        params.scale = s.scale;
-    }
-    let status = unix_call(&mut params);
-    let us = elapsed_us(started);
-    if status != 0 {
-        warn!(
-            target: LOG_TARGET,
-            "SetCursorOverlay: hash={hash:#018x} flags={flags:?} pixels={} rejected (status={status:#x}) us={us}",
-            sprite.is_some(),
-        );
-        return false;
-    }
-    debug!(
-        target: LOG_TARGET,
-        "SetCursorOverlay: hash={hash:#018x} flags={flags:?} pixels={} us={us}",
-        sprite.is_some(),
-    );
-    true
-}
 
 /// Build the transparent HCURSOR software mode realizes.
 ///
@@ -2021,56 +1312,6 @@ fn build_hcursor(
     Some(cursor)
 }
 
-/// Upscale a tight `w*h` BGRA buffer by `scale`.
-///
-/// The `xbr` crate only provides 2×, so every other factor takes the
-/// nearest-neighbor arm. Factors above 2 are unheard of on current
-/// hardware (retina is 2×); that arm exists for forward compatibility
-/// rather than panicking.
-///
-/// Byte-order note: `xbr::Block` stores BGRA/RGBA as `Vec<u8>` and
-/// compares pixels in YUV space. Our buffer is native-endian BGRA `u32`;
-/// we pass the bytes through unchanged. The YUV luma weights are
-/// technically computed with R/B swapped, but for an alpha cursor the
-/// edge-detection output is visually identical — alpha is still in the
-/// high byte, so downstream mask derivation stays correct.
-///
-/// # Panics
-///
-/// Panics if source dimensions exceed `u32::MAX`. Unreachable: callers
-/// originate `w`/`h` from `u32` inputs.
-fn scale_cursor_pixels(
-    scale: usize,
-    w: usize,
-    h: usize,
-    src_pixels: Vec<u32>,
-) -> (usize, usize, Vec<u32>, &'static str) {
-    match scale {
-        1 => (w, h, src_pixels, "1x-identity"),
-        2 => {
-            let src_bytes = u32_to_u8_vec(&src_pixels);
-            let block = xbr::x2(xbr::Block {
-                bytes: src_bytes,
-                width: u32::try_from(w).expect("cursor width fits u32"),
-                height: u32::try_from(h).expect("cursor height fits u32"),
-            });
-            let out = u8_to_u32_vec(&block.bytes);
-            (block.width as usize, block.height as usize, out, "2x-xbr")
-        }
-        n => {
-            let sw = w * n;
-            let sh = h * n;
-            let mut dst = vec![0u32; sw * sh];
-            for y in 0..sh {
-                for x in 0..sw {
-                    dst[y * sw + x] = src_pixels[(y / n) * w + (x / n)];
-                }
-            }
-            (sw, sh, dst, "nx-nearest")
-        }
-    }
-}
-
 /// Derive an AND mask from upscaled alpha.
 ///
 /// The DDB mask is 1-bit-per-pixel with WORD-aligned rows; a bit of 1 means
@@ -2098,26 +1339,4 @@ fn derive_and_mask(pixels: &[u32], sw: usize, sh: usize, any_alpha: bool) -> Vec
         }
     }
     and_mask
-}
-
-/// Pack a tight BGRA `u32` buffer into a byte buffer for `xbr::Block`.
-///
-/// Bytes land in native-endian order (`b, g, r, a` on little-endian
-/// macOS/Windows — which matches the wire convention Wine and Metal use
-/// for `D3DFMT_A8R8G8B8`).
-fn u32_to_u8_vec(src: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len() * 4);
-    for &p in src {
-        out.extend_from_slice(&p.to_ne_bytes());
-    }
-    out
-}
-
-/// Inverse of `u32_to_u8_vec` — read 4-byte chunks back into BGRA `u32`s.
-fn u8_to_u32_vec(src: &[u8]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(src.len() / 4);
-    for chunk in src.as_chunks::<4>().0 {
-        out.push(u32::from_ne_bytes(*chunk));
-    }
-    out
 }
