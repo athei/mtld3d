@@ -83,6 +83,13 @@ APP_POINTER_EXEMPT='windows/d3d9/src/platform/win32/crash.rs'
 APP_POINTER_INPTR="InPtr(Mut)?(::)?<('[a-z_]+, *)?(mtld3d_types::)?(D3D|Guid|LUID)"
 APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it with ValueIn, write it with OutPtr'
 
+# The system `d3d9` runs on is reached through `platform.rs`, and the Win32
+# implementation lives under `platform/`. Everywhere else in the crate is
+# shared by both builds, so it declares no foreign function and no cfg that
+# tells the builds apart.
+PLATFORM_DIR=windows/d3d9/src
+PLATFORM_HOME='^windows/d3d9/src/platform(\.rs$|/)'
+
 status=0
 
 # Report a finding and name the section of docs/CONVENTIONS.md it comes from,
@@ -258,6 +265,45 @@ app_pointer_derefs() {
     ' "$@"
 }
 
+# A Win32 import or a platform cfg outside `platform.rs` and `platform/`: an
+# `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or
+# `cfg_attr` that names `windows`, `unix` or `target_os`. A cfg is read up to
+# its closing parenthesis, which may be lines later. Comment lines are skipped.
+platform_split() {
+    awk '
+        function depth(s,   t, o, c) {
+            t = s; o = gsub(/\(/, "", t)
+            t = s; c = gsub(/\)/, "", t)
+            return o - c
+        }
+        function finding(line, what) {
+            printf "%s:%d: %s in %s\n", FILENAME, line, what, text
+        }
+        FNR == 1 { nest = 0 }
+        /^[ \t]*\/\// { next }
+        nest > 0 {
+            cfg = cfg " " $0
+            nest += depth($0)
+            if (nest <= 0 && cfg ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/)
+                finding(start, "platform cfg")
+            next
+        }
+        {
+            text = $0
+            if ($0 ~ /unsafe extern( "[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
+            if ($0 ~ /#\[link\(/) finding(FNR, "#[link(")
+            if ($0 ~ /os::windows/) finding(FNR, "os::windows")
+            if (match($0, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
+                cfg = substr($0, RSTART)
+                start = FNR
+                nest = depth(cfg)
+                if (nest <= 0 && cfg ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/)
+                    finding(start, "platform cfg")
+            }
+        }
+    ' "$@"
+}
+
 # Every type deriving Clone and/or Copy, as `path Type Derives`. The committed
 # inventory is diffed against this, so a speculative derive cannot slip in
 # unnoticed: adding one means consciously recording it.
@@ -399,6 +445,15 @@ case "${1:-}" in
         ;;
     esac
     case $file in
+    "$PLATFORM_DIR"/*.rs)
+        if ! printf '%s\n' "$file" | grep -qE "$PLATFORM_HOME"; then
+            findings=$(platform_split "$file")
+            [ -z "$findings" ] || report 'Win32 stays behind platform.rs' \
+                'Win32 import or platform cfg outside platform.rs and platform/' "$findings"
+        fi
+        ;;
+    esac
+    case $file in
     windows/*.rs)
         if ! printf '%s\n' "$file" | grep -qE "$PE_JOIN_EXEMPT"; then
             banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
@@ -493,6 +548,17 @@ if [ -n "$app_sources" ]; then
     # shellcheck disable=SC2086
     banned "$APP_POINTER_INPTR" "An application's pointer promises no alignment" \
         "$APP_POINTER_INPTR_MESSAGE" $app_sources
+fi
+
+shared_sources=$(git ls-files "$PLATFORM_DIR/*.rs" | grep -vE "$PLATFORM_HOME" || true)
+if [ -n "$shared_sources" ]; then
+    # shellcheck disable=SC2086
+    findings=$(platform_split $shared_sources)
+    if [ -n "$findings" ]; then
+        report 'Win32 stays behind platform.rs' \
+            'Win32 import or platform cfg outside platform.rs and platform/' \
+            "$findings"
+    fi
 fi
 
 modules=$(git ls-files '*/mod.rs' || true)
