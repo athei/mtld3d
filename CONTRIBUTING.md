@@ -741,11 +741,17 @@ work can be estimated, one effort label:
 - Effort: `effort/S` is hours; `effort/M` is a normal single-PR change;
   `effort/L` is multi-day or needs a design first.
 
-Two modifiers exist. `blocked` marks an issue waiting on an external trigger,
-a machine we do not have, or an upstream change, with the body naming exactly
-what it waits for; a blocked issue keeps its priority, the label only says why
-it is not moving. `needs-repro` marks an external report that has not been
-reproduced or root-caused locally yet.
+Three modifiers exist. `blocked` marks an issue waiting on an external trigger
+or a machine we do not have, with the body naming exactly what it waits for; a
+blocked issue keeps its priority, the label only says why it is not moving.
+`needs-repro` marks an external report that has not been reproduced or
+root-caused locally yet. `upstream` marks an issue that an active merge request
+or pull request in Wine, DXMT, or another dependency covers, with the body
+linking it: we do not implement or carry what an upstream is about to ship. It
+takes the place of `blocked` for that case. An upstream issue or a plan without
+a PR does not count, and when the PR is rejected or goes quiet the label comes
+off and the issue is ours again. Once the change is in the Wine or dependency
+we build against, the issue is verified and closed.
 
 File the issue with its labels attached. When a claim in an issue body stops
 being true, edit the body rather than correcting it in a comment trail.
