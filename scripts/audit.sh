@@ -296,9 +296,10 @@ platform_split() {
         /^[ \t]*\/\// { next }
         nest > 0 {
             cfg = cfg " " $0
-            nest += depth($0)
-            if (nest <= 0 && names_platform(cfg))
-                finding(start, "platform cfg")
+            if (depth(closed(cfg)) == 0) {
+                nest = 0
+                if (names_platform(cfg)) finding(start, "platform cfg")
+            }
             next
         }
         {
@@ -309,8 +310,8 @@ platform_split() {
             if (match($0, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
                 cfg = substr($0, RSTART)
                 start = FNR
-                nest = depth(cfg)
-                if (nest <= 0 && names_platform(cfg))
+                nest = depth(closed(cfg))
+                if (nest == 0 && names_platform(cfg))
                     finding(start, "platform cfg")
             }
         }
