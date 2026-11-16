@@ -24,8 +24,9 @@ use objc2_core_graphics::{CGColor, CGColorSpace};
 use super::{
     bounded_cast,
     layer::{
-        DisplayCaps, LayerAttachRequest, PresentPacing, min_present_duration,
-        natural_drawable_size, pack_pacing, sync_drawable_size, unpack_pacing,
+        DisplayCaps, LayerAttachRequest, PresentPacing, ScreenPixels, backing_pixels,
+        min_present_duration, natural_drawable_size, pack_pacing, scaled_down_to_panel,
+        sync_drawable_size, unpack_pacing,
     },
 };
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -2366,9 +2367,12 @@ fn resolve_layer_mode(
 /// Reconcile every live attachment against its display. **Main thread only.**
 ///
 /// The screen-parameter filter calls this on a real topology or mode change,
-/// when every window may have landed on another panel.
+/// when every window may have landed on another panel. A display id can name
+/// another panel after a reconfiguration, so each record's cached panel
+/// lookup is forgotten first.
 fn refresh_all_on_main() {
     for att in attachment::live() {
+        att.set_panel_display(0);
         refresh_attachment_on_main(&att);
     }
 }
@@ -2390,7 +2394,8 @@ fn refresh_all_on_main() {
 /// The walk starts from whichever window the view is in *now*, which the
 /// record follows ([`follow_view_window`]), and ends on whichever screen that
 /// window is on now, so it is also where everything the display decides is
-/// reconciled against that screen for this record: the layer's own
+/// reconciled against that screen for this record: the pixel sizes that cap
+/// the drawable ([`follow_screen_pixels`]), the layer's own
 /// configuration ([`follow_screen_layer_mode`]), the present throttle
 /// ([`follow_screen_present_throttle`]), the backing scale the PE side
 /// consumes ([`follow_layer_backing_scale`]) and the window layers a covering
@@ -2431,6 +2436,7 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     // between displays reports none, and the layer is better left as it is
     // than reconfigured twice against a screen the window is leaving.
     if let Some(screen) = screen.as_deref() {
+        follow_screen_pixels(att, screen, mtm);
         follow_screen_layer_mode(att, screen, mtm);
         follow_screen_present_throttle(att, screen);
         follow_layer_backing_scale(att, mtm);
@@ -2552,7 +2558,7 @@ fn configure_metal_layer_inner(
     height: u32,
     color: LayerColorRefs<'_>,
 ) {
-    use objc2_quartz_core::{CAMetalLayer, kCAGravityResizeAspect};
+    use objc2_quartz_core::{CAMetalLayer, kCAGravityResize};
 
     // Cast the raw `*mut c_void` from Wine's macdrv into typed
     // `Retained<CAMetalLayer>`. Using typed objc2 setters means a
@@ -2573,20 +2579,21 @@ fn configure_metal_layer_inner(
     let cs_label = apply_layer_color(&layer, color);
     // Games are fullscreen-style — no alpha blending with desktop.
     layer.setOpaque(true);
-    // Gravity decides what Core Animation does when the drawable is not the
-    // size of the layer's backing store. We never leave it that way on
-    // purpose: `drawableSize` stays at its default (the layer's own
-    // `bounds × contentsScale`) and present resolves the back buffer onto
-    // it, so the composite pass is a 1:1 copy and this setting is inert.
-    // It is here for the frames where a resize has changed the layer but
-    // our next drawable has not caught up yet: aspect-fit centres the
-    // stale frame rather than distorting it, and the bars are the layer's
-    // own background, which is why it gets an explicit opaque black.
+    // Gravity decides how Core Animation fits a drawable that is not the size
+    // of the layer's backing store. In a scaled display mode the drawable is
+    // capped at the panel's pixels (`sync_drawable_size`), which keeps the
+    // panel's aspect, and that differs from the layer's by up to about 0.1 %:
+    // aspect-fit would leave a 1 px bar, so the drawable is stretched over the
+    // whole layer. An uncapped drawable is the backing store's size, and
+    // gravity is inert. During a live resize the previous drawable is
+    // stretched over the new bounds until the next present resizes it. The
+    // magnification filter follows the screen in the main-thread refresh
+    // (`follow_screen_pixels`).
     //
-    // SAFETY: `kCAGravityResizeAspect` is a CoreAnimation string constant
-    // with static storage duration — reading it is a load of an immutable
-    // global the framework initialised before `main`.
-    let gravity = unsafe { kCAGravityResizeAspect };
+    // SAFETY: `kCAGravityResize` is a CoreAnimation string constant with
+    // static storage duration, an immutable global the framework
+    // initialised before `main`.
+    let gravity = unsafe { kCAGravityResize };
     layer.setContentsGravity(gravity);
     let backdrop = CGColor::new_generic_gray(0.0, 1.0);
     layer.setBackgroundColor(Some(&backdrop));
@@ -2623,9 +2630,10 @@ fn configure_metal_layer_inner(
     // backing store is a second resample, after whatever present already
     // did, with a phase we do not control. Owning the resample ourselves is
     // what keeps the frame on the pixel grid the screen actually has.
-    // Present re-syncs this before every `nextDrawable`; the push here is
-    // so the first frame does not have to.
-    sync_drawable_size(&layer);
+    // Present re-syncs this before every `nextDrawable`, capped at the panel
+    // once the screen's sizes are known; the push here is so the first frame
+    // does not have to.
+    sync_drawable_size(&layer, &ScreenPixels::UNKNOWN, None);
     crate::hud_state::show_row(&layer);
     //
     // Confirm the install. `colorspace` is the label the SDR/HDR
@@ -2884,6 +2892,129 @@ fn follow_layer_backing_scale(att: &Arc<Attachment>, mtm: MainThreadMarker) {
         target: LOG_TARGET,
         "present: the Wine layer's contents scale is {scale}x (was {applied}x), cursor scale republished to the guest",
     );
+}
+
+/// Publish the panel size and frame of `screen`, which cap the drawable. **Main thread only.**
+///
+/// The frame is in points; the presenter takes it to the layer's pixels at
+/// the `contentsScale` it reads per present. The panel lookup reruns only
+/// when the window's display id changes or a reconfiguration forgot it
+/// ([`refresh_all_on_main`]). A screen with no display id or no native mode
+/// publishes no panel, and the drawable then keeps the layer's own size.
+///
+/// The same pass sets the layer's magnification filter: linear while the
+/// display scales the backing store down to the panel, where a capped
+/// drawable is magnified back over the layer, and nearest otherwise, as
+/// winemac creates the layer, so a layer at scale 1 on a 2x screen is
+/// doubled pixel for pixel.
+fn follow_screen_pixels(
+    att: &Arc<Attachment>,
+    screen: &objc2_app_kit::NSScreen,
+    mtm: MainThreadMarker,
+) {
+    use objc2_quartz_core::{kCAFilterLinear, kCAFilterNearest};
+
+    let Some(layer) = attachment::retain_layer(att, mtm) else {
+        return;
+    };
+    let frame = screen.frame().size;
+    let frame = (
+        bounded_cast::f64_to_u32_saturating(frame.width.round()),
+        bounded_cast::f64_to_u32_saturating(frame.height.round()),
+    );
+    let display = screen_display_id(screen);
+    let panel = match display {
+        Some(display) if display == att.panel_display() => att.screen_pixels().panel,
+        Some(display) => {
+            att.set_panel_display(display);
+            native_panel_pixels(display)
+        }
+        None => {
+            att.set_panel_display(0);
+            None
+        }
+    };
+    let pixels = ScreenPixels {
+        panel,
+        frame: Some(frame).filter(|&(width, height)| width != 0 && height != 0),
+    };
+    if att.set_screen_pixels(&pixels) {
+        debug!(
+            target: LOG_TARGET,
+            "present: '{}' panel {:?}, frame {:?} points",
+            screen.localizedName(),
+            pixels.panel,
+            pixels.frame,
+        );
+    }
+    let scaled_down = scaled_down_to_panel(
+        backing_pixels(pixels.frame, layer.contentsScale()),
+        pixels.panel,
+    );
+    let filter = if scaled_down {
+        // SAFETY: a CoreAnimation string constant with static storage duration.
+        unsafe { kCAFilterLinear }
+    } else {
+        // SAFETY: as above.
+        unsafe { kCAFilterNearest }
+    };
+    if *layer.magnificationFilter() != *filter {
+        layer.setMagnificationFilter(filter);
+        debug!(
+            target: LOG_TARGET,
+            "present: layer magnification filter {filter} (screen scaled down to the panel: \
+             {scaled_down})",
+        );
+    }
+}
+
+/// The `CGDirectDisplayID` of the display behind `screen`, if it names one.
+fn screen_display_id(screen: &objc2_app_kit::NSScreen) -> Option<u32> {
+    let number = screen
+        .deviceDescription()
+        .objectForKey(&objc2_foundation::NSString::from_str("NSScreenNumber"))?;
+    // `NSScreenNumber` is documented as an `NSNumber` holding the `CGDirectDisplayID`.
+    let display = number
+        .downcast_ref::<objc2_foundation::NSNumber>()?
+        .unsignedIntValue();
+    (display != 0).then_some(display)
+}
+
+/// The native pixel size of `display`, if it reports one.
+///
+/// A display flags one native mode per refresh rate, and with the duplicate
+/// low-resolution modes listed also the scaled modes whose pixels are the
+/// panel's, so the largest flagged pixel size is taken. Some external 5K
+/// displays flag a 3840x2160 mode under a 5120x2880 panel; whether they flag
+/// a 5120x2880 one in the duplicate list too is not known, and if not, a
+/// drawable there is capped at 3840x2160 whenever the frame fits it.
+fn native_panel_pixels(display: u32) -> Option<(u32, u32)> {
+    use objc2_core_foundation::{CFBoolean, CFDictionary, CFString};
+    use objc2_core_graphics::{
+        CGDisplayCopyAllDisplayModes, CGDisplayMode, kCGDisplayShowDuplicateLowResolutionModes,
+    };
+
+    /// `kDisplayModeNativeFlag` (`IOKit` `IOGraphicsTypes.h`), which no `objc2` crate binds.
+    const DISPLAY_MODE_NATIVE_FLAG: u32 = 0x0200_0000;
+
+    // SAFETY: `kCGDisplayShowDuplicateLowResolutionModes` is a CoreGraphics
+    // string constant with static storage duration.
+    let key = unsafe { kCGDisplayShowDuplicateLowResolutionModes };
+    let options = CFDictionary::<CFString, CFBoolean>::from_slices(&[key], &[CFBoolean::new(true)]);
+    // SAFETY: the options map that key to a `CFBoolean`, the type CoreGraphics
+    // documents for it; the display id came from `AppKit`.
+    let modes = unsafe { CGDisplayCopyAllDisplayModes(display, Some(options.as_ref())) }?;
+    // SAFETY: CoreGraphics documents every element of the array as a `CGDisplayMode`.
+    let modes = unsafe { modes.cast_unchecked::<CGDisplayMode>() };
+    modes
+        .iter()
+        .filter(|mode| CGDisplayMode::io_flags(Some(mode)) & DISPLAY_MODE_NATIVE_FLAG != 0)
+        .filter_map(|mode| {
+            let width = u32::try_from(CGDisplayMode::pixel_width(Some(&mode))).ok()?;
+            let height = u32::try_from(CGDisplayMode::pixel_height(Some(&mode))).ok()?;
+            (width != 0 && height != 0).then_some((width, height))
+        })
+        .max_by_key(|&(width, height)| u64::from(width) * u64::from(height))
 }
 
 /// Clear what the window's layers paint under a metal view that covers it. **Main thread only.**

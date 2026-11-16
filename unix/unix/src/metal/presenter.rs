@@ -57,6 +57,7 @@ use super::{
     command::{self, PresentEncode, diagnostics},
     frame_signal::{FrameSignal, PacedMark},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
+    layer::{DrawableSizes, ScreenPixels},
     macdrv::attachment,
     record::DeviceRecord,
     texture,
@@ -170,6 +171,8 @@ struct Inner {
 pub struct PresentPacket {
     seq: u64,
     source: MetalHandle<MTLTextureKind>,
+    /// The source texture's width and height, which a snapshot slot it is retargeted at shares.
+    source_size: (u32, u32),
     layer: MetalHandle<CAMetalLayerKind>,
     slot: Option<usize>,
     /// The `NSView*` the layer belongs to: the attachment record's key.
@@ -193,6 +196,10 @@ impl PresentPacket {
         layer: Retained<CAMetalLayer>,
         view: usize,
     ) -> Self {
+        let source_size = (
+            u32::try_from(source.width()).expect("a texture width fits u32"),
+            u32::try_from(source.height()).expect("a texture height fits u32"),
+        );
         // SAFETY: `Retained::into_raw` transfers the retain into the raw
         // address; the handle carries it until `Drop` releases it.
         let source =
@@ -203,6 +210,7 @@ impl PresentPacket {
         Self {
             seq,
             source,
+            source_size,
             layer,
             slot: None,
             view,
@@ -868,7 +876,7 @@ fn presenter_main(record: &Arc<DeviceRecord>, queue: MetalHandle<MTLCommandQueue
 /// `false` once the state is stopped and every packet dropped.
 fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLCommandQueue>) -> bool {
     let state = record.present();
-    let (seq, layer, view, gate, ready_at) = {
+    let (seq, layer, view, source_size, gate, ready_at) = {
         let inner = state.lock();
         let mut inner = state
             .presenter_cv
@@ -895,6 +903,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             front.seq,
             front.layer,
             front.view,
+            front.source_size,
             inner.gate.clone(),
             front.ready_at,
         )
@@ -949,8 +958,15 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     // one. A window resize changes the layer under us and `drawableSize`
     // does not follow on its own, so without this the frames between the
     // resize and the guest's own reaction would be composited at the old
-    // size, which means rescaled.
-    super::layer::sync_drawable_size(&layer);
+    // size, which means rescaled. In a scaled display mode it is capped at
+    // the panel's pixels, once the main thread has published them.
+    let screen = attachment
+        .as_deref()
+        .map_or(ScreenPixels::UNKNOWN, attachment::Attachment::screen_pixels);
+    let sizes = super::layer::sync_drawable_size(&layer, &screen, Some(source_size));
+    if let (Some(att), Some(sizes)) = (attachment.as_deref(), sizes) {
+        log_drawable_cap(att, &sizes, &screen);
+    }
     mtld3d_shared::crumb!("present:nextdraw", seq);
     let mut drawable_wait_ns: u64 = 0;
     let drawable = {
@@ -1122,6 +1138,34 @@ fn count_paced_present(att: &attachment::Attachment, displayed: bool) {
         ),
         None => {}
     }
+}
+
+/// Log when the drawable of `att`'s layer starts or stops being capped at the panel.
+fn log_drawable_cap(att: &attachment::Attachment, sizes: &DrawableSizes, screen: &ScreenPixels) {
+    let capped = sizes.drawable != sizes.natural;
+    if !att.note_drawable_capped(capped) {
+        return;
+    }
+    let ((natural_w, natural_h), (drawable_w, drawable_h)) = (sizes.natural, sizes.drawable);
+    let (panel, backing) = (
+        screen.panel.unwrap_or_default(),
+        sizes.backing.unwrap_or_default(),
+    );
+    let what = if capped {
+        "capped at the panel"
+    } else {
+        "back at the layer's size"
+    };
+    log::info!(
+        target: LOG_TARGET,
+        "presenter: window {:#x} drawable {what}, {natural_w}x{natural_h} -> \
+         {drawable_w}x{drawable_h} (panel {}x{}, screen backing {}x{})",
+        att.hwnd(),
+        panel.0,
+        panel.1,
+        backing.0,
+        backing.1,
+    );
 }
 
 /// Pop the front packet under the caller's lock and consume it unpresented.
