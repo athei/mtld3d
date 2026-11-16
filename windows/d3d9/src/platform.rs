@@ -11,7 +11,20 @@ mod imp;
 pub use imp::{
     ADDRESS_SPACE_WALKS, SurfaceDc, acquire_logger, adapter_luid, address_space_map,
     apply_device_control_word, caller_holds_loader_lock, capture_hotkey_pressed, client_size,
-    create_surface_dc, current_display_mode, cursor, destroy_surface_dc, dispatch_unix_call,
-    enumerate_display_modes, free_space, fullscreen, is_maximized, main_image_version_blob,
-    note_create_device, primary_monitor, release_logger, system_dpi, unix_path, warn_if_dpi_scaled,
+    create_surface_dc, current_display_mode, destroy_surface_dc, dispatch_unix_call,
+    enumerate_display_modes, free_space, is_maximized, main_image_version_blob, note_create_device,
+    primary_monitor, release_logger, system_dpi, unix_path, warn_if_dpi_scaled,
 };
+
+/// The device's cursor.
+pub mod cursor {
+    pub use super::imp::cursor::CursorState;
+}
+
+/// A fullscreen device's window and display mode.
+pub mod fullscreen {
+    pub use super::imp::fullscreen::{
+        SavedWindow, activate_focus_window, enter, leave, reactivate, reassert_cover, try_leave,
+        update,
+    };
+}

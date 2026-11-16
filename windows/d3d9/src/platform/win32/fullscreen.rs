@@ -90,7 +90,7 @@ const LOG_TARGET: &str = "mtld3d::d3d9::display";
 /// Win32 `RECT`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Rect {
+pub(super) struct Rect {
     pub left: i32,
     pub top: i32,
     pub right: i32,
@@ -423,7 +423,7 @@ fn set_requested_mode(requested: Option<ModeRequest>) -> ModeSetOutcome {
 /// comparison because the registry view may report 0 where the current view
 /// reports the real rate. The caller names the outcome in its own line,
 /// which says why the mode went back.
-pub fn restore_registry_mode() -> RegistryRestore {
+fn restore_registry_mode() -> RegistryRestore {
     let Some(cur) = query_display_mode(ENUM_CURRENT_SETTINGS) else {
         return RegistryRestore::Unreadable;
     };
@@ -487,7 +487,7 @@ unsafe extern "system" {
 }
 
 /// Set one of a window's `GWL_*` / `GWLP_*` longs, returning the previous value.
-pub fn set_window_long_ptr(hwnd: *mut c_void, index: i32, new: isize) -> isize {
+pub(super) fn set_window_long_ptr(hwnd: *mut c_void, index: i32, new: isize) -> isize {
     // SAFETY: SetWindowLongPtrW (or SetWindowLongW on 32-bit) accepts any
     // HWND and isize; documented to return the previous value.
     unsafe { SetWindowLongPtrW(hwnd, index, new) }
@@ -531,7 +531,7 @@ pub fn primary_monitor() -> *mut c_void {
 /// This is the rect a fullscreen device's window is stretched over. While a
 /// display mode is set it is that mode's rect, which win32u maps onto the
 /// physical monitor; between mode-sets it is the desktop's.
-pub fn primary_monitor_rect() -> Option<Rect> {
+fn primary_monitor_rect() -> Option<Rect> {
     let monitor = primary_monitor();
     let mut info = MonitorInfo {
         cb_size: MONITOR_INFO_SIZE,
@@ -665,7 +665,7 @@ static DRIVING_WINDOWS: LazyLock<Mutex<FxHashMap<usize, u32>>> =
 ///
 /// Read by the cursor subclass to skip the auto-resize for a `WM_SIZE` we
 /// caused ourselves on that window.
-pub fn driving_window(hwnd: *mut c_void) -> bool {
+pub(super) fn driving_window(hwnd: *mut c_void) -> bool {
     DRIVING_WINDOWS
         .lock()
         .expect("driving-windows mutex poisoned")
@@ -764,7 +764,7 @@ impl Drop for LeaveWatchGuard {
 }
 
 /// Counts one call into the application's procedure for a watched window while it lives.
-pub struct AppProcedureCall {
+pub(super) struct AppProcedureCall {
     hwnd: usize,
 }
 
@@ -773,7 +773,7 @@ pub struct AppProcedureCall {
 /// The cursor subclass holds the returned value across its call to the
 /// procedure it replaced, so a move the procedure makes is told apart from
 /// one the driver applies while the thread waits.
-pub fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
+pub(super) fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
     let hwnd = hwnd as usize;
     LEAVE_WATCHES
         .lock()
@@ -802,7 +802,7 @@ impl Drop for AppProcedureCall {
 /// it. Any other is the driver's or another thread's. A driver move the
 /// thread applies while that procedure is itself waiting counts as the
 /// application's, so the leave keeps it, as it kept every move before.
-pub fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
+pub(super) fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
     if flags & (SWP_NOMOVE | SWP_NOSIZE) == SWP_NOMOVE | SWP_NOSIZE {
         return;
     }
@@ -1002,7 +1002,7 @@ pub fn reactivate(saved: &mut SavedWindow) {
 /// It takes the window rather than the session: the restore broadcasts
 /// `WM_DISPLAYCHANGE` synchronously, which can re-enter the subclass and
 /// borrow the device mutably, so no borrow of the device may span it.
-pub fn deactivate(hwnd: *mut c_void) {
+pub(super) fn deactivate(hwnd: *mut c_void) {
     let restore = restore_registry_mode();
     log!(
         target: LOG_TARGET,
