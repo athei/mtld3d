@@ -276,6 +276,19 @@ platform_split() {
             t = s; c = gsub(/\)/, "", t)
             return o - c
         }
+        # The cfg expression alone: `s` cut after the parenthesis that closes it.
+        function closed(s,   i, c, d, seen) {
+            d = 0; seen = 0
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "(") { d++; seen = 1 }
+                else if (c == ")") { d--; if (seen && d == 0) return substr(s, 1, i) }
+            }
+            return s
+        }
+        function names_platform(s) {
+            return closed(s) ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/
+        }
         function finding(line, what) {
             printf "%s:%d: %s in %s\n", FILENAME, line, what, text
         }
@@ -284,20 +297,20 @@ platform_split() {
         nest > 0 {
             cfg = cfg " " $0
             nest += depth($0)
-            if (nest <= 0 && cfg ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/)
+            if (nest <= 0 && names_platform(cfg))
                 finding(start, "platform cfg")
             next
         }
         {
             text = $0
-            if ($0 ~ /unsafe extern( "[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
+            if ($0 ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
             if ($0 ~ /#\[link\(/) finding(FNR, "#[link(")
             if ($0 ~ /os::windows/) finding(FNR, "os::windows")
             if (match($0, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
                 cfg = substr($0, RSTART)
                 start = FNR
                 nest = depth(cfg)
-                if (nest <= 0 && cfg ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/)
+                if (nest <= 0 && names_platform(cfg))
                     finding(start, "platform cfg")
             }
         }
