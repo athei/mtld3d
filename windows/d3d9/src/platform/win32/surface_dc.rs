@@ -76,7 +76,13 @@ impl SurfaceDc {
 }
 
 /// Wrap `source` in a memory DC whose DIB aliases the pixels, `None` when GDI refuses.
-pub fn create_surface_dc(source: &SurfaceDcSource) -> Option<SurfaceDc> {
+///
+/// # Safety
+///
+/// `source.memory` points at `source.height` rows of `source.pitch` bytes. GDI
+/// reads and writes them until [`destroy_surface_dc`] tears the DC down, so
+/// they stay valid until then.
+pub unsafe fn create_surface_dc(source: &SurfaceDcSource) -> Option<SurfaceDc> {
     // Wrap the pixel store in a memory DC + DIB via
     // `D3DKMTCreateDCFromMemory`. Unlike `CreateDIBSection`, the
     // kernel leaves `biSizeImage` 0 and stores a negative top-down `biHeight`,
@@ -99,7 +105,7 @@ pub fn create_surface_dc(source: &SurfaceDcSource) -> Option<SurfaceDc> {
     };
     // SAFETY: `&mut desc` is a live, aligned `D3DKMT_CREATEDCFROMMEMORY`; the call
     // fills `h_dc` / `h_bitmap` on success and returns a non-zero NTSTATUS on
-    // failure. `p_memory` stays valid for the DC's lifetime (surface store).
+    // failure. The caller keeps `p_memory` valid for the DC's lifetime.
     let status = unsafe { D3DKMTCreateDCFromMemory(&raw mut desc) };
     if !device_dc.is_null() {
         // SAFETY: `device_dc` is the live template memory DC created above; it has

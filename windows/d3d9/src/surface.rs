@@ -3686,12 +3686,17 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     let Ok(pitch) = u32::try_from(px.src_pitch) else {
         return D3DERR_INVALIDCALL;
     };
-    let Some(dc) = crate::platform::create_surface_dc(&crate::platform::SurfaceDcSource {
-        memory: px.bits,
-        format: px.d3d_format,
-        width: px.width,
-        height: px.height,
-        pitch,
+    // SAFETY: `px.bits` is the non-null store `dc_pixels` resolved, `height`
+    // rows of `pitch` bytes; the surface owns it, and the pin below keeps a
+    // texture level's staging until the DC is destroyed.
+    let Some(dc) = (unsafe {
+        crate::platform::create_surface_dc(&crate::platform::SurfaceDcSource {
+            memory: px.bits,
+            format: px.d3d_format,
+            width: px.width,
+            height: px.height,
+            pitch,
+        })
     }) else {
         return D3DERR_INVALIDCALL;
     };
