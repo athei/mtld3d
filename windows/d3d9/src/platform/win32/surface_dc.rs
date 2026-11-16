@@ -2,21 +2,14 @@
 
 use core::ffi::c_void;
 
+use crate::surface::SurfaceDcSource;
+
 #[link(name = "gdi32")]
 unsafe extern "system" {
     fn CreateCompatibleDC(dc: *mut c_void) -> *mut c_void;
     fn DeleteDC(dc: *mut c_void) -> i32;
     fn D3DKMTCreateDCFromMemory(desc: *mut D3DKMT_CREATEDCFROMMEMORY) -> u32;
     fn D3DKMTDestroyDCFromMemory(desc: *const D3DKMT_DESTROYDCFROMMEMORY) -> u32;
-}
-
-/// The pixel store and geometry a `GetDC` wraps.
-pub struct SurfaceDcSource {
-    pub memory: *mut u8,
-    pub format: u32,
-    pub width: u32,
-    pub height: u32,
-    pub pitch: u32,
 }
 
 /// The GDI objects backing an outstanding `GetDC`.

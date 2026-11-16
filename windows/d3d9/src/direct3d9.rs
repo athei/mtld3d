@@ -2372,7 +2372,7 @@ fn restore_from_fullscreen(saved: Option<&crate::platform::fullscreen::SavedWind
     if let Some(saved) = saved {
         crate::platform::fullscreen::leave(
             saved,
-            crate::platform::fullscreen::LeaveKind::Plain,
+            crate::device::LeaveKind::Plain,
             &mtld3d_core::fullscreen_log::LeaveReason::FailedCreate,
         );
     }

@@ -9,10 +9,9 @@
 #[cfg_attr(not(windows), path = "platform/native.rs")]
 mod imp;
 pub use imp::{
-    ADDRESS_SPACE_WALKS, SurfaceDc, SurfaceDcSource, acquire_logger, adapter_luid,
-    address_space_map, apply_device_control_word, caller_holds_loader_lock, capture_hotkey_pressed,
-    client_size, create_surface_dc, current_display_mode, cursor, destroy_surface_dc,
-    dispatch_unix_call, enumerate_display_modes, free_space, fullscreen, is_maximized,
-    main_image_version_blob, note_create_device, primary_monitor, release_logger, system_dpi,
-    unix_path, warn_if_dpi_scaled,
+    ADDRESS_SPACE_WALKS, SurfaceDc, acquire_logger, adapter_luid, address_space_map,
+    apply_device_control_word, caller_holds_loader_lock, capture_hotkey_pressed, client_size,
+    create_surface_dc, current_display_mode, cursor, destroy_surface_dc, dispatch_unix_call,
+    enumerate_display_modes, free_space, fullscreen, is_maximized, main_image_version_blob,
+    note_create_device, primary_monitor, release_logger, system_dpi, unix_path, warn_if_dpi_scaled,
 };

@@ -222,13 +222,13 @@ windows/core/src/upload_redirty.rs RedirtySubresource Clone,Copy,PartialEq,Eq,Ha
 windows/core/src/visibility.rs QueryStatus Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/device.rs DepthTextureCreateInfo Clone,Copy
 windows/d3d9/src/device.rs DeviceFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/d3d9/src/device.rs LeaveKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/device.rs ResetCall Clone,Copy
 windows/d3d9/src/device.rs SnapshotDirty Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/device.rs TextureCreateArgs Clone,Copy
 windows/d3d9/src/direct3d9.rs DisplayModeInfo Clone,Copy
 windows/d3d9/src/pixel_shader.rs PsUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/platform/win32/cursor.rs CursorFlags Clone,Copy,Debug,Default,PartialEq,Eq
-windows/d3d9/src/platform/win32/fullscreen.rs LeaveKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/platform/win32/fullscreen.rs Rect Clone,Copy
 windows/d3d9/src/platform/win32/surface_dc.rs SurfaceDc Clone,Copy
 windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,PartialEq,Eq

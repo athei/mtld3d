@@ -142,7 +142,7 @@ pub use fullscreen::{
 pub use log_sink::{
     acquire as acquire_logger, caller_holds_loader_lock, release as release_logger,
 };
-pub use surface_dc::{SurfaceDc, SurfaceDcSource, create_surface_dc, destroy_surface_dc};
+pub use surface_dc::{SurfaceDc, create_surface_dc, destroy_surface_dc};
 pub use window::client_size;
 pub use wine_path::unix_path;
 

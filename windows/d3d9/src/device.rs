@@ -3215,11 +3215,11 @@ impl DeviceInner {
     }
 
     /// How leaving fullscreen puts this device's window back.
-    pub const fn leave_kind(&self) -> crate::platform::fullscreen::LeaveKind {
+    pub const fn leave_kind(&self) -> LeaveKind {
         if self.is_extended() {
-            crate::platform::fullscreen::LeaveKind::Extended
+            LeaveKind::Extended
         } else {
-            crate::platform::fullscreen::LeaveKind::Plain
+            LeaveKind::Plain
         }
     }
 
@@ -3441,6 +3441,18 @@ struct HeldImplicitSurfaces {
 }
 
 // ── IDirect3DDevice9 COM object ──
+
+/// How leaving fullscreen puts the window back, which the kind of device decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeaveKind {
+    /// A plain device: the pre-fullscreen rect, with the visibility the window has now.
+    Plain,
+    /// An extended device: the window stays where fullscreen put it and gets its saved visibility.
+    ///
+    /// `D3D9Ex` restores the window's style when it leaves fullscreen,
+    /// visibility included, and leaves its position and size alone.
+    Extended,
+}
 
 /// Parameters for `Direct3DDevice9::new`.
 ///

@@ -80,7 +80,7 @@ use mtld3d_core::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::direct3d9::DisplayModeInfo;
+use crate::{device::LeaveKind, direct3d9::DisplayModeInfo};
 
 /// Sub-target shared with the display-enumeration probes in `direct3d9`.
 const LOG_TARGET: &str = "mtld3d::d3d9::display";
@@ -1136,18 +1136,6 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) -> WindowPlac
         rect.width(), rect.height(), rect.left, rect.top,
     );
     WindowPlacement::Placed(rect.label())
-}
-
-/// How leaving fullscreen puts the window back, which the kind of device decides.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LeaveKind {
-    /// A plain device: the pre-fullscreen rect, with the visibility the window has now.
-    Plain,
-    /// An extended device: the window stays where fullscreen put it and gets its saved visibility.
-    ///
-    /// `D3D9Ex` restores the window's style when it leaves fullscreen,
-    /// visibility included, and leaves its position and size alone.
-    Extended,
 }
 
 /// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.
