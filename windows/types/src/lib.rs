@@ -1,5 +1,6 @@
 mod caps;
 mod cursor;
+mod d3dkmt;
 mod device;
 mod direct3d9;
 mod ff;
@@ -11,6 +12,7 @@ mod vertex_decl;
 
 pub use caps::*;
 pub use cursor::{CURSOR_SHOWING, CURSORINFO, ICONINFO, POINT};
+pub use d3dkmt::*;
 pub use device::*;
 pub use direct3d9::*;
 pub use ff::{

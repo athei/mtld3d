@@ -2445,6 +2445,10 @@ impl TextureInner {
                     mtld3d_shared::mtl::TextureCreateFlags::TYPE_CUBE,
                     self.flags.contains(TextureFlags::CUBE),
                 );
+                flags.set(
+                    mtld3d_shared::mtl::TextureCreateFlags::SHARED,
+                    self.flags.contains(TextureFlags::SHARED),
+                );
                 flags
             },
             swizzle: self.swizzle.unwrap_or([Swizzle::Zero; 4]),
@@ -3825,6 +3829,16 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
         log::debug!(
             target: crate::LOG_TARGET,
             "target texture destroyed: {texture_id:?} ptr={this:p}"
+        );
+    }
+
+    // A shared texture no encoder adopted gives its storage back while its
+    // device lives; a device that is gone took the storage with it.
+    if ti.flags.contains(TextureFlags::SHARED) && dev_inner_raw != 0 {
+        crate::shared_texture::release(
+            ti.device_handle,
+            DeviceInner::from_ptr(dev_inner_raw).record_handle(),
+            texture_id.raw(),
         );
     }
 

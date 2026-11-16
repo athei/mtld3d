@@ -31,6 +31,7 @@ use super::{
     gpu_time::GpuTime,
     handle::ReleaseRetain,
     presenter::{PresentState, Presented},
+    shared_texture::ParkedTextures,
     transient::UploadRing,
     upscale::UpscaleCache,
 };
@@ -57,6 +58,8 @@ pub struct DeviceRecord {
     depth_planes: Mutex<PlanePool>,
     /// GPU time of this device's finished command buffers, until a submission reports it.
     gpu_time: GpuTime,
+    /// The shared textures made inside `CreateTexture` that the encoder has not adopted yet.
+    shared_textures: ParkedTextures,
 }
 
 impl Drop for DeviceRecord {
@@ -85,6 +88,7 @@ impl DeviceRecord {
             upload_ring: Mutex::new(UploadRing::default()),
             depth_planes: Mutex::new(PlanePool::default()),
             gpu_time: GpuTime::new(),
+            shared_textures: ParkedTextures::new(),
         })
     }
 
@@ -116,6 +120,11 @@ impl DeviceRecord {
     /// The GPU time the device's completion handlers add and its submissions drain.
     pub const fn gpu_time(&self) -> &GpuTime {
         &self.gpu_time
+    }
+
+    /// The device's shared textures between their `CreateTexture` and their adoption.
+    pub const fn shared_textures(&self) -> &ParkedTextures {
+        &self.shared_textures
     }
 
     /// The device's upload ring, for the length of one submission.

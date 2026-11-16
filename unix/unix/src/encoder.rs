@@ -1840,7 +1840,7 @@ impl FrameEncoder {
         if descs.is_empty() {
             return 0;
         }
-        let Some(_) = &self.record else {
+        let Some(record) = &self.record else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "CreateTexturesBatch: no device record for handle {:#x}; the call is dropped",
@@ -1848,7 +1848,13 @@ impl FrameEncoder {
             );
             return 0xC000_0001_u32.cast_signed();
         };
-        if crate::metal::create_textures(&self.device, descs, views_out, &mut self.texture_clears) {
+        if crate::metal::create_textures(
+            &self.device,
+            Some(record.shared_textures()),
+            descs,
+            views_out,
+            &mut self.texture_clears,
+        ) {
             return 0;
         }
         0xC000_0001_u32.cast_signed()
@@ -1908,10 +1914,13 @@ impl FrameEncoder {
         // carries the render-target bit, since D3D9 leaves depth contents
         // undefined and the frame-end discard already takes that licence.
         let mut flags = info.create_flags();
+        // A shared texture is another runtime's draw output; clearing it here
+        // would erase a frame that runtime already rendered.
         flags.set(
             TextureCreateFlags::CLEAR_ON_CREATE,
             usage_flags.contains(TextureUsage::RENDER_TARGET)
-                && !usage_flags.contains(TextureUsage::DEPTH_STENCIL),
+                && !usage_flags.contains(TextureUsage::DEPTH_STENCIL)
+                && !flags.contains(TextureCreateFlags::SHARED),
         );
         if mtld3d_core::upload_pass::needs_render_target(
             info.d3d_format(),
@@ -7357,7 +7366,24 @@ impl FrameEncoder {
                 ));
         let ordered_color = ordered
             && mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format()).is_none();
-        if !ORDERED && sampled && !ordered_color {
+        // A shared texture keeps its one storage: a new version would leave
+        // the other Direct3D runtime drawing into, or sampling, the retired
+        // one. Its upload lands in the live texture, so a draw earlier in
+        // this frame that sampled it reads the newer pixels.
+        let shared = job
+            .info()
+            .create_flags()
+            .contains(TextureCreateFlags::SHARED);
+        if shared && !ORDERED && sampled && !ordered_color {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "run_texture_upload: an upload into shared texture {:#x} follows a draw of the \
+                 same frame that sampled it; the texture is not renamed, so that draw reads the \
+                 uploaded pixels",
+                job.info().texture_id().raw(),
+            );
+        }
+        if !ORDERED && sampled && !ordered_color && !shared {
             handle = self.rename_sampled_texture(job, handle, ordered);
             if handle == 0 {
                 decline_texture_upload(job, "the sampled-texture rename found no destination");

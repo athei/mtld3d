@@ -7,8 +7,8 @@ use mtld3d_shared::{
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
     GetDeviceInfoParams, InPtr, InPtrMut, LogLineKind, MetalHandle, OpenLogParams,
-    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams, WriteLogParams,
-    identity,
+    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams,
+    SharedTextureParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind},
     mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
@@ -744,6 +744,25 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
         metal::TRANSPARENT_BLACK,
     );
     STATUS_SUCCESS
+}
+
+/// Open or forget the Metal texture behind a D3D9 shared texture.
+///
+/// Synchronous, on the API thread: `CreateTexture` answers its
+/// `pSharedHandle` from this call's result.
+pub extern "C" fn shared_texture_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const SharedTextureParams.
+    let Some(params) = (unsafe { InPtr::<SharedTextureParams>::opt(args.cast()) }) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Some(record) = device_record(params.record_handle, "SharedTexture") else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if metal::serve_shared_texture(record.shared_textures(), &params) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
 }
 
 pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {

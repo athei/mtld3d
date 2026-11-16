@@ -30,6 +30,7 @@ mod private_data;
 mod query;
 mod shader_bindings;
 mod shader_validator;
+mod shared_texture;
 mod stage_bindings;
 mod state_block;
 mod surface;

@@ -7,6 +7,7 @@
 //! assertions. D3D9 constants come from `mtld3d_types`; nothing is restated.
 
 mod check;
+mod d3d11;
 mod ffi;
 mod harness;
 mod in_flight;
@@ -18,6 +19,7 @@ mod vertex;
 mod vtbl;
 mod win32;
 
+pub use d3d11::{D3d11Device, D3d11Texture};
 pub use harness::{
     DrawIndexedUpParams, Factory, Harness, HarnessConfig, UNWRITTEN, config_value, config_var,
     extended::SharedHandle, render_scale_is_identity, run_child,

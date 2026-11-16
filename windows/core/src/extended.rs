@@ -59,6 +59,12 @@ pub enum SharedHandleVerdict {
     /// packed initial data for a single-level system-memory texture or
     /// offscreen plain surface.
     UserMemory,
+    /// The handle shares a `D3DPOOL_DEFAULT` texture with another runtime.
+    ///
+    /// An extended device's `CreateTexture` reads `*pSharedHandle`: a handle
+    /// there names the texture to open, and null asks for a new shared
+    /// texture, which the create refuses.
+    Shared,
     /// The create fails with the refusal's code.
     Refuse(SharedRefusal),
 }
@@ -68,7 +74,7 @@ pub enum SharedHandleVerdict {
 pub enum SharedRefusal {
     /// A plain device has neither shared resources nor user memory.
     PlainDevice,
-    /// A shared `D3DPOOL_DEFAULT` resource, which this layer does not implement.
+    /// A shared `D3DPOOL_DEFAULT` resource other than a 2D texture, which is not implemented.
     SharedResource,
     /// User memory outside the one shape that takes it, or sharing outside the default pool.
     InvalidCall,
@@ -92,7 +98,7 @@ impl SharedRefusal {
     pub const fn reason(&self) -> &'static str {
         match self {
             Self::PlainDevice => "a plain device has no shared resources or user memory",
-            Self::SharedResource => "shared resources are not implemented",
+            Self::SharedResource => "only a 2D texture can be a shared resource",
             Self::InvalidCall => {
                 "user memory is a single-level D3DPOOL_SYSTEMMEM texture or offscreen plain \
                  surface, and sharing needs D3DPOOL_DEFAULT"
@@ -107,8 +113,8 @@ impl SharedRefusal {
 /// A null handle changes nothing on either kind of device. A plain device
 /// refuses any other with `E_NOTIMPL`. An extended device reads it as user
 /// memory for a single-level `D3DPOOL_SYSTEMMEM` 2D texture or offscreen plain
-/// surface, as a shared resource for `D3DPOOL_DEFAULT`, which is refused with
-/// `D3DERR_NOTAVAILABLE` because sharing across processes is not implemented,
+/// surface, as a shared resource for `D3DPOOL_DEFAULT`, which a 2D texture
+/// opens and every other kind refuses with `D3DERR_NOTAVAILABLE`,
 /// and as an invalid call for every other pool; a vertex or index buffer
 /// outside the default pool answers `D3DERR_NOTAVAILABLE` instead.
 #[must_use]
@@ -125,7 +131,10 @@ pub const fn shared_handle_verdict(
         return SharedHandleVerdict::Refuse(SharedRefusal::PlainDevice);
     }
     if pool == D3DPOOL_DEFAULT {
-        return SharedHandleVerdict::Refuse(SharedRefusal::SharedResource);
+        return match kind {
+            CreateKind::Texture { .. } => SharedHandleVerdict::Shared,
+            _ => SharedHandleVerdict::Refuse(SharedRefusal::SharedResource),
+        };
     }
     match kind {
         CreateKind::Texture { levels: 1 } | CreateKind::OffscreenPlain

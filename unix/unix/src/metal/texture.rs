@@ -25,6 +25,7 @@ use objc2_metal::{
 use crate::metal::{
     command::diagnostics,
     handle::{IntoRetained, ReleaseRetain},
+    shared_texture::ParkedTextures,
 };
 
 /// The texture handles this side has minted and not yet destroyed.
@@ -861,6 +862,8 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 
 /// Create texture views, keeping successful slots when another creation fails.
 ///
+/// `parked` is where a `TextureCreateFlags::SHARED` descriptor finds its
+/// storage; a caller that creates no shared texture passes `None`.
 /// The caller supplies an autorelease pool. Each distinct returned handle owns
 /// one retain. The caller commits `clears` before submitting texture-consuming work.
 /// Returns whether every creation succeeded.
@@ -869,6 +872,7 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// Panics when the descriptor and output counts differ.
 pub fn create_textures(
     device: &ProtocolObject<dyn MTLDevice>,
+    parked: Option<&ParkedTextures>,
     descs: &[TextureCreateDesc],
     views: &mut [TextureViews],
     clears: &mut TextureClearBatch,
@@ -876,7 +880,12 @@ pub fn create_textures(
     assert_eq!(descs.len(), views.len());
     let mut any_failed = false;
     for (desc, slot) in descs.iter().zip(views) {
-        if let Some(created) = create_texture(device, desc) {
+        let created = if desc.flags.contains(TextureCreateFlags::SHARED) {
+            adopt_shared_texture(device, parked, desc)
+        } else {
+            create_texture(device, desc)
+        };
+        if let Some(created) = created {
             *slot = created;
             if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
                 clears.retain(slot.linear);
@@ -894,6 +903,36 @@ pub fn create_textures(
         }
     }
     !any_failed
+}
+
+/// The views of a shared texture, over the storage its `CreateTexture` parked.
+///
+/// The storage is the one another Direct3D runtime draws into or samples: the
+/// `SharedTexture` thunk opened it and parked it under the texture's id. It
+/// is adopted once. A second create of the same id, or a create with
+/// no device record to look in, finds nothing and fails like a refused
+/// allocation, which the caller logs.
+fn adopt_shared_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    parked: Option<&ParkedTextures>,
+    desc: &TextureCreateDesc,
+) -> Option<TextureViews> {
+    let Some(storage) = parked.and_then(|parked| parked.take(desc.tex_id)) else {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: desc.tex_id,
+            "shared texture {:#x}: nothing is parked under the id, so the texture has no \
+             storage (its share was forgotten, or it is being created a second time)",
+            desc.tex_id
+        );
+        return None;
+    };
+    log::info!(
+        target: crate::LOG_TARGET,
+        "shared texture {:#x}: adopted by the encoder ({}x{} {:?})",
+        desc.tex_id, desc.width, desc.height, desc.pixel_format
+    );
+    create_texture_over(device, desc, Some(storage))
 }
 
 /// Creates a texture for sampling.
@@ -918,6 +957,18 @@ pub fn create_textures(
 pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
+) -> Option<TextureViews> {
+    create_texture_over(device, desc, None)
+}
+
+/// The views of the texture `desc` describes, over `storage` when the caller brings it.
+///
+/// `storage` is the texture a shared create already opened
+/// ([`adopt_shared_texture`]); without it the texture is allocated here.
+fn create_texture_over(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &TextureCreateDesc,
+    storage: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
 ) -> Option<TextureViews> {
     let depth = if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
         desc.depth
@@ -988,7 +1039,10 @@ pub fn create_texture(
         tex_desc.setStorageMode(mtl_storage_mode(desc.storage_mode));
     }
 
-    let texture = new_texture(device, &tex_desc, "mtld3d-tex")?;
+    let texture = match storage {
+        Some(storage) => storage,
+        None => new_texture(device, &tex_desc, "mtld3d-tex")?,
+    };
 
     // Label the handle the PE side will see — surfaces the mtld3d TextureId
     // alongside the MTLTexture in Xcode frame captures, which is the
