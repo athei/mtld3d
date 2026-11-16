@@ -1,8 +1,7 @@
 //! The cursor methods of `IDirect3DDevice9` and the words the unix side publishes for a device.
 //!
-//! The entry points take the D3D9 arguments apart and hand the operation to
-//! the device's [`CursorState`], the platform's cursor, which owns what the
-//! cursor does on screen.
+//! The entry points unpack the D3D9 arguments and hand the operation to the
+//! device's [`CursorState`].
 //!
 //! [`CursorState`]: crate::platform::cursor::CursorState
 

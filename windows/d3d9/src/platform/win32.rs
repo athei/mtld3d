@@ -1,14 +1,9 @@
 //! The Win32 side of the platform: what `d3d9.dll` needs from Windows and from Wine.
 //!
-//! It holds `DllMain` and the image's life (the pin, the exit hooks, the
-//! crash handler), the PE logger, the exports with their hook prologue, and
-//! every user32, gdi32, kernel32 and advapi32 import. The items re-exported at
-//! the bottom are the interface the shared code calls; the native platform
-//! defines the same ones.
+//! It holds `DllMain`, the image's life, the PE logger, the exports and every
+//! Win32 import. Its public items are the interface the shared code calls.
 //!
-//! Each child module is named by a `path` attribute: this file is reached
-//! through one itself, so a plain `mod` would look for its children beside it
-//! rather than under `win32/`.
+//! This file is reached through a `path` attribute, so its children need one too.
 
 use core::{
     ffi::c_void,
@@ -20,8 +15,7 @@ use mtld3d_shared::{InitLoggerParams, identity};
 use self::crash::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA,
 };
-// The modules below name the crate-root items through `super::`, as they did
-// when they sat at the crate root.
+// The modules below name these crate-root items through `super::`.
 use crate::{
     D3D_OK, E_NOINTERFACE, LOG_TARGET, create9, create9_ex, null_out,
     unix_call::{self, unix_call},

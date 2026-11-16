@@ -1,7 +1,4 @@
 //! Where the process's log file goes, named to the unix side once per interface.
-//!
-//! The location is a path the unix side can open, so every directory is
-//! handed over through [`crate::platform::unix_path`].
 
 use std::path::Path;
 
