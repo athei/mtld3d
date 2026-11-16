@@ -27,6 +27,16 @@ fn an_out_of_range_pool_value_is_not_cpu_only() {
 }
 
 #[test]
+fn the_pools_with_a_runtime_copy_start_zeroed() {
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+        assert!(system_copy_starts_zeroed(pool), "pool {pool}");
+    }
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED_EX, 4, 0xFFFF_FFFF] {
+        assert!(!system_copy_starts_zeroed(pool), "pool {pool}");
+    }
+}
+
+#[test]
 fn only_the_managed_pool_is_runtime_managed() {
     assert!(is_runtime_managed(D3DPOOL_MANAGED));
     // Create* rejects the out-of-range values before they reach a resource;

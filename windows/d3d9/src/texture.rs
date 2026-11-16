@@ -351,6 +351,18 @@ pub struct TextureInner {
     /// whole level again. Every other subresource keeps reading its staging
     /// with no copy at all.
     snapshot_staging: u128,
+    /// Subresources whose staging still holds what the allocator handed out.
+    ///
+    /// Indexed like `observed_staging`. Set at creation for the pools whose
+    /// system-memory copy D3D9 hands out zeroed, whose staging came from the
+    /// page-box pool or the allocator unwritten: a pooled box carries a
+    /// released resource's bytes. The first exposure of a subresource's
+    /// staging, a lock, a device context, a partial write, a read as a copy
+    /// source or an upload, zeroes it and clears the bit; a write that covers
+    /// the whole level clears the bit without the memset. A subresource that
+    /// is never exposed costs nothing. Only an exposure can make an upload
+    /// read the staging, so a set bit also means no upload has read it.
+    unzeroed_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -644,19 +656,26 @@ impl TextureInner {
     /// untouched would otherwise push staging the GPU's pixels never reached
     /// back over them. `face` is a cube face index and zero for every other
     /// texture kind.
+    ///
+    /// It is also the subresource's exposure: staging still as the allocator
+    /// handed it out is zeroed first, unless the write covers the whole level
+    /// or the read back fills it.
     fn move_subresource_to_staging(&mut self, face: u32, level: usize, whole_level: bool) -> bool {
-        match self.level_authority.plan_write(face, level, whole_level) {
-            // An overwrite releases the claim only once the caller finishes its write.
-            WritePlan::WriteStaging | WritePlan::Overwrite => true,
-            WritePlan::ReadBackFirst => {
-                if !materialize_subresource_from_gpu(self, face, level) {
-                    return false;
-                }
-                self.level_authority.staging_wrote(face, level);
-                self.mark_read_back_as_uploaded(face, level);
-                true
+        let plan = self.level_authority.plan_write(face, level, whole_level);
+        // An overwrite releases the claim only once the caller finishes its write.
+        if matches!(plan, WritePlan::ReadBackFirst) {
+            if !materialize_subresource_from_gpu(self, face, level) {
+                return false;
             }
+            self.staging_overwritten(face, level);
+            self.level_authority.staging_wrote(face, level);
+            self.mark_read_back_as_uploaded(face, level);
+        } else if whole_level {
+            self.staging_overwritten(face, level);
+        } else {
+            self.expose_staging(face, level);
         }
+        true
     }
 
     /// Count a read back of `(face, level)` as that subresource's upload.
@@ -2727,6 +2746,100 @@ impl TextureInner {
             .unwrap_or(0)
     }
 
+    /// Zero `(face, level)`'s staging at its first exposure, if it still holds what it was given.
+    ///
+    /// Every path that hands the staging to the application, reads it as a
+    /// copy source or uploads it calls this first (see `unzeroed_staging`).
+    /// A set bit means no upload has read the box, so this thread owns it
+    /// alone and the memset lands in place. `face` is a cube face index and
+    /// zero for every other texture kind.
+    pub fn expose_staging(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        if self.unzeroed_staging & bit == 0 {
+            return;
+        }
+        self.unzeroed_staging &= !bit;
+        if let Some(page) = self.unexposed_staging_page(face, level) {
+            page.zero_logical();
+        }
+    }
+
+    /// The staging box of `(face, level)` while no other owner holds it.
+    ///
+    /// For the zeroing of a subresource no upload has read yet, whose box
+    /// therefore has no other owner. `None`, warned once, breaks that
+    /// invariant, and the box is left as allocated.
+    fn unexposed_staging_page(&mut self, face: u32, level: usize) -> Option<&mut PageBox> {
+        let slot = if self.cube.is_some() {
+            let index = self.cube_subresource_index(face, level);
+            self.cube
+                .as_deref_mut()
+                .zip(index)
+                .and_then(|(cube, index)| cube.staging.get_mut(index))
+        } else {
+            self.staging.get_mut(level)
+        };
+        let page = slot.and_then(Arc::get_mut);
+        if page.is_none() {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "texture staging: an unexposed level is shared → left as allocated");
+        }
+        page
+    }
+
+    /// Record that a read back from the GPU wrote every row of `(face, level)`'s staging.
+    ///
+    /// The read back writes each row's pixels and not the padding up to the
+    /// level's pitch, so a subresource that had not been exposed yet gets
+    /// only that padding zeroed rather than the whole level.
+    fn readback_overwrote(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        if self.unzeroed_staging & bit == 0 {
+            return;
+        }
+        self.unzeroed_staging &= !bit;
+        let row_bytes =
+            (self.mip_width(level) as usize).saturating_mul(self.bytes_per_pixel as usize);
+        let pitch = self.mip_bytes_per_row(level) as usize;
+        let rows = self.mip_height(level) as usize;
+        if row_bytes == 0 || pitch <= row_bytes {
+            return;
+        }
+        if let Some(page) = self.unexposed_staging_page(face, level) {
+            page.zero_row_padding(rows, row_bytes, pitch);
+        }
+    }
+
+    /// [`Self::expose_staging`] for every subresource, ahead of a copy that may read any of them.
+    pub fn expose_all_staging(&mut self) {
+        // The bit index is `cube_subresource_index` for a cube, face-major, and
+        // the level otherwise.
+        let levels = self.levels.max(1) as usize;
+        let mut remaining = self.unzeroed_staging;
+        while remaining != 0 {
+            let index = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            let (face, level) = if self.cube.is_some() {
+                (
+                    u32::try_from(index / levels).expect("a cube face index fits u32"),
+                    index % levels,
+                )
+            } else {
+                (0, index)
+            };
+            self.expose_staging(face, level);
+        }
+    }
+
+    /// Record that a write is about to define every byte of `(face, level)`'s staging.
+    ///
+    /// The write is the subresource's first exposure and leaves nothing of what
+    /// the allocator handed out, so the memset is skipped.
+    fn staging_overwritten(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        self.unzeroed_staging &= !bit;
+    }
+
     /// Record that a GPU operation on this texture follows every upload scheduled so far.
     ///
     /// Called where a draw's stage walk, a vertex texture bind, a `StretchRect`
@@ -3313,6 +3426,8 @@ impl TextureInner {
     /// of a level's contents are re-armed: a later `UpdateTexture` from this
     /// texture copies the level again, and a bind for sampling uploads it.
     pub fn mark_readback_written(&mut self, face: Option<u32>, level: usize) {
+        // The read back wrote every row of the subresource.
+        self.readback_overwrote(face.unwrap_or(0), level);
         if let Some(face) = face {
             self.mark_cube_surface_dirty(face, level);
             return;
@@ -3357,17 +3472,18 @@ impl TextureInner {
     }
 }
 
-/// Take uninitialized page-aligned staging, a parked box of each size first.
+/// Take uninitialised page-aligned staging, a parked box of each size first.
 ///
-/// Used by the `FreshBox` Lock path and by `CreateTexture` for initial
-/// staging — the game writes the dirty rect before any GPU read, and
-/// the blit upload only copies the dirty sub-rect, so untouched bytes
-/// are never observed. On an initial Draw-before-Lock, the freshly-
-/// created `MTLTexture` is the GPU-visible surface and is zeroed by
-/// Metal; the staging `PageBox` is only read when an upload blit fires,
-/// which requires a prior Lock write. A box popped from the page-box
-/// pool carries another texture's stale bytes under exactly that
-/// contract, so it is interchangeable with a fresh allocation.
+/// A box popped from the page-box pool carries a released resource's bytes
+/// and a fresh one is uninitialised, so the two are interchangeable, and
+/// neither is zeroed here. A create of a pool whose system-memory copy D3D9
+/// hands out zeroed marks its staging unwritten, and each subresource is
+/// zeroed at its first exposure ([`TextureInner::expose_staging`]). The
+/// other takes need no zero: a rename copies the old contents in or is
+/// covered by the write, and every other take re-creates a released level,
+/// which only a default-pool texture has. That level is read back from the
+/// GPU when the GPU holds its pixels; otherwise D3D9 leaves a default-pool
+/// level's unwritten contents undefined, and the pages go out as allocated.
 ///
 /// Page-aligned because the encoder wraps the staging via
 /// `newBufferWithBytesNoCopy:`, which on non-UMA Macs (Intel/AMD)
@@ -3455,6 +3571,13 @@ pub struct TextureCreateInfo {
     /// an `Arc<PageBox>` for refcount-based handoff to the encoder thread.
     /// Empty for depth-format textures (`LockRect` rejected upstream).
     pub staging: Vec<PageBox>,
+    /// Whether `staging` is as the allocator handed it out and has to read zero.
+    ///
+    /// True for the pools whose system-memory copy D3D9 hands out zeroed
+    /// ([`mtld3d_core::pool::system_copy_starts_zeroed`]), unless the create
+    /// filled the staging itself (an extended device's user-memory texture).
+    /// Each subresource is zeroed at its first exposure rather than here.
+    pub staging_unwritten: bool,
     pub mip_widths: Vec<u32>,
     pub mip_heights: Vec<u32>,
     pub mip_bytes_per_row: Vec<u32>,
@@ -3512,6 +3635,24 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
             Some(DirtyRect::full(w, h))
         })
         .collect();
+    // One bit per staging box, indexed as `observed_bit` indexes them: a cube's
+    // boxes are face-major, which is `cube_subresource_index`'s order. The
+    // largest chain D3D9 builds is 15 levels, six faces of it 90 boxes, so
+    // every box has its bit; a box past the mask would never be zeroed.
+    debug_assert!(
+        info.staging.len() <= u128::BITS as usize,
+        "{} staging boxes do not fit the unzeroed mask",
+        info.staging.len()
+    );
+    let unzeroed_staging = if info.staging_unwritten {
+        match info.staging.len() {
+            0 => 0,
+            count if count >= u128::BITS as usize => u128::MAX,
+            count => (1u128 << count) - 1,
+        }
+    } else {
+        0
+    };
     let (staging, cube): (Vec<Arc<PageBox>>, Option<Box<CubeStorage>>) = if is_cube {
         (
             Vec::new(),
@@ -3554,6 +3695,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         dc_open: 0,
         observed_staging: 0,
         snapshot_staging: 0,
+        unzeroed_staging,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -5242,6 +5384,8 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     rect: DirtyRect,
 ) {
     let level_u = level as usize;
+    // An `AddDirtyRect` can publish a level no lock exposed; it uploads zero.
+    ti.expose_staging(0, level_u);
     if ti.dropped_staging & (1u32 << level_u) != 0 {
         // Nothing to upload from: the level's bytes live on the GPU only. A
         // re-upload request (eviction, device rehydration) for it is moot.
@@ -5442,6 +5586,10 @@ fn schedule_cube_upload<const ORDERED: bool>(
     rect: DirtyRect,
 ) {
     let level_u = level as usize;
+    // A guard, one bit test: every path that marks a face for upload exposes
+    // it first (a cube's `AddDirtyRect` marks only the `UpdateTexture`
+    // region), so this zeroes only a face a later path publishes unexposed.
+    ti.expose_staging(face, level_u);
     let index = ti
         .cube_subresource_index(face, level_u)
         .expect("validated cube subresource");
@@ -6135,6 +6283,8 @@ extern "system" fn volume_lock_box(
     };
     let read_only = flags & D3DLOCK_READONLY != 0;
     let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
+    // The lock hands the level to the application, which may read any of it.
+    inner.expose_staging(0, lvl);
     // A read-only lock writes nothing, so it reads the pages an upload may
     // still be reading rather than moving the level off them.
     if !read_only {

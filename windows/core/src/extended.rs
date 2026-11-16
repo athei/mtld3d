@@ -277,8 +277,11 @@ impl PackedRows {
 
 /// Copy packed user-memory rows into a level whose rows are `dst_pitch` bytes apart.
 ///
-/// Returns `false`, copying nothing, when either side is too short for the
-/// rows or the pitch is narrower than a row.
+/// The bytes of each destination row past `row_bytes`, up to the pitch, are
+/// zeroed, so a lock of the level reads zero in the padding as it does in
+/// any other level the application has not written. Returns `false`, copying
+/// nothing, when either side is too short for the rows or the pitch is
+/// narrower than a row.
 #[must_use]
 pub fn copy_packed_rows(src: &[u8], rows: &PackedRows, dst: &mut [u8], dst_pitch: usize) -> bool {
     if dst_pitch < rows.row_bytes || src.len() < rows.total_bytes() {
@@ -301,7 +304,9 @@ pub fn copy_packed_rows(src: &[u8], rows: &PackedRows, dst: &mut [u8], dst_pitch
         .take(rows.rows)
         .zip(dst.chunks_mut(dst_pitch))
     {
-        dst_row[..rows.row_bytes].copy_from_slice(src_row);
+        let (row, padding) = dst_row.split_at_mut(rows.row_bytes);
+        row.copy_from_slice(src_row);
+        padding.fill(0);
     }
     true
 }
