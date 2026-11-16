@@ -593,14 +593,15 @@ impl Direct3DSurface9 {
     /// Created by `CreateOffscreenPlainSurface` with `D3DPOOL_SYSTEMMEM`.
     /// Backed by a page-aligned PE-heap buffer that `GetRenderTargetData` blits
     /// into and `LockRect` reads back — the destination half of the conformance
-    /// / portrait readback path.
+    /// / portrait readback path. `unwritten` says the backing is as the
+    /// allocator handed it out, to be zeroed at its first exposure.
     pub fn new_system_memory(
         device_inner: *mut DeviceInner,
-        width: u32,
-        height: u32,
+        (width, height): (u32, u32),
         format: u32,
         pool: u32,
         backing: PageBox,
+        unwritten: bool,
     ) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
@@ -621,7 +622,11 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: Some(HeldPages::new(backing, PageHolder::Surface)),
-            flags: SurfaceFlags::empty(),
+            flags: if unwritten {
+                SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN
+            } else {
+                SurfaceFlags::empty()
+            },
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -1050,8 +1055,13 @@ impl Direct3DSurface9 {
     /// state, so a later `UpdateTexture` from it copies the new content and a
     /// bind for sampling uploads it.
     pub fn note_system_memory_written(&self) {
-        let inner = self.inner();
+        // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
+        // access is exclusive (D3D9 objects are single-threaded, or serialised
+        // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
+        // transient exclusive borrow taken to update its flags is sound.
+        let inner = unsafe { &mut *self.inner };
         if inner.parent_texture.is_null() {
+            inner.readback_overwrote_system_memory();
             return;
         }
         let face = (inner.cube_face != u32::MAX).then_some(inner.cube_face);
@@ -1072,10 +1082,18 @@ impl Direct3DSurface9 {
     /// `CreateOffscreenPlainSurface` allocated and `systemmem_lock_rect`
     /// reports: a block-row stride for compressed formats and a dword-aligned
     /// pixel-row stride for linear formats.
+    ///
+    /// The read is the backing's exposure, so a backing nothing has written
+    /// yet is zeroed first.
     pub fn system_memory_source(&self) -> Option<(*const u8, usize, usize, u32, u32, u32)> {
         if !self.inner().parent_texture.is_null() {
             return None;
         }
+        // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
+        // access is exclusive (D3D9 objects are single-threaded, or serialised
+        // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
+        // transient exclusive borrow taken to zero the backing is sound.
+        unsafe { &mut *self.inner }.expose_system_memory();
         let inner = self.inner();
         let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
         let pitch = mtld3d_core::format::block_row_pitch(
@@ -1131,6 +1149,14 @@ bitflags::bitflags! {
         /// surface. Clear on the device's own implicit back buffer, which the
         /// device keeps.
         const PINS_SWAP_CHAIN = 1 << 3;
+        /// `system_memory` still holds what the allocator handed out.
+        ///
+        /// Set at creation for a system-memory surface the create did not fill.
+        /// D3D9 hands such a surface out zeroed, so its first exposure, a
+        /// lock, a device context or a read as an `UpdateSurface` source,
+        /// zeroes the bytes and clears the flag; a read back into the surface
+        /// writes every byte and clears it without the memset.
+        const SYSTEM_MEMORY_UNWRITTEN = 1 << 4;
     }
 }
 
@@ -3031,6 +3057,7 @@ fn systemmem_lock_rect(
     if let Err(hr) = inner.try_begin_lock() {
         return hr;
     }
+    inner.expose_system_memory();
     let full_w = inner.standalone_width;
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         return D3DERR_INVALIDCALL;
@@ -3490,6 +3517,45 @@ impl SurfaceInner {
                 != 0
     }
 
+    /// Zero a system-memory surface's backing at its first exposure.
+    ///
+    /// A no-op once the backing has been exposed or written whole, and for
+    /// every surface without system memory (see
+    /// [`SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN`]).
+    fn expose_system_memory(&mut self) {
+        if !self.flags.contains(SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN) {
+            return;
+        }
+        self.flags.remove(SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN);
+        if let Some(page) = self.system_memory.as_mut() {
+            page.zero_logical();
+        }
+    }
+
+    /// Record that a read back wrote every row of a system-memory surface's backing.
+    ///
+    /// The read back writes each row's pixels and not the padding up to the
+    /// lock pitch, so a backing that had not been exposed yet gets only that
+    /// padding zeroed rather than the whole surface.
+    fn readback_overwrote_system_memory(&mut self) {
+        if !self.flags.contains(SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN) {
+            return;
+        }
+        self.flags.remove(SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN);
+        let Some(fmt) = mtld3d_core::format::map_d3d_format(self.standalone_format) else {
+            return;
+        };
+        let bpp = fmt.bytes_per_pixel();
+        let row_bytes = (self.standalone_width as usize).saturating_mul(bpp as usize);
+        let pitch = mtld3d_core::format::linear_row_pitch(self.standalone_width, bpp) as usize;
+        let rows = self.standalone_height as usize;
+        if let Some(page) = self.system_memory.as_mut()
+            && bpp != 0
+        {
+            page.zero_row_padding(rows, row_bytes, pitch);
+        }
+    }
+
     /// True for a lockable standalone render target.
     ///
     /// `CreateRenderTarget` with `Lockable == TRUE`: a standalone colour
@@ -3718,6 +3784,7 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     if !refill_dc_texture_level(inner) {
         return D3DERR_INVALIDCALL;
     }
+    inner.expose_system_memory();
     let Some(px) = inner.dc_pixels() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "IDirect3DSurface9::GetDC on a surface with no host pixel store → INVALIDCALL");

@@ -4180,16 +4180,22 @@ const fn create_kind_key(kind: &mtld3d_core::extended::CreateKind) -> u64 {
     }
 }
 
-/// Copy an extended create's user memory into the level that backs it.
+/// Copy an extended create's user memory, when it names some, into the level that backs it.
 ///
 /// `rows` is the level's packed extent and `pitch` the row pitch of `level`.
-/// A level too small for the rows is left as it was, warned once.
+/// The copy zeroes each row's padding past the pixels. A level too small for
+/// the rows is zeroed whole instead, warned once, so it reads as a level the
+/// application has not written. Returns whether the level was filled, which
+/// is false, touching nothing, for a create that names no user memory.
 fn copy_user_memory(
-    memory: NonNull<u8>,
+    memory: Option<NonNull<u8>>,
     rows: &mtld3d_core::extended::PackedRows,
     level: &mut [u8],
     pitch: usize,
-) {
+) -> bool {
+    let Some(memory) = memory else {
+        return false;
+    };
     // SAFETY: an extended device's user-memory contract: the application's
     // pointer covers the level's tightly packed rows, which `rows` sizes from
     // the create's own extent and format, and it stays valid for the create.
@@ -4198,9 +4204,11 @@ fn copy_user_memory(
     if !mtld3d_core::extended::copy_packed_rows(src, rows, level, pitch) {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
             "user memory: {} rows of {} bytes do not fit a level of pitch {pitch} and {} bytes; \
-             the level starts uninitialised",
+             the level starts zeroed",
             rows.rows, rows.row_bytes, level.len());
+        level.fill(0);
     }
+    true
 }
 
 /// Hold the device's API lock for the thunk; a no-op unless the app asked for `MULTITHREADED`.
@@ -6685,10 +6693,12 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // Allocate per-mip staging buffers as independent page-aligned
     // heap blocks. Each becomes an `Arc<PageBox>` inside `TextureInner`
     // so the upload operation can hand the encoder thread a refcount bump
-    // (no memcpy) at `UnlockRect` time. Contents are uninitialized —
-    // the blit upload only copies the dirty sub-rect the game writes,
-    // and a draw that references a never-Locked MTLTexture samples
-    // Metal-zeroed texture memory (independent of the staging PageBox).
+    // (no memcpy) at `UnlockRect` time. Contents are uninitialised: a
+    // pooled box carries a released resource's bytes. The texture marks
+    // the staging of a pool whose system-memory copy D3D9 hands out zeroed
+    // as unwritten, and zeroes each level at its first exposure, so a lock
+    // or an upload reads zero where the game wrote nothing. A level no
+    // upload reaches samples whatever the device gave the `MTLTexture`.
     // Page alignment satisfies `newBufferWithBytesNoCopy:`'s contract
     // on non-UMA Macs (Intel/AMD). Each level pops a parked box of its
     // padded size from the page-box pool before it falls back to the
@@ -6739,16 +6749,16 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     }
     // An extended device's single-level system-memory texture starts with the
     // application's pixels, packed row after row, copied into the level once.
-    if let Some(memory) = user_memory {
-        let rows = mtld3d_core::extended::PackedRows::of_level(
-            width,
-            height,
-            fmt.bytes_per_pixel(),
-            (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
-        );
-        let pitch = usize::try_from(mip_bytes_per_row[0]).expect("a row pitch fits usize");
-        copy_user_memory(memory, &rows, staging[0].as_mut_slice(), pitch);
-    }
+    // Every other texture's staging is as the allocator handed it out.
+    let rows = mtld3d_core::extended::PackedRows::of_level(
+        width,
+        height,
+        fmt.bytes_per_pixel(),
+        (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
+    );
+    let pitch = usize::try_from(mip_bytes_per_row[0]).expect("a row pitch fits usize");
+    let filled = copy_user_memory(user_memory, &rows, staging[0].as_mut_slice(), pitch);
+    let staging_unwritten = !filled && mtld3d_core::pool::system_copy_starts_zeroed(pool);
 
     obj.inner()
         .perf_mut()
@@ -6783,6 +6793,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         block_h: fmt.block_height(),
         block_bytes: fmt.block_bytes(),
         staging,
+        staging_unwritten,
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -7069,6 +7080,8 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         block_h: 1,
         block_bytes: bytes_per_pixel,
         staging,
+        // Allocated zeroed above, and only for a dynamic depth texture.
+        staging_unwritten: false,
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -7269,6 +7282,7 @@ extern "system" fn device_create_volume_texture(
         block_h: fmt.block_height(),
         block_bytes: fmt.block_bytes(),
         staging,
+        staging_unwritten: mtld3d_core::pool::system_copy_starts_zeroed(pool),
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -7489,6 +7503,7 @@ extern "system" fn device_create_cube_texture(
         block_h: fmt.block_height(),
         block_bytes: fmt.block_bytes(),
         staging,
+        staging_unwritten: mtld3d_core::pool::system_copy_starts_zeroed(pool),
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -8183,6 +8198,11 @@ fn copy_systemmem_to_default(
         );
         return D3DERR_INVALIDCALL;
     }
+    // The copy reads the source's staging, which is the first exposure of a
+    // level the application never locked; it reads as zero.
+    // SAFETY: `src_parent` is a live texture distinct from `dst_parent`, and
+    // no other borrow of its inner is live across this call.
+    unsafe { (*src_parent).inner_mut() }.expose_all_staging();
     // SAFETY: re-borrow of the immutable src inner via a raw pointer; the
     // allocation is distinct from the dst inner (src_parent != dst_parent).
     let src_inner = unsafe { &*core::ptr::from_ref(src_tex.inner()) };
@@ -8468,11 +8488,22 @@ fn update_surface_into_color_target(
         }
     } else {
         // SAFETY: a non-null parent is the live `Direct3DTexture9` the source
-        // surface holds a reference on.
-        let tex = unsafe { &*src_parent };
-        if tex.d3d_pool() != D3DPOOL_SYSTEMMEM {
+        // surface holds a reference on; the shared borrow ends with the call.
+        if unsafe { (*src_parent).d3d_pool() } != D3DPOOL_SYSTEMMEM {
             return reject(4, "the source is not D3DPOOL_SYSTEMMEM");
         }
+        // The read is the level's exposure: a level the application never
+        // locked reads as zero.
+        // SAFETY: `src_parent` is the live source texture, and no borrow of
+        // the wrapper or its inner is live here: the exclusive one ends with
+        // the call, before `tex` below is derived.
+        unsafe { (*src_parent).inner_mut() }.expose_staging(
+            src_surf.cube_face().unwrap_or(0),
+            src_surf.mip_level() as usize,
+        );
+        // SAFETY: as above; the exclusive borrow has ended, and this shared
+        // one lives until the image is copied out below.
+        let tex = unsafe { &*src_parent };
         let Some(image) = tex
             .inner()
             .surface_source_image(src_surf.cube_face(), src_surf.mip_level() as usize)
@@ -10317,23 +10348,29 @@ extern "system" fn device_create_offscreen_plain_surface(
         return refuse_unallocatable_staging("CreateOffscreenPlainSurface", surface);
     };
     // An extended device's system-memory surface starts with the
-    // application's packed pixels, copied once at the lock pitch.
-    if let Some(memory) = user_memory {
-        let rows = mtld3d_core::extended::PackedRows::of_level(
-            width,
-            height,
-            bpp,
-            (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
-        );
-        let pitch = if bpp == 0 {
-            rows.row_bytes
-        } else {
-            linear_row_pitch(width, bpp) as usize
-        };
-        copy_user_memory(memory, &rows, backing.as_mut_slice(), pitch);
-    }
-    let surf =
-        Direct3DSurface9::new_system_memory(obj.inner_ptr(), width, height, format, pool, backing);
+    // application's packed pixels, copied once at the lock pitch. Every other
+    // surface's backing is as the allocator handed it out, zeroed at its
+    // first exposure.
+    let rows = mtld3d_core::extended::PackedRows::of_level(
+        width,
+        height,
+        bpp,
+        (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
+    );
+    let pitch = if bpp == 0 {
+        rows.row_bytes
+    } else {
+        linear_row_pitch(width, bpp) as usize
+    };
+    let unwritten = !copy_user_memory(user_memory, &rows, backing.as_mut_slice(), pitch);
+    let surf = Direct3DSurface9::new_system_memory(
+        obj.inner_ptr(),
+        (width, height),
+        format,
+        pool,
+        backing,
+        unwritten,
+    );
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live system-memory surface at
     // refcount 1.
