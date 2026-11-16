@@ -394,6 +394,7 @@ pub struct SystemCursor {
 }
 
 impl SystemCursor {
+    /// The system cursor of a device on `hwnd`, with no image yet.
     pub const fn new(hwnd: *mut c_void) -> Self {
         Self {
             hwnd,

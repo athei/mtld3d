@@ -198,6 +198,7 @@ pub struct CursorState {
 }
 
 impl CursorState {
+    /// The cursor of a device on `hwnd`: hidden, with no cursor set.
     pub fn new(
         hwnd: *mut c_void,
         scale: u32,
