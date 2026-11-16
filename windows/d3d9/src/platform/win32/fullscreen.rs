@@ -191,14 +191,13 @@ const DPI_AWARENESS_UNAWARE: i32 = 0;
 /// end is a bug this cap turns into a truncated list rather than a hang.
 const MAX_ENUMERATED_MODES: u32 = 4096;
 
-impl DisplayModeInfo {
-    const fn from_devmode(dm: &DevModeW) -> Self {
-        Self {
-            width: dm.pels_width,
-            height: dm.pels_height,
-            refresh_hz: dm.display_frequency,
-            bits_per_pel: dm.bits_per_pel,
-        }
+/// The display mode a `DEVMODEW` describes.
+const fn display_mode_from_devmode(dm: &DevModeW) -> DisplayModeInfo {
+    DisplayModeInfo {
+        width: dm.pels_width,
+        height: dm.pels_height,
+        refresh_hz: dm.display_frequency,
+        bits_per_pel: dm.bits_per_pel,
     }
 }
 
@@ -243,7 +242,7 @@ fn query_display_mode(mode_num: u32) -> Option<DisplayModeInfo> {
         );
         return None;
     }
-    Some(DisplayModeInfo::from_devmode(&dm))
+    Some(display_mode_from_devmode(&dm))
 }
 
 /// The primary display's current mode in the Win32 coordinate space.
@@ -271,7 +270,7 @@ pub fn enumerate_display_modes() -> Vec<DisplayModeInfo> {
         if !enum_display_settings(mode_num, &mut dm) {
             return modes;
         }
-        modes.push(DisplayModeInfo::from_devmode(&dm));
+        modes.push(display_mode_from_devmode(&dm));
     }
     warn!(
         target: LOG_TARGET,
