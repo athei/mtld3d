@@ -618,6 +618,9 @@ impl CursorState {
                 );
                 return None;
             };
+            // The cursor counts as set from here: an `UnlockRect` that reenters
+            // `ShowCursor` before `realize_bitmap` sees it set.
+            self.flags.insert(CursorFlags::SET);
             let outcome = if hash == prev_hash {
                 "unchanged"
             } else if self.uploaded.contains(&hash) {
@@ -999,8 +1002,10 @@ bitflags::bitflags! {
     struct CursorFlags: u8 {
         /// Game-requested visibility (ShowCursor / ShowCursor toggles).
         const VISIBLE = 1 << 0;
-        /// A `SetCursorProperties` was accepted, and no release destroyed its image since.
+        /// A cursor image is set, and no release destroyed it since.
         ///
+        /// Set once `SetCursorProperties` holds an image: the software blank
+        /// as soon as it is built, a hardware bitmap once realized.
         /// `ShowCursor` changes the visibility only while it is set, and the
         /// overlay shows a cursor only then.
         const SET = 1 << 1;
