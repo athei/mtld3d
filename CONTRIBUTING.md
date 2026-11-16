@@ -571,11 +571,12 @@ Each of these rots silently when it is left for later:
   the `mtld3d.conf` sample with the default and a short why.
 - A new built-in app profile ships with the rationale for every key it sets as
   the comment on its entry in `windows/core/src/app_profile.rs` and a test that
-  resolves it from the version strings the shipped binary actually carries.
+  resolves it from the version strings the shipped binary actually carries,
+  or from its Steam app id when the binary carries no version resource.
   `docs/GAMES.md` names a game's profile in its row; the settings and
   reasons stay in `app_profile.rs`.
-  A profile that pins no version field is not a profile, it is a name collision
-  waiting to happen.
+  A profile that pins neither a version field nor a Steam app id is not a
+  profile, it is a name collision waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
   (`scripts/audit.sh --update-derives`).
 

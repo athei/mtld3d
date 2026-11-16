@@ -111,7 +111,8 @@ Each option is resolved from four layers. A later layer wins, key by key:
 4. `MTLD3D_CONFIG`.
 
 A profile matches on the executable name plus the version resource its
-vendor linked in, and the log names the profile that matched. The
+vendor linked in, or the Steam app id for an executable that carries no
+version resource, and the log names the profile that matched. The
 [sample `mtld3d.conf`](mtld3d.conf) documents every option, its default and
 why it exists. [`app_profile.rs`](windows/core/src/app_profile.rs) lists the
 profiles and the reason for each setting they make.
