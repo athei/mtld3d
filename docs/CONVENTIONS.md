@@ -67,7 +67,7 @@ The Makefile enforces the C/C++ half after the build. Every production install l
 
 ## Every device entry point holds the API lock
 
-A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `device/extended.rs` (the `IDirect3DDevice9Ex` entry points), `device/cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
+A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `device/extended.rs` (the `IDirect3DDevice9Ex` entry points), `device/cursor.rs`, `platform/win32/cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
 
 ## The PE side waits for its threads, it never joins them
 
@@ -314,7 +314,7 @@ Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (
 
 - **`CachedComPtr<T: ComUnknown, K: Ownership>`**: owning cached pointer with RAII refcount. `unsafe fn adopt(p)` takes a device-internal reference and `Drop` gives it back, so the application's public refcount never counts it. Use for every reference the device keeps on an external D3D9 COM object: `K = Bound` for bindings (bound RT/DS/VB/IB, textures, shaders, declaration), `K = Captured` for the objects a state block captures or records, which also keeps a `D3DPOOL_DEFAULT` object outstanding for `Reset`. Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
 
-Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
+Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `platform/win32/cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
 
 ### An application's pointer promises no alignment
 
