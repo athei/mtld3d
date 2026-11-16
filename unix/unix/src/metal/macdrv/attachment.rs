@@ -7,7 +7,8 @@
 //! Everything the display decides for that window lives on the record:
 //! whether the layer carries the HDR configuration, the live EDR headroom,
 //! the present throttle, the window's occlusion, the backing scale published
-//! to the PE side and the present-geometry streak. Several devices attached
+//! to the PE side, the screen's panel size and frame that cap the drawable,
+//! and the present-geometry streak. Several devices attached
 //! at once each own their record, and one device's teardown touches only its
 //! own.
 //!
@@ -42,7 +43,10 @@ use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
-use crate::metal::command::{GeometryStreak, PresentGeometry};
+use crate::metal::{
+    command::{GeometryStreak, PresentGeometry},
+    layer::ScreenPixels,
+};
 
 /// How many presents may pass between headroom refreshes.
 ///
@@ -249,6 +253,23 @@ pub struct Attachment {
     current_backing_scale: AtomicU32,
     /// Consecutive presents at one geometry; gates the `MetalFX` route.
     present_streak: GeometryStreak,
+    /// The panel size and frame of the screen under the window, as `ScreenPixels::pack`.
+    ///
+    /// Written by the main-thread refresh, read by the presenter before it
+    /// sizes the drawable. One word, so a window moving between screens
+    /// never hands the presenter one screen's panel beside another's frame.
+    screen_pixels: AtomicU64,
+    /// The `CGDirectDisplayID` whose panel size `screen_pixels` holds, `0` = none looked up.
+    ///
+    /// The panel lookup walks every display mode, so it runs only when the
+    /// window's display changes, or after a display reconfiguration forgets
+    /// it. Main thread only.
+    panel_display: AtomicU32,
+    /// Whether the presenter last sized the drawable below the layer's own size.
+    ///
+    /// Written and read by the presenter alone, to log the cap once when it
+    /// starts and once when it stops.
+    drawable_capped: AtomicBool,
     /// Whether the present pass applies this layer's gamma ramp.
     ///
     /// The ramp's 256 entries live in `metal::gamma`, which owns them for as
@@ -287,6 +308,9 @@ impl Attachment {
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
+            screen_pixels: AtomicU64::new(0),
+            panel_display: AtomicU32::new(0),
+            drawable_capped: AtomicBool::new(false),
             gamma_active: AtomicBool::new(false),
         }
     }
@@ -364,6 +388,34 @@ impl Attachment {
     #[must_use]
     pub const fn color_space(&self) -> ColorSpacePolicy {
         self.color_space
+    }
+
+    /// The panel size and frame of the screen under the window, as last published.
+    #[must_use]
+    pub fn screen_pixels(&self) -> ScreenPixels {
+        ScreenPixels::unpack(self.screen_pixels.load(Ordering::Relaxed))
+    }
+
+    /// Publish the screen's sizes; answers whether they changed. **Main thread.**
+    pub fn set_screen_pixels(&self, pixels: &ScreenPixels) -> bool {
+        let packed = pixels.pack();
+        self.screen_pixels.swap(packed, Ordering::Relaxed) != packed
+    }
+
+    /// The display whose panel size is published, `0` = none. **Main thread.**
+    #[must_use]
+    pub fn panel_display(&self) -> u32 {
+        self.panel_display.load(Ordering::Relaxed)
+    }
+
+    /// Record the display whose panel size is published, `0` to look it up again. **Main thread.**
+    pub fn set_panel_display(&self, display: u32) {
+        self.panel_display.store(display, Ordering::Relaxed);
+    }
+
+    /// Note whether the drawable is now capped; answers whether that changed. **Presenter.**
+    pub fn note_drawable_capped(&self, capped: bool) -> bool {
+        self.drawable_capped.swap(capped, Ordering::Relaxed) != capped
     }
 
     /// The raw `NSWindow*` the occlusion observer matches, `0` = none.
