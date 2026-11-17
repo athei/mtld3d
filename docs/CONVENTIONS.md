@@ -28,7 +28,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
 | In an `extern "system" fn` under `windows/d3d9/src`, a pointer parameter turned into a reference, read or written through `*p`, `p.read()` or `p.write()`, or made a typed slice = 0, and `InPtr` / `InPtrMut` over a `D3D*`, `Guid` or `LUID` type = 0 | §An application's pointer promises no alignment |
-| Under `windows/d3d9/src`, outside `platform.rs` and `platform/`: an `unsafe extern` block, `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or `target_os` = 0 | §Win32 stays behind `platform.rs` |
+| Under `windows/d3d9/src`, outside `platform.rs` and `platform/`: an `unsafe extern` block, `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key = 0 | §Win32 stays behind `platform.rs` |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -103,7 +103,7 @@ Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;
 
 ## Win32 stays behind `platform.rs`
 
-`d3d9` reaches the system it runs on through `windows/d3d9/src/platform.rs`. The Win32 implementation lives under `platform/`. Win32 imports stay in `platform.rs` and `platform/`. So do the cfgs that tell the Win32 build from a native one. Every other file of the crate is shared by both builds. `make audit` fails on an `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or `target_os` anywhere else in `windows/d3d9/src`.
+`d3d9` reaches the system it runs on through `windows/d3d9/src/platform.rs`. The Win32 implementation lives under `platform/`. Win32 imports stay in `platform.rs` and `platform/`. So do the cfgs that tell the Win32 build from a native one. Every other file of the crate is shared by both builds. `make audit` fails on an `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key anywhere else in `windows/d3d9/src`.
 
 ## End every edit cycle with `make fmt` + `make install`
 

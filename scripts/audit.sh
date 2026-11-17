@@ -267,8 +267,9 @@ app_pointer_derefs() {
 
 # A Win32 import or a platform cfg outside `platform.rs` and `platform/`: an
 # `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or
-# `cfg_attr` that names `windows`, `unix` or `target_os`. A cfg is read up to
-# its closing parenthesis, which may be lines later. Comment lines are skipped.
+# `cfg_attr` that names `windows`, `unix` or a `target_*` key. A cfg is read up
+# to its closing parenthesis, which may be lines later. One still open at the
+# end of its file is a finding. Comment lines are skipped.
 platform_split() {
     awk '
         function depth(s,   t, o, c) {
@@ -287,7 +288,7 @@ platform_split() {
             return s
         }
         function names_platform(s) {
-            return closed(s) ~ /(^|[^A-Za-z0-9_])(windows|unix|target_os)([^A-Za-z0-9_]|$)/
+            return closed(s) ~ /(^|[^A-Za-z0-9_])(windows|unix|target_[a-z0-9_]+)([^A-Za-z0-9_]|$)/
         }
         function finding(line, what) {
             printf "%s:%d: %s in %s\n", FILENAME, line, what, text
@@ -297,12 +298,18 @@ platform_split() {
             while (match(s, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
                 cfg = substr(s, RSTART)
                 start = FNR
-                if (depth(closed(cfg)) != 0) { nest = 1; return }
+                if (depth(closed(cfg)) != 0) { nest = 1; open_file = FILENAME; open_text = $0; return }
                 if (names_platform(cfg)) finding(start, "platform cfg")
                 s = substr(cfg, length(closed(cfg)) + 1)
             }
         }
-        FNR == 1 { nest = 0 }
+        # A cfg the scan never closed hides every line after it.
+        function unclosed() {
+            if (nest > 0) printf "%s:%d: cfg never closed in %s\n", open_file, start, open_text
+            nest = 0
+        }
+        FNR == 1 { unclosed() }
+        END { unclosed() }
         /^[ \t]*\/\// { next }
         nest > 0 {
             cfg = cfg " " $0
