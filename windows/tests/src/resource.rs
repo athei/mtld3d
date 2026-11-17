@@ -2480,6 +2480,16 @@ impl BufferLock<'_> {
         out
     }
 
+    /// The pointer `Lock` returned.
+    ///
+    /// It outlives the guard only while the layer keeps the buffer's CPU copy
+    /// after `Unlock`, as `buffer.drawTimeUpload` makes it do; a write through
+    /// it after `Unlock` is otherwise a write into freed memory.
+    #[must_use]
+    pub const fn mapped(&self) -> *mut u8 {
+        self.bits.cast()
+    }
+
     /// Unlock now and return the `Unlock` hr, which the drop would discard.
     #[must_use]
     pub fn unlock(self) -> i32 {

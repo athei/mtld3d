@@ -42,6 +42,7 @@ fn defaults_match_documented_values() {
     assert!(!d.query_flush_immediate);
     assert!(!d.query_event_immediate);
     assert!(!d.buffer_ignore_lock_bounds);
+    assert!(!d.buffer_draw_time_upload);
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     assert_eq!(d.present_max_fps, 0);
@@ -263,6 +264,24 @@ fn buffer_ignore_lock_bounds_defaults_off_and_round_trips() {
     assert!(cfg.buffer_ignore_lock_bounds);
     let cfg = parse(None, "buffer.ignoreLockBounds = false\n", None);
     assert!(!cfg.buffer_ignore_lock_bounds);
+}
+
+#[test]
+fn buffer_draw_time_upload_defaults_off_and_round_trips() {
+    let cfg = parse(None, "", None);
+    assert!(!cfg.buffer_draw_time_upload);
+    let cfg = parse(None, "buffer.drawTimeUpload = true\n", None);
+    assert!(cfg.buffer_draw_time_upload);
+    assert!(
+        !cfg.buffer_ignore_lock_bounds,
+        "the two buffer keys are independent"
+    );
+    let cfg = parse(
+        None,
+        "buffer.drawTimeUpload = true\n",
+        Some("buffer.drawTimeUpload=false"),
+    );
+    assert!(!cfg.buffer_draw_time_upload);
 }
 
 #[test]

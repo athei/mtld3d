@@ -7588,6 +7588,7 @@ extern "system" fn device_create_vertex_buffer(
         usage,
         fvf,
         pool,
+        draw_time_upload: dev.config().buffer_draw_time_upload,
     }) else {
         return refuse_unallocatable_staging("CreateVertexBuffer", vb);
     };
@@ -7686,6 +7687,7 @@ extern "system" fn device_create_index_buffer(
         usage,
         format,
         pool,
+        draw_time_upload: dev.config().buffer_draw_time_upload,
     }) else {
         return refuse_unallocatable_staging("CreateIndexBuffer", ib);
     };
@@ -12447,9 +12449,7 @@ extern "system" fn device_draw_primitive(
         std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     }
-    // Flush any bound buffer that's drawn while still mapped, before the draw
-    // snapshot reads it.
-    flush_mapped_bound_buffers(obj.inner());
+    flush_bound_buffers_before_draw(obj.inner());
     if let Err(hr) = obj.inner().latched_encoder_status() {
         std::hint::cold_path();
         return hr;
@@ -12525,9 +12525,7 @@ fn draw_bound_triangle_fan(
     index_source: IndexSource,
     no_vertex_buffer_hr: i32,
 ) -> i32 {
-    // Flush any bound buffer that's drawn while still mapped, before the draw
-    // snapshot reads it.
-    flush_mapped_bound_buffers(obj.inner());
+    flush_bound_buffers_before_draw(obj.inner());
     if let Err(hr) = obj.inner().known_encoder_status() {
         return hr;
     }
@@ -12576,7 +12574,7 @@ fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer
     let inner = unsafe { &mut *ib }.inner_mut();
     // A fan can be drawn before Unlock. Its readback must follow the mapped
     // range's upload, just as it follows every already-queued Unlock upload.
-    inner.flush_staged_if_mapped(dev);
+    inner.flush_staged_before_draw(dev);
     // A whole-buffer mapped write already completes the CPU mirror.
     if !inner.backing_needs_readback() {
         return true;
@@ -12735,9 +12733,7 @@ extern "system" fn device_draw_indexed_primitive(
         return D3DERR_INVALIDCALL;
     }
 
-    // Flush any bound buffer that's drawn while still mapped, before the draw
-    // snapshot reads it.
-    flush_mapped_bound_buffers(obj.inner());
+    flush_bound_buffers_before_draw(obj.inner());
     if let Err(hr) = obj.inner().latched_encoder_status() {
         std::hint::cold_path();
         return hr;
@@ -12783,17 +12779,18 @@ extern "system" fn device_draw_indexed_primitive(
     result.map_or_else(|error| obj.inner().capture_failure(error), |()| D3D_OK)
 }
 
-/// Upload any still-mapped `Staged` VB/IB dirty span before a draw reads it.
+/// Upload the bound `Staged` VB/IB dirty spans a draw reads, before its snapshot.
 ///
 /// A buffer drawn while locked never reached `Unlock`'s upload, so its latest
 /// CPU writes are flushed here. The lock stays open and `dirty` stays set, so
-/// `Unlock` still flushes afterwards.
+/// `Unlock` still flushes afterwards. Under `buffer.drawTimeUpload` `Unlock`
+/// uploads nothing, and an unlocked buffer's writes are flushed here instead.
 ///
 /// Only the streams the bound declaration reads are visited, the same set
 /// [`snapshot_bound_streams`] captures: a buffer bound to a stream the draw
 /// does not read is not read by it either.
 #[inline]
-fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
+fn flush_bound_buffers_before_draw(dev: &mut DeviceInner) {
     let mut mask = declared_stream_mask(dev);
     while mask != 0 {
         let stream = mask.trailing_zeros() as usize;
@@ -12801,13 +12798,13 @@ fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
         let vb = dev.bound_buffers().stream_vertex_buffer(stream);
         if !vb.is_null() {
             // SAFETY: a bound vertex buffer is a live wrapper while bound.
-            unsafe { (*vb).inner_mut() }.flush_staged_if_mapped(dev);
+            unsafe { (*vb).inner_mut() }.flush_staged_before_draw(dev);
         }
     }
     let ib = dev.bound_buffers().index_buffer();
     if !ib.is_null() {
         // SAFETY: a bound index buffer is a live wrapper while bound.
-        unsafe { (*ib).inner_mut() }.flush_staged_if_mapped(dev);
+        unsafe { (*ib).inner_mut() }.flush_staged_before_draw(dev);
     }
 }
 

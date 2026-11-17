@@ -40,6 +40,7 @@ impl WireValue for Mtld3dConfig {
         self.query_event_immediate.write_wire(writer)?;
         self.depth_alias_same_size.write_wire(writer)?;
         self.buffer_ignore_lock_bounds.write_wire(writer)?;
+        self.buffer_draw_time_upload.write_wire(writer)?;
         self.vbib_retention_cap_bytes.write_wire(writer)?;
         self.vram_budget_cap_bytes.write_wire(writer)?;
         self.pagebox_pool_cap_bytes.write_wire(writer)?;
@@ -77,6 +78,7 @@ impl WireValue for Mtld3dConfig {
             query_event_immediate: <bool>::read_wire(reader)?,
             depth_alias_same_size: <bool>::read_wire(reader)?,
             buffer_ignore_lock_bounds: <bool>::read_wire(reader)?,
+            buffer_draw_time_upload: <bool>::read_wire(reader)?,
             vbib_retention_cap_bytes: <u64>::read_wire(reader)?,
             vram_budget_cap_bytes: <u64>::read_wire(reader)?,
             pagebox_pool_cap_bytes: <u64>::read_wire(reader)?,

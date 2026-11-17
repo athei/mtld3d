@@ -236,6 +236,17 @@ pub struct Mtld3dConfig {
     /// retention against `memory.vbibRetentionCapMB`.
     /// File key: `buffer.ignoreLockBounds`.
     pub buffer_ignore_lock_bounds: bool,
+    /// Upload a static VB/IB's written bytes at the draw that reads them, not at `Unlock`.
+    ///
+    /// A per-game quirk for a title that keeps writing through a `Lock`
+    /// pointer after `Unlock`, which D3D9 leaves undefined. With it on, a
+    /// `Staged` buffer keeps its CPU copy for its whole life, `Unlock`
+    /// uploads nothing, and each draw uploads what was written since the
+    /// last upload, so the writes made between `Unlock` and that draw reach
+    /// the GPU and the late writes land in memory the buffer still owns.
+    /// Writes after that draw wait for the next `Lock`. Default: `false`.
+    /// File key: `buffer.drawTimeUpload`.
+    pub buffer_draw_time_upload: bool,
     /// Proactive cap on live VB/IB retained-`PageBox` bytes.
     ///
     /// When live retention reaches this, the capped alloc path (a Lock
@@ -414,6 +425,7 @@ impl Default for Mtld3dConfig {
             query_event_immediate: false,
             depth_alias_same_size: false,
             buffer_ignore_lock_bounds: false,
+            buffer_draw_time_upload: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             // The 32-bit address space is the ceiling that matters, not the
             // GPU's memory: a unified-memory Mac has far more than a D3D9
@@ -593,6 +605,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: buffer.drawTimeUpload = {}", cfg.buffer_draw_time_upload
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: memory.vbibRetentionCapMB = {}",
         cfg.vbib_retention_cap_bytes / (1024 * 1024)
     );
@@ -697,6 +713,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "buffer.ignoreLockBounds" => {
             assign_bool(source, key, value, &mut cfg.buffer_ignore_lock_bounds);
+        }
+        "buffer.drawTimeUpload" => {
+            assign_bool(source, key, value, &mut cfg.buffer_draw_time_upload);
         }
         "memory.vbibRetentionCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);

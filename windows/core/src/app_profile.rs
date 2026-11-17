@@ -12,10 +12,13 @@
 //!
 //! A profile is keyed by the version resource the vendor linked into the image,
 //! not by a path, so it follows the game wherever it is installed and cannot
-//! catch an unrelated program that happens to share a file name.
+//! catch an unrelated program that happens to share a file name. An image that
+//! carries no version resource is keyed by the Steam app id instead, which
+//! Steam sets in the environment of every game it starts.
 //!
-//! Pure logic: the PE side supplies the executable's name and the raw
-//! `VS_VERSIONINFO` blob, so everything here is host-testable.
+//! Pure logic: the PE side supplies the executable's name, the raw
+//! `VS_VERSIONINFO` blob and the `SteamAppId` variable, so everything here is
+//! host-testable.
 
 use log::info;
 
@@ -23,9 +26,35 @@ use super::LOG_TARGET;
 
 /// The profiles mtld3d ships.
 ///
-/// Every entry pins at least one version-resource field, so a rule can never
-/// fire on a same-named program from someone else.
+/// Every entry pins at least one version-resource field, or a Steam app id for
+/// an image without a version resource, so a rule can never fire on a
+/// same-named program from someone else.
 static PROFILES: &[AppProfile] = &[
+    // Counter-Strike: Global Offensive, the legacy build.
+    //
+    // With Apple's vendor id the game stops at start-up with its CSM error,
+    // and with NVIDIA's it fails to initialise NVAPI; with AMD's it starts.
+    //
+    // Loading a map, it writes through the pointer a `Lock` of a static
+    // write-only buffer returned after it has called `Unlock`. The layer
+    // frees that buffer's CPU copy at `Unlock`, so the write lands in freed
+    // memory and the process dies. `buffer.drawTimeUpload` keeps the copy and
+    // uploads it at the draw, so the late writes reach the GPU too.
+    //
+    // `csgo.exe` carries no version resource, so the entry is pinned on the
+    // Steam app id. The legacy build is its own app, 4465480, and the
+    // `steam_appid.txt` it ships names 730, so either id can reach the game.
+    // 730 is also Counter-Strike 2's app, whose executable is `cs2.exe`,
+    // which the name pin leaves out.
+    AppProfile {
+        name: "csgo",
+        exes: &["csgo.exe"],
+        company: None,
+        product: None,
+        original_filename: None,
+        steam_apps: &[4_465_480, 730],
+        settings: "adapter.spoof=amd;buffer.drawTimeUpload=true",
+    },
     // Fallout 3.
     //
     // Its renderer turns "3.0 Lighting" on only for an adapter whose `Driver`
@@ -57,6 +86,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Bethesda Softworks"),
         product: Some("Fallout 3"),
         original_filename: None,
+        steam_apps: &[],
         settings: "adapter.spoof=nvidia",
     },
     // Fallout: New Vegas.
@@ -71,6 +101,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Bethesda Softworks"),
         product: Some("New Vegas"),
         original_filename: None,
+        steam_apps: &[],
         settings: "adapter.spoof=nvidia",
     },
     // Grand Theft Auto IV.
@@ -92,6 +123,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Rockstar Games"),
         product: Some("Grand Theft Auto IV"),
         original_filename: None,
+        steam_apps: &[],
         settings: "adapter.spoof=amd;caps.dfFormats=false;depth.aliasSameSize=true",
     },
     // Halo 2.
@@ -106,6 +138,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Microsoft Corporation"),
         product: Some("Halo 2 for Windows Vista"),
         original_filename: Some("Halo2.exe"),
+        steam_apps: &[],
         settings: "buffer.ignoreLockBounds=true",
     },
     // The Elder Scrolls IV: Oblivion.
@@ -131,6 +164,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Bethesda Softworks"),
         product: Some("TES4: Oblivion"),
         original_filename: None,
+        steam_apps: &[],
         settings: "adapter.spoof=nvidia",
     },
     // World of Warcraft, the 1.12 and 3.3.5 clients alike.
@@ -165,6 +199,7 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Blizzard Entertainment"),
         product: Some("World of Warcraft"),
         original_filename: None,
+        steam_apps: &[],
         settings: "query.flushImmediate=true;query.eventImmediate=true;display.maxResolutions=32",
     },
 ];
@@ -180,6 +215,8 @@ pub struct AppProfile {
     company: Option<&'static str>,
     product: Option<&'static str>,
     original_filename: Option<&'static str>,
+    /// The Steam app ids the profile accepts; empty places no constraint.
+    steam_apps: &'static [u32],
     settings: &'static str,
 }
 
@@ -201,41 +238,52 @@ impl AppProfile {
     /// The executable name has to equal one of the profile's names,
     /// case-insensitively. Each version field the profile pins is an additional
     /// case-insensitive substring test, so `Rockstar Games` also matches a
-    /// `CompanyName` of `Rockstar Games, Inc.`. The pins hold for every listed
-    /// executable alike.
+    /// `CompanyName` of `Rockstar Games, Inc.`. A profile that lists Steam app
+    /// ids also needs the process to carry one of them. The pins hold for every
+    /// listed executable alike.
     fn matches(&self, id: &AppIdentity) -> bool {
         self.exes.iter().any(|exe| id.exe.eq_ignore_ascii_case(exe))
             && field_matches(self.company, &id.company)
             && field_matches(self.product, &id.product)
             && field_matches(self.original_filename, &id.original_filename)
+            && (self.steam_apps.is_empty()
+                || id
+                    .steam_app
+                    .is_some_and(|app| self.steam_apps.contains(&app)))
     }
 }
 
 /// Who the running application is.
 ///
-/// The executable's file name, plus the three `VS_VERSIONINFO` strings a vendor
-/// sets at link time. The version strings are empty when the image carries no
-/// version resource, which leaves it matchable by name alone.
+/// The executable's file name, the three `VS_VERSIONINFO` strings a vendor
+/// sets at link time, and the Steam app id the process was started under. The
+/// version strings are empty when the image carries no version resource, which
+/// leaves it matchable by name alone.
 pub struct AppIdentity {
     exe: String,
     company: String,
     product: String,
     original_filename: String,
+    steam_app: Option<u32>,
 }
 
 impl AppIdentity {
-    /// Build an identity from the executable's name and its version resource.
+    /// Build an identity from the executable's name, version resource and Steam app id.
     ///
     /// `version_blob` is the raw `RT_VERSION` resource as UTF-16 units, or
-    /// `None` for an image that has none.
+    /// `None` for an image that has none. `steam_app_id_var` is the value of
+    /// the `SteamAppId` environment variable, or `None` when it is unset. A
+    /// value that is empty, 0, or anything but decimal digits that fit a `u32`
+    /// carries no id (`steam_app_id`).
     #[must_use]
-    pub fn new(exe: String, version_blob: Option<&[u16]>) -> Self {
+    pub fn new(exe: String, version_blob: Option<&[u16]>, steam_app_id_var: Option<&str>) -> Self {
         let runs = version_blob.map(utf16_runs).unwrap_or_default();
         Self {
             exe,
             company: value_after(&runs, "CompanyName"),
             product: value_after(&runs, "ProductName"),
             original_filename: value_after(&runs, "OriginalFilename"),
+            steam_app: steam_app_id_var.and_then(steam_app_id),
         }
     }
 }
@@ -245,20 +293,23 @@ impl AppIdentity {
 /// Logs the outcome either way: which profile took effect and the options it
 /// sets, or that none did. Both answers are the first thing to establish when a
 /// game behaves differently than its options say it should. A miss also logs
-/// the image's company and product, so a new profile can be keyed from a
-/// user's log.
+/// the image's company and product and the Steam app id, so a new profile can
+/// be keyed from a user's log.
 #[must_use]
 pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
     let profile = PROFILES.iter().find(|p| p.matches(id));
+    let steam_app = id
+        .steam_app
+        .map_or_else(|| "none".to_owned(), |app| app.to_string());
     match profile {
         Some(p) => info!(
             target: LOG_TARGET,
-            "app profile: {} matched {} ({}, {}): {}",
+            "app profile: {} matched {} ({}, {}, steam app {steam_app}): {}",
             p.name, id.exe, id.company, id.product, p.settings
         ),
         None => info!(
             target: LOG_TARGET,
-            "app profile: none for {} ({:?}, {:?})",
+            "app profile: none for {} ({:?}, {:?}, steam app {steam_app})",
             id.exe, id.company, id.product
         ),
     }
@@ -272,6 +323,17 @@ pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
 #[must_use]
 pub fn builtin(name: &str) -> Option<&'static AppProfile> {
     PROFILES.iter().find(|p| p.name == name)
+}
+
+/// The Steam app id a `SteamAppId` value names.
+///
+/// A value that is empty, 0, or anything but decimal digits that fit a `u32`
+/// is no app id: Steam's own processes carry the variable empty.
+fn steam_app_id(digits: &str) -> Option<u32> {
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|&id| id != 0)
 }
 
 /// Whether an optional substring constraint holds, case-insensitively.
