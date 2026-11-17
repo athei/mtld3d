@@ -7,7 +7,7 @@ use mtld3d_tests::{
     VolumeVertex, assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8,
     D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
@@ -621,6 +621,24 @@ fn nonzero_texels(locked: &LockedRect<'_>, width: usize, height: usize) -> usize
         .sum()
 }
 
+/// Asserts a sampled X8R8G8B8 pixel, leaving the swizzle-filled alpha lane to physical GPUs.
+///
+/// The colour lanes are the stored bytes and are compared on every device.
+/// Alpha is one only through the view swizzle that fills the X byte. The
+/// paravirtual device samples a swizzle view through the base texture's lanes,
+/// so zeroed staging samples alpha zero there; alpha is left out of the
+/// comparison on that device and required on every physical GPU.
+#[track_caller]
+fn assert_x8_pixel_eq(h: &Harness, actual: u32, expected: u32, context: &str) {
+    const COLOUR: u32 = 0x00FF_FFFF;
+    let mask = if h.device_is_paravirtual() {
+        COLOUR
+    } else {
+        u32::MAX
+    };
+    assert_pixel_eq(actual & mask, expected & mask, context);
+}
+
 /// A whole-level lock that writes part of a new managed level samples black for the rest.
 ///
 /// D3D9 backs a new managed texture's system-memory copy with zeroed memory,
@@ -647,10 +665,12 @@ fn a_partly_written_level_samples_black_where_the_lock_wrote_nothing() {
     let [written, unwritten, last_row] =
         sample_points(&h, &tex, [(320, 60), (320, 300), (320, 476)]);
     assert_pixel_eq(written, GREEN, "the rows the lock wrote");
-    assert!(
-        unwritten == BLACK && last_row == BLACK,
-        "the rows the lock left alone sample opaque black, got {unwritten:#010x} and \
-         {last_row:#010x}"
+    assert_x8_pixel_eq(&h, unwritten, BLACK, "the rows the lock left alone");
+    assert_x8_pixel_eq(
+        &h,
+        last_row,
+        BLACK,
+        "the last row, which the lock left alone",
     );
 }
 
@@ -693,7 +713,8 @@ fn add_dirty_rect_after_a_partial_lock_uploads_zero_outside_the_lock() {
     assert_eq!(tex.add_dirty_rect(), 0, "AddDirtyRect");
     let [inside, outside] = sample_points(&h, &tex, [(160, 120), (480, 360)]);
     assert_pixel_eq(inside, GREEN, "the quadrant the lock wrote");
-    assert_pixel_eq(
+    assert_x8_pixel_eq(
+        &h,
         outside,
         BLACK,
         "the quadrants the lock left alone upload as zero",
@@ -720,7 +741,8 @@ fn update_texture_from_a_partly_written_system_memory_source_copies_zero() {
     assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture");
     let [inside, outside] = sample_points(&h, &dst, [(160, 120), (480, 360)]);
     assert_pixel_eq(inside, GREEN, "the quadrant the source's lock wrote");
-    assert_pixel_eq(
+    assert_x8_pixel_eq(
+        &h,
         outside,
         BLACK,
         "the quadrants the source's lock left alone copy as zero",
@@ -742,8 +764,8 @@ fn update_texture_from_a_never_written_system_memory_source_copies_zero() {
     let dst = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
     assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture");
     let [centre, corner] = sample_points(&h, &dst, [(320, 240), (630, 470)]);
-    assert_pixel_eq(centre, BLACK, "the copied level's centre");
-    assert_pixel_eq(corner, BLACK, "the copied level's last texel");
+    assert_x8_pixel_eq(&h, centre, BLACK, "the copied level's centre");
+    assert_x8_pixel_eq(&h, corner, BLACK, "the copied level's last texel");
 }
 
 /// The first lock of a face of a new managed cube reads zero.
@@ -813,8 +835,8 @@ fn add_dirty_rect_on_a_never_locked_managed_level_uploads_zero() {
     let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
     assert_eq!(tex.add_dirty_rect(), 0, "AddDirtyRect");
     let [centre, corner] = sample_points(&h, &tex, [(320, 240), (630, 470)]);
-    assert_pixel_eq(centre, BLACK, "the published level's centre");
-    assert_pixel_eq(corner, BLACK, "the published level's last texel");
+    assert_x8_pixel_eq(&h, centre, BLACK, "the published level's centre");
+    assert_x8_pixel_eq(&h, corner, BLACK, "the published level's last texel");
 }
 
 /// `UpdateTexture` from a new system-memory cube nothing wrote copies zero into every face.
@@ -838,7 +860,8 @@ fn update_texture_from_a_never_written_system_memory_cube_copies_zero() {
     let dst = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
     assert_eq!(h.update_cube_texture_hr(&src, &dst), 0, "UpdateTexture");
     for direction_x in [1.0, -1.0] {
-        assert_pixel_eq(
+        assert_x8_pixel_eq(
+            &h,
             sample_cube_x(&h, &dst, direction_x),
             BLACK,
             &format!("the copied face toward x = {direction_x}"),
@@ -891,6 +914,9 @@ fn get_render_target_data_into_a_new_system_memory_level_leaves_its_padding_zero
     const SIZE: (u32, u32) = (33, 3100);
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
     let h = Harness::new();
+    if r5g6b5_render_target_denied(&h, SIZE) {
+        return;
+    }
     let released = {
         let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
         let mut locked = tex.lock_rect(0, 0);
@@ -922,6 +948,9 @@ fn get_render_target_data_into_a_new_system_memory_surface_leaves_its_padding_ze
     const SIZE: (u32, u32) = (33, 3100);
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
     let h = Harness::new();
+    if r5g6b5_render_target_denied(&h, SIZE) {
+        return;
+    }
     let released = {
         let surface =
             h.create_offscreen_plain_surface(SIZE.0, SIZE.1, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
@@ -945,6 +974,29 @@ fn get_render_target_data_into_a_new_system_memory_surface_leaves_its_padding_ze
         "precondition: the allocator handed the released surface's memory back"
     );
     check_read_back_padding(&locked, width, height);
+}
+
+/// Whether the device denies R5G6B5 render targets, checking that the create is rejected to match.
+///
+/// A device without Metal's packed 16-bit pixel formats does not advertise
+/// them as render targets and rejects the create, which leaves nothing to read
+/// back. That contract is pinned in `expand16`.
+fn r5g6b5_render_target_denied(h: &Harness, (width, height): (u32, u32)) -> bool {
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) == D3D_OK
+    {
+        return false;
+    }
+    assert_ne!(
+        h.create_render_target_hr(width, height, D3DFMT_R5G6B5),
+        D3D_OK,
+        "a 16-bit render target is rejected where the caps deny it"
+    );
+    true
 }
 
 /// Check a 33-texel-wide R5G6B5 read back of red: 68-byte rows, red pixels, zero padding.
