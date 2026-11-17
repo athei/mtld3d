@@ -4,21 +4,30 @@
 //! back of a released level whose GPU format is wider than its staging, an
 //! `UpdateTexture` between levels that overlap only in part, cube face locks
 //! taken through one object and released through another, `ReleaseDC` on a
-//! level that holds no device context, and creates whose system-memory copy
-//! cannot be allocated.
+//! level that holds no device context, creates whose system-memory copy
+//! cannot be allocated, and, under `buffer.drawTimeUpload`, buffer writes made
+//! through a `Lock` pointer after its `Unlock`.
 
 use mtld3d_tests::{Harness, TexturedVertex, Vertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFMT_R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_WRITEONLY,
+    D3D_OK, D3DCULL_NONE, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16,
+    D3DFMT_R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_CULLMODE, D3DRS_LIGHTING,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP,
+    D3DTEXF_POINT, D3DUSAGE_WRITEONLY,
 };
 
-use super::device::{await_logged_lines, run_in_private_log_child, running_as};
+use super::device::{
+    await_logged_lines, run_in_private_log_child, run_in_private_log_child_with, running_as,
+};
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
 const FAILED_DEVICE_CHILD_NAME: &str = "lock_lifetime_failed_device.exe";
+const LATE_VERTEX_WRITE_CHILD_NAME: &str = "lock_lifetime_late_vertex_write.exe";
+const LATE_INDEX_WRITE_CHILD_NAME: &str = "lock_lifetime_late_index_write.exe";
+const LATE_WRITE_RELOCK_CHILD_NAME: &str = "lock_lifetime_late_write_relock.exe";
+/// The configuration the late-write workloads run under.
+const DRAW_TIME_UPLOAD: &str = "buffer.drawTimeUpload=true";
 #[cfg(target_arch = "x86")]
 const OUT_OF_MEMORY_CHILD_NAME: &str = "lock_lifetime_out_of_memory.exe";
 const BLACK: u32 = 0xFF00_0000;
@@ -414,6 +423,212 @@ fn creates_whose_staging_cannot_be_allocated_answer_out_of_memory() {
         );
     });
     assert_pixel_eq(h.read_pixel(320, 280), GREEN, "the device still draws");
+}
+
+/// Copy `data` through a pointer a buffer `Lock` returned, after its `Unlock`.
+///
+/// # Safety
+/// The buffer must be alive and its layer must keep the CPU copy `mapped`
+/// points into, as `buffer.drawTimeUpload` makes it do, and the copy must
+/// hold `size_of_val(data)` bytes from `mapped` on.
+const unsafe fn write_after_unlock<T: Copy>(mapped: *mut u8, data: &[T]) {
+    // SAFETY: the caller's contract: `mapped` points at `size_of_val(data)`
+    // writable bytes of a live copy, which `data` cannot overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), mapped, size_of_val(data));
+    }
+}
+
+/// Under `buffer.drawTimeUpload` a vertex write made after `Unlock` reaches the next draw.
+///
+/// D3D9 leaves a write through the `Lock` pointer after `Unlock` undefined;
+/// a title that makes one relies on a driver that kept the memory and read it
+/// at the draw. The key keeps the CPU copy and uploads it at the draw, so the
+/// red triangle written after `Unlock` is the one drawn, not the green one
+/// `Unlock` saw. Runs in a process of its own, since without the key the
+/// write lands in memory the layer has freed.
+#[test]
+fn a_vertex_write_after_unlock_reaches_the_draw_under_draw_time_upload() {
+    if running_as(LATE_VERTEX_WRITE_CHILD_NAME) {
+        late_vertex_write_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        LATE_VERTEX_WRITE_CHILD_NAME,
+        "lock_lifetime::a_vertex_write_after_unlock_reaches_the_draw_under_draw_time_upload",
+        "warn",
+        DRAW_TIME_UPLOAD,
+    );
+}
+
+/// Write a green triangle, `Unlock`, write a red one through the kept pointer, then draw.
+fn late_vertex_write_workload() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    let mut lock = vb.lock(0, 0, 0);
+    lock.write(&solid_triangle(GREEN));
+    let mapped = lock.mapped();
+    assert_eq!(lock.unlock(), D3D_OK, "Unlock");
+    // SAFETY: `vb` is alive, the child runs under `buffer.drawTimeUpload`, and
+    // the lock covered the whole three-vertex buffer.
+    unsafe { write_after_unlock(mapped, &solid_triangle(RED)) };
+
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            0,
+            "DrawPrimitive"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 280),
+        RED,
+        "the vertices written after Unlock reach the draw",
+    );
+}
+
+/// Under `buffer.drawTimeUpload` an index write made after `Unlock` reaches the next draw.
+///
+/// The index-buffer form of the vertex case above. Indices 0-1-2 fill the
+/// left half and 0-3-2 the right, so the right triangle and an empty left
+/// half show that the indices written after `Unlock` are the ones drawn.
+#[test]
+fn an_index_write_after_unlock_reaches_the_draw_under_draw_time_upload() {
+    if running_as(LATE_INDEX_WRITE_CHILD_NAME) {
+        late_index_write_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        LATE_INDEX_WRITE_CHILD_NAME,
+        "lock_lifetime::an_index_write_after_unlock_reaches_the_draw_under_draw_time_upload",
+        "warn",
+        DRAW_TIME_UPLOAD,
+    );
+}
+
+/// Write the left triangle's indices, `Unlock`, write the right one's through the kept pointer.
+fn late_index_write_workload() {
+    let corner = |x: f32, y: f32| Vertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let verts = [
+        corner(0.0, 0.9),
+        corner(-0.9, -0.9),
+        corner(-0.05, -0.9),
+        corner(0.9, -0.9),
+    ];
+    // Well inside each triangle at y = 400 of the 640x480 back buffer.
+    let (in_left, in_right) = ((150, 400), (450, 400));
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(stride() * 4, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    let mut lock = ib.lock(0, 0, 0);
+    lock.write(&[0u16, 1, 2]);
+    let mapped = lock.mapped();
+    assert_eq!(lock.unlock(), D3D_OK, "Unlock");
+    // SAFETY: `ib` is alive, the child runs under `buffer.drawTimeUpload`, and
+    // the lock covered the whole six-byte buffer.
+    unsafe { write_after_unlock(mapped, &[0u16, 3, 2]) };
+
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "culling off"
+    );
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 1),
+            0,
+            "DrawIndexedPrimitive"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(in_right.0, in_right.1),
+        GREEN,
+        "the indices written after Unlock reach the draw",
+    );
+    assert_pixel_eq(
+        h.read_pixel(in_left.0, in_left.1),
+        BLUE,
+        "the indices Unlock saw are not the ones drawn",
+    );
+}
+
+/// Under `buffer.drawTimeUpload` a write after the first draw reaches the draw after a relock.
+///
+/// The first draw uploads what was written and the write after it waits for
+/// a `Lock`. A whole-buffer `Lock` and `Unlock` that write nothing carry it:
+/// the copy the buffer kept holds the red triangle, and the draw after the
+/// relock shows it. Without the key the relock re-creates a zeroed copy and
+/// uploads it, so the draw shows the clear colour. Runs in a process of its
+/// own for the reason the vertex case does.
+#[test]
+fn a_write_after_the_first_draw_reaches_the_draw_after_a_relock_under_draw_time_upload() {
+    if running_as(LATE_WRITE_RELOCK_CHILD_NAME) {
+        late_write_relock_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        LATE_WRITE_RELOCK_CHILD_NAME,
+        "lock_lifetime::a_write_after_the_first_draw_reaches_the_draw_after_a_relock_under_draw_time_upload",
+        "warn",
+        DRAW_TIME_UPLOAD,
+    );
+}
+
+/// Draw a buffer, write it through the kept pointer, relock it without a write, then draw again.
+fn late_write_relock_workload() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    let mut lock = vb.lock(0, 0, 0);
+    lock.write(&solid_triangle(GREEN));
+    let mapped = lock.mapped();
+    assert_eq!(lock.unlock(), D3D_OK, "Unlock");
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+    let draw = || {
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+                0,
+                "DrawPrimitive"
+            );
+        });
+    };
+    draw();
+    assert_pixel_eq(h.read_pixel(320, 280), GREEN, "the first draw");
+    // SAFETY: `vb` is alive, the child runs under `buffer.drawTimeUpload`, and
+    // the lock covered the whole three-vertex buffer.
+    unsafe { write_after_unlock(mapped, &solid_triangle(RED)) };
+
+    assert_eq!(vb.lock(0, 0, 0).unlock(), D3D_OK, "the relock's Unlock");
+    draw();
+    assert_pixel_eq(
+        h.read_pixel(320, 280),
+        RED,
+        "the write after the first draw reaches the draw after the relock",
+    );
 }
 
 /// A render target released after the device failed is destroyed with the device.

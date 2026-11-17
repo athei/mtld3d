@@ -1,8 +1,9 @@
 //! The [`Mtld3dConfig`] an `IDirect3D9` resolves at `Direct3DCreate9`.
 //!
 //! Three lookups feed it. The built-in [`AppProfile`] for this application, if
-//! it has one, comes from the executable's name plus the version resource of the
-//! image the loader mapped. The optional `mtld3d.conf` is
+//! it has one, comes from the executable's name, the version resource of the
+//! image the loader mapped and the `SteamAppId` variable of the process's
+//! Windows environment. The optional `mtld3d.conf` is
 //! `std::env::current_exe()` -> strip basename -> join `mtld3d.conf`; a missing
 //! file is fine. The `MTLD3D_CONFIG` env var, when set, beats both. See
 //! `mtld3d.conf` at the repo root for the user-facing sample with documented
@@ -65,7 +66,12 @@ fn app_profile() -> Option<&'static AppProfile> {
     let exe = std::env::current_exe().ok()?;
     let name = exe.file_name()?.to_string_lossy().into_owned();
     let blob = crate::platform::main_image_version_blob();
-    mtld3d_core::app_profile::lookup(&AppIdentity::new(name, blob.as_deref()))
+    let steam_app = std::env::var("SteamAppId").ok();
+    mtld3d_core::app_profile::lookup(&AppIdentity::new(
+        name,
+        blob.as_deref(),
+        steam_app.as_deref(),
+    ))
 }
 
 fn read_conf_file() -> Option<String> {

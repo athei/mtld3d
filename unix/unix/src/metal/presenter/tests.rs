@@ -25,6 +25,7 @@ fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
     PresentPacket {
         seq,
         source: MetalHandle::<MTLTextureKind>::NULL,
+        source_size: (640, 480),
         layer: MetalHandle::<CAMetalLayerKind>::NULL,
         slot,
         view: 0,

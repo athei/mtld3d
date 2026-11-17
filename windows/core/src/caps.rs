@@ -94,9 +94,11 @@ const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 /// ignored to match: the ramp is applied exactly as the application wrote it,
 /// with no correction for the display's own response.
 ///
-/// `CANSHARERESOURCE` stays off: a shared resource is asked for with a
-/// non-NULL `pSharedHandle`, which every create rejects with `E_NOTIMPL`
-/// because the device is not an extended one.
+/// `CANSHARERESOURCE` stays off: sharing a resource across processes is not
+/// implemented. A shared resource is asked for with a non-NULL
+/// `pSharedHandle`, which a plain device refuses with `E_NOTIMPL` and an
+/// extended device refuses on a `D3DPOOL_DEFAULT` create with
+/// `D3DERR_NOTAVAILABLE`.
 const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::DYNAMICTEXTURES)
     .union(Caps2::FULLSCREENGAMMA)

@@ -41,6 +41,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.query_event_immediate = !value.query_event_immediate;
     value.depth_alias_same_size = !value.depth_alias_same_size;
     value.buffer_ignore_lock_bounds = !value.buffer_ignore_lock_bounds;
+    value.buffer_draw_time_upload = !value.buffer_draw_time_upload;
     value.vbib_retention_cap_bytes = u64::MAX - 123;
     value.vram_budget_cap_bytes = u64::MAX - 123;
     value.pagebox_pool_cap_bytes = u64::MAX - 123;

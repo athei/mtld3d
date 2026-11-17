@@ -7,7 +7,7 @@ use mtld3d_tests::{
     VolumeVertex, assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8,
     D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
@@ -575,6 +575,445 @@ fn first_mip_upload_survives_release_before_submission() {
             "the uploaded mip survives release before native submission",
         );
     }
+}
+
+/// The colour every released level is filled with before its staging goes back to the pool.
+const RELEASED_FILL: u32 = 0xFFFF_00FF;
+
+/// Fill a whole-level lock of `width` x `height` texels with [`RELEASED_FILL`].
+///
+/// Returns the lock's address, which is where the level's staging lives.
+fn fill_whole_level(locked: &mut LockedRect<'_>, width: usize, height: usize) -> usize {
+    locked.write_u32_rect(width, height, &vec![RELEASED_FILL; width * height]);
+    locked.bits_ptr().addr()
+}
+
+/// Create a one-level X8R8G8B8 texture in `pool`, fill it, release it, return its staging address.
+///
+/// The texture is never drawn, so no upload holds its staging and the
+/// release parks the staging in the page-box pool at once, where the next
+/// create of the same size takes it back.
+fn released_filled_level(h: &Harness, (width, height): (u32, u32), pool: u32) -> usize {
+    let tex = h.create_texture(width, height, 1, 0, D3DFMT_X8R8G8B8, pool);
+    let mut locked = tex.lock_rect(0, 0);
+    fill_whole_level(&mut locked, width as usize, height as usize)
+}
+
+/// Fail unless a create took the released level's staging back, the case the test is about.
+fn assert_took_released_staging(bits: usize, released: usize) {
+    assert_eq!(
+        bits, released,
+        "precondition: the create took the released level's staging back from the page-box pool"
+    );
+}
+
+/// The texels of a `width` x `height` whole-level lock that are not zero.
+fn nonzero_texels(locked: &LockedRect<'_>, width: usize, height: usize) -> usize {
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let texels = locked.as_u32(pitch * (height - 1) + width);
+    (0..height)
+        .map(|y| {
+            texels[y * pitch..y * pitch + width]
+                .iter()
+                .filter(|&&texel| texel != 0)
+                .count()
+        })
+        .sum()
+}
+
+/// Asserts a sampled X8R8G8B8 pixel, leaving the swizzle-filled alpha lane to physical GPUs.
+///
+/// The colour lanes are the stored bytes and are compared on every device.
+/// Alpha is one only through the view swizzle that fills the X byte. The
+/// paravirtual device samples a swizzle view through the base texture's lanes,
+/// so zeroed staging samples alpha zero there; alpha is left out of the
+/// comparison on that device and required on every physical GPU.
+#[track_caller]
+fn assert_x8_pixel_eq(h: &Harness, actual: u32, expected: u32, context: &str) {
+    const COLOUR: u32 = 0x00FF_FFFF;
+    let mask = if h.device_is_paravirtual() {
+        COLOUR
+    } else {
+        u32::MAX
+    };
+    assert_pixel_eq(actual & mask, expected & mask, context);
+}
+
+/// A whole-level lock that writes part of a new managed level samples black for the rest.
+///
+/// D3D9 backs a new managed texture's system-memory copy with zeroed memory,
+/// so the rows a rect-less lock leaves alone upload as zero, opaque black in
+/// a format without alpha. The level's staging is one a released texture of
+/// its size filled.
+#[test]
+fn a_partly_written_level_samples_black_where_the_lock_wrote_nothing() {
+    const SIZE: (u32, u32) = (96, 128);
+    const WRITTEN_ROWS: usize = 32;
+    const GREEN: u32 = 0xFF00_FF00;
+    let width = SIZE.0 as usize;
+    let h = Harness::new();
+    let released = released_filled_level(&h, SIZE, D3DPOOL_MANAGED);
+    let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    let bits = {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32_rect(width, WRITTEN_ROWS, &vec![GREEN; width * WRITTEN_ROWS]);
+        locked.bits_ptr().addr()
+    };
+    assert_took_released_staging(bits, released);
+    // The quad spans the unit square over a 640x480 target, so texel row r
+    // covers y 3.75 * r to 3.75 * (r + 1): the written rows end at y 120.
+    let [written, unwritten, last_row] =
+        sample_points(&h, &tex, [(320, 60), (320, 300), (320, 476)]);
+    assert_pixel_eq(written, GREEN, "the rows the lock wrote");
+    assert_x8_pixel_eq(&h, unwritten, BLACK, "the rows the lock left alone");
+    assert_x8_pixel_eq(
+        &h,
+        last_row,
+        BLACK,
+        "the last row, which the lock left alone",
+    );
+}
+
+/// The first lock of a new managed level reads zero, a `D3DLOCK_READONLY` one included.
+#[test]
+fn a_read_only_first_lock_of_a_new_managed_level_reads_zero() {
+    const SIZE: (u32, u32) = (128, 128);
+    let h = Harness::new();
+    let released = released_filled_level(&h, SIZE, D3DPOOL_MANAGED);
+    let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    let locked = tex.lock_rect(0, D3DLOCK_READONLY);
+    assert_took_released_staging(locked.bits_ptr().addr(), released);
+    assert_eq!(
+        nonzero_texels(&locked, SIZE.0 as usize, SIZE.1 as usize),
+        0,
+        "a new managed level reads zero through its first lock"
+    );
+}
+
+/// `AddDirtyRect` after a partial lock of a new managed level uploads zero outside the lock.
+///
+/// The dirty rect re-publishes the whole level, so every texel the lock did
+/// not write reaches the GPU from the level's system-memory copy, which D3D9
+/// hands out zeroed.
+#[test]
+fn add_dirty_rect_after_a_partial_lock_uploads_zero_outside_the_lock() {
+    const SIZE: (u32, u32) = (160, 128);
+    const GREEN: u32 = 0xFF00_FF00;
+    let (half_w, half_h) = (SIZE.0 as usize / 2, SIZE.1 as usize / 2);
+    let h = Harness::new();
+    let released = released_filled_level(&h, SIZE, D3DPOOL_MANAGED);
+    let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    let bits = {
+        let quadrant = [0, 0, (SIZE.0 / 2).cast_signed(), (SIZE.1 / 2).cast_signed()];
+        let mut locked = tex.lock_rect_partial(0, &quadrant, 0);
+        locked.write_u32_rect(half_w, half_h, &vec![GREEN; half_w * half_h]);
+        locked.bits_ptr().addr()
+    };
+    assert_took_released_staging(bits, released);
+    assert_eq!(tex.add_dirty_rect(), 0, "AddDirtyRect");
+    let [inside, outside] = sample_points(&h, &tex, [(160, 120), (480, 360)]);
+    assert_pixel_eq(inside, GREEN, "the quadrant the lock wrote");
+    assert_x8_pixel_eq(
+        &h,
+        outside,
+        BLACK,
+        "the quadrants the lock left alone upload as zero",
+    );
+}
+
+/// `UpdateTexture` from a system-memory source written in part copies zero for the rest.
+#[test]
+fn update_texture_from_a_partly_written_system_memory_source_copies_zero() {
+    const SIZE: (u32, u32) = (192, 128);
+    const GREEN: u32 = 0xFF00_FF00;
+    let (half_w, half_h) = (SIZE.0 as usize / 2, SIZE.1 as usize / 2);
+    let h = Harness::new();
+    let released = released_filled_level(&h, SIZE, D3DPOOL_SYSTEMMEM);
+    let src = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let bits = {
+        let quadrant = [0, 0, (SIZE.0 / 2).cast_signed(), (SIZE.1 / 2).cast_signed()];
+        let mut locked = src.lock_rect_partial(0, &quadrant, 0);
+        locked.write_u32_rect(half_w, half_h, &vec![GREEN; half_w * half_h]);
+        locked.bits_ptr().addr()
+    };
+    assert_took_released_staging(bits, released);
+    let dst = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture");
+    let [inside, outside] = sample_points(&h, &dst, [(160, 120), (480, 360)]);
+    assert_pixel_eq(inside, GREEN, "the quadrant the source's lock wrote");
+    assert_x8_pixel_eq(
+        &h,
+        outside,
+        BLACK,
+        "the quadrants the source's lock left alone copy as zero",
+    );
+}
+
+/// `UpdateTexture` from a system-memory source nothing wrote copies zero.
+///
+/// A new source is dirty in full, so the copy reads every byte of a level no
+/// lock has exposed. Nothing hands out the source's address, so the test
+/// cannot check that its staging is the released texture's; the release
+/// parks it with no upload pending, and the create takes it back.
+#[test]
+fn update_texture_from_a_never_written_system_memory_source_copies_zero() {
+    const SIZE: (u32, u32) = (224, 128);
+    let h = Harness::new();
+    let _released = released_filled_level(&h, SIZE, D3DPOOL_SYSTEMMEM);
+    let src = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture");
+    let [centre, corner] = sample_points(&h, &dst, [(320, 240), (630, 470)]);
+    assert_x8_pixel_eq(&h, centre, BLACK, "the copied level's centre");
+    assert_x8_pixel_eq(&h, corner, BLACK, "the copied level's last texel");
+}
+
+/// The first lock of a face of a new managed cube reads zero.
+#[test]
+fn a_first_lock_of_a_new_managed_cube_face_reads_zero() {
+    const EDGE: u32 = 176;
+    let edge = EDGE as usize;
+    let h = Harness::new();
+    let released: Vec<usize> = {
+        let cube = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+        (0..6)
+            .map(|face| {
+                let mut locked = cube.lock_rect(face, 0, 0);
+                fill_whole_level(&mut locked, edge, edge)
+            })
+            .collect()
+    };
+    let cube = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    let locked = cube.lock_rect(0, 0, D3DLOCK_READONLY);
+    assert!(
+        released.contains(&locked.bits_ptr().addr()),
+        "precondition: the create took a released face's staging back from the page-box pool"
+    );
+    assert_eq!(
+        nonzero_texels(&locked, edge, edge),
+        0,
+        "a new managed cube face reads zero through its first lock"
+    );
+}
+
+/// The first `LockBox` of a new managed volume reads zero.
+#[test]
+fn a_first_lock_box_of_a_new_managed_volume_reads_zero() {
+    const EXTENT: [u32; 3] = [64, 64, 9];
+    let texels = EXTENT.iter().map(|&e| e as usize).product::<usize>();
+    let h = Harness::new();
+    let released = {
+        let (hr, volume) =
+            h.try_create_volume_texture(EXTENT, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+        assert_eq!(hr, 0, "CreateVolumeTexture");
+        let volume = volume.expect("a volume texture");
+        volume.write_u32(0, &vec![RELEASED_FILL; texels]);
+        volume.read_u32_with_bits(0).0
+    };
+    let (hr, volume) = h.try_create_volume_texture(EXTENT, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0, "CreateVolumeTexture");
+    let (bits, read) = volume.expect("a volume texture").read_u32_with_bits(0);
+    assert_took_released_staging(bits, released);
+    assert_eq!(
+        read.iter().filter(|&&texel| texel != 0).count(),
+        0,
+        "a new managed volume reads zero through its first LockBox"
+    );
+}
+
+/// `AddDirtyRect` on a new managed level nothing locked uploads zero.
+///
+/// The dirty rect publishes the whole level from its system-memory copy,
+/// which no lock has exposed. Nothing hands out the level's address, so the
+/// test cannot check that its staging is the released texture's; the
+/// release parks it with no upload pending, and the create takes it back.
+#[test]
+fn add_dirty_rect_on_a_never_locked_managed_level_uploads_zero() {
+    const SIZE: (u32, u32) = (160, 256);
+    let h = Harness::new();
+    let _released = released_filled_level(&h, SIZE, D3DPOOL_MANAGED);
+    let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(tex.add_dirty_rect(), 0, "AddDirtyRect");
+    let [centre, corner] = sample_points(&h, &tex, [(320, 240), (630, 470)]);
+    assert_x8_pixel_eq(&h, centre, BLACK, "the published level's centre");
+    assert_x8_pixel_eq(&h, corner, BLACK, "the published level's last texel");
+}
+
+/// `UpdateTexture` from a new system-memory cube nothing wrote copies zero into every face.
+///
+/// A new source cube is dirty in full, so the copy reads every face of a
+/// cube no lock has exposed. The test cannot check that the faces' staging
+/// is the released cube's, as above.
+#[test]
+fn update_texture_from_a_never_written_system_memory_cube_copies_zero() {
+    const EDGE: u32 = 208;
+    let edge = EDGE as usize;
+    let h = Harness::new();
+    {
+        let cube = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+        for face in 0..6 {
+            let mut locked = cube.lock_rect(face, 0, 0);
+            fill_whole_level(&mut locked, edge, edge);
+        }
+    }
+    let src = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_cube_texture_owned(EDGE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_cube_texture_hr(&src, &dst), 0, "UpdateTexture");
+    for direction_x in [1.0, -1.0] {
+        assert_x8_pixel_eq(
+            &h,
+            sample_cube_x(&h, &dst, direction_x),
+            BLACK,
+            &format!("the copied face toward x = {direction_x}"),
+        );
+    }
+}
+
+/// `UpdateSurface` from a level of a new system-memory texture nothing locked copies zero.
+///
+/// The destination is the back buffer, which takes the copy without a CPU
+/// copy of its own, cleared blue first so a copy that never landed shows.
+/// The test cannot check that the source's staging is the released
+/// texture's, as above.
+#[test]
+fn update_surface_from_a_never_locked_system_memory_level_copies_zero() {
+    const SIZE: (u32, u32) = (192, 240);
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let _released = released_filled_level(&h, SIZE, D3DPOOL_SYSTEMMEM);
+    let src = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let back_buffer = h.render_target(0);
+    assert_eq!(h.clear_target(BLUE), 0, "Clear");
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &back_buffer),
+        0,
+        "UpdateSurface"
+    );
+    // The copy carries the source's X byte into the back buffer, whose read
+    // back reports it as alpha, so only the colour channels are compared.
+    let copied = h.read_pixel(96, 120);
+    assert_eq!(
+        copied & 0x00FF_FFFF,
+        0,
+        "the copied level is black, got {copied:#010x}"
+    );
+    assert_pixel_eq(
+        h.read_pixel(400, 400),
+        BLUE,
+        "the back buffer past the copy",
+    );
+}
+
+/// `GetRenderTargetData` into a new system-memory level leaves its row padding zero.
+///
+/// An R5G6B5 level 33 texels wide has a 68-byte pitch for 66 bytes of
+/// pixels. The read back writes the pixels of each row, so the two bytes
+/// after them read zero, as in any level nothing has written there.
+#[test]
+fn get_render_target_data_into_a_new_system_memory_level_leaves_its_padding_zero() {
+    const SIZE: (u32, u32) = (33, 3100);
+    let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+    let h = Harness::new();
+    if r5g6b5_render_target_denied(&h, SIZE) {
+        return;
+    }
+    let released = {
+        let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+        let mut locked = tex.lock_rect(0, 0);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+        locked.write::<u8>(&vec![0xAB; pitch * height]);
+        locked.bits_ptr().addr()
+    };
+    let dst = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    let rt = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_R5G6B5);
+    assert_eq!(h.color_fill_hr(&rt, 0xFFFF_0000), 0, "ColorFill");
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &dst.surface_level(0)),
+        0,
+        "GetRenderTargetData"
+    );
+    let locked = dst.lock_rect(0, D3DLOCK_READONLY);
+    assert_took_released_staging(locked.bits_ptr().addr(), released);
+    check_read_back_padding(&locked, width, height);
+}
+
+/// `GetRenderTargetData` into a new system-memory offscreen surface leaves its row padding zero.
+///
+/// The surface counterpart of the test above. A surface's memory comes from
+/// the allocator rather than the page-box pool, which hands a block of the
+/// size just freed back to the next request of that size; the test checks
+/// that it did.
+#[test]
+fn get_render_target_data_into_a_new_system_memory_surface_leaves_its_padding_zero() {
+    const SIZE: (u32, u32) = (33, 3100);
+    let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+    let h = Harness::new();
+    if r5g6b5_render_target_denied(&h, SIZE) {
+        return;
+    }
+    let released = {
+        let surface =
+            h.create_offscreen_plain_surface(SIZE.0, SIZE.1, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+        let mut locked = surface.lock_rect(0);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+        locked.write::<u8>(&vec![0xAB; pitch * height]);
+        locked.bits_ptr().addr()
+    };
+    let dst = h.create_offscreen_plain_surface(SIZE.0, SIZE.1, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    let rt = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_R5G6B5);
+    assert_eq!(h.color_fill_hr(&rt, 0xFFFF_0000), 0, "ColorFill");
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &dst),
+        0,
+        "GetRenderTargetData"
+    );
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    assert_eq!(
+        locked.bits_ptr().addr(),
+        released,
+        "precondition: the allocator handed the released surface's memory back"
+    );
+    check_read_back_padding(&locked, width, height);
+}
+
+/// Whether the device denies R5G6B5 render targets, checking that the create is rejected to match.
+///
+/// A device without Metal's packed 16-bit pixel formats does not advertise
+/// them as render targets and rejects the create, which leaves nothing to read
+/// back. That contract is pinned in `expand16`.
+fn r5g6b5_render_target_denied(h: &Harness, (width, height): (u32, u32)) -> bool {
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) == D3D_OK
+    {
+        return false;
+    }
+    assert_ne!(
+        h.create_render_target_hr(width, height, D3DFMT_R5G6B5),
+        D3D_OK,
+        "a 16-bit render target is rejected where the caps deny it"
+    );
+    true
+}
+
+/// Check a 33-texel-wide R5G6B5 read back of red: 68-byte rows, red pixels, zero padding.
+fn check_read_back_padding(locked: &LockedRect<'_>, width: usize, height: usize) {
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+    assert_eq!(pitch, 68, "33 two-byte texels are 66 bytes, reported as 68");
+    let bytes = locked.as_u8(pitch * height);
+    let padding = (0..height)
+        .flat_map(|row| &bytes[row * pitch + width * 2..(row + 1) * pitch])
+        .filter(|&&byte| byte != 0)
+        .count();
+    assert_eq!(padding, 0, "the row padding after the read back reads zero");
+    assert_eq!(
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+        0xF800,
+        "the read back's red"
+    );
 }
 
 #[test]

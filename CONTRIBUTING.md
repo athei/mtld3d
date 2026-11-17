@@ -571,11 +571,12 @@ Each of these rots silently when it is left for later:
   the `mtld3d.conf` sample with the default and a short why.
 - A new built-in app profile ships with the rationale for every key it sets as
   the comment on its entry in `windows/core/src/app_profile.rs` and a test that
-  resolves it from the version strings the shipped binary actually carries.
+  resolves it from the version strings the shipped binary actually carries,
+  or from its Steam app id when the binary carries no version resource.
   `docs/GAMES.md` names a game's profile in its row; the settings and
   reasons stay in `app_profile.rs`.
-  A profile that pins no version field is not a profile, it is a name collision
-  waiting to happen.
+  A profile that pins neither a version field nor a Steam app id is not a
+  profile, it is a name collision waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
   (`scripts/audit.sh --update-derives`).
 
@@ -741,11 +742,17 @@ work can be estimated, one effort label:
 - Effort: `effort/S` is hours; `effort/M` is a normal single-PR change;
   `effort/L` is multi-day or needs a design first.
 
-Two modifiers exist. `blocked` marks an issue waiting on an external trigger,
-a machine we do not have, or an upstream change, with the body naming exactly
-what it waits for; a blocked issue keeps its priority, the label only says why
-it is not moving. `needs-repro` marks an external report that has not been
-reproduced or root-caused locally yet.
+Three modifiers exist. `blocked` marks an issue waiting on an external trigger
+or a machine we do not have, with the body naming exactly what it waits for; a
+blocked issue keeps its priority, the label only says why it is not moving.
+`needs-repro` marks an external report that has not been reproduced or
+root-caused locally yet. `upstream` marks an issue that an active merge request
+or pull request in Wine, DXMT, or another dependency covers, with the body
+linking it: we do not implement or carry what an upstream is about to ship. It
+takes the place of `blocked` for that case. An upstream issue or a plan without
+a PR does not count, and when the PR is rejected or goes quiet the label comes
+off and the issue is ours again. Once the change is in the Wine or dependency
+we build against, the issue is verified and closed.
 
 File the issue with its labels attached. When a claim in an issue body stops
 being true, edit the body rather than correcting it in a comment trail.

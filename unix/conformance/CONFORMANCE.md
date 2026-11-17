@@ -388,8 +388,11 @@ record. A knob, where one makes sense, is named with its default.
   window loses those bytes (warned once). Inside a large-address-aware 32-bit
   title those copies measured near a gigabyte of the 4 GiB the title needs
   itself. An indexed triangle fan on a released index buffer copies it back
-  off the GPU once, at one mid-frame GPU wait. Knob: `buffer.ignoreLockBounds`
-  keeps the copy, default `false`.
+  off the GPU once, at one mid-frame GPU wait. Knobs: `buffer.ignoreLockBounds`
+  keeps the copy, default `false`; `buffer.drawTimeUpload` keeps it and moves
+  the upload from `Unlock` to the next draw, so a title that writes through
+  the pointer after `Unlock` (undefined in D3D9) gets those writes drawn,
+  default `false`.
 - **The window procedure mtld3d subclasses is the device window's, and it
   follows a `Reset` that names another one.** D3D9 subclasses the focus
   window and leaves that subclass where it is across a retarget. Our hook is

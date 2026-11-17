@@ -491,6 +491,65 @@ impl VolumeTexture<'_> {
         (locked.row_pitch, locked.slice_pitch, texels)
     }
 
+    /// Read a 32-bit-per-texel mip through a `D3DLOCK_READONLY` `LockBox`, with the lock's address.
+    ///
+    /// The texels come back tightly packed slice by slice, row by row; the
+    /// address is the `pBits` the lock handed out, which is where the level's
+    /// bytes live.
+    ///
+    /// # Panics
+    /// Panics if the description or the lock fails.
+    #[must_use]
+    pub fn read_u32_with_bits(&self, level: u32) -> (usize, Vec<u32>) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "VolumeTexture GetLevelDesc");
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: the live volume owns the level, the output is writable,
+        // and a null box requests the complete level.
+        expect_ok(
+            unsafe {
+                (self.vtbl().lock_box)(
+                    self.ptr,
+                    level,
+                    &raw mut locked,
+                    core::ptr::null(),
+                    mtld3d_types::D3DLOCK_READONLY,
+                )
+            },
+            "VolumeTexture LockBox",
+        );
+        assert!(!locked.bits.is_null());
+        let row = usize::try_from(locked.row_pitch).expect("positive row pitch");
+        let slice = usize::try_from(locked.slice_pitch).expect("positive slice pitch");
+        let (width, height, depth) = (
+            desc.width as usize,
+            desc.height as usize,
+            desc.depth as usize,
+        );
+        assert!(row >= width * 4 && slice >= row * height);
+        let mut texels = Vec::with_capacity(width * height * depth);
+        for z in 0..depth {
+            for y in 0..height {
+                for x in 0..width {
+                    // SAFETY: the row and slice bounds checked above keep this
+                    // four-byte texel inside the locked level; no alignment is
+                    // assumed and the copied value outlives the lock.
+                    let texel =
+                        unsafe { locked.bits.cast::<u8>().add(z * slice + y * row + x * 4) };
+                    // SAFETY: `texel` points to one four-byte texel of the live lock.
+                    texels.push(unsafe { texel.cast::<u32>().read_unaligned() });
+                }
+            }
+        }
+        let bits = locked.bits.addr();
+        expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
+        (bits, texels)
+    }
+
     /// Fill a signed four-lane box, preserving texels outside it.
     ///
     /// # Panics
@@ -2419,6 +2478,16 @@ impl BufferLock<'_> {
         // SAFETY: the copy above initialised `count` elements.
         unsafe { out.set_len(count) };
         out
+    }
+
+    /// The pointer `Lock` returned.
+    ///
+    /// It outlives the guard only while the layer keeps the buffer's CPU copy
+    /// after `Unlock`, as `buffer.drawTimeUpload` makes it do; a write through
+    /// it after `Unlock` is otherwise a write into freed memory.
+    #[must_use]
+    pub const fn mapped(&self) -> *mut u8 {
+        self.bits.cast()
     }
 
     /// Unlock now and return the `Unlock` hr, which the drop would discard.

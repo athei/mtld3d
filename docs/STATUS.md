@@ -226,6 +226,14 @@ unless its entry says otherwise.
   texture query and only a `D3DPOOL_SCRATCH` texture creates. They remain
   offscreen plain surfaces, and a DEFAULT-pool one is a `StretchRect` source
   that decodes into any render target and 1:1 into a colour offscreen plain.
+- A write through a level-0 lock of a `D3DPOOL_MANAGED` texture that runs
+  on into the rest of its mip chain. Each level has its own staging
+  allocation, a lock hands out the locked level's, and an unlock dirties
+  only that level, so the lower levels never receive the data. Where the
+  chain is longer than level 0's allocation, which is padded to 16 KiB, the
+  write runs past it, so this one does not fail cleanly. The
+  `visual.c/test_mipmap_upload` site of Wine's tests fails on it; no title
+  run here needs it.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
@@ -323,7 +331,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
-  `buffer.ignoreLockBounds` keeps the copy.
+  `buffer.ignoreLockBounds` keeps the copy. `buffer.drawTimeUpload` keeps it
+  too and uploads at the draw instead of at `Unlock`, so writes a title makes
+  through the pointer after `Unlock` reach that draw.
 - The window procedure carrying cursor realization and the windowed
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.

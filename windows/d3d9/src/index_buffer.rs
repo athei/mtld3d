@@ -73,6 +73,10 @@ pub struct IndexBufferInner {
     map_mode: BufferMapMode,
     /// `Staged` only: byte range dirtied since the last upload.
     dirty: DirtyRange,
+    /// `Staged` under `buffer.drawTimeUpload`: the draw uploads `dirty`, not `Unlock`.
+    ///
+    /// Latched at creation, as the vertex buffer's twin field is.
+    draw_time_upload: bool,
     /// Canonical CPU backing.
     ///
     /// Released like a vertex buffer's once an upload has carried every
@@ -152,33 +156,38 @@ impl IndexBufferInner {
         );
     }
 
-    /// Upload a still-mapped `Staged` buffer's dirty span without ending the lock.
+    /// Upload a `Staged` buffer's dirty span before a draw reads it.
     ///
     /// So an indexed draw issued while the buffer is mapped reads the latest
-    /// CPU writes, per D3D9 behaviour. `dirty` is left set so `Unlock` (and any
-    /// later draw) re-flushes. No-op unless locked + `Staged` + dirty. Mirrors
-    /// `ib_unlock`'s upload, minus the clear.
+    /// CPU writes, per D3D9 behaviour. `dirty` is left set then, so `Unlock`
+    /// (and any later draw) re-flushes. Under `buffer.drawTimeUpload` an
+    /// unlocked buffer's span is uploaded here as well and cleared. No-op
+    /// unless `Staged` + dirty and either locked or under that key.
     #[inline]
-    pub fn flush_staged_if_mapped(&mut self, dev: &mut DeviceInner) {
-        if self.lock_count == 0 || !matches!(self.map_mode, BufferMapMode::Staged) {
+    pub fn flush_staged_before_draw(&mut self, dev: &mut DeviceInner) {
+        if self.lock_count == 0 && (!self.draw_time_upload || self.dirty.is_empty()) {
             return;
         }
-        self.flush_mapped_dirty_span(dev);
+        if !matches!(self.map_mode, BufferMapMode::Staged) {
+            return;
+        }
+        self.upload_dirty_span_for_draw(dev);
     }
 
-    /// The upload behind [`Self::flush_staged_if_mapped`], for a locked `Staged` buffer.
+    /// The upload behind [`Self::flush_staged_before_draw`].
     ///
-    /// Out of line and cold so a draw inlines only the lock test: a draw
-    /// issued while its buffer is still mapped is rare.
+    /// Out of line and cold so a draw inlines only the lock and key tests: a
+    /// draw issued while its buffer is still mapped is rare, and so is a
+    /// title under `buffer.drawTimeUpload`.
     #[cold]
     #[inline(never)]
-    fn flush_mapped_dirty_span(&mut self, dev: &mut DeviceInner) {
+    fn upload_dirty_span_for_draw(&mut self, dev: &mut DeviceInner) {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
         let Some(src) = self.backing.read_ptr_at(min as usize) else {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "flush_staged_if_mapped: no CPU backing behind a mapped dirty range");
+                "flush_staged_before_draw: no CPU backing behind the dirty range a draw reads");
             return;
         };
         let size = (max - min) as usize;
@@ -193,6 +202,11 @@ impl IndexBufferInner {
         }
         self.backing.note_upload(min, max);
         dev.push_stage_upload(self.buffer_id, transient, min, max - min);
+        // An unlocked buffer has no `Unlock` left to carry the span, so it is
+        // done once the upload is queued; a locked one keeps it for its `Unlock`.
+        if self.lock_count == 0 && dev.encoder_status().is_ok() {
+            self.dirty.clear();
+        }
     }
 
     pub const fn map_mode(&self) -> BufferMapMode {
@@ -229,6 +243,8 @@ pub struct IndexBufferCreateInfo {
     pub usage: u32,
     pub format: u32,
     pub pool: u32,
+    /// The device's `buffer.drawTimeUpload`.
+    pub draw_time_upload: bool,
 }
 
 impl Direct3DIndexBuffer9 {
@@ -249,7 +265,8 @@ impl Direct3DIndexBuffer9 {
             classify_backing(info.usage, info.pool),
         );
         let map_mode = classify_map_mode(info.usage, info.pool);
-        let dirty = if matches!(map_mode, BufferMapMode::Staged) {
+        let staged = matches!(map_mode, BufferMapMode::Staged);
+        let dirty = if staged {
             DirtyRange::full(info.length)
         } else {
             DirtyRange::empty()
@@ -264,6 +281,7 @@ impl Direct3DIndexBuffer9 {
             private_data: PrivateDataStore::default(),
             map_mode,
             dirty,
+            draw_time_upload: staged && info.draw_time_upload,
             backing,
             last_submit_seq: 0,
             lock_count: 0,
@@ -768,6 +786,11 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
             // lock, as D3D9 counts them.
             return D3D_OK;
         }
+    }
+    if inner.draw_time_upload {
+        // The next draw that reads the buffer uploads `dirty`, so what the
+        // game writes through the pointer after this `Unlock` reaches it too.
+        return D3D_OK;
     }
     if matches!(inner.map_mode, BufferMapMode::Staged)
         && let Some((min, max)) = inner.dirty.span()
