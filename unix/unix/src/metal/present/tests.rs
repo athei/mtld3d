@@ -1,7 +1,7 @@
 //! Unit tests for the present pass shader library and its pipelines.
 //!
-//! Every test needs a real Metal device and skips when there is none. The
-//! first compiles the embedded MSL and resolves the shared vertex stage
+//! The first three tests need a real Metal device and skip when there is none.
+//! The first compiles the embedded MSL and resolves the shared vertex stage
 //! plus all three fragment entry points (copy, HDR pass-through,
 //! BT.2446), so a typo or a rename landed on one side only fails here
 //! instead of at the first present. The second builds every pipeline for
@@ -9,7 +9,8 @@
 //! with the fragment output would otherwise surface as a black frame. The
 //! third does the same for the gamma twins, which the end-to-end suite
 //! never builds: it creates windowed devices, and only a fullscreen device
-//! applies a ramp.
+//! applies a ramp. The fourth checks the BT.2446 constants folded into the MSL
+//! against their formula and against `hdr_uniforms`, and needs no device.
 
 use super::*;
 
@@ -91,4 +92,48 @@ fn gamma_pipelines_build_for_every_stage() {
             "the {name} pipeline must build"
         );
     }
+}
+
+/// The literal of a `constant float <name> = <literal>;` line in the present MSL.
+fn msl_float_constant(name: &str) -> f64 {
+    let prefix = format!("constant float {name} = ");
+    let rest = PRESENT_MSL
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("present MSL must declare {name}"));
+    let literal = rest
+        .split_once(';')
+        .map_or(rest, |(literal, _)| literal)
+        .trim();
+    literal
+        .trim_end_matches('f')
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} must be a float literal, found {literal}"))
+}
+
+/// The BT.2446 SDR constants match their formula and the HDR side at peak 1.0.
+///
+/// `P_SDR` and `LOG_P_SDR` are folded into the MSL while `hdr_uniforms` computes
+/// the HDR side on the CPU, so nothing else ties the two together. A peak of 1.0
+/// is the SDR reference white, where `p_hdr` has to equal `P_SDR`.
+#[test]
+fn bt2446_sdr_constants_match_the_formula() {
+    let l_sdr = msl_float_constant("L_SDR");
+    let p_sdr = msl_float_constant("P_SDR");
+    let log_p_sdr = msl_float_constant("LOG_P_SDR");
+    let expected = 32.0_f64.mul_add((l_sdr / 10000.0).powf(1.0 / 2.4), 1.0);
+    assert!(
+        (p_sdr - expected).abs() < 1e-6,
+        "P_SDR is {p_sdr}, the formula gives {expected} at L_SDR = {l_sdr}"
+    );
+    assert!(
+        (log_p_sdr - expected.ln()).abs() < 1e-6,
+        "LOG_P_SDR is {log_p_sdr}, ln(P_SDR) is {}",
+        expected.ln()
+    );
+    let hdr_at_unit_peak = f64::from(hdr_uniforms(1.0)[1]);
+    assert!(
+        (hdr_at_unit_peak - p_sdr).abs() < 1e-5,
+        "p_hdr at peak 1.0 is {hdr_at_unit_peak}, P_SDR is {p_sdr}"
+    );
 }

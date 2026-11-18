@@ -92,8 +92,8 @@ struct HdrUniforms {
 
 constant float L_SDR = 100.0;
 // P_SDR = 1 + 32 * pow(L_SDR / 10000, 1/2.4) at L_SDR = 100. Folded.
-constant float P_SDR = 5.4395284707f;
-constant float LOG_P_SDR = 1.6937747f; // log(P_SDR)
+constant float P_SDR = 5.6969577f;
+constant float LOG_P_SDR = 1.7399323f; // log(P_SDR)
 
 // sRGB → linear EOTF (IEC 61966-2-1, piecewise). Shared by every HDR stage,
 // frame and cursor alike, so the two can never disagree on the decode.
