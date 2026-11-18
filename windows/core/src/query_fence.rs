@@ -40,5 +40,35 @@ pub const fn end_in_recording_frame(end_seq: u64, current_seq: u64) -> bool {
     end_seq != 0 && end_seq >= current_seq
 }
 
+/// The permissive occlusion answer: "fully visible", so nothing is culled on it.
+pub const OCCLUSION_VISIBLE: u64 = u32::MAX as u64;
+
+/// Most early occlusion submits per presented frame (`query.occlusionEarlySubmit`).
+///
+/// Each one costs a command buffer and a state re-emit; an engine that issues
+/// its occlusion boxes in one block needs a single split.
+pub const MAX_EARLY_OCCLUSION_SUBMITS: u32 = 2;
+
+/// What an occlusion read answers under `query.occlusionEarlySubmit`.
+///
+/// `issued` is whether the query's status is `Issued`, which the visibility
+/// core reports only when the retired result belongs to the generation the
+/// application issued last; `count` is that result. Anything else (not
+/// retired in time, discarded, re-armed) answers [`OCCLUSION_VISIBLE`]: a
+/// stale or zero count makes the title cull geometry that is on screen.
+#[must_use]
+pub const fn early_occlusion_answer(issued: bool, count: u64) -> u64 {
+    if issued { count } else { OCCLUSION_VISIBLE }
+}
+
+/// Whether a colour render-target change should hand the open frame to the GPU early.
+///
+/// Only after an occlusion `Issue(END)` recorded since the last split, and at
+/// most [`MAX_EARLY_OCCLUSION_SUBMITS`] times per presented frame.
+#[must_use]
+pub const fn early_occlusion_submit_due(end_since_split: bool, splits_this_frame: u32) -> bool {
+    end_since_split && splits_this_frame < MAX_EARLY_OCCLUSION_SUBMITS
+}
+
 #[cfg(test)]
 mod tests;

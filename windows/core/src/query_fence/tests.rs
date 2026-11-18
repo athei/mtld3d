@@ -1,4 +1,7 @@
-use super::{end_in_recording_frame, event_completed, event_needs_submit};
+use super::{
+    MAX_EARLY_OCCLUSION_SUBMITS, OCCLUSION_VISIBLE, early_occlusion_answer,
+    early_occlusion_submit_due, end_in_recording_frame, event_completed, event_needs_submit,
+};
 
 /// An EVENT query completes only when its frame retires.
 ///
@@ -59,4 +62,32 @@ fn an_end_is_in_the_recording_frame_only_under_its_seq() {
         "ended in a frame already handed over"
     );
     assert!(!end_in_recording_frame(0, 7), "never ended");
+}
+
+/// An early-submit occlusion read never reports a count it did not retire.
+///
+/// A zeroed or stale count reads as "occluded" and made large on-screen
+/// objects vanish; only the real result of the exact issue may be returned,
+/// anything else answers "visible".
+#[test]
+fn an_early_occlusion_read_answers_zero_only_when_it_is_real() {
+    assert_eq!(early_occlusion_answer(false, 0), OCCLUSION_VISIBLE);
+    assert_eq!(early_occlusion_answer(false, 1234), OCCLUSION_VISIBLE);
+    assert_eq!(early_occlusion_answer(true, 0), 0);
+    assert_eq!(early_occlusion_answer(true, 1234), 1234);
+    assert_eq!(OCCLUSION_VISIBLE, u64::from(u32::MAX));
+}
+
+#[test]
+fn an_early_occlusion_submit_needs_an_end_and_stays_bounded() {
+    assert!(!early_occlusion_submit_due(false, 0));
+    assert!(early_occlusion_submit_due(true, 0));
+    assert!(early_occlusion_submit_due(
+        true,
+        MAX_EARLY_OCCLUSION_SUBMITS - 1
+    ));
+    assert!(!early_occlusion_submit_due(
+        true,
+        MAX_EARLY_OCCLUSION_SUBMITS
+    ));
 }

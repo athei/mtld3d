@@ -39,6 +39,8 @@ fn resolved_configuration_preserves_nondefaults() {
     value.present_occluded = !value.present_occluded;
     value.query_flush_immediate = !value.query_flush_immediate;
     value.query_event_immediate = !value.query_event_immediate;
+    value.query_occlusion_early_submit = !value.query_occlusion_early_submit;
+    value.query_occlusion_wait_us = 1234;
     value.depth_alias_same_size = !value.depth_alias_same_size;
     value.buffer_ignore_lock_bounds = !value.buffer_ignore_lock_bounds;
     value.buffer_draw_time_upload = !value.buffer_draw_time_upload;
