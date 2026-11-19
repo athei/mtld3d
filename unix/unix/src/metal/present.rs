@@ -93,8 +93,9 @@ use crate::{
 /// Vertex stage: synthesise a single oversized triangle covering the
 /// full viewport from `vertex_id` alone — no vertex buffer required.
 /// The standard fullscreen-triangle trick saves the edge-overlap
-/// rasterisation cost of a two-triangle quad. Shared between all three
-/// fragment entry points.
+/// rasterisation cost of a two-triangle quad. Shared by every fragment
+/// entry point: the frame and cursor stages, their gamma twins and the
+/// readback copies.
 ///
 /// `L_SDR` is pinned to `100.0` because Apple's compositor anchors
 /// `1.0`-in-the-drawable to 100 nits and reports

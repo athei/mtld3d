@@ -2,7 +2,7 @@
 //!
 //! The first three tests need a real Metal device and skip when there is none.
 //! The first compiles the embedded MSL and resolves the shared vertex stage
-//! plus all three fragment entry points (copy, HDR pass-through,
+//! and the three frame fragment entry points (copy, HDR pass-through,
 //! BT.2446), so a typo or a rename landed on one side only fails here
 //! instead of at the first present. The second builds every pipeline for
 //! the drawable format its route writes, where a format that disagrees
@@ -14,16 +14,19 @@
 
 use super::*;
 
-/// Smoke test: the present MSL compiles and every entry point resolves.
+/// Smoke test: the present MSL compiles and the frame pass's entry points resolve.
 ///
 /// Catches shader typos at unit-test time so a regression never ships to
 /// the game first. The entry-point lookups are what would fail if a
-/// rename landed on one side only.
+/// rename landed on one side only. They cover the vertex stage and the
+/// three frame fragment stages; the cursor stages and the gamma twins
+/// resolve in the pipeline builds of the next two tests, and the nearest
+/// readback copy in the exact-copy test of `command/tests.rs`.
 #[test]
 fn present_msl_compiles_under_metal() {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
-        eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
     };
     let source = NSString::from_str(PRESENT_MSL);
@@ -57,7 +60,7 @@ fn present_msl_compiles_under_metal() {
 fn present_pipelines_build_for_both_drawable_formats() {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
-        eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
     };
     assert!(
