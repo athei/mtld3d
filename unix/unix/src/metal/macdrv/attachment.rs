@@ -935,7 +935,8 @@ pub fn request_cursor_kick_all() {
 ///
 /// `1.0` until the first refresh lands, which is still correct for the HDR
 /// present: at a headroom of 1 it shows the SDR picture exactly, since the
-/// tone map is never darker than SDR and Method A lies at or below SDR there.
+/// tone map never lowers a pixel's luminance below SDR and Method A lies at
+/// or below SDR there.
 pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
     count_present(att);
     att.headroom()

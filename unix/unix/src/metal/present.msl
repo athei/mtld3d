@@ -84,7 +84,7 @@ fragment float4 mtld3d_readback_ps_copy_nearest(
 }
 
 struct HdrUniforms {
-    float l_hdr_nits;       // min(headroom * REFERENCE_WHITE_NITS, 10000)
+    float l_hdr_nits;       // min(max(headroom, 1) * REFERENCE_WHITE_NITS, 10000)
     float p_hdr;            // 1 + 32 * pow(l_hdr_nits/10000, 1/2.4)
     float log2_p_hdr;       // log2(p_hdr)
     float inv_p_minus_one;  // 1 / (p_hdr - 1)
@@ -100,8 +100,10 @@ constant float LOG_P_SDR = 1.7399323f; // log(P_SDR)
 // show at EDR 1.0 at every headroom.
 constant float REFERENCE_WHITE_NITS = 203.0;
 // Widest blend of the smooth maximum in `bt2446_ictcp`, in ln luminance.
-// Narrower than the smallest gap of Method A above SDR at L_HDR 1000 over the
-// 8-bit grey codes (0.134), so from there on the curve is Method A's own.
+// Narrower than the smallest gap of Method A above SDR at L_HDR 1000 for a
+// luminance at or above 8-bit grey code 1 (0.134, at code 1), so from L_HDR
+// 1000 on such a luminance takes Method A's own value. Only luminances under
+// grey code 1 still blend there (the gap falls towards 0.06 as Y goes to 0).
 constant float ITM_SMOOTH = 0.12;
 
 // sRGB → linear EOTF (IEC 61966-2-1, piecewise). Shared by every HDR stage,
@@ -219,28 +221,30 @@ inline float bt2446_a_nits(float y_sdr, constant HdrUniforms& u) {
     return pow(yp_hdr, 2.4f) * u.l_hdr_nits;
 }
 
-// The inverse tone map of one linear BT.709 pixel, never darker than SDR.
-// Shared by the frame and the cursor sprite, which is what keeps the cursor
-// exactly as bright as the UI it hovers over.
+// The inverse tone map of one linear BT.709 pixel, its luminance never below
+// SDR. Shared by the frame and the cursor sprite, which is what keeps the
+// cursor exactly as bright as the UI it hovers over.
 //
-// The SDR picture shows a pixel of luminance Y at Y * REFERENCE_WHITE_NITS. Up to
-// a headroom of about 4, Method A puts part of the range under that (at 1.5
-// every 8-bit grey code up to 199, at 3 the darkest eight), so the pixel
-// takes the brighter of the two through a smooth maximum in ln luminance:
-// with a = ln(Y * REFERENCE_WHITE_NITS) and b = ln(Method A),
+// The SDR picture shows a pixel of luminance Y at Y * REFERENCE_WHITE_NITS.
+// Up to a headroom of about 4, Method A puts part of the range under that
+// (at 1.5 every 8-bit grey code up to 199, at 3 the darkest eight), so the
+// pixel takes the brighter of the two through a smooth maximum in ln
+// luminance: with a = ln(Y * REFERENCE_WHITE_NITS) and b = ln(Method A),
 // max(a, b) + k h^2 / 4, h = max(k - |a - b|, 0) / k.
 // It is never below either curve, its slope is continuous where they cross
 // (a hard maximum creases there, which bands a bright gradient), and it does
 // not decrease in Y or in the headroom. Its width k = min(ITM_SMOOTH,
-// L_HDR / REFERENCE_WHITE_NITS - 1) is 0 at a headroom of 1, where Method A lies
-// at or below SDR for every Y, so the result there is the SDR picture.
+// L_HDR / REFERENCE_WHITE_NITS - 1) is 0 at a headroom of 1, where Method A
+// lies at or below SDR for every Y, so the result there is the SDR picture.
 //
 // The new luminance scales the pixel's I, Ct and Cp by one ratio,
-// PQ(Y_out) / PQ(Y * REFERENCE_WHITE_NITS), which keeps the ICtCp hue angle and
-// Ct / I, so saturated content (spells, fire, sunset) keeps its chroma
+// PQ(Y_out) / PQ(Y * REFERENCE_WHITE_NITS), which keeps the ICtCp hue angle
+// and Ct / I, so saturated content (spells, fire, sunset) keeps its chroma
 // instead of bleaching toward white; a pixel the tone map leaves at its SDR
-// luminance keeps its SDR colour. A strong primary can leave the gamut and
-// is clipped at 0. Up to L_HDR 10000 every value stays finite.
+// luminance keeps its SDR colour. The rule holds for luminance, not for each
+// channel: a single channel of a saturated colour can come out below its SDR
+// value. A strong primary can leave the gamut and is clipped at 0. Up to
+// L_HDR 10000 every value stays finite.
 inline float3 bt2446_ictcp(float3 lin, constant HdrUniforms& u) {
     float y_sdr = max(dot(lin, float3(0.2126f, 0.7152f, 0.0722f)), 1e-20f);
     float y_sdr_nits = y_sdr * REFERENCE_WHITE_NITS;

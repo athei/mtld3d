@@ -21,8 +21,9 @@
 //! The `ICtCp` variant of BT.2446 Method A scales the pixel's I
 //! (intensity) and Ct/Cp (chroma) by one ratio, so saturated content
 //! (spells, fire, sunset) keeps its chroma when lifted into HDR
-//! brightness instead of desaturating toward white. It never shows a
-//! pixel darker than the SDR picture.
+//! brightness instead of desaturating toward white. No pixel's luminance
+//! is lower than in the SDR picture (a single channel of a saturated
+//! colour can be).
 //!
 //! Output values are in linear BT.709/sRGB primaries — the same
 //! primaries the source backbuffer uses. The display-class-matched
@@ -77,8 +78,8 @@ use crate::{
 ///   linear sRGB/BT.709 primaries; the display-class-matched
 ///   `kCGColorSpaceExtendedLinear*` layer tag lets macOS gamut-convert
 ///   to the panel. At a headroom of 1 the BT.2446 stage gives the SDR
-///   picture too (it is never darker than SDR, and Method A lies at or
-///   below SDR there), so this stage is the same picture without the
+///   picture too (it never lowers a pixel's luminance below SDR, and
+///   Method A lies at or below SDR there), so this stage is the same picture without the
 ///   tone map's per-pixel work, and the switch between the two makes no
 ///   step.
 ///
@@ -89,9 +90,9 @@ use crate::{
 ///   and Ct / I, so saturated content (spell effects, fire, sunset) does
 ///   not desaturate toward white as it is lifted into HDR brightness.
 ///   Method A's output in nits is divided by 203 (BT.2408's HDR
-///   reference white), and the stage never shows a pixel darker than the
-///   SDR picture. Output is in linear BT.709 primaries; `1.0` = the
-///   screen's SDR white, white reaches the headroom.
+///   reference white), and no pixel's luminance is lower than in the SDR
+///   picture. Output is in linear BT.709 primaries; `1.0` = the screen's
+///   SDR white, white reaches the headroom.
 ///
 /// Vertex stage: synthesise a single oversized triangle covering the
 /// full viewport from `vertex_id` alone — no vertex buffer required.
@@ -118,12 +119,11 @@ use crate::{
 /// shaders (`Shaders/lilium__include/inverse_tone_mappers.fxh`). The
 /// BT.709→LMS and LMS-PQ→ICtCp matrices come from BT.2100 (transitively
 /// published in Lilium's `colour_space.fxh`); their inverses are computed
-/// from them. The 203-nit anchor and the never-darker maximum are not
-/// part of Lilium's port. Stripped of the `InputNitsFactor`,
-/// `GammaIn/Out`, and `BT2020 + PQ encode` output steps that don't
-/// apply when we feed linearised sRGB
-/// and output linear sRGB (the layer's `ExtendedLinear*` tag handles
-/// gamut + OETF for the actual display).
+/// from them. The 203-nit anchor and the maximum with the SDR luminance
+/// are not part of Lilium's port. Stripped of the `InputNitsFactor`,
+/// `GammaIn/Out`, and `BT2020 + PQ encode` output steps that don't apply
+/// when we feed linearised sRGB and output linear sRGB (the layer's
+/// `ExtendedLinear*` tag handles gamut + OETF for the actual display).
 ///
 /// MSL language version pinned to 2.4 for parity with the rest of mtld3d
 /// (`shader.rs`) — keeps the same library working on Intel/AMD Macs.
@@ -168,8 +168,9 @@ const PQ_PEAK_NITS: f32 = 10000.0;
 /// `{ l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one }`, 16 bytes. `peak` is
 /// the live EDR headroom, the screen's peak as a multiple of its SDR white;
 /// BT.2446-A takes the peak in nits, `L_hdr = peak × 203`, so the frame's
-/// white reaches the headroom. A peak under 1 (or NaN) is taken as 1, and `L_hdr` stops at
-/// PQ's 10000 nits (a headroom above 49), which also covers an infinite one.
+/// white reaches the headroom. A peak under 1 (or NaN) is taken as 1, and
+/// `L_hdr` stops at PQ's 10000 nits (a headroom above 49), which also
+/// covers an infinite one.
 /// The three derived terms only depend on it and are hoisted out of the
 /// fragment stage. One function for the frame and the cursor sprite, so the
 /// two can never disagree on the curve.

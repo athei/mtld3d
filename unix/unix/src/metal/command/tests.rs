@@ -12,8 +12,8 @@
 //! byte. A ramp pass that cannot be encoded must leave the plain copy on the destination,
 //! and the HDR pass-through must write the linear values of the source into an
 //! `RGBA16Float` destination. The HDR tone map is checked against a float64 port of
-//! its stage, against the pass-through at a headroom of 1, and for never reading below
-//! SDR while rising with the code and the headroom.
+//! its stage, against the pass-through at a headroom of 1, and for never putting a grey
+//! below SDR while rising with the code and the headroom.
 //!
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
@@ -1916,7 +1916,7 @@ fn the_hdr_tone_map_at_a_headroom_of_one_is_the_sdr_picture() {
     }
 }
 
-/// The tone map never darkens SDR and rises with both the code and the headroom.
+/// The tone map never puts a grey below SDR and rises with both the code and the headroom.
 ///
 /// Every 8-bit grey code, from a headroom of 1 (the pass-through) to 2 in
 /// steps of 0.05, and at 3, 5, 15 and 60. No code reads below its SDR value

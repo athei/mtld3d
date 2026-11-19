@@ -1548,8 +1548,9 @@ fn encode_hdr_present_upscaled_with(
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
 ///
-/// Rendered via a fullscreen triangle that sRGB-decodes each sample and
-/// multiplies by the EDR boost factor.
+/// Rendered via a fullscreen triangle that sRGB-decodes each sample and, at
+/// a headroom above 1, inverse tone maps it into the headroom with BT.2446
+/// Method A (`present.rs` describes the curve).
 ///
 /// `dst` is the drawable at the default scale, and the render-resolution
 /// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
