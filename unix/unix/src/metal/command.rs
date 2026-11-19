@@ -853,7 +853,7 @@ pub fn encode_present(
     // macOS hasn't promoted the screen yet (early frames) or
     // brightness/thermal state physically rules it out for the
     // session. In that case the shader short-circuits to a
-    // sRGB→linear pass-through (see `hdr_present.rs`), which
+    // sRGB→linear pass-through (see `present.rs`), which
     // writes correct SDR-equivalent values into the
     // ExtendedLinear layer instead of crushing the image with
     // an over-headroom BT.2446 boost. macOS global-scales

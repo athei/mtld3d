@@ -65,7 +65,7 @@ fn present_pipelines_build_for_both_drawable_formats() {
     };
     assert!(
         create(&device).is_some(),
-        "copy, pass-through and BT.2446 pipelines must all build"
+        "the six frame and cursor pipelines (copy, pass-through, BT.2446) must all build"
     );
 }
 
