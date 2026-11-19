@@ -9,8 +9,10 @@
 //! with the fragment output would otherwise surface as a black frame. The
 //! third does the same for the gamma twins, which the end-to-end suite
 //! never builds: it creates windowed devices, and only a fullscreen device
-//! applies a ramp. The fourth checks the BT.2446 constants folded into the MSL
-//! against their formula and against `hdr_uniforms`, and needs no device.
+//! applies a ramp. The last three need no device: they check the BT.2446
+//! constants folded into the MSL against their formula, `hdr_uniforms` against
+//! the headroom × 203 rule, and the colour matrices against their inverses.
+//! The tone map's output is checked on the GPU in `command/tests.rs`.
 
 use super::*;
 
@@ -114,11 +116,10 @@ fn msl_float_constant(name: &str) -> f64 {
         .unwrap_or_else(|_| panic!("{name} must be a float literal, found {literal}"))
 }
 
-/// The BT.2446 SDR constants match their formula and the HDR side at peak 1.0.
+/// The BT.2446 SDR constants match their formula.
 ///
-/// `P_SDR` and `LOG_P_SDR` are folded into the MSL while `hdr_uniforms` computes
-/// the HDR side on the CPU, so nothing else ties the two together. A peak of 1.0
-/// is the SDR reference white, where `p_hdr` has to equal `P_SDR`.
+/// `P_SDR` and `LOG_P_SDR` are folded into the MSL from `L_SDR`, so nothing
+/// else ties the three together.
 #[test]
 fn bt2446_sdr_constants_match_the_formula() {
     let l_sdr = msl_float_constant("L_SDR");
@@ -134,9 +135,107 @@ fn bt2446_sdr_constants_match_the_formula() {
         "LOG_P_SDR is {log_p_sdr}, ln(P_SDR) is {}",
         expected.ln()
     );
-    let hdr_at_unit_peak = f64::from(hdr_uniforms(1.0)[1]);
+}
+
+/// The uniforms put white at the headroom: `L_hdr` is the headroom × 203, from 203 to 10000.
+///
+/// The MSL divides by its own `REFERENCE_WHITE_NITS`, which has to be the 203 the
+/// CPU multiplies by. A headroom under 1 or NaN is taken as 1, and PQ's
+/// 10000 nits stop a headroom above 49, an infinite one included. The three
+/// derived terms follow BT.2446's formula at that `L_hdr`.
+#[test]
+fn hdr_uniforms_put_white_at_the_headroom() {
+    let white = msl_float_constant("REFERENCE_WHITE_NITS");
     assert!(
-        (hdr_at_unit_peak - p_sdr).abs() < 1e-5,
-        "p_hdr at peak 1.0 is {hdr_at_unit_peak}, P_SDR is {p_sdr}"
+        (white - f64::from(REFERENCE_WHITE_NITS)).abs() < 1e-9 && (white - 203.0).abs() < 1e-9,
+        "the MSL's REFERENCE_WHITE_NITS is {white}, the CPU's {REFERENCE_WHITE_NITS}, BT.2408's 203"
     );
+    for (headroom, l_hdr) in [
+        (1.0, 203.0_f64),
+        (1000.0 / 203.0, 1000.0),
+        (15.0, 3045.0),
+        (0.5, 203.0),
+        (f32::NAN, 203.0),
+        (60.0, 10000.0),
+        (f32::INFINITY, 10000.0),
+    ] {
+        let [nits, p_hdr, log2_p_hdr, inv_p_minus_one] = hdr_uniforms(headroom).map(f64::from);
+        let p = 32.0_f64.mul_add((l_hdr / 10000.0).powf(1.0 / 2.4), 1.0);
+        for (name, read, wanted) in [
+            ("l_hdr_nits", nits, l_hdr),
+            ("p_hdr", p_hdr, p),
+            ("log2_p_hdr", log2_p_hdr, p.log2()),
+            ("inv_p_minus_one", inv_p_minus_one, 1.0 / (p - 1.0)),
+        ] {
+            assert!(
+                (read - wanted).abs() <= wanted.abs() * 1e-5,
+                "{name} at a headroom of {headroom} is {read}, the formula gives {wanted}"
+            );
+        }
+    }
+}
+
+/// The columns of a `constant float3x3 <name> = float3x3(...)` block in the present MSL.
+fn msl_matrix(name: &str) -> [[f64; 3]; 3] {
+    let start = format!("constant float3x3 {name} = float3x3(");
+    let body = PRESENT_MSL
+        .split_once(start.as_str())
+        .and_then(|(_, rest)| rest.split_once(");"))
+        .map_or_else(
+            || panic!("present MSL must declare {name}"),
+            |(body, _)| body,
+        );
+    let numbers: Vec<f64> = body
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .flat_map(|code| code.split(['(', ')', ',']))
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && *token != "float3")
+        .map(|token| {
+            token
+                .trim_end_matches('f')
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} holds {token}, not a float literal"))
+        })
+        .collect();
+    assert_eq!(numbers.len(), 9, "{name} must hold nine literals");
+    core::array::from_fn(|column| core::array::from_fn(|row| numbers[column * 3 + row]))
+}
+
+/// The present's colour matrices and their inverses round-trip to the identity.
+///
+/// `M_LMS_TO_BT709` and `M_ICTCP_TO_LMS_PQ` are the inverses of the forward
+/// matrices as the MSL writes them, so a pixel the tone map leaves at its SDR
+/// luminance comes back with its SDR value, SDR white as 1.0. Both products,
+/// in both orders, are the identity within 1e-6 (the literals give 1e-9).
+#[test]
+fn present_matrix_inverses_round_trip() {
+    for (forward, inverse) in [
+        ("M_BT709_TO_LMS", "M_LMS_TO_BT709"),
+        ("M_LMS_PQ_TO_ICTCP", "M_ICTCP_TO_LMS_PQ"),
+    ] {
+        let (a, b) = (msl_matrix(forward), msl_matrix(inverse));
+        for (left, right, order) in [
+            (a, b, "forward after inverse"),
+            (b, a, "inverse after forward"),
+        ] {
+            // Column-major: column `column` of `left * right` is `left` applied
+            // to column `column` of `right`.
+            for (column, right_column) in right.iter().enumerate() {
+                let product: [f64; 3] = core::array::from_fn(|row| {
+                    left.iter()
+                        .zip(right_column)
+                        .map(|(left_column, weight)| left_column[row] * weight)
+                        .sum()
+                });
+                for (row, value) in product.into_iter().enumerate() {
+                    let identity = if row == column { 1.0 } else { 0.0 };
+                    assert!(
+                        (value - identity).abs() < 1e-6,
+                        "{forward} and {inverse}, {order}: ({row}, {column}) is {value}"
+                    );
+                }
+            }
+        }
+    }
 }

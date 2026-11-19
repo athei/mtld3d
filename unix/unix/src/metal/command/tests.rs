@@ -11,7 +11,9 @@
 //! `MetalFX` route ends with, at matching odd extents must give back the source byte for
 //! byte. A ramp pass that cannot be encoded must leave the plain copy on the destination,
 //! and the HDR pass-through must write the linear values of the source into an
-//! `RGBA16Float` destination.
+//! `RGBA16Float` destination. The HDR tone map is checked against a float64 port of
+//! its stage, against the pass-through at a headroom of 1, and for never putting a grey
+//! below SDR while rising with the code and the headroom.
 //!
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
@@ -1812,6 +1814,220 @@ fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
     }
 }
 
+/// The tone map's output against a float64 port of the stage at reference points.
+///
+/// The port is the BT.2446 stage step for step in `f64`: the sRGB decode,
+/// Method A at `L_HDR = min(max(headroom, 1) × 203, 10000)` with
+/// `L_SDR = 100`, the smooth maximum in ln luminance of `Y × 203` and Method
+/// A (`max(a, b) + k h² / 4`, `h = max(k − |a − b|, 0) / k`,
+/// `k = min(0.12, L_HDR / 203 − 1)`), one PQ ratio on I, Ct and Cp, ST 2084,
+/// and the output divided by 203. The sources are 16-bit sRGB codes: 30235 is
+/// linear 0.18 (mid grey), 65535 white, (48192, 35199, 25465) linear
+/// (0.5, 0.25, 0.125). White reaches the headroom up to PQ's 10000 nits,
+/// 49.26 × SDR white, and a headroom of 60 or an infinite one stops there
+/// with every channel finite, a saturated blue included.
+#[test]
+fn the_hdr_tone_map_matches_its_reference_values() {
+    const GREY: [u16; 4] = [30235, 30235, 30235, 65535];
+    const WHITE: [u16; 4] = [65535; 4];
+    const COLOUR: [u16; 4] = [48192, 35199, 25465, 65535];
+    const BLUE: [u16; 4] = [0, 0, 65535, 65535];
+    let cases: [([u16; 4], f32, [f32; 3]); 14] = [
+        (GREY, 2.0, [0.193_365; 3]),
+        (GREY, 5.0, [0.378_151; 3]),
+        (GREY, 15.0, [0.833_174; 3]),
+        (GREY, 60.0, [1.916_529; 3]),
+        (GREY, f32::INFINITY, [1.916_529; 3]),
+        (WHITE, 1.5, [1.5; 3]),
+        (WHITE, 5.0, [5.0; 3]),
+        (WHITE, 15.0, [15.0; 3]),
+        (WHITE, 60.0, [49.261_257; 3]),
+        (COLOUR, 2.0, [0.564_657, 0.279_665, 0.138_375]),
+        (COLOUR, 5.0, [1.216_523, 0.565_387, 0.260_549]),
+        (COLOUR, 15.0, [3.011_8, 1.286_592, 0.538_12]),
+        (BLUE, 60.0, [0.699_825, 0.0, 18.197_902]),
+        (BLUE, f32::INFINITY, [0.699_825, 0.0, 18.197_902]),
+    ];
+    let queue = test_queue();
+    for (texel, headroom, expected) in cases {
+        let bytes: Vec<u8> = texel
+            .iter()
+            .flat_map(|channel| channel.to_le_bytes())
+            .collect();
+        let src = uploaded(
+            &queue,
+            MTLPixelFormat::RGBA16Unorm,
+            (4, 4),
+            &bytes.repeat(16),
+        );
+        let values = hdr_values(&queue, &src, |cmd, dst| {
+            super::encode_hdr_present(cmd, &src, dst, headroom, 0)
+        });
+        for (channel, wanted) in expected.into_iter().enumerate() {
+            let read = values[0][channel];
+            assert!(
+                (read - wanted).abs() <= wanted.mul_add(4.0e-3, 1.0e-4),
+                "{texel:?} at a headroom of {headroom}: channel {channel} reads {read}, the \
+                 reference is {wanted}"
+            );
+        }
+    }
+}
+
+/// At a headroom of 1 the BT.2446 stage gives the pass-through's picture.
+///
+/// The present takes the pass-through stage up to a headroom of 1 and the
+/// BT.2446 stage above it, so the two have to agree there for the switch
+/// to make no step. Every 8-bit grey code and a row of colours run through
+/// both; they agree within the rounding of a half.
+#[test]
+fn the_hdr_tone_map_at_a_headroom_of_one_is_the_sdr_picture() {
+    let queue = test_queue();
+    // Row 0 is every grey code, row 1 a colour per code: BGRA bytes.
+    let greys = (0..=255_u8).flat_map(|code| [code, code, code, 255]);
+    let colours = (0..=255_u8).flat_map(|code| [code / 2, 255 - code, code, 255]);
+    let bytes: Vec<u8> = greys.chain(colours).collect();
+    let src = uploaded(&queue, MTLPixelFormat::BGRA8Unorm, (256, 2), &bytes);
+    let resources = crate::metal::present::ensure_resources(&queue.device()).expect("pipelines");
+    let passthrough = hdr_values(&queue, &src, |cmd, dst| {
+        super::encode_hdr_present(cmd, &src, dst, 1.0, 0)
+    });
+    let tone_mapped = hdr_values(&queue, &src, |cmd, dst| {
+        super::encode_present_pass(
+            cmd,
+            &src,
+            dst,
+            &super::PresentStage {
+                plain: resources.bt2446,
+                ramp: None,
+                uniforms: Some(crate::metal::present::hdr_uniforms(1.0)),
+                gamma_layer: 0,
+            },
+        )
+    });
+    for (index, (sdr, hdr)) in passthrough.iter().zip(&tone_mapped).enumerate() {
+        for (channel, (read, wanted)) in hdr.iter().zip(sdr).take(3).enumerate() {
+            assert!(
+                (read - wanted).abs() <= wanted.mul_add(2.0e-3, 1.0e-5),
+                "texel {index} channel {channel}: BT.2446 at a headroom of 1 reads {read}, the \
+                 pass-through {wanted}"
+            );
+        }
+    }
+}
+
+/// The tone map never puts a grey below SDR and rises with both the code and the headroom.
+///
+/// Every 8-bit grey code, from a headroom of 1 (the pass-through) to 2 in
+/// steps of 0.05, and at 3, 5, 15 and 60. No code reads below its SDR value
+/// or below the code under it or below itself at the headroom before, and
+/// over 1 to 2 no code rises by more than white does per step (0.05; the
+/// float64 port's largest is 0.05005), so the switch from the pass-through
+/// stage makes no step. The tolerances are the rounding of a half.
+#[test]
+fn the_hdr_tone_map_never_darkens_and_rises_with_code_and_headroom() {
+    let queue = test_queue();
+    let bytes: Vec<u8> = (0..=255_u8)
+        .flat_map(|code| [code, code, code, 255])
+        .collect();
+    let src = uploaded(&queue, MTLPixelFormat::BGRA8Unorm, (256, 1), &bytes);
+    let headrooms = (0..=20_u8)
+        .map(|step| f32::from(step).mul_add(0.05, 1.0))
+        .chain([3.0, 5.0, 15.0, 60.0]);
+    let mut previous: Option<(f32, Vec<f32>)> = None;
+    for headroom in headrooms {
+        let values: Vec<f32> = hdr_values(&queue, &src, |cmd, dst| {
+            super::encode_hdr_present(cmd, &src, dst, headroom, 0)
+        })
+        .iter()
+        .map(|texel| texel[0])
+        .collect();
+        for (code, &value) in (0..=255_u8).zip(&values) {
+            let encoded = f32::from(code) / 255.0;
+            let sdr = if encoded <= 0.040_45 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            };
+            assert!(
+                value >= sdr.mul_add(-2.0e-3, sdr) - 1.0e-6,
+                "code {code} at a headroom of {headroom} reads {value}, under its SDR {sdr}"
+            );
+        }
+        for (code, pair) in values.windows(2).enumerate() {
+            assert!(
+                pair[1] >= pair[0].mul_add(-1.0e-3, pair[0]),
+                "code {} at a headroom of {headroom} reads {}, under code {code}'s {}",
+                code + 1,
+                pair[1],
+                pair[0]
+            );
+        }
+        if let Some((last_headroom, last)) = &previous {
+            for (code, (now, before)) in values.iter().zip(last).enumerate() {
+                assert!(
+                    *now >= before.mul_add(-1.0e-3, *before),
+                    "code {code} reads {now} at a headroom of {headroom}, {before} at \
+                     {last_headroom}"
+                );
+                if headroom <= 2.0 {
+                    assert!(
+                        now - before <= 0.053,
+                        "code {code} rises from {before} to {now} between a headroom of \
+                         {last_headroom} and {headroom}"
+                    );
+                }
+            }
+        }
+        previous = Some((headroom, values));
+    }
+}
+
+/// Run `encode` into an `RGBA16Float` destination of `src`'s size and read every texel.
+///
+/// The destination is Private and render-target only, like the float
+/// drawable of an EDR layer. Every channel must be a finite half.
+fn hdr_values(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>, &ProtocolObject<dyn MTLTexture>) -> bool,
+) -> Vec<[f32; 4]> {
+    let dst = drawable_shaped(
+        queue,
+        MTLPixelFormat::RGBA16Float,
+        src.width(),
+        src.height(),
+    );
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-tone-map")));
+    assert!(encode(&cmd, &dst), "the HDR pass must encode");
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    texture_bytes(queue, &dst)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|texel| {
+            let halves = texel.as_chunks::<2>().0;
+            core::array::from_fn(|channel| {
+                let bits = u16::from_le_bytes(halves[channel]);
+                assert_ne!(
+                    bits & 0x7c00,
+                    0x7c00,
+                    "channel {channel} is not a finite half"
+                );
+                half_to_f32(bits)
+            })
+        })
+        .collect()
+}
+
 /// A finite IEEE half's value.
 fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
@@ -1824,9 +2040,9 @@ fn half_to_f32(bits: u16) -> f32 {
     sign * normal
 }
 
-/// Bytes per texel of the two drawable formats.
+/// Bytes per texel of the two drawable formats and the 16-bit test sources.
 fn bytes_per_texel(format: MTLPixelFormat) -> usize {
-    if format == MTLPixelFormat::RGBA16Float {
+    if format == MTLPixelFormat::RGBA16Float || format == MTLPixelFormat::RGBA16Unorm {
         8
     } else {
         4

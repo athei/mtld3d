@@ -934,7 +934,9 @@ pub fn request_cursor_kick_all() {
 /// polled would never see a panel with headroom appear under it.
 ///
 /// `1.0` until the first refresh lands, which is still correct for the HDR
-/// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve.
+/// present: at a headroom of 1 it shows the SDR picture exactly, since the
+/// tone map never lowers a pixel's luminance below SDR and Method A lies at
+/// or below SDR there.
 pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
     count_present(att);
     att.headroom()

@@ -84,16 +84,27 @@ fragment float4 mtld3d_readback_ps_copy_nearest(
 }
 
 struct HdrUniforms {
-    float l_hdr_nits;
+    float l_hdr_nits;       // min(max(headroom, 1) * REFERENCE_WHITE_NITS, 10000)
     float p_hdr;            // 1 + 32 * pow(l_hdr_nits/10000, 1/2.4)
     float log2_p_hdr;       // log2(p_hdr)
     float inv_p_minus_one;  // 1 / (p_hdr - 1)
 };
 
+// BT.2446-A's SDR reference white in nits: its input 1.0, at its design point.
 constant float L_SDR = 100.0;
 // P_SDR = 1 + 32 * pow(L_SDR / 10000, 1/2.4) at L_SDR = 100. Folded.
 constant float P_SDR = 5.6969577f;
 constant float LOG_P_SDR = 1.7399323f; // log(P_SDR)
+// BT.2408's HDR reference white in nits: where the HDR picture puts the
+// screen's SDR white. Method A's output in nits is divided by it, so 203 nits
+// show at EDR 1.0 at every headroom.
+constant float REFERENCE_WHITE_NITS = 203.0;
+// Widest blend of the smooth maximum in `bt2446_ictcp`, in ln luminance.
+// Narrower than the smallest gap of Method A above SDR at L_HDR 1000 for a
+// luminance at or above 8-bit grey code 1 (0.134, at code 1), so from L_HDR
+// 1000 on such a luminance takes Method A's own value. Only luminances under
+// grey code 1 still blend there (the gap falls towards 0.06 as Y goes to 0).
+constant float ITM_SMOOTH = 0.12;
 
 // sRGB → linear EOTF (IEC 61966-2-1, piecewise). Shared by every HDR stage,
 // frame and cursor alike, so the two can never disagree on the decode.
@@ -135,32 +146,35 @@ constant float3x3 M_BT709_TO_LMS = float3x3(
     float3(0.0810847778320f, 0.1164960937500f, 0.8083459472656f)  // col 2
 );
 
-// LMS → BT.709 linear-light (combined inverse).
+// LMS → BT.709 linear-light: the inverse of M_BT709_TO_LMS, computed in
+// float64 and rounded to ten decimals, so the round trip is the identity
+// within 1e-9 and SDR white comes back as 1.0.
 constant float3x3 M_LMS_TO_BT709 = float3x3(
-    float3( 6.1729507446289f, -1.3236293334961f, -0.0118084289551f),
-    float3(-5.3198394775391f,  2.5602416992188f, -0.2641143798828f),
-    float3( 0.1465606689453f, -0.2363464355469f,  1.2761764526367f)
+    float3( 6.1740117436f, -1.3246879448f, -0.0122371492f),
+    float3(-5.3216416751f,  2.5608829838f, -0.2641562583f),
+    float3( 0.1476250327f, -0.2361870399f,  1.2763909094f)
 );
 
-// LMS-PQ → ICtCp (BT.2100-2 §3.4 / Lilium `colour_space/ictcp.fxh`
-// matched pair). Each row of the spec table becomes a column here.
-// Ct/Cp rows are the standard /4096 form; the inverse below is the
-// matching /4096 inverse so the round-trip is identity. A /8192-form
-// forward (half these Ct/Cp values) paired with this /4096 inverse
-// silently drops chromatic deltas by ~50% — invisible on grey
-// (Ct=Cp=0), catastrophic on saturated content.
+// LMS-PQ → ICtCp (BT.2100-2 / Lilium `colour_space/ictcp.fxh`). Each row
+// of the spec table becomes a column here. The Ct and Cp coefficients are
+// Lilium's, within 1.2e-4 of BT.2100's integers over 4096; the inverse
+// below is computed from these values, not from the spec's. An inverse of
+// other values (the spec's, or the /8192 form that halves Ct and Cp)
+// shifts the colour of every chromatic pixel, even one whose luminance the
+// tone map leaves alone.
 constant float3x3 M_LMS_PQ_TO_ICTCP = float3x3(
     float3(0.5f,  1.61370003f,  4.37806224f), // col 0  (L' coeffs)
     float3(0.5f, -3.32339620f, -4.24553966f), // col 1  (M' coeffs)
     float3(0.0f,  1.70969617f, -0.13252264f)  // col 2  (S' coeffs)
 );
 
-// ICtCp → LMS-PQ (BT.2100-2 §3.4 inverse). Matched pair with
-// M_LMS_PQ_TO_ICTCP above.
+// ICtCp → LMS-PQ: the inverse of M_LMS_PQ_TO_ICTCP, computed in float64
+// and rounded to ten decimals, so the round trip is the identity within
+// 1e-9.
 constant float3x3 M_ICTCP_TO_LMS_PQ = float3x3(
-    float3(1.0f, 1.0f, 1.0f),                       // col 0  (I coeffs)
-    float3(0.00860903f, -0.00860903f,  0.56003270f),// col 1  (Ct coeffs)
-    float3(0.11102963f, -0.11102963f, -0.32062717f) // col 2  (Cp coeffs)
+    float3(1.0000000067f, 0.9999999933f, 0.9999999808f),   // col 0  (I coeffs)
+    float3(0.0086064749f, -0.0086064749f, 0.5600462947f),  // col 1  (Ct coeffs)
+    float3(0.1110335352f, -0.1110335352f, -0.3206319682f)  // col 2  (Cp coeffs)
 );
 
 // PQ OETF: linear nits (0..10000) → PQ-encoded [0..1]. ST.2084 inverse
@@ -188,17 +202,9 @@ inline float3 pq_eotf(float3 pq) {
     return 10000.0f * pow(num / den, float3(1.0f / M1));
 }
 
-// BT.2446 Method A in ICtCp on one linear BT.709 pixel. Shared by the frame
-// and the cursor sprite, which is what keeps the cursor exactly as bright as
-// the UI it hovers over.
-inline float3 bt2446_ictcp(float3 lin, constant HdrUniforms& u) {
-    // ── BT.2446 Method A in ICtCp ──
-    // Run the inverse tone-map curve on BT.709 luminance (`yp_sdr →
-    // yp_c → yp_p → yp_hdr → y_hdr_linear`). Then transplant the new
-    // luminance into the pixel's ICtCp representation while leaving
-    // Ct/Cp untouched — that's the chroma-preserving step that saves
-    // saturated highlights from desaturating toward white.
-    float y_sdr = max(dot(lin, float3(0.2126f, 0.7152f, 0.0722f)), 1e-20f);
+// BT.2446 Method A: the luminance of an SDR pixel (1.0 = L_SDR) to HDR nits
+// for the peak `u.l_hdr_nits` (`yp_sdr → yp_c → yp_p → yp_hdr → nits`).
+inline float bt2446_a_nits(float y_sdr, constant HdrUniforms& u) {
     float yp_sdr = pow(y_sdr, 1.0f / 2.4f);
     float yp_c = log((yp_sdr * (P_SDR - 1.0f)) + 1.0f) / LOG_P_SDR;
     // Three-segment piecewise inversion of the SDR mapping; the
@@ -212,39 +218,55 @@ inline float3 bt2446_ictcp(float3 lin, constant HdrUniforms& u) {
     // CPU-hoisted constants: pow(p_hdr, yp_p) → exp2(yp_p * log2_p_hdr);
     // 1/(p_hdr-1) replaces the divide.
     float yp_hdr = (exp2(yp_p * u.log2_p_hdr) - 1.0f) * u.inv_p_minus_one;
-    float y_hdr_linear_nits = pow(yp_hdr, 2.4f) * u.l_hdr_nits;
+    return pow(yp_hdr, 2.4f) * u.l_hdr_nits;
+}
 
-    // Forward into ICtCp to extract the pixel's chroma signature.
-    // Multiply by L_SDR to enter the absolute-nits domain that PQ
-    // expects.
-    float3 lms_nits = M_BT709_TO_LMS * (lin * L_SDR);
-    float3 lms_pq = pq_oetf(lms_nits);
-    float3 ictcp_in = M_LMS_PQ_TO_ICTCP * lms_pq;
+// The inverse tone map of one linear BT.709 pixel, its luminance never below
+// SDR. Shared by the frame and the cursor sprite, which is what keeps the
+// cursor exactly as bright as the UI it hovers over.
+//
+// The SDR picture shows a pixel of luminance Y at Y * REFERENCE_WHITE_NITS.
+// Up to a headroom of about 4, Method A puts part of the range under that
+// (at 1.5 every 8-bit grey code up to 199, at 3 the darkest eight), so the
+// pixel takes the brighter of the two through a smooth maximum in ln
+// luminance: with a = ln(Y * REFERENCE_WHITE_NITS) and b = ln(Method A),
+// max(a, b) + k h^2 / 4, h = max(k - |a - b|, 0) / k.
+// It is never below either curve, its slope is continuous where they cross
+// (a hard maximum creases there, which bands a bright gradient), and it does
+// not decrease in Y or in the headroom. Its width k = min(ITM_SMOOTH,
+// L_HDR / REFERENCE_WHITE_NITS - 1) is 0 at a headroom of 1, where Method A
+// lies at or below SDR for every Y, so the result there is the SDR picture.
+//
+// The new luminance scales the pixel's I, Ct and Cp by one ratio,
+// PQ(Y_out) / PQ(Y * REFERENCE_WHITE_NITS), which keeps the ICtCp hue angle
+// and Ct / I, so saturated content (spells, fire, sunset) keeps its chroma
+// instead of bleaching toward white; a pixel the tone map leaves at its SDR
+// luminance keeps its SDR colour. The rule holds for luminance, not for each
+// channel: a single channel of a saturated colour can come out below its SDR
+// value. A strong primary can leave the gamut and is clipped at 0. Up to
+// L_HDR 10000 every value stays finite.
+inline float3 bt2446_ictcp(float3 lin, constant HdrUniforms& u) {
+    float y_sdr = max(dot(lin, float3(0.2126f, 0.7152f, 0.0722f)), 1e-20f);
+    float y_sdr_nits = y_sdr * REFERENCE_WHITE_NITS;
+    float a = log(y_sdr_nits);
+    float b = log(max(bt2446_a_nits(y_sdr, u), 1e-30f));
+    float k = clamp(u.l_hdr_nits * (1.0f / REFERENCE_WHITE_NITS) - 1.0f, 0.0f, ITM_SMOOTH);
+    if (b <= a - k) {
+        return lin;
+    }
+    float h = k > 0.0f ? max(k - abs(a - b), 0.0f) / k : 0.0f;
+    float y_out_nits = exp(max(a, b) + k * h * h * 0.25f);
+    float ratio = pq_oetf(float3(y_out_nits)).x
+                / max(pq_oetf(float3(y_sdr_nits)).x, 1e-9f);
 
-    // Derive the new I corresponding to `y_hdr_linear_nits`. For a
-    // neutral grey, I = pq_oetf(Y).x; for chromatic pixels the actual
-    // I mixes the PQ-encoded LMS values and differs from this
-    // grey-equivalent, but as the luminance transplant target it's the
-    // right thing to put on the I axis.
-    float i_hdr = pq_oetf(float3(y_hdr_linear_nits)).x;
+    // PQ takes absolute nits, so the pixel enters ICtCp at
+    // REFERENCE_WHITE_NITS a unit and leaves the same way.
+    float3 ictcp = M_LMS_PQ_TO_ICTCP * pq_oetf(M_BT709_TO_LMS * (lin * REFERENCE_WHITE_NITS));
+    float3 rgb_nits = M_LMS_TO_BT709 * pq_eotf(M_ICTCP_TO_LMS_PQ * (ictcp * ratio));
 
-    // Scale Ct, Cp by the **same ratio** as I — keeps chroma proportional
-    // to intensity so saturated content (spells, fire, neon, sunset) stays
-    // saturated under the HDR boost instead of bleaching toward white.
-    // Without this, ICtCp's absolute Ct/Cp + a larger I produce
-    // Hunt-effect-style perceived desaturation (the chroma-to-luminance
-    // ratio drops as I rises). Matches the chroma-preserving upmap pattern
-    // used in Lilium's ICtCp port.
-    float i_ratio = i_hdr / max(ictcp_in.x, 1e-6f);
-    float3 ictcp_out = float3(i_hdr, ictcp_in.y * i_ratio, ictcp_in.z * i_ratio);
-    float3 lms_pq_out = M_ICTCP_TO_LMS_PQ * ictcp_out;
-    float3 lms_nits_out = pq_eotf(lms_pq_out);
-    float3 rgb_nits_out = M_LMS_TO_BT709 * lms_nits_out;
-
-    // Back to normalised linear BT.709 (1.0 = paper-white = 100 nits).
-    // The layer's `ExtendedLinear*` tag will gamut-convert + OETF-encode
-    // for the actual display.
-    return max(rgb_nits_out, float3(0.0f)) / L_SDR;
+    // Linear BT.709, 1.0 = the screen's SDR white. The layer's
+    // `ExtendedLinear*` tag gamut-converts and encodes for the display.
+    return max(rgb_nits, float3(0.0f)) / REFERENCE_WHITE_NITS;
 }
 
 fragment float4 mtld3d_present_ps_hdr_bt2446(

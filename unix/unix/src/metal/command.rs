@@ -1548,8 +1548,9 @@ fn encode_hdr_present_upscaled_with(
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
 ///
-/// Rendered via a fullscreen triangle that sRGB-decodes each sample and
-/// multiplies by the EDR boost factor.
+/// Rendered via a fullscreen triangle that sRGB-decodes each sample and, at
+/// a headroom above 1, inverse tone maps it into the headroom with BT.2446
+/// Method A (`present.rs` describes the curve).
 ///
 /// `dst` is the drawable at the default scale, and the render-resolution
 /// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
@@ -1571,8 +1572,9 @@ fn encode_hdr_present(
     // Pick the pass-through pipeline when the panel reports no EDR
     // headroom this frame, BT.2446 otherwise. The two pipelines share
     // the vertex stage and the sRGB EOTF; pass-through skips the
-    // BT.2446 math and requires no uniforms. See `present.rs` for
-    // the per-pipeline rationale.
+    // BT.2446 math and requires no uniforms. BT.2446 at a headroom of 1
+    // gives the same SDR picture, so the switch makes no step. See
+    // `present.rs` for the per-pipeline rationale.
     // A gamma ramp replaces the stage with its twin, which looks each channel
     // up in the layer's table before the sRGB decode. The twins are compiled
     // on first use, so a session without a ramp pays nothing for them; a

@@ -50,8 +50,10 @@ and no game breaks, speed wins. Those trades are listed in
   are sampled for the smaller render size.
 - **HDR output.** On by default. On a display with EDR headroom the frame is
   expanded into that headroom by inverse tone mapping that follows the live
-  headroom. Turned off, or on a display without EDR headroom, the frame is
-  presented as SDR.
+  headroom: the screen's SDR white stands for 203 nits of the HDR picture,
+  the frame's white reaches the headroom, and no pixel's luminance is lower
+  than in the SDR picture. Turned off, or on a display without EDR headroom,
+  the frame is presented as SDR.
 - **Software cursor.** The cursor is drawn in its own overlay window
   independently of the game's frames, so it is not tied to the frame rate
   and has hardware-cursor latency. Under HDR it is tone-mapped like the
