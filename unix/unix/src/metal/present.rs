@@ -2,8 +2,9 @@
 //!
 //! Every present that `MetalFX` does not upscale comes through here, matching
 //! extents included: the drawable is framebuffer-only, so no blit can write
-//! it. One fullscreen triangle, three fragment entry points, one for each
-//! thing present has to do:
+//! it. One fullscreen triangle and three frame stages, one for each thing
+//! present has to do (each with a cursor twin and gamma-ramp twins, listed
+//! at `PRESENT_MSL`):
 //!
 //! - **SDR at any ratio**: sample and write. Exact at matching extents, a
 //!   filtered stretch otherwise. This is the route that guarantees every
@@ -58,10 +59,13 @@ use crate::{
 
 /// MSL source for the present-pass library.
 ///
-/// One library, one shared vertex stage, **three frame fragment entry points**
-/// and their three cursor twins (`mtld3d_cursor_ps_*`: the same colour
-/// transform, then straight alpha premultiplied for the overlay window's
-/// compositor):
+/// One library, one shared vertex stage and thirteen fragment entry points:
+/// the **three frame stages** below, their three cursor twins
+/// (`mtld3d_cursor_ps_*`: the same colour transform, then straight alpha
+/// premultiplied for the overlay window's compositor), a gamma twin of each
+/// of those six (`*_gamma`: the D3D9 gamma ramp looked up before the
+/// transform), and the nearest-texel readback copy
+/// (`mtld3d_readback_ps_copy_nearest`). The frame stages:
 ///
 /// - `mtld3d_present_ps_copy`: sample the source backbuffer and return it
 ///   unchanged. Source and destination are both gamma-encoded 8-bit, so
@@ -93,8 +97,9 @@ use crate::{
 /// Vertex stage: synthesise a single oversized triangle covering the
 /// full viewport from `vertex_id` alone — no vertex buffer required.
 /// The standard fullscreen-triangle trick saves the edge-overlap
-/// rasterisation cost of a two-triangle quad. Shared between all three
-/// fragment entry points.
+/// rasterisation cost of a two-triangle quad. Shared by every fragment
+/// entry point: the frame and cursor stages, their gamma twins and the
+/// readback copies.
 ///
 /// `L_SDR` is pinned to `100.0` because Apple's compositor anchors
 /// `1.0`-in-the-drawable to 100 nits and reports
@@ -130,13 +135,14 @@ const PRESENT_MSL: &str = include_str!("present.msl");
 /// at process exit: these are process-lifetime objects, the same as the device
 /// and command queue.
 ///
-/// Six pipeline states share one MSL library, one per fragment entry
-/// point. `copy` writes the SDR drawable format; the two HDR states write
-/// the EDR one. A layer is one format or the other for its lifetime, so
-/// the unused pipelines cost one compile each and nothing else, cheaper
-/// than the per-format map the extra generality would need. The `cursor_*`
-/// trio are the software cursor's sprite passes, same formats, same
-/// transforms, premultiplied output.
+/// Six pipeline states share one MSL library, one per frame and cursor
+/// stage without a gamma ramp (the gamma twins and the readback copies are
+/// built on demand). `copy` writes the SDR drawable format; the two HDR
+/// states write the EDR one. A layer is one format or the other for its
+/// lifetime, so the unused pipelines cost one compile each and nothing
+/// else, cheaper than the per-format map the extra generality would need.
+/// The `cursor_*` trio are the software cursor's sprite passes, same
+/// formats, same transforms, premultiplied output.
 #[derive(Clone, Copy)]
 pub struct PresentPipelines {
     pub copy: u64,               // MTLRenderPipelineState*
