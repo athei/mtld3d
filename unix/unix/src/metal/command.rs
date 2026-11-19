@@ -1571,8 +1571,9 @@ fn encode_hdr_present(
     // Pick the pass-through pipeline when the panel reports no EDR
     // headroom this frame, BT.2446 otherwise. The two pipelines share
     // the vertex stage and the sRGB EOTF; pass-through skips the
-    // BT.2446 math and requires no uniforms. See `present.rs` for
-    // the per-pipeline rationale.
+    // BT.2446 math and requires no uniforms. BT.2446 at a headroom of 1
+    // gives the same SDR picture, so the switch makes no step. See
+    // `present.rs` for the per-pipeline rationale.
     // A gamma ramp replaces the stage with its twin, which looks each channel
     // up in the layer's table before the sRGB decode. The twins are compiled
     // on first use, so a session without a ramp pays nothing for them; a
