@@ -79,9 +79,9 @@ use crate::{
 ///   `kCGColorSpaceExtendedLinear*` layer tag lets macOS gamut-convert
 ///   to the panel. At a headroom of 1 the BT.2446 stage gives the SDR
 ///   picture too (it never lowers a pixel's luminance below SDR, and
-///   Method A lies at or below SDR there), so this stage is the same picture without the
-///   tone map's per-pixel work, and the switch between the two makes no
-///   step.
+///   Method A lies at or below SDR there), so this stage is the same
+///   picture without the tone map's per-pixel work, and the switch
+///   between the two makes no step.
 ///
 /// - `mtld3d_present_ps_hdr_bt2446` — sample, sRGB → linear EOTF, then
 ///   **ITU-R BT.2446 Method A** SDR→HDR inverse tone mapping operated
