@@ -3,10 +3,12 @@
 //! The swap is pinned on stand-ins for winemac's classes: a `CAMetalLayer`
 //! subclass in the role of the hook class, which turns into a plain
 //! `CAMetalLayer` exactly once, and another subclass, which keeps its class.
-//! The field read is pinned on runtime-built classes carrying the field the
-//! way winemac's cocoa view does, under either name a Wine gives it (with
-//! `CrossOver`'s preferred when a class declares both), and on classes that
-//! lack it or carry it under another type.
+//! A real key-value observer pins that a layer is judged by the class it
+//! reports, while the observer's subclass stays in place. The field read is
+//! pinned on runtime-built classes carrying the field the way winemac's cocoa
+//! view does, under either name a Wine gives it (with `CrossOver`'s preferred
+//! when a class declares both), and on classes that lack it or carry it under
+//! another type.
 
 use core::ffi::c_void;
 
@@ -14,6 +16,9 @@ use objc2::{
     define_class, extern_methods,
     rc::Retained,
     runtime::{ClassBuilder, NSObject},
+};
+use objc2_foundation::{
+    NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSString,
 };
 
 use super::*;
@@ -48,7 +53,66 @@ impl OtherLayer {
     );
 }
 
-/// The class `layer` answers with now.
+define_class!(
+    /// A key-value observer that ignores what it is told.
+    #[unsafe(super(NSObject))]
+    #[name = "Mtld3dTestLayerObserver"]
+    struct LayerObserver;
+
+    impl LayerObserver {
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut c_void,
+        ) {
+        }
+    }
+);
+
+impl LayerObserver {
+    extern_methods!(
+        #[unsafe(method(new))]
+        #[unsafe(method_family = new)]
+        fn new() -> Retained<Self>;
+    );
+}
+
+/// A key-value observer on a layer's `contentsScale`, which gives the layer a subclass of its own.
+struct Observation {
+    observer: Retained<LayerObserver>,
+    key: Retained<NSString>,
+}
+
+impl Observation {
+    /// Register an observer on `layer`.
+    fn new(layer: &CAMetalLayer) -> Self {
+        let observer = LayerObserver::new();
+        let key = NSString::from_str("contentsScale");
+        // SAFETY: `observer` implements `observeValueForKeyPath:ofObject:change:context:`
+        // and outlives the registration, which `remove` ends before the
+        // layer drops; the context is null and never read.
+        unsafe {
+            layer.addObserver_forKeyPath_options_context(
+                &observer,
+                &key,
+                NSKeyValueObservingOptions::empty(),
+                core::ptr::null_mut(),
+            );
+        }
+        Self { observer, key }
+    }
+
+    /// End the registration on `layer`, the layer [`Self::new`] observed.
+    fn remove(self, layer: &CAMetalLayer) {
+        // SAFETY: `new` registered this observer on `layer` for this key path.
+        unsafe { layer.removeObserver_forKeyPath(&self.observer, &self.key) };
+    }
+}
+
+/// The isa class of `layer`, which a key-value observer's subclass replaces.
 fn class_of(layer: &CAMetalLayer) -> &'static AnyClass {
     let object: &AnyObject = layer.as_ref();
     object.class()
@@ -89,6 +153,47 @@ fn another_subclass_keeps_its_class() {
         LayerClass::Foreign
     );
     assert_eq!(class_of(layer), OtherLayer::class());
+}
+
+#[test]
+fn a_plain_layer_under_a_key_value_observer_is_plain() {
+    let layer = CAMetalLayer::new();
+    let observation = Observation::new(&layer);
+    let observed = class_of(&layer);
+    assert_ne!(
+        observed,
+        CAMetalLayer::class(),
+        "the observer subclassed the layer"
+    );
+    assert_eq!(
+        bypass_hook_class(&layer, HookLayer::class()),
+        LayerClass::Plain
+    );
+    assert_eq!(
+        class_of(&layer),
+        observed,
+        "the observer keeps its subclass"
+    );
+    observation.remove(&layer);
+}
+
+#[test]
+fn the_hook_class_under_a_key_value_observer_keeps_its_class() {
+    let layer = HookLayer::new();
+    let layer: &CAMetalLayer = &layer;
+    let observation = Observation::new(layer);
+    let observed = class_of(layer);
+    assert_ne!(
+        observed,
+        HookLayer::class(),
+        "the observer subclassed the layer"
+    );
+    assert_eq!(
+        bypass_hook_class(layer, HookLayer::class()),
+        LayerClass::Foreign
+    );
+    assert_eq!(class_of(layer), observed, "the observer keeps its subclass");
+    observation.remove(layer);
 }
 
 /// A runtime class named `name` over `superclass`, with the client surface field typed `T`.
