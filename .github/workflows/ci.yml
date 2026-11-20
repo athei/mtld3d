@@ -86,12 +86,12 @@ env:
 
 # The shape: three machines compile, everything else replays. `build` makes the
 # stage every test leg installs and runs from, so the suites fan out over
-# machines that carry no toolchain, and no compile happens twice. `check` runs the lint, doc and unit legs as steps of
-# one job, with the cheap checks first for earlier feedback, and `check-perf`
-# runs the `PERF=1` lint and unit legs beside it, since they build into a
-# target directory of their own and would only add to `check`'s length. A tag
-# push runs only `release`, which reads the result the same commit already got
-# on main.
+# machines that carry no toolchain, and no compile happens twice. `check` runs
+# the lint, doc and unit legs as steps of one job, with the cheap checks first
+# for earlier feedback, and `check-perf` runs the `PERF=1` lint and unit legs
+# beside it, since they build into a target directory of their own and would
+# only add to `check`'s length. A tag push runs only `release`, which reads the
+# result the same commit already got on main.
 jobs:
   # Everything a test machine needs, built once: the i686 and ARM64X builds,
   # the unix `.so`, the e2e test binaries of every PE arch, and the e2e and
