@@ -1,5 +1,5 @@
 # mtld3d d3d9 conformance baseline — per-site failure counts.
-# Wine: wine-11.20-32-g9c44ed65ef
+# Wine: wine-11.21-54-g501796b0ed
 # Regenerate with 'make conformance-baseline'. Classifications + triage prose
 # live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test
 # keeps the two files covering the same sites.
@@ -60,8 +60,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686/visual] crash=0
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -199,8 +199,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686+intel/visual] crash=1
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -343,9 +343,9 @@
   device.c:14930 count=1
   device.c:14946 count=1
   device.c:14955 count=1
-  device.c:15039 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15081 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686+intel@mac2/visual] crash=1
   visual.c:5088 count=1
   visual.c:5167 count=1
@@ -478,8 +478,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686+scale/visual] crash=0
   visual.c:199 count=8
   visual.c:3887 count=1
@@ -648,8 +648,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [x86_64/visual] crash=0
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -785,8 +785,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [x86_64+intel/visual] crash=1
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -929,9 +929,9 @@
   device.c:14930 count=1
   device.c:14946 count=1
   device.c:14955 count=1
-  device.c:15039 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15081 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [x86_64+intel@mac2/visual] crash=1
   visual.c:5088 count=1
   visual.c:5167 count=1
@@ -1064,8 +1064,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [x86_64+scale/visual] crash=0
   visual.c:199 count=8
   visual.c:3887 count=1
@@ -1234,9 +1234,9 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686-arm64/visual] crash=0
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -1372,9 +1372,9 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686-arm64+intel/visual] crash=1
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -1513,9 +1513,9 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
-  device.c:15357 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
+  device.c:15399 count=1
 [i686-arm64+scale/visual] crash=0
   visual.c:199 count=8
   visual.c:3887 count=1
@@ -1684,8 +1684,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [arm64x/visual] crash=0
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -1821,8 +1821,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [arm64x+intel/visual] crash=1
   visual.c:3887 count=1
   visual.c:3889 count=1
@@ -1961,8 +1961,8 @@
   device.c:12780 count=72
   device.c:12819 count=477
   device.c:14946 count=1
-  device.c:15104 count=1
-  device.c:15176 count=1
+  device.c:15146 count=1
+  device.c:15218 count=1
 [arm64x+scale/visual] crash=0
   visual.c:199 count=8
   visual.c:3887 count=1
