@@ -11,9 +11,10 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DBOX, D3DFMT_DXT1, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
-    D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_DYNAMIC,
+    D3DFVF_XYZ, D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_DYNAMIC,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -176,10 +177,10 @@ fn draw_cube_face<const N: usize>(
     )
 }
 
-/// Draw the row `v = 0.5` of the first slice of a two-slice `volume`, read `points`.
+/// Draw the row `v = 0.5` of slice `slice` of a two-slice `volume`, read `points`.
 fn draw_volume_row<const N: usize>(
     h: &Harness,
-    volume: &VolumeTexture<'_>,
+    (volume, slice): (&VolumeTexture<'_>, u8),
     clear: u32,
     points: [(u32, u32); N],
 ) -> [u32; N] {
@@ -187,7 +188,7 @@ fn draw_volume_row<const N: usize>(
     draw_and_read(
         h,
         D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16),
-        &volume_row_quad(0.25),
+        &volume_row_quad(f32::midpoint(f32::from(slice), 0.5)),
         clear,
         points,
     )
@@ -510,18 +511,105 @@ fn texels_a_partial_lock_box_leaves_alone_in_a_new_dynamic_default_pool_volume_s
         || {
             let released = create();
             released.write_u32(0, &[YELLOW_X8; TEXELS]);
-            assert_released_yellow(draw_volume_row(&h, &released, BLACK, [(320, 240)])[0]);
+            assert_released_yellow(draw_volume_row(&h, (&released, 0), BLACK, [(320, 240)])[0]);
         },
         || {
             let probe = create();
             probe.write_box_u32(0, &LEFT_HALF, &[RED_X8; TEXELS / 2]);
-            draw_volume_row(&h, &probe, CLEAR, HALVES)
+            draw_volume_row(&h, (&probe, 0), CLEAR, HALVES)
         },
     );
     assert!(
         sampled.iter().all(|halves| *halves == [RED_X8 & RGB, 0]),
         "dynamic default-pool volume: the half the lock left alone samples black in every \
          round, got {sampled:06x?}"
+    );
+}
+
+/// The slice an `UpdateTexture` from a shallower source leaves alone in a new volume samples black.
+///
+/// D3D9 pairs volume levels on their largest extent, so an 8x8x1 source
+/// updates an 8x8x2 level: the copy covers every row of the level but only
+/// its first slice, and the level uploads whole.
+#[test]
+fn the_slice_an_update_texture_from_a_shallower_volume_leaves_alone_samples_black() {
+    const EXTENT: [u32; 3] = [8, 8, 2];
+    const TEXELS: usize = 8 * 8 * 2;
+    let h = Harness::new();
+    let volume = |extent, pool| {
+        let (hr, volume) = h.try_create_volume_texture(extent, 1, 0, D3DFMT_X8R8G8B8, pool);
+        assert_eq!(hr, 0, "CreateVolumeTexture {extent:?} in pool {pool}");
+        volume.expect("a volume texture")
+    };
+    let sampled = probe_after_releases(
+        &h,
+        || {
+            let source = volume(EXTENT, D3DPOOL_SYSTEMMEM);
+            source.write_u32(0, &[YELLOW_X8; TEXELS]);
+            let released = volume(EXTENT, D3DPOOL_DEFAULT);
+            assert_eq!(h.update_volume_texture_hr(&source, &released), 0);
+            assert_released_yellow(draw_volume_row(&h, (&released, 1), BLACK, [(320, 240)])[0]);
+        },
+        || {
+            // Created first, so its staging is a box a released volume parked.
+            let probe = volume(EXTENT, D3DPOOL_DEFAULT);
+            let source = volume([8, 8, 1], D3DPOOL_SYSTEMMEM);
+            source.write_u32(0, &[RED_X8; TEXELS / 2]);
+            assert_eq!(
+                h.update_volume_texture_hr(&source, &probe),
+                0,
+                "UpdateTexture from the 8x8x1 source"
+            );
+            [0, 1].map(|slice| draw_volume_row(&h, (&probe, slice), CLEAR, [(320, 240)])[0])
+        },
+    );
+    assert!(
+        sampled.iter().all(|slices| *slices == [RED_X8 & RGB, 0]),
+        "default-pool volume: the slice the copy left alone samples black in every round, got \
+         {sampled:06x?}"
+    );
+}
+
+/// A first `D3DLOCK_DISCARD` lock of a new dynamic default-pool level hands out zero.
+///
+/// The lock covers the whole level and its upload does too, so the block
+/// columns the write after it leaves alone sample black.
+#[test]
+fn a_first_discard_lock_of_a_new_dynamic_default_pool_level_hands_out_zero() {
+    let yellow = dxt1_solid_block(YELLOW_565);
+    let rows = (PROBE_SIDE / 4) as usize;
+    let column = dxt1_solid_block(RED_565).repeat(rows);
+    let h = Harness::new();
+    let create = || {
+        h.create_texture(
+            PROBE_SIDE,
+            PROBE_SIDE,
+            1,
+            D3DUSAGE_DYNAMIC,
+            D3DFMT_DXT1,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let sampled = probe_after_releases(
+        &h,
+        || {
+            let tex = create();
+            lock_dxt1_level(&h, &tex, 0, yellow);
+            assert_released_yellow(draw_quadrants(&h, &tex, BLACK)[0]);
+        },
+        || {
+            let probe = create();
+            // The first block of every block row: the first block column.
+            probe
+                .lock_rect(0, D3DLOCK_DISCARD)
+                .write_u8_rect(8, rows, &column);
+            draw_2d(&h, &probe, CLEAR, BLOCK_COLUMNS)
+        },
+    );
+    assert!(
+        sampled.iter().all(|columns| *columns == [RED_RGB, 0, 0, 0]),
+        "dynamic default-pool level under D3DLOCK_DISCARD: the block columns the write left \
+         alone sample black in every round, got {sampled:06x?}"
     );
 }
 

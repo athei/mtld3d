@@ -915,8 +915,7 @@ impl TextureInner {
         self.ensure_staging(level);
         Arc::get_mut(&mut self.staging[level])
             .expect("re-created staging is unique")
-            .as_mut_slice()
-            .fill(0);
+            .zero_logical();
     }
 
     /// Re-materialise `level`'s released staging for a `LockRect`.
@@ -1504,15 +1503,16 @@ impl TextureInner {
         let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
         let (dx, dy) = (dst_rect.x, dst_rect.y);
         // Preserve GPU-only pixels before a partial write reaches staging.
-        let whole = self.write_covers_level(dst_level, dst_rect);
+        // A volume level is covered only when every one of its slices is.
+        let whole = self.write_covers_level(dst_level, dst_rect)
+            && self.copy_covers_depth(dst_level, src, src_level);
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
-        self.prepare_staging_write(0, dst_level, whole && every_slice);
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1796,15 +1796,16 @@ impl TextureInner {
             return false;
         };
         // Preserve GPU-only pixels before a partial conversion reaches staging.
-        let whole = self.write_covers_level(dst_level, dst_rect);
+        // A volume level is covered only when every one of its slices is.
+        let whole = self.write_covers_level(dst_level, dst_rect)
+            && self.copy_covers_depth(dst_level, src, src_level);
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
-        self.prepare_staging_write(0, dst_level, whole && every_slice);
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -4543,7 +4544,8 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         // zeros. Otherwise the claim came from a `StretchRect` or a
         // `ColorFill` the encoder dropped for a missing texture, it names
         // pixels that do not exist, and the staging is the level's only copy,
-        // which the caller keeps as the answer.
+        // which the caller keeps as the answer; nothing wrote it, so a staging
+        // no one has exposed yet is zeroed first.
         if ti.cube.is_none() && ti.dropped_staging & (1u32 << level) != 0 {
             mtld3d_shared::log_once_trace_by!(target: TEX_TRACE_TARGET, key: texture_id.raw(),
                 "texture {texture_id:#x}: level {level} read before any GPU use; it reads as zeros");
@@ -4552,6 +4554,7 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "texture {texture_id:#x}: no Metal texture behind the GPU write of face {face} \
                  level {level}; the staging keeps the level's pixels");
+            ti.expose_staging(face, level);
         }
         return true;
     }
@@ -4873,7 +4876,13 @@ extern "system" fn texture_lock_rect(
     // this Lock hands out is what the level holds next. A render-target level
     // is the GPU's after any pass, so it is claimed here first.
     ti.claim_render_target_for_cpu_read(0, level_u);
-    if !ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0) {
+    let discard = flags & D3DLOCK_DISCARD != 0;
+    // A DISCARD lock is still the level's exposure: the first one hands out
+    // zero where nothing was ever written, as every other first lock does.
+    if discard {
+        ti.expose_staging(0, level_u);
+    }
+    if !ti.move_subresource_to_staging(0, level_u, discard) {
         return D3DERR_INVALIDCALL;
     }
     let read_only = flags & D3DLOCK_READONLY != 0;
@@ -6945,8 +6954,13 @@ pub extern "system" fn cube_lock_rect(
     // Lock hands out a pointer into its staging, and before `cube_lock_region_ptr`
     // may rename the box. A surviving `D3DLOCK_DISCARD` is a whole-level one and
     // promises a whole-level overwrite, so it skips the stall and the claim goes
-    // with it.
-    if !ti.move_subresource_to_staging(face, level_u, flags & D3DLOCK_DISCARD != 0) {
+    // with it. It is still the face's exposure, so the first one hands out zero
+    // where nothing was ever written.
+    let discard = flags & D3DLOCK_DISCARD != 0;
+    if discard {
+        ti.expose_staging(face, level_u);
+    }
+    if !ti.move_subresource_to_staging(face, level_u, discard) {
         return D3DERR_INVALIDCALL;
     }
     let Some((ptr, pitch)) = ti.cube_lock_region_ptr(face, level_u, dirty_rect, flags) else {
