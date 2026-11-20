@@ -18,8 +18,9 @@ use mtld3d_core::{
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
-        LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
-        honoured_lock_flags, is_in_flight, staging_droppable_class, staging_lazy_class,
+        LockAction, MipShape, PreserveKind, ReleasedLevelFill, StagingWrite, decide_lock_action,
+        decide_staging_write, honoured_lock_flags, is_in_flight, staging_droppable_class,
+        staging_lazy_class,
     },
 };
 use mtld3d_shared::{
@@ -281,7 +282,8 @@ pub struct TextureInner {
     /// rect its `UnlockRect` publishes. The box also spans texels between the
     /// writes, which is sound only because a present staging holds every
     /// texel the GPU was given: a partial write into a released level reads
-    /// it back first ([`TextureInner::ensure_staging_for_write`]). Whole-mip
+    /// it back first, or starts from zero when the GPU was given nothing
+    /// ([`TextureInner::ensure_staging_for_write`]). Whole-mip
     /// writes reset the entry to `None`.
     pending_upload_rects: Vec<Option<DirtyRect>>,
     /// Levels whose staging was released after their upload retired (bit N = level N).
@@ -353,10 +355,12 @@ pub struct TextureInner {
     snapshot_staging: u128,
     /// Subresources whose staging still holds what the allocator handed out.
     ///
-    /// Indexed like `observed_staging`. Set at creation for the pools whose
-    /// system-memory copy D3D9 hands out zeroed, whose staging came from the
-    /// page-box pool or the allocator unwritten: a pooled box carries a
-    /// released resource's bytes. The first exposure of a subresource's
+    /// Indexed like `observed_staging`. Set at creation for staging that came
+    /// from the page-box pool or the allocator unwritten: a pooled box carries
+    /// a released resource's bytes, where D3D9 hands out a zeroed
+    /// system-memory copy and a new default-pool texture reads zero. A level
+    /// that releases its staging loses its bit with the pages
+    /// ([`Self::drop_staging`]). The first exposure of a subresource's
     /// staging, a lock, a device context, a partial write, a read as a copy
     /// source or an upload, zeroes it and clears the bit; a write that covers
     /// the whole level clears the bit without the memset. A subresource that
@@ -835,10 +839,14 @@ impl TextureInner {
     }
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
+    ///
+    /// The level's unzeroed bit goes with the pages: the placeholder is never
+    /// exposed, and the re-creation decides what its fresh pages start as.
     fn drop_staging(&mut self, level: usize) {
         let released = core::mem::replace(&mut self.staging[level], dropped_staging_placeholder());
         retire_staging(self.device_inner, released);
         self.dropped_staging |= 1u32 << level;
+        self.unzeroed_staging &= !self.observed_bit(0, level);
         self.reset_staging_coverage(level);
     }
 
@@ -870,9 +878,10 @@ impl TextureInner {
 
     /// Give `level` a staging buffer again before a write lands in it.
     ///
-    /// The fresh buffer holds no pixels, so it serves only a caller that
-    /// defines every byte it will upload: a whole-level write, a level the GPU
-    /// never received, or a read back of the level. A partial CPU write goes
+    /// The fresh buffer holds a released resource's bytes, so it serves only a
+    /// caller that defines every byte it will upload: a whole-level write, a
+    /// `D3DLOCK_DISCARD` lock, or a read back of the level. A level the GPU
+    /// never received takes [`Self::ensure_zeroed_staging`]. A partial CPU write goes
     /// through [`Self::ensure_staging_for_write`] and a `LockRect`, which D3D9
     /// promises the level's current contents, through
     /// [`Self::ensure_staging_for_lock`].
@@ -906,8 +915,7 @@ impl TextureInner {
         self.ensure_staging(level);
         Arc::get_mut(&mut self.staging[level])
             .expect("re-created staging is unique")
-            .as_mut_slice()
-            .fill(0);
+            .zero_logical();
     }
 
     /// Re-materialise `level`'s released staging for a `LockRect`.
@@ -916,26 +924,34 @@ impl TextureInner {
     /// holds them on the GPU alone, so the fresh pages are filled from there
     /// before the pointer goes out. The read costs a synchronous flush and blit
     /// per lock, which the warning names. `D3DLOCK_DISCARD` and a level the GPU
-    /// never received skip it and take the pages as allocated: the first
-    /// because the caller declared the old contents dead, the second because
-    /// there are none to read.
+    /// never received skip it: the first takes the pages as allocated, because
+    /// the caller declared the old contents dead, and the second takes them
+    /// zeroed, which is what the GPU holds for a level it never received.
     fn ensure_staging_for_lock(&mut self, level: usize, flags: u32) -> bool {
         if self.dropped_staging & (1u32 << level) == 0 {
             return true;
         }
-        let readback = mtld3d_core::texture_staging::released_level_lock_needs_readback(flags)
-            && self.was_uploaded[level];
-        if !readback {
-            self.ensure_staging(level);
-            mtld3d_shared::log_once_info_by!(
-                target: crate::LOG_TARGET,
-                key: self.texture_id.raw(),
-                "texture {:#x}: lock of level {level} after its staging was released hands out \
-                 uninitialised pixels; the lock discards the level's contents or the GPU never \
-                 received them",
-                self.texture_id.raw()
-            );
-            return true;
+        match mtld3d_core::texture_staging::released_level_lock_fill(
+            flags,
+            self.was_uploaded[level],
+        ) {
+            ReleasedLevelFill::AsAllocated => {
+                self.ensure_staging(level);
+                mtld3d_shared::log_once_info_by!(
+                    target: crate::LOG_TARGET,
+                    key: self.texture_id.raw(),
+                    "texture {:#x}: D3DLOCK_DISCARD lock of level {level} after its staging was \
+                     released hands out the pages as allocated; the lock discards the level's \
+                     contents",
+                    self.texture_id.raw()
+                );
+                return true;
+            }
+            ReleasedLevelFill::Zeroed => {
+                self.ensure_zeroed_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::ReadBack => {}
         }
         if self.read_released_level_back(level) {
             mtld3d_shared::log_once_warn_by!(
@@ -964,19 +980,27 @@ impl TextureInner {
     /// level, so the level is read back from the GPU before the write lands.
     /// It then keeps its staging (`kept_staging`): a level written in part
     /// after its release is written again, and each release would cost the
-    /// same blocking read at the next write. A whole-level write and a level
-    /// the GPU never received take the pages as allocated. Returns false when
-    /// the read back fails, which rejects the write.
+    /// same blocking read at the next write. A level the GPU never received
+    /// holds zero there, so its staging starts zeroed instead, and a
+    /// whole-level write takes the pages as allocated. Returns false when the
+    /// read back fails, which rejects the write.
     fn ensure_staging_for_write(&mut self, level: usize, whole_level: bool) -> bool {
         if self.dropped_staging & (1u32 << level) == 0 {
             return true;
         }
-        if !mtld3d_core::texture_staging::released_level_write_needs_readback(
+        match mtld3d_core::texture_staging::released_level_write_fill(
             whole_level,
             self.was_uploaded[level],
         ) {
-            self.ensure_staging(level);
-            return true;
+            ReleasedLevelFill::AsAllocated => {
+                self.ensure_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::Zeroed => {
+                self.ensure_zeroed_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::ReadBack => {}
         }
         if self.read_released_level_back(level) {
             self.kept_staging |= 1u32 << level;
@@ -1479,15 +1503,16 @@ impl TextureInner {
         let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
         let (dx, dy) = (dst_rect.x, dst_rect.y);
         // Preserve GPU-only pixels before a partial write reaches staging.
-        let whole = self.write_covers_level(dst_level, dst_rect);
+        // A volume level is covered only when every one of its slices is.
+        let whole = self.write_covers_level(dst_level, dst_rect)
+            && self.copy_covers_depth(dst_level, src, src_level);
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
-        self.prepare_staging_write(0, dst_level, whole && every_slice);
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1771,15 +1796,16 @@ impl TextureInner {
             return false;
         };
         // Preserve GPU-only pixels before a partial conversion reaches staging.
-        let whole = self.write_covers_level(dst_level, dst_rect);
+        // A volume level is covered only when every one of its slices is.
+        let whole = self.write_covers_level(dst_level, dst_rect)
+            && self.copy_covers_depth(dst_level, src, src_level);
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
-        self.prepare_staging_write(0, dst_level, whole && every_slice);
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -2334,6 +2360,12 @@ impl TextureInner {
             return false;
         }
         let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
+        // The fill is the level's exposure, as any other CPU write is.
+        if whole {
+            self.staging_overwritten(0, level);
+        } else {
+            self.expose_staging(0, level);
+        }
         self.prepare_staging_write(0, level, whole);
         let Some(box_) = self.staging.get(level) else {
             return false;
@@ -3573,9 +3605,10 @@ pub struct TextureCreateInfo {
     pub staging: Vec<PageBox>,
     /// Whether `staging` is as the allocator handed it out and has to read zero.
     ///
-    /// True for the pools whose system-memory copy D3D9 hands out zeroed
-    /// ([`mtld3d_core::pool::system_copy_starts_zeroed`]), unless the create
-    /// filled the staging itself (an extended device's user-memory texture).
+    /// True in every pool unless the create filled the staging itself (an
+    /// extended device's user-memory texture) or allocated it zeroed. D3D9
+    /// hands out a zeroed system-memory copy, and a new default-pool texture
+    /// reads zero on the GPU, which an upload of the staging must not undo.
     /// Each subresource is zeroed at its first exposure rather than here.
     pub staging_unwritten: bool,
     pub mip_widths: Vec<u32>,
@@ -4511,7 +4544,8 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         // zeros. Otherwise the claim came from a `StretchRect` or a
         // `ColorFill` the encoder dropped for a missing texture, it names
         // pixels that do not exist, and the staging is the level's only copy,
-        // which the caller keeps as the answer.
+        // which the caller keeps as the answer; nothing wrote it, so a staging
+        // no one has exposed yet is zeroed first.
         if ti.cube.is_none() && ti.dropped_staging & (1u32 << level) != 0 {
             mtld3d_shared::log_once_trace_by!(target: TEX_TRACE_TARGET, key: texture_id.raw(),
                 "texture {texture_id:#x}: level {level} read before any GPU use; it reads as zeros");
@@ -4520,6 +4554,7 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "texture {texture_id:#x}: no Metal texture behind the GPU write of face {face} \
                  level {level}; the staging keeps the level's pixels");
+            ti.expose_staging(face, level);
         }
         return true;
     }
@@ -4841,7 +4876,13 @@ extern "system" fn texture_lock_rect(
     // this Lock hands out is what the level holds next. A render-target level
     // is the GPU's after any pass, so it is claimed here first.
     ti.claim_render_target_for_cpu_read(0, level_u);
-    if !ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0) {
+    let discard = flags & D3DLOCK_DISCARD != 0;
+    // A DISCARD lock is still the level's exposure: the first one hands out
+    // zero where nothing was ever written, as every other first lock does.
+    if discard {
+        ti.expose_staging(0, level_u);
+    }
+    if !ti.move_subresource_to_staging(0, level_u, discard) {
         return D3DERR_INVALIDCALL;
     }
     let read_only = flags & D3DLOCK_READONLY != 0;
@@ -6913,8 +6954,13 @@ pub extern "system" fn cube_lock_rect(
     // Lock hands out a pointer into its staging, and before `cube_lock_region_ptr`
     // may rename the box. A surviving `D3DLOCK_DISCARD` is a whole-level one and
     // promises a whole-level overwrite, so it skips the stall and the claim goes
-    // with it.
-    if !ti.move_subresource_to_staging(face, level_u, flags & D3DLOCK_DISCARD != 0) {
+    // with it. It is still the face's exposure, so the first one hands out zero
+    // where nothing was ever written.
+    let discard = flags & D3DLOCK_DISCARD != 0;
+    if discard {
+        ti.expose_staging(face, level_u);
+    }
+    if !ti.move_subresource_to_staging(face, level_u, discard) {
         return D3DERR_INVALIDCALL;
     }
     let Some((ptr, pitch)) = ti.cube_lock_region_ptr(face, level_u, dirty_rect, flags) else {

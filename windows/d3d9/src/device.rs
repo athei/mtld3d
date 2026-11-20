@@ -6695,10 +6695,10 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // so the upload operation can hand the encoder thread a refcount bump
     // (no memcpy) at `UnlockRect` time. Contents are uninitialised: a
     // pooled box carries a released resource's bytes. The texture marks
-    // the staging of a pool whose system-memory copy D3D9 hands out zeroed
-    // as unwritten, and zeroes each level at its first exposure, so a lock
-    // or an upload reads zero where the game wrote nothing. A level no
-    // upload reaches samples whatever the device gave the `MTLTexture`.
+    // the staging as unwritten in every pool, and zeroes each level at its
+    // first exposure, so a lock or an upload reads zero where the game
+    // wrote nothing. A level no upload reaches samples whatever the device
+    // gave the `MTLTexture`.
     // Page alignment satisfies `newBufferWithBytesNoCopy:`'s contract
     // on non-UMA Macs (Intel/AMD). Each level pops a parked box of its
     // padded size from the page-box pool before it falls back to the
@@ -6758,7 +6758,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     );
     let pitch = usize::try_from(mip_bytes_per_row[0]).expect("a row pitch fits usize");
     let filled = copy_user_memory(user_memory, &rows, staging[0].as_mut_slice(), pitch);
-    let staging_unwritten = !filled && mtld3d_core::pool::system_copy_starts_zeroed(pool);
+    let staging_unwritten = !filled;
 
     obj.inner()
         .perf_mut()
@@ -7282,7 +7282,7 @@ extern "system" fn device_create_volume_texture(
         block_h: fmt.block_height(),
         block_bytes: fmt.block_bytes(),
         staging,
-        staging_unwritten: mtld3d_core::pool::system_copy_starts_zeroed(pool),
+        staging_unwritten: true,
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -7503,7 +7503,7 @@ extern "system" fn device_create_cube_texture(
         block_h: fmt.block_height(),
         block_bytes: fmt.block_bytes(),
         staging,
-        staging_unwritten: mtld3d_core::pool::system_copy_starts_zeroed(pool),
+        staging_unwritten: true,
         mip_widths,
         mip_heights,
         mip_bytes_per_row,

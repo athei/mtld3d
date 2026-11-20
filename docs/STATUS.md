@@ -329,6 +329,11 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   undefined values. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
+- A `D3DLOCK_DISCARD` lock of a DEFAULT-pool texture level, cube face or
+  offscreen plain surface whose pages an upload still reads hands out fresh
+  pages that hold a released resource's bytes, and the whole level uploads,
+  so texels the caller leaves unwritten sample those bytes. D3D9 leaves the
+  contents after `D3DLOCK_DISCARD` undefined. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy. `buffer.drawTimeUpload` keeps it
