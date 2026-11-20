@@ -13,7 +13,7 @@
 use core::ffi::c_void;
 
 use objc2::{
-    define_class, extern_methods,
+    Message, define_class, extern_methods,
     rc::Retained,
     runtime::{ClassBuilder, NSObject},
 };
@@ -81,7 +81,11 @@ impl LayerObserver {
 }
 
 /// A key-value observer on a layer's `contentsScale`, which gives the layer a subclass of its own.
+///
+/// It retains the layer and the observer, and its drop ends the
+/// registration before either is released, on a panic's unwind too.
 struct Observation {
+    layer: Retained<CAMetalLayer>,
     observer: Retained<LayerObserver>,
     key: Retained<NSString>,
 }
@@ -89,11 +93,13 @@ struct Observation {
 impl Observation {
     /// Register an observer on `layer`.
     fn new(layer: &CAMetalLayer) -> Self {
+        let layer = layer.retain();
         let observer = LayerObserver::new();
         let key = NSString::from_str("contentsScale");
-        // SAFETY: `observer` implements `observeValueForKeyPath:ofObject:change:context:`
-        // and outlives the registration, which `remove` ends before the
-        // layer drops; the context is null and never read.
+        // SAFETY: `observer` implements `observeValueForKeyPath:ofObject:change:context:`;
+        // the returned value retains both it and the layer, and its drop
+        // removes the registration before releasing either; the context is
+        // null and never read.
         unsafe {
             layer.addObserver_forKeyPath_options_context(
                 &observer,
@@ -102,13 +108,22 @@ impl Observation {
                 core::ptr::null_mut(),
             );
         }
-        Self { observer, key }
+        Self {
+            layer,
+            observer,
+            key,
+        }
     }
+}
 
-    /// End the registration on `layer`, the layer [`Self::new`] observed.
-    fn remove(self, layer: &CAMetalLayer) {
-        // SAFETY: `new` registered this observer on `layer` for this key path.
-        unsafe { layer.removeObserver_forKeyPath(&self.observer, &self.key) };
+impl Drop for Observation {
+    fn drop(&mut self) {
+        // SAFETY: `new` registered this observer on this layer for this key
+        // path, and nothing else removes it.
+        unsafe {
+            self.layer
+                .removeObserver_forKeyPath(&self.observer, &self.key);
+        }
     }
 }
 
@@ -158,7 +173,7 @@ fn another_subclass_keeps_its_class() {
 #[test]
 fn a_plain_layer_under_a_key_value_observer_is_plain() {
     let layer = CAMetalLayer::new();
-    let observation = Observation::new(&layer);
+    let _observation = Observation::new(&layer);
     let observed = class_of(&layer);
     assert_ne!(
         observed,
@@ -174,14 +189,13 @@ fn a_plain_layer_under_a_key_value_observer_is_plain() {
         observed,
         "the observer keeps its subclass"
     );
-    observation.remove(&layer);
 }
 
 #[test]
 fn the_hook_class_under_a_key_value_observer_keeps_its_class() {
     let layer = HookLayer::new();
     let layer: &CAMetalLayer = &layer;
-    let observation = Observation::new(layer);
+    let _observation = Observation::new(layer);
     let observed = class_of(layer);
     assert_ne!(
         observed,
@@ -193,7 +207,6 @@ fn the_hook_class_under_a_key_value_observer_keeps_its_class() {
         LayerClass::Foreign
     );
     assert_eq!(class_of(layer), observed, "the observer keeps its subclass");
-    observation.remove(layer);
 }
 
 /// A runtime class named `name` over `superclass`, with the client surface field typed `T`.
