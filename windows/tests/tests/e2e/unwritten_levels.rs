@@ -473,13 +473,13 @@ fn texels_between_two_locks_of_a_new_dynamic_default_pool_level_sample_black() {
     assert_outer_columns_only(&sampled, "dynamic default-pool 2D level");
 }
 
-/// The texels a partial `UpdateTexture` leaves alone in a new default-pool volume sample black.
+/// The texels a partial `LockBox` leaves alone in a new dynamic default-pool volume sample black.
 ///
 /// The volume keeps the staging its create took from the page-box pool, and
-/// a volume level uploads whole, so one partial copy is enough to carry the
+/// a volume level uploads whole, so one partial lock is enough to carry the
 /// rest of the staging to the GPU.
 #[test]
-fn texels_a_partial_update_texture_leaves_alone_in_a_new_default_pool_volume_sample_black() {
+fn texels_a_partial_lock_box_leaves_alone_in_a_new_dynamic_default_pool_volume_sample_black() {
     const EXTENT: [u32; 3] = [8, 8, 2];
     const TEXELS: usize = 8 * 8 * 2;
     // The left half of the volume, every row and slice.
@@ -494,38 +494,34 @@ fn texels_a_partial_update_texture_leaves_alone_in_a_new_default_pool_volume_sam
     // The centres of the left and right halves of the row the draw samples.
     const HALVES: [(u32, u32); 2] = [(160, 240), (480, 240)];
     let h = Harness::new();
-    let volume = |pool| {
-        let (hr, volume) = h.try_create_volume_texture(EXTENT, 1, 0, D3DFMT_X8R8G8B8, pool);
-        assert_eq!(hr, 0, "CreateVolumeTexture in pool {pool}");
+    let create = || {
+        let (hr, volume) = h.try_create_volume_texture(
+            EXTENT,
+            1,
+            D3DUSAGE_DYNAMIC,
+            D3DFMT_X8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        assert_eq!(hr, 0, "CreateVolumeTexture");
         volume.expect("a volume texture")
     };
     let sampled = probe_after_releases(
         &h,
         || {
-            let source = volume(D3DPOOL_SYSTEMMEM);
-            source.write_u32(0, &[YELLOW_X8; TEXELS]);
-            let released = volume(D3DPOOL_DEFAULT);
-            assert_eq!(h.update_volume_texture_hr(&source, &released), 0);
+            let released = create();
+            released.write_u32(0, &[YELLOW_X8; TEXELS]);
             assert_released_yellow(draw_volume_row(&h, &released, BLACK, [(320, 240)])[0]);
         },
         || {
-            // A new source is dirty in full; a first copy into a texture of
-            // its own leaves it dirty for the box the lock writes alone.
-            let source = volume(D3DPOOL_SYSTEMMEM);
-            assert_eq!(
-                h.update_volume_texture_hr(&source, &volume(D3DPOOL_DEFAULT)),
-                0
-            );
-            source.write_box_u32(0, &LEFT_HALF, &[RED_X8; TEXELS / 2]);
-            let probe = volume(D3DPOOL_DEFAULT);
-            assert_eq!(h.update_volume_texture_hr(&source, &probe), 0);
+            let probe = create();
+            probe.write_box_u32(0, &LEFT_HALF, &[RED_X8; TEXELS / 2]);
             draw_volume_row(&h, &probe, CLEAR, HALVES)
         },
     );
     assert!(
         sampled.iter().all(|halves| *halves == [RED_X8 & RGB, 0]),
-        "default-pool volume: the half the copy left alone samples black in every round, got \
-         {sampled:06x?}"
+        "dynamic default-pool volume: the half the lock left alone samples black in every \
+         round, got {sampled:06x?}"
     );
 }
 
