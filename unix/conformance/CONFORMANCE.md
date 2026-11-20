@@ -389,11 +389,12 @@ record. A knob, where one makes sense, is named with its default.
   `test_map_synchronisation` below. No knob.
 - **A contended `D3DLOCK_DISCARD` lock of a DEFAULT-pool texture level, cube
   face or offscreen plain surface hands out a released resource's bytes.**
-  DISCARD is honoured on every whole-level DEFAULT-pool lock whatever the
-  usage (`honoured_lock_flags` in `windows/core/src/texture_staging.rs`), and
-  an offscreen plain surface locks through its backing texture's level. When
-  an upload still reads the level's pages, the lock renames to a fresh
-  page-box box (`rename_staging` and `rename_cube_staging` in
+  DISCARD is honoured on every whole-level DEFAULT-pool `LockRect` whatever
+  the usage (`honoured_lock_flags` in `windows/core/src/texture_staging.rs`),
+  and an offscreen plain surface locks through its backing texture's level;
+  a volume's `LockBox` ignores the flag, and its rename copies the old
+  contents. When an upload still reads the level's pages, the lock renames
+  to a fresh page-box box (`rename_staging` and `rename_cube_staging` in
   `windows/d3d9/src/texture.rs`) that nothing zeroes, and its `UnlockRect`
   publishes the whole level, so texels the caller leaves unwritten sample
   what the box's last owner left there. D3D9 leaves the contents after
