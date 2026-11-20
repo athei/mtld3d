@@ -61,7 +61,7 @@ of them in the environment or on the command line stops the run with a
 message naming `WINE_SDK`.
 
 The versions CI pins (the Rust toolchains, the cargo tools, nextest, the two
-wine-build releases, the arm64 Wine that macos-26 runs and the x86_64 one
+Wine bundles, the arm64 Wine that macos-26 runs and the x86_64 one
 that macos-15 and the Intel image run, and llvm-mingw) are in the `env`
 block of
 [`ci.yml`](../.github/workflows/ci.yml). The MSVC CRT and Windows SDK
