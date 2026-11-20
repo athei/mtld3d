@@ -309,10 +309,13 @@ record. A knob, where one makes sense, is named with its default.
   a texture would otherwise lose every upload. The cost is system memory: the
   level's staging, released once its upload retires, is re-created, and a
   partial lock after that release leaves the pixels outside its rect out of
-  step with the GPU copy (warned once per texture). A render-target texture
-  holds no staging until a CPU path first needs a level, and every lock of a
-  level reads it back from the GPU first, unless the level holds a CPU write
-  no upload has carried yet. No knob.
+  step with the GPU copy (warned once per texture). A `D3DLOCK_DISCARD` lock
+  of a released level takes the re-created pages as allocated, a released
+  resource's bytes; a lock D3D9 rejects has no contents to keep, and zeroing
+  would cost a memset at every such lock after a release. A render-target
+  texture holds no staging until a CPU path first needs a level, and every
+  lock of a level reads it back from the GPU first, unless the level holds a
+  CPU write no upload has carried yet. No knob.
 - **The last reported mip levels of a scaled render-target texture can share
   one rasterized level.** A render-target or depth texture at the reported
   back-buffer size reports the chain of that size, but rasterizes at
@@ -383,6 +386,17 @@ record. A knob, where one makes sense, is named with its default.
   frame. The rename path has been measured peaking near 1.4 GB of retained
   backings, which is why `memory.vbibRetentionCapMB` exists. Site:
   `test_map_synchronisation` below. No knob.
+- **A contended `D3DLOCK_DISCARD` lock of a dynamic DEFAULT-pool texture level
+  or cube face hands out a released resource's bytes.** When an upload still
+  reads the level's pages, the lock renames to a fresh page-box box
+  (`rename_staging` and `rename_cube_staging` in `windows/d3d9/src/texture.rs`)
+  that nothing zeroes, and its `UnlockRect` publishes the whole level, so
+  texels the caller leaves unwritten sample what the box's last owner left
+  there. D3D9 leaves the contents after `D3DLOCK_DISCARD` undefined. Zeroing
+  the box would cost a level-sized memset on every contended DISCARD lock,
+  the per-frame path of a streamed dynamic texture. What stays defined: the
+  first lock of a subresource, `D3DLOCK_DISCARD` included, hands out zero.
+  No knob.
 - **A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
   no CPU copy once every byte has reached the GPU.** D3D9 preserves contents
   across a plain `Lock` whatever the usage says, so a title that reads back
