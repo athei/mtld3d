@@ -558,8 +558,8 @@ after encoding so idle cache entries hold no source texture. Both presents
 scale the gamma-encoded frame in Perceptual mode. Tone-mapping at render size
 and scaling the float result in HDR mode instead loses precision in the range
 the tone map adds: measured on an M-series GPU at 2x, flat white came back
-1.6 % low at a headroom of 4 and 3.2 % low at 15. A preparation, copy or tone-map failure returns to the
-original source's SDR or HDR present shader.
+1.6 % low at a headroom of 4 and 3.2 % low at 15. A preparation, copy or
+tone-map failure returns to the original source's SDR or HDR present shader.
 
 
 A Reset that changes `PresentationInterval` reaches the record through `SetDisplaySyncEnabled` on the encoder thread, whether it flips the vsync request (`IMMEDIATE` against the rest) or only moves the frame-rate ceiling (`ONE` against `TWO`, `THREE` or `FOUR`, which the PE side resolves to the reported refresh rate over N and folds with `present.maxFps` into the one ceiling the thunk carries). The thunk latches the new pacing on the record and queues that same reconciliation, so the throttle is re-derived on the main thread for the panel under the window within one present and nothing on the encoder thread reads a screen.

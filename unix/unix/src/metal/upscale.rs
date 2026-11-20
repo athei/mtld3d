@@ -439,13 +439,17 @@ fn encode_with(
     unsafe { scaler.setColorTexture(None) };
     // SAFETY: nullable property write on the live scaler after encoding.
     unsafe { scaler.setOutputTexture(None) };
-    // `finish` runs under `scalers` too. The exact copy takes no lock. The HDR
-    // present's tone map reads the present pipelines' `OnceLock`s and, with a
-    // ramp, takes `GAMMA_PIPELINES` and the gamma `TABLES` lock, and it
-    // compiles the gamma pipeline on the first present that needs one: that
-    // present holds `scalers` for the compile, stalling `retire_evicted` on
-    // the submit thread that long. No code takes `scalers` while holding
-    // either lock, so the order is `scalers` first, and a lock added inside a
+    // `finish` runs under `scalers` too, and so do the locks it takes:
+    // - the exact copy takes `READBACK_PIPELINES` and compiles its
+    //   nearest-texel pipeline on the first upscaled SDR present per format;
+    // - the HDR present's tone map reads the present pipelines' `OnceLock`s
+    //   and, with a ramp, takes `GAMMA_PIPELINES`, compiling the gamma
+    //   pipeline on the first present that needs one, and the gamma `TABLES`;
+    // - both reach the present library's `OnceLock`, and the logger.
+    // A present that compiles holds `scalers` for the compile, stalling
+    // `retire_evicted` on the submit thread that long. No code takes
+    // `scalers` while holding `READBACK_PIPELINES`, `GAMMA_PIPELINES` or
+    // `TABLES`, so the order is `scalers` first, and a lock added inside a
     // `finish` pass keeps it.
     let encoded = finish(cmd_buf, &output, dst);
     log::debug!(target: "mtld3d::unix::present",
