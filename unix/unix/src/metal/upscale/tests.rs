@@ -323,12 +323,13 @@ fn two_devices_at_one_geometry_get_their_own_scaler() {
         let key = super::scaler_key(
             &src,
             &dst,
+            dst.pixelFormat(),
             MTLFXSpatialScalerColorProcessingMode::Perceptual,
         )?;
         let scalers = cache.scalers.lock().ok()?;
         scalers.scalers.get(&key).map(|entry| entry.slot.scaler)
     };
-    if !super::can_scale(
+    if !prepared(
         &device,
         &first_cache,
         &src,
@@ -338,7 +339,7 @@ fn two_devices_at_one_geometry_get_their_own_scaler() {
         eprintln!("MetalFX unavailable on this GPU, skipping");
         return;
     }
-    assert!(super::can_scale(
+    assert!(prepared(
         &device,
         &second_cache,
         &src,
@@ -612,6 +613,30 @@ fn gpu() -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>> {
     Some(device)
 }
 
+/// Build and prepare the cache's scaler for this pair without encoding, as a lookup does.
+///
+/// `false` when `MetalFX` cannot serve the pair: no `MetalFX`, a geometry it
+/// does not enlarge, a scaler Metal declined, or an input usage the scaler
+/// cannot read.
+fn prepared(
+    device: &ProtocolObject<dyn MTLDevice>,
+    cache: &UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    mode: MTLFXSpatialScalerColorProcessingMode,
+) -> bool {
+    if !super::is_available(device) {
+        return false;
+    }
+    let Some(key) = super::scaler_key(src, dst, dst.pixelFormat(), mode) else {
+        return false;
+    };
+    let mut scalers = cache.scalers.lock().expect("scaler cache lock");
+    super::scaler_in(&mut scalers, device, key)
+        .and_then(|slot| slot.prepare(device, src, dst, dst.pixelFormat()))
+        .is_some()
+}
+
 fn target(
     device: &ProtocolObject<dyn MTLDevice>,
     size: usize,
@@ -815,7 +840,7 @@ fn drawable_outputs_equal_the_intermediate_in_sdr_and_hdr() {
             "mtld3d-test-upscale-pair",
         )));
         fill(&cmd, &src, red);
-        assert!(super::can_scale(&device, &cache, &src, &dst, mode));
+        assert!(prepared(&device, &cache, &src, &dst, mode));
         assert_eq!(
             output_count(&cache),
             1,
@@ -852,6 +877,63 @@ fn drawable_outputs_equal_the_intermediate_in_sdr_and_hdr() {
     }
 }
 
+/// `encode_then` finishes from an intermediate in the source's format at the destination's extent.
+///
+/// The HDR present scales a `BGRA8Unorm` frame for an `RGBA16Float` drawable
+/// this way and tone-maps the intermediate across, so the pass it is handed
+/// must be able to sample it and must target the drawable itself.
+#[test]
+fn encode_then_finishes_from_the_source_format_at_the_destination_extent() {
+    use objc2_metal::MTLCommandBufferStatus;
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let cache = UpscaleCache::new();
+    let src = target(
+        &device,
+        32,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
+    );
+    let dst = drawable(&device, 64, MTLPixelFormat::RGBA16Float);
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-upscale-then",
+    )));
+    fill(&cmd, &src, 0.75);
+    let mut seen = None;
+    assert!(super::encode_then(
+        &cmd,
+        &device,
+        &cache,
+        &src,
+        &dst,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual,
+        |_, enlarged, finished| {
+            seen = Some((
+                enlarged.pixelFormat(),
+                (enlarged.width(), enlarged.height()),
+                enlarged.usage().contains(MTLTextureUsage::ShaderRead),
+                core::ptr::eq(finished, &raw const *dst),
+            ));
+            true
+        },
+    ));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    assert_eq!(
+        seen,
+        Some((MTLPixelFormat::BGRA8Unorm, (64, 64), true, true))
+    );
+    super::retire(&cache);
+}
+
 #[test]
 fn unknown_usage_is_permissive_and_explicit_usage_must_cover_requirements() {
     let required = MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
@@ -880,7 +962,8 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
     );
     let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
-    let key = super::scaler_key(&src, &dst, mode).expect("key");
+    let format = dst.pixelFormat();
+    let key = super::scaler_key(&src, &dst, format, mode).expect("key");
     let mut scalers = ScalerCache {
         scalers: FxHashMap::default(),
         tick: 0,
@@ -891,11 +974,11 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
     let cache = UpscaleCache::new();
     let mut slot = super::build_scaler(&device, &key).expect("scaler");
     assert!(
-        slot.prepare_with(&device, &src, &dst, |_, _, _| None)
+        slot.prepare_with(&device, &src, &dst, format, |_, _, _, _| None)
             .is_none()
     );
     assert!(slot.output.is_null());
-    assert!(slot.prepare(&device, &src, &dst).is_some());
+    assert!(slot.prepare(&device, &src, &dst, format).is_some());
     slot.release();
     let cmd = queue.commandBuffer().expect("command buffer");
     fill(&cmd, &src, 0.75);
@@ -905,7 +988,7 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
         &cache,
         &src,
         &dst,
-        mode,
+        key,
         |_, _, _| false
     ));
     // A later attempt can still encode and cover the full destination.
@@ -1000,7 +1083,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
         MTLTextureUsage::ShaderRead,
     );
     let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
-    assert!(super::can_scale(
+    assert!(prepared(
         &device,
         first,
         &src,
@@ -1011,9 +1094,9 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
     super::retire(first);
 }
 
-/// A preflight eviction must retire even when no subsequent upscale is encoded.
+/// An eviction from a lookup must retire even when no upscale is encoded after it.
 #[test]
-fn fallback_submission_drains_preflight_evictions() {
+fn fallback_submission_drains_lookup_evictions() {
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
     let cache = UpscaleCache::new();
@@ -1026,7 +1109,7 @@ fn fallback_submission_drains_preflight_evictions() {
             MTLTextureUsage::ShaderRead,
         );
         let dst = drawable(&device, 32 + step * 2, MTLPixelFormat::BGRA8Unorm);
-        assert!(super::can_scale(
+        assert!(prepared(
             &device,
             &cache,
             &src,
@@ -1069,7 +1152,7 @@ fn the_intermediate_serves_the_scaler_and_the_copy_and_invalid_input_is_refused(
     );
     let dst = drawable(&device, 64, MTLPixelFormat::BGRA8Unorm);
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
-    assert!(super::can_scale(&device, &cache, &src, &dst, mode));
+    assert!(prepared(&device, &cache, &src, &dst, mode));
     let output = cached_output(&cache);
     let scaler_usage = {
         let scalers = cache.scalers.lock().expect("cache lock");
@@ -1096,6 +1179,6 @@ fn the_intermediate_serves_the_scaler_and_the_copy_and_invalid_input_is_refused(
         MTLStorageMode::Private,
         MTLTextureUsage::RenderTarget,
     );
-    assert!(!super::can_scale(&device, &cache, &invalid, &dst, mode));
+    assert!(!prepared(&device, &cache, &invalid, &dst, mode));
     super::retire(&cache);
 }
