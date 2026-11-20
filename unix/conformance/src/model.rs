@@ -28,7 +28,7 @@ pub enum Arch {
     Arm64x,
 }
 
-/// Which device answers the run was measured under, in baseline-output order.
+/// Which configuration the run was measured under, in baseline-output order.
 ///
 /// `Native` runs against the device's own capabilities; `Scale` rasterizes
 /// every frame at 75% of the resolution D3D9 reports and lets `MetalFX`
@@ -40,7 +40,7 @@ pub enum Variant {
     Scale,
 }
 
-/// One runner process's identity: architecture and device answers.
+/// One runner process's identity: architecture and configuration.
 ///
 /// The baseline is keyed by leg and subtest, so a measurement at the reduced
 /// render scale never overwrites the native one for the same architecture.

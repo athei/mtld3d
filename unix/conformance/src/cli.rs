@@ -29,7 +29,7 @@ pub struct Config {
     pub tests_wine_version: Option<String>,
     /// `--arch`: which build `exe` runs against, i.e. the label results record under.
     pub arch: Arch,
-    /// `--variant`: which device answers the run is measured under.
+    /// `--variant`: which configuration the run is measured under.
     ///
     /// `native` (the default) runs against the device's own capabilities;
     /// `scale` runs at a reduced `render.scale` and records under a separate
