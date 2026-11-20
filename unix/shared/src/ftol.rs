@@ -2,7 +2,7 @@
 //!
 //! On 32-bit x86 a compiler-lowered `f64 as i64` emits an x87 `fld`/`fisttp`
 //! (or the fnstcw/fistp control-word dance) plus a saturation clamp — under
-//! Rosetta each x87 op expands ~20×, so every such cast in a hot path shows up
+//! x86 translation each x87 op expands ~20×, so every such cast in a hot path shows up
 //! as a profiler row. This kernel truncates from the raw IEEE bits in pure
 //! integer code instead — used by the i686 trig kernel and any other code
 //! needing a float→int cast without the x87 tax.

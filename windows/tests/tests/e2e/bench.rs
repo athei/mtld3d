@@ -195,7 +195,7 @@ const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
 /// The least time the calls of one [`CallTimes`] sample add up to.
 ///
 /// At least a hundred times the clock's step, so one step is under 1 % of a
-/// sample. Under Rosetta `rdtsc` steps by 41 ns (a run's
+/// sample. The ARM generic timer steps by 41 ns (a run's
 /// `tsc_granularity_ns`), which puts the floor at 4.1 us; 5 us keeps a
 /// margin over it. A clock whose metrics report a coarser step needs a
 /// higher floor.
@@ -251,8 +251,8 @@ const PROCESS_BYTES_KEYS: [&str; 4] = [
 /// The `perf-kv` flag of Metal's capture layer, which [`perf_rule`] records as `exact`.
 ///
 /// The layer sits under every Metal call, so a leg measured with it and one
-/// without it measure different things. `make bench`, `make bench-ab` and
-/// `make bench-variants` unset `MTL_CAPTURE_ENABLED`; legs run in different
+/// without it measure different things. `make bench` and `make bench-ab`
+/// unset `MTL_CAPTURE_ENABLED`; legs run in different
 /// environments some other way fail on this row.
 const CAPTURE_LAYER_KEY: &str = "metal_capture_layer_count";
 
@@ -2204,17 +2204,15 @@ pub fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
 ///
 /// Draws, passes, commands, the calls of every API, device, bind, surface
 /// and keys-gating row and the keys gate's skips, texture uploads and
-/// dirty rects, user-pointer draws, generated fans, draws off the stack
-/// pin and staging uploads: a frame that repeats the calls of the one
-/// before repeats these. Anything else counts events that depend on how
-/// the CPU and the GPU overlap.
+/// dirty rects, user-pointer draws, generated fans and staging uploads: a
+/// frame that repeats the calls of the one before repeats these. Anything
+/// else counts events that depend on how the CPU and the GPU overlap.
 fn structural(base: &str) -> bool {
-    const WHOLE: [&str; 6] = [
+    const WHOLE: [&str; 5] = [
         "draws",
         "passes",
         "commands",
         "fan_generated",
-        "draw_unpinned",
         "vbib_staging_uploads",
     ];
     const PREFIX: [&str; 4] = ["tex_uploads", "tex_dirtyrect", "up_", "keys_"];

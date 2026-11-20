@@ -45,9 +45,6 @@ mod exit_code_hook;
 mod fpu;
 #[path = "win32/fullscreen.rs"]
 pub mod fullscreen;
-#[cfg(target_arch = "x86_64")]
-#[path = "win32/guest_mem.rs"]
-mod guest_mem;
 #[path = "win32/import_patch.rs"]
 mod import_patch;
 #[path = "win32/log_sink.rs"]
@@ -489,8 +486,6 @@ fn log_identity(instance: *mut c_void) {
     let arch = identity::ARCH;
     let base = instance as usize;
     log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded at {base:#x} as {arch}");
-    #[cfg(target_arch = "x86_64")]
-    guest_mem::log_route();
 }
 
 /// `DLL_PROCESS_ATTACH` body.

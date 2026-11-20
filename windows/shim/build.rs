@@ -17,7 +17,6 @@ fn main() {
     // fails here instead of silently linking another arch's `unix_lib.o`.
     let (lib_arch, object_arch) = match target.split('-').next().expect("target triple has an arch")
     {
-        "x86_64" => ("x86_64-windows", "x86_64-windows"),
         "i686" => ("i386-windows", "i386-windows"),
         "aarch64" => ("aarch64-windows", "aarch64-windows"),
         "arm64ec" => ("aarch64-windows", "arm64ec-windows"),

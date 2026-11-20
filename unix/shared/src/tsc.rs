@@ -1,18 +1,16 @@
 //! TSC-based timing helper.
 //!
-//! Compiles to a single `rdtsc` instruction on both PE targets (i386 and
-//! `x86_64`), bypassing any Wine-side `QueryPerformanceCounter` translation.
-//! Under Rosetta 2 on Apple Silicon the instruction is trapped to the ARM
-//! generic timer; cost stays near-native (~10–30 cycles). On aarch64 (the
-//! native test/lint builds, and the `.so` built for an arm64 Wine) the counter
-//! is read as `CNTVCT_EL0` directly instead of through Rosetta.
+//! Compiles to a single `rdtsc` instruction on the x86 PE targets (the i386
+//! build and the `x86_64` end-to-end test executables), bypassing any
+//! Wine-side `QueryPerformanceCounter` translation; the arm64 Wine's x86
+//! translator answers it from the ARM generic timer. On aarch64 and arm64ec
+//! (the native test/lint builds, the `.so`, and the ARM64X builtin) the
+//! counter is read as `CNTVCT_EL0` directly.
 //!
-//! Returns raw TSC cycles, not nanoseconds. TSC is invariant on Nehalem+
-//! so a single runtime calibration against `Instant` yields a
-//! process-lifetime Hz value. Under Rosetta the emulated ARM generic
-//! timer is likewise fixed-frequency (~945 MHz in practice, NOT CPU
-//! clock), which is why the calibration is runtime-determined instead of
-//! hard-coded.
+//! Returns raw counter ticks, not nanoseconds. The ARM generic timer is
+//! fixed-frequency (not the CPU clock), so a single runtime calibration
+//! against `Instant` yields a process-lifetime Hz value; the calibration is
+//! runtime-determined instead of hard-coded.
 
 use std::{
     sync::LazyLock,
@@ -39,8 +37,8 @@ const LOG_TARGET: &str = "mtld3d::perf";
 pub fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: RDTSC is unprivileged on every x86_64 mode we run in
-        // (Wine PE process). No preconditions; returns the cycle counter.
+        // SAFETY: RDTSC is unprivileged in a Wine PE process (the x64 test
+        // executables). No preconditions; returns the cycle counter.
         unsafe { core::arch::x86_64::_rdtsc() }
     }
     #[cfg(target_arch = "x86")]

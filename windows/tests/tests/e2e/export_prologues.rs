@@ -4,8 +4,8 @@
 //! instructions of the export with a length decoder of their own, copying at
 //! least five bytes of whole instructions into a trampoline and writing a
 //! `jmp rel32` over them; a decoder that meets an instruction it does not know
-//! skips the hook. The layer pins the first bytes of each export to one
-//! prologue per arch that such decoders know, so this reads them through
+//! skips the hook. The i386 build pins the first bytes of each export to the
+//! hot-patch prologue such decoders know, so this reads them through
 //! `GetProcAddress`, the address a hook engine patches, and compares them
 //! byte for byte. The list of exports is read from `d3d9.def`, so an export
 //! added there as a plain function fails here. Each is resolved by its
@@ -15,28 +15,24 @@
 //! No shared harness: the point is the export table, as in `d3dperf.rs`.
 
 use core::ffi::{c_char, c_void};
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 use std::ffi::CString;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryA(name: *const c_char) -> *mut c_void;
     fn FreeLibrary(module: *mut c_void) -> i32;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86")]
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
 /// The `.def` file `d3d9.dll` links with: its `EXPORTS` section lists every export and its ordinal.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 const D3D9_DEF: &str = include_str!("../../../d3d9/d3d9.def");
 
 /// `mov edi, edi; push ebp; mov ebp, esp; pop ebp`, in the encodings MSVC emits.
 #[cfg(target_arch = "x86")]
 const PROLOGUE: [u8; 6] = [0x8B, 0xFF, 0x55, 0x8B, 0xEC, 0x5D];
-
-/// The five-byte NOP, `nop dword ptr [rax + rax]`.
-#[cfg(target_arch = "x86_64")]
-const PROLOGUE: [u8; 5] = [0x0F, 0x1F, 0x44, 0x00, 0x00];
 
 #[test]
 fn every_api_export_starts_with_the_hook_prologue() {
@@ -44,25 +40,20 @@ fn every_api_export_starts_with_the_hook_prologue() {
     let lib = unsafe { LoadLibraryA(c"d3d9.dll".as_ptr()) };
     assert!(!lib.is_null(), "LoadLibrary(d3d9.dll)");
 
-    // The ARM64X build's exports are ARM64EC code in an x64 process and ARM64
-    // code in a native ARM64 one, which an x86 hook engine cannot decode
-    // whatever their first bytes are. A native ARM64 process loads only that
-    // image, so it checks nothing.
-    #[cfg(target_arch = "aarch64")]
+    // An x64 or a native ARM64 process loads the ARM64X build, whose exports
+    // are ARM64EC or ARM64 code, which an x86 hook engine cannot decode
+    // whatever their first bytes are.
+    #[cfg(not(target_arch = "x86"))]
     eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64 code, not checked");
-    #[cfg(not(target_arch = "aarch64"))]
-    if is_hybrid_image(lib) {
-        eprintln!("[e2e] d3d9.dll is an ARM64X image: its exports are ARM64EC code, not checked");
-    } else {
-        check_prologues(lib);
-    }
+    #[cfg(target_arch = "x86")]
+    check_prologues(lib);
 
     // SAFETY: balancing the LoadLibrary above.
     assert_ne!(unsafe { FreeLibrary(lib) }, 0, "FreeLibrary(d3d9.dll)");
 }
 
 /// Compare the first bytes of every export `d3d9.def` lists with [`PROLOGUE`].
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 fn check_prologues(lib: *mut c_void) {
     let exports = def_exports();
     assert!(
@@ -86,7 +77,7 @@ fn check_prologues(lib: *mut c_void) {
 }
 
 /// One entry of the `EXPORTS` section of `d3d9.def`.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 #[derive(Debug)]
 struct DefExport {
     /// The export's name, `None` for a `NONAME` entry.
@@ -94,7 +85,7 @@ struct DefExport {
     ordinal: u16,
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 impl DefExport {
     /// The name the entry has in a failure message.
     fn label(&self) -> String {
@@ -107,7 +98,7 @@ impl DefExport {
 }
 
 /// Every entry the `EXPORTS` section of `d3d9.def` lists: `Name @ordinal [NONAME]`.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 fn def_exports() -> Vec<DefExport> {
     let (_, exports) = D3D9_DEF
         .split_once("\nEXPORTS")
@@ -136,7 +127,7 @@ fn def_exports() -> Vec<DefExport> {
 ///
 /// Resolved by ordinal, and a named export by name too, the two addresses
 /// required to match.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86")]
 fn first_bytes(lib: *mut c_void, export: &DefExport) -> [u8; PROLOGUE.len()] {
     // `MAKEINTRESOURCE`: an ordinal is passed as the low word of the name pointer.
     let by_ordinal = core::ptr::without_provenance::<c_char>(usize::from(export.ordinal));
@@ -153,40 +144,4 @@ fn first_bytes(lib: *mut c_void, export: &DefExport) -> [u8; PROLOGUE.len()] {
     // code section, which holds at least the prologue's length past every
     // entry: the function itself or the padding that aligns the next one.
     unsafe { core::ptr::read_unaligned(addr.cast::<[u8; PROLOGUE.len()]>()) }
-}
-
-/// Whether the loaded image is an ARM64X one, whose load config names CHPE metadata.
-#[cfg(target_arch = "x86_64")]
-fn is_hybrid_image(lib: *mut c_void) -> bool {
-    /// The offset of `e_lfanew` in the DOS header, the start of the NT headers.
-    const E_LFANEW: usize = 0x3C;
-    /// The offset of the load-config data directory in the PE32+ NT headers.
-    const LOAD_CONFIG_DIRECTORY: usize = 24 + 112 + 10 * 8;
-    /// The offset of `CHPEMetadataPointer` in the 64-bit load-config directory.
-    const CHPE_METADATA_POINTER: usize = 0xC8;
-
-    let base = lib.cast::<u8>();
-    let read_u32 = |offset: usize| {
-        // SAFETY: every offset read here lies in the mapped headers or the
-        // load-config directory of the image `base` is the module handle of.
-        unsafe { core::ptr::read_unaligned(base.wrapping_add(offset).cast::<u32>()) }
-    };
-    let as_usize = |value: u32| usize::try_from(value).expect("u32 fits usize on x86_64");
-    let nt = as_usize(read_u32(E_LFANEW));
-    let load_config = as_usize(read_u32(nt + LOAD_CONFIG_DIRECTORY));
-    // The directory's own `Size` field says which fields this image carries.
-    if load_config == 0 || as_usize(read_u32(load_config)) < CHPE_METADATA_POINTER + 8 {
-        return false;
-    }
-    let field = base.wrapping_add(load_config + CHPE_METADATA_POINTER);
-    // SAFETY: the load-config directory is mapped with the image and its size
-    // covers the field, checked above.
-    let chpe = unsafe { core::ptr::read_unaligned(field.cast::<u64>()) };
-    chpe != 0
-}
-
-/// An i386 process never loads the ARM64X image.
-#[cfg(target_arch = "x86")]
-const fn is_hybrid_image(_lib: *mut c_void) -> bool {
-    false
 }

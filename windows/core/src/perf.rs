@@ -175,7 +175,7 @@ const SNAPSHOT_SECTIONS: [(usize, &str, &str); 17] = [
 /// One rebuilding draw in this many gets its `keys` sections timed.
 ///
 /// A section timer costs about as much as a small section's rebuild (two
-/// counter reads under Rosetta), so timing every draw would inflate `keys`
+/// counter reads), so timing every draw would inflate `keys`
 /// and the API thread by that much. The sampled cycles are scaled back up by
 /// the rebuilding draws over the sampled ones. A power of two, so the pick
 /// is a mask of the per-device xorshift state.
@@ -185,7 +185,7 @@ const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 /// One frame in this many, on average, runs its per-call and per-draw timers.
 ///
 /// A timer costs about as much as a cheap call (two counter reads and the
-/// booking, 12 to 17 ns under Rosetta), so a `PERF=1` build that times
+/// booking, 12 to 17 ns as measured), so a `PERF=1` build that times
 /// every call of every frame runs its API thread about half again slower
 /// than the production build. Timing whole frames keeps every timed frame
 /// exact (nesting, exclusive time, the rows that are a parent less its
@@ -1347,8 +1347,7 @@ struct EncoderFrameCounters {
     /// Per-frame count of uploads written by the GPU upload pass.
     ///
     /// Taken when a blit copy cannot express the upload: the texture's D3D
-    /// format is packed 16-bit over a BGRA8 backing (a device without the
-    /// native packed formats, or `intel.expandPacked16`), or the staging row
+    /// format is 24-bit `R8G8B8` over a BGRA8 backing, or the staging row
     /// pitch is under the device's linear texture alignment. The staging is
     /// read by a fragment function instead. One per upload, whatever the
     /// pass count (a volume upload opens one per slice), so the row still
@@ -1394,12 +1393,6 @@ struct EncoderFrameCounters {
     /// unix side copied it into its upload ring. Non-indexed fans ride the
     /// shared pattern buffer and are not counted. A tripwire: 0 is the goal.
     fan_generated: u32,
-    /// Draws whose draw path did not run at its pinned stack page offset.
-    ///
-    /// The unix side runs every draw at one 4 KiB stack page offset so that
-    /// frames above it cannot move its calls across a page boundary. A
-    /// tripwire for a build that lost the pin: 0 is the goal.
-    draw_unpinned: u32,
     /// `DrawIndexedPrimitiveUP` draws, whose inline indices the unix side copies into its ring.
     up_indexed: u32,
     /// UP draws whose inline vertices exceed `SET_BYTES_MAX` and go through the ring.
@@ -1514,7 +1507,6 @@ impl EncoderFrameCounters {
             op_sub_detail: [0; OpSubDetail::COUNT],
             pipeline_memo_hits: 0,
             fan_generated: 0,
-            draw_unpinned: 0,
             up_indexed: 0,
             up_vertex_oversized: 0,
             pipeline_memo_calls: 0,
@@ -2819,11 +2811,6 @@ impl EncoderPerfState {
         self.enc.fan_generated = self.enc.fan_generated.saturating_add(1);
     }
 
-    /// Count one draw that ran off its pinned stack page offset.
-    pub const fn bump_draw_unpinned(&mut self) {
-        self.enc.draw_unpinned = self.enc.draw_unpinned.saturating_add(1);
-    }
-
     /// Count one `DrawIndexedPrimitiveUP` draw.
     pub const fn bump_up_indexed(&mut self) {
         self.enc.up_indexed = self.enc.up_indexed.saturating_add(1);
@@ -3413,8 +3400,6 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_fan_generated(&mut self) {}
     #[inline]
-    pub const fn bump_draw_unpinned(&mut self) {}
-    #[inline]
     pub const fn bump_up_indexed(&mut self) {}
     #[inline]
     pub const fn bump_up_vertex_oversized(&mut self) {}
@@ -3670,7 +3655,6 @@ struct PerfWindow {
     /// Pipeline-resolve memo hits / calls — rendered as a hit rate (sum only).
     pipeline_memo_hits: Stat,
     fan_generated: Stat,
-    draw_unpinned: Stat,
     up_indexed: Stat,
     up_vertex_oversized: Stat,
     pipeline_memo_calls: Stat,
@@ -3974,7 +3958,6 @@ impl PerfWindow {
         self.pipeline_memo_hits
             .add(u64::from(s.enc.pipeline_memo_hits));
         self.fan_generated.add(u64::from(s.enc.fan_generated));
-        self.draw_unpinned.add(u64::from(s.enc.draw_unpinned));
         self.up_indexed.add(u64::from(s.enc.up_indexed));
         self.up_vertex_oversized
             .add(u64::from(s.enc.up_vertex_oversized));
@@ -4502,7 +4485,7 @@ impl Bottleneck {
 ///
 /// Pure: takes a `PerfWindow` snapshot plus the live cache sizes and produces
 /// a `String`. Kept off `log_frame_summary` so it's host-testable under
-/// `cargo test -p mtld3d-core --target x86_64-apple-darwin`.
+/// `cargo test -p mtld3d-core --target aarch64-apple-darwin`.
 #[cfg(perf_tracking)]
 struct Summary<'a> {
     /// The timed frames: every timer row's time and the per-call and per-draw ratios built on it.
@@ -6202,7 +6185,7 @@ impl<'a> Summary<'a> {
         // source had to be repacked into a transient widened-stride buffer
         // (extra alloc + memcpy + sync `CreateBuffer` thunk). `pass` is the
         // GPU upload pass: the staging is read by a fragment function, which
-        // is the only form a packed 16-bit widening has and the cheaper form
+        // is the only form a 24-bit widening has and the cheaper form
         // for a row pitch under the linear texture alignment.
         let raw_blits = w.raw_texture_uploads();
         self.res_row(
@@ -7078,7 +7061,6 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("pipeline_memo_hits", c.pipeline_memo_hits.sum);
     kv.total("pipeline_memo_calls", c.pipeline_memo_calls.sum);
     kv.total("fan_generated", c.fan_generated.sum);
-    kv.total("draw_unpinned", c.draw_unpinned.sum);
     kv.total("up_indexed", c.up_indexed.sum);
     kv.total("up_oversized", c.up_vertex_oversized.sum);
 

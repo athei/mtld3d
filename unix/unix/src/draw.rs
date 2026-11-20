@@ -316,33 +316,22 @@ fn resolve_pipeline_slow(
 /// (primitive type and vertex and index source). UP spans borrow the API
 /// frame capture until native submit replay completes.
 /// [`DrawView::new`] has already rejected malformed draw fields, so nothing
-/// here fails. The draw runs at a fixed stack page offset (see
-/// [`crate::stack_page`]), so its speed does not depend on the frames above it.
+/// here fails.
 ///
 /// # Safety
 /// The view must belong to the authentic admitted packet. Its captured bytes and
 /// backing allocations remain immutable and retained until submit completion. The
 /// tokens in `snap` must have been decoded from records retained by that packet.
 pub unsafe fn emit_draw(enc: &mut FrameEncoder, snap: &CurrentSnapshot, draw: &DrawView<'_>) {
-    crate::stack_page::run_pinned(|| {
-        #[cfg(perf_tracking)]
-        if !crate::stack_page::at_pin() {
-            enc.bump_draw_unpinned();
-        }
-        emit_draw_view(
-            enc,
-            snap,
-            draw.metal_primitive(),
-            draw.vertices(),
-            draw.indices(),
-        );
-    });
+    emit_draw_view(
+        enc,
+        snap,
+        draw.metal_primitive(),
+        draw.vertices(),
+        draw.indices(),
+    );
 }
 
-// Kept out of line so that its frame, and so every call it makes, sits below
-// the gap `run_pinned` reserves; inlined, each of the 64 gap instances would
-// also carry its own copy of this function.
-#[inline(never)]
 fn emit_draw_view(
     enc: &mut FrameEncoder,
     snap: &CurrentSnapshot,
