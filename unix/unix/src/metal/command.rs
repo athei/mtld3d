@@ -1420,11 +1420,11 @@ fn clear_texture(
 ///
 /// The other order, tone-mapping at render size and scaling the float result
 /// in `ColorProcessingMode::HDR`, runs the tone map over fewer pixels, but
-/// that mode loses precision in exactly the range the tone map adds: at 2x,
-/// flat white comes back 1.6 % low at a headroom of 4 and 3.2 % low at 15,
-/// and a bright gradient gains steps that go down. In this order white
-/// reaches the headroom exactly, and the gradient has the steps `Perceptual`
-/// scaling gives in SDR.
+/// that mode loses precision in exactly the range the tone map adds. Measured
+/// on an M-series GPU at 2x, flat white came back 1.6 % low at a headroom of 4
+/// and 3.2 % low at 15, and a bright gradient gained steps that go down. In
+/// this order upscaled white reads what the tone map gives without `MetalFX`,
+/// and the gradient has the steps `Perceptual` scaling gives in SDR.
 ///
 /// Any failure falls back to tone-mapping the original source directly onto
 /// the drawable. Returns `false` only when neither route could encode the

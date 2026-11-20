@@ -544,7 +544,9 @@ scaler's output usage, and a render pass in the same command buffer carries it
 onto the drawable. In SDR the intermediate has the drawable's format and a
 nearest-texel pass (`encode_exact_copy`) copies it. In HDR it has the back
 buffer's format, and the BT.2446 pass tone-maps it onto the `RGBA16Float`
-drawable (`upscale::encode_then`).
+drawable (`upscale::encode_then`). The back buffer is always `BGRA8Unorm`, the
+SDR drawable's format, so the two presents of one geometry build the same
+scaler key and share one entry and its intermediate.
 Only the entry a lookup lands on keeps its intermediate: the lookup moves
 every other entry's output to the eviction list, so a queue holds one
 drawable-sized intermediate however many geometries a resize walked through.
@@ -555,8 +557,8 @@ are retired on fallback submissions too. Scaler texture bindings are cleared
 after encoding so idle cache entries hold no source texture. Both presents
 scale the gamma-encoded frame in Perceptual mode. Tone-mapping at render size
 and scaling the float result in HDR mode instead loses precision in the range
-the tone map adds: at 2x, flat white comes back 1.6 % low at a headroom of 4
-and 3.2 % low at 15. A preparation, copy or tone-map failure returns to the
+the tone map adds: measured on an M-series GPU at 2x, flat white came back
+1.6 % low at a headroom of 4 and 3.2 % low at 15. A preparation, copy or tone-map failure returns to the
 original source's SDR or HDR present shader.
 
 

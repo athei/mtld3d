@@ -87,8 +87,12 @@ struct ScalerKey {
 ///
 /// A scaler is not a cheap thing to hold: measured on an M-series GPU, one at
 /// `1920x1200 → 2560x1600` costs **~16 MiB** of device memory for its
-/// intermediates. Steady-state play needs two at most (the SDR and the HDR
-/// present of one geometry), so this never evicts during a game. What it bounds
+/// intermediates. Steady-state play needs one: the back buffer is always
+/// `BGRA8Unorm`, so the SDR present (output in the `BGRA8Unorm` drawable's
+/// format) and the HDR present (output in the back buffer's) of one geometry
+/// build the same key and share one entry and its output. A second entry per
+/// geometry would take a back-buffer format other than the SDR drawable's, so
+/// this never evicts during a game. What it bounds
 /// is a *window being resized*, which walks through a new geometry for every
 /// size the user rests at: twelve of them in forty seconds of dragging,
 /// measured, which unbounded is ~190 MiB that never comes back. The bound is
@@ -435,6 +439,14 @@ fn encode_with(
     unsafe { scaler.setColorTexture(None) };
     // SAFETY: nullable property write on the live scaler after encoding.
     unsafe { scaler.setOutputTexture(None) };
+    // `finish` runs under `scalers` too. The exact copy takes no lock. The HDR
+    // present's tone map reads the present pipelines' `OnceLock`s and, with a
+    // ramp, takes `GAMMA_PIPELINES` and the gamma `TABLES` lock, and it
+    // compiles the gamma pipeline on the first present that needs one: that
+    // present holds `scalers` for the compile, stalling `retire_evicted` on
+    // the submit thread that long. No code takes `scalers` while holding
+    // either lock, so the order is `scalers` first, and a lock added inside a
+    // `finish` pass keeps it.
     let encoded = finish(cmd_buf, &output, dst);
     log::debug!(target: "mtld3d::unix::present",
         "MetalFX encoded={encoded} {}x{} -> {}x{} {:?}, destination storage {:?} usage {:?}",
@@ -666,8 +678,8 @@ pub fn is_supported(device_handle: MetalHandle<MTLDeviceKind>) -> bool {
 /// [`is_supported`] for a device already in hand.
 ///
 /// Present-time callers reach the device through `cmd_buf.device()` and hold no
-/// handle. They ask this before allocating anything a declined scaler would
-/// orphan.
+/// handle. The present asks this to pick its route, so a GPU without `MetalFX`
+/// never reaches the scaler path.
 pub fn is_available(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     supported(device)
 }
