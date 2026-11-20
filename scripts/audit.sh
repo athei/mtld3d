@@ -269,7 +269,7 @@ app_pointer_derefs() {
 # `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or
 # `cfg_attr` that names `windows`, `unix` or a `target_*` key. A cfg is read up
 # to its closing parenthesis, which may be lines later. One still open at the
-# end of its file is a finding. Comment lines are skipped.
+# end of its file is a finding. Each line is cut at its first `//` first.
 platform_split() {
     awk '
         function depth(s,   t, o, c) {
@@ -311,8 +311,9 @@ platform_split() {
         FNR == 1 { unclosed() }
         END { unclosed() }
         /^[ \t]*\/\// { next }
+        { code = $0; sub(/\/\/.*/, "", code) }
         nest > 0 {
-            cfg = cfg " " $0
+            cfg = cfg " " code
             if (depth(closed(cfg)) == 0) {
                 nest = 0
                 if (names_platform(cfg)) finding(start, "platform cfg")
@@ -322,10 +323,10 @@ platform_split() {
         }
         {
             text = $0
-            if ($0 ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
-            if ($0 ~ /#\[link\(/) finding(FNR, "#[link(")
-            if ($0 ~ /os::windows/) finding(FNR, "os::windows")
-            scan($0)
+            if (code ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
+            if (code ~ /#\[link\(/) finding(FNR, "#[link(")
+            if (code ~ /os::windows/) finding(FNR, "os::windows")
+            scan(code)
         }
     ' "$@"
 }
