@@ -62,9 +62,7 @@
 //! the metrics keep their definitions, each leg ran one build of each kind
 //! of benchmark binary throughout ([`Kind`]),
 //! the two legs ran two different `d3d9.dll` images, and both ran the same
-//! profile. Anything else is an error, exit code 2, not a verdict. A layout
-//! comparison ([`Layouts`]) is the exception to the images rule: its legs run
-//! one commit, so a binary the two layouts share is one image in both.
+//! profile. Anything else is an error, exit code 2, not a verdict.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -75,7 +73,7 @@ use std::{
 };
 
 use super::{
-    LAYOUTS_FILE, Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE, machine,
+    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE, machine,
     metrics::{self, Class, Direction, Metric, MetricsFile, Unit},
     shape::{self, ShapeReport},
     stats::{MAD_SIGMA, mad, median},
@@ -310,100 +308,6 @@ impl Kind {
             .flat_map(BTreeMap::values)
             .filter(|loaded| self.holds(&loaded.file))
             .collect()
-    }
-}
-
-/// Where one leg of a layout comparison ran: which Wine, and which build of the PE side.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Layout {
-    /// The Wine the leg ran under, as the Makefile names it (`sdk`, `arm64`).
-    pub runtime: String,
-    /// The build of `d3d9.dll` and `mtld3d.dll` the leg loaded (`x86_64`, `arm64x`).
-    pub variant: String,
-}
-
-/// Both legs' layouts in a run that compares one commit in two layouts.
-///
-/// Such a run measures the layouts, not a change: both legs build the same
-/// commit, so its legs must carry one stamp, and a binary the two layouts
-/// share (the `d3d9.dll` of two runtimes, the `mtld3d.so` of two variants on
-/// one runtime) is one image in both, which is noted rather than refused.
-/// `bench-ab` writes it to the A/B directory as `layouts.txt`, one line a
-/// leg, `base <runtime> <variant>` and `cand <runtime> <variant>`.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Layouts {
-    /// Where the base leg ran.
-    pub base: Layout,
-    /// Where the candidate leg ran.
-    pub cand: Layout,
-}
-
-impl Layouts {
-    /// The text of `layouts.txt`.
-    #[must_use]
-    pub fn render(&self) -> String {
-        format!(
-            "base {} {}\ncand {} {}\n",
-            self.base.runtime, self.base.variant, self.cand.runtime, self.cand.variant
-        )
-    }
-
-    /// Parse the text of `layouts.txt`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when a leg's line is missing, repeated or malformed.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let (mut base, mut cand) = (None, None);
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let [leg, runtime, variant] = words[..] else {
-                return Err(format!(
-                    "{LAYOUTS_FILE}: {line:?} is not `<leg> <runtime> <variant>`"
-                ));
-            };
-            let layout = Layout {
-                runtime: runtime.to_owned(),
-                variant: variant.to_owned(),
-            };
-            let slot = match leg {
-                "base" => &mut base,
-                "cand" => &mut cand,
-                other => return Err(format!("{LAYOUTS_FILE}: no leg {other:?}")),
-            };
-            if slot.replace(layout).is_some() {
-                return Err(format!("{LAYOUTS_FILE}: the {leg} leg appears twice"));
-            }
-        }
-        match (base, cand) {
-            (Some(base), Some(cand)) => Ok(Self { base, cand }),
-            _ => Err(format!(
-                "{LAYOUTS_FILE} names no layout for one of the legs"
-            )),
-        }
-    }
-
-    /// The layouts of the A/B directory `dir`, `None` when it holds no layout comparison.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the file cannot be read or does not parse.
-    pub fn read(dir: &Path) -> Result<Option<Self>, String> {
-        let path = dir.join(LAYOUTS_FILE);
-        match fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&text).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        }
-    }
-
-    /// The report's line naming both layouts.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        format!(
-            "layouts: base {} runtime, {} DLLs   cand {} runtime, {} DLLs",
-            self.base.runtime, self.base.variant, self.cand.runtime, self.cand.variant
-        )
     }
 }
 
@@ -654,21 +558,7 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
         ));
     }
     let allow_same_image = options.allow_same_image || dir.join(SAME_IMAGE_FILE).exists();
-    let layouts = Layouts::read(dir)?;
-    if let Some(layouts) = layouts
-        .as_ref()
-        .filter(|layouts| layouts.base == layouts.cand)
-    {
-        return Err(format!(
-            "{}: both legs have the layout {} {}: a layout comparison needs two",
-            dir.join(LAYOUTS_FILE).display(),
-            layouts.base.runtime,
-            layouts.base.variant
-        ));
-    }
-    let one_image = if layouts.is_some() {
-        OneImage::Layouts
-    } else if allow_same_image {
+    let one_image = if allow_same_image {
         OneImage::AA
     } else {
         OneImage::Refused
@@ -692,9 +582,6 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
     comparison.warnings = machine::warnings(dir, &[Leg::Base.dir(), Leg::Cand.dir()], base.len());
     comparison.notes.extend(shapes.notes);
     let mut header = vec![format!("bench-compare: {}", dir.display())];
-    if let Some(layouts) = &layouts {
-        header.push(layouts.describe());
-    }
     for (kind, builds) in kinds {
         comparison.notes.extend(builds.notes);
         let build = format!(
@@ -853,12 +740,10 @@ pub fn check_kinds(
 /// That holds for every image key both legs carry, while a leg carrying
 /// one alone is an error. The release stamps may be equal, since a
 /// candidate with uncommitted changes carries the stamp of the commit it
-/// sits on. The exceptions are a true A/A run, one commit against itself
-/// from a clean tree, where a deterministic build gives both legs the same
-/// image, and a layout comparison, one commit in two layouts, where a binary
-/// both layouts share is one image: `one_image` says which the run is, and
-/// equal stamps confirm it, a layout comparison requiring them. `None` when
-/// neither leg has a file of the kind.
+/// sits on. The exception is a true A/A run, one commit against itself from
+/// a clean tree, where a deterministic build gives both legs the same image:
+/// `one_image` says whether the run is one, and equal stamps confirm it.
+/// `None` when neither leg has a file of the kind.
 ///
 /// # Errors
 ///
@@ -901,12 +786,6 @@ pub fn check_builds(
         }
     }
     let one_stamp = base_meta["layer"] == cand_meta["layer"];
-    if *one_image == OneImage::Layouts && !one_stamp {
-        return Err(format!(
-            "a layout comparison runs one commit in both legs, but base is {} and cand is {}",
-            base_meta["layer"], cand_meta["layer"]
-        ));
-    }
     let a_a = *one_image == OneImage::AA && one_stamp;
     let mut notes = Vec::new();
     let mut images = Vec::new();
@@ -917,8 +796,6 @@ pub fn check_builds(
         );
         let same = if a_a {
             SameImage::AA
-        } else if *one_image == OneImage::Layouts {
-            SameImage::Layouts
         } else if kind.distinct_images {
             SameImage::Error
         } else {
@@ -947,16 +824,12 @@ pub enum OneImage {
     Refused,
     /// In a true A/A run.
     AA,
-    /// In a layout comparison, for a binary its two layouts share.
-    Layouts,
 }
 
 /// What one image in both legs means.
 enum SameImage {
     /// A true A/A run, where a deterministic build gives both legs one image: a note.
     AA,
-    /// A binary both layouts of a layout comparison share: a note.
-    Layouts,
     /// A kind whose binary a change may leave as it was: a note.
     Unchanged,
     /// A kind whose legs must run two binaries: an error.
@@ -988,9 +861,6 @@ fn check_image(
     } else if base_image == cand_image {
         let note = match same {
             SameImage::AA => SAME_IMAGE_NOTE.to_owned(),
-            SameImage::Layouts => {
-                format!("both legs ran {binary} image {base_image}: their layouts share it")
-            }
             SameImage::Unchanged => format!(
                 "both legs ran {binary} image {base_image}: the change leaves the code it links \
                  unchanged"
