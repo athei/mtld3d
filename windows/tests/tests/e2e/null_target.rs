@@ -405,7 +405,7 @@ fn a_depth_only_pass_through_a_null_target_writes_an_intz_surface() {
 /// then shows on the right half only, at any scale.
 #[test]
 fn a_null_target_over_the_back_buffer_depth_draws_in_its_space() {
-    let h = Harness::new();
+    let h = Harness::with_depth();
     let back_buffer = h.render_target(0);
     let null = h.create_render_target(NULL_EDGE, NULL_EDGE, D3DFMT_NULL);
     let (width, height) = h.dims();
@@ -449,7 +449,13 @@ fn a_null_target_over_the_back_buffer_depth_draws_in_its_space() {
     for (x, y) in [(width / 8, height / 8), (width / 4, height * 7 / 8)] {
         assert_eq!(h.read_pixel(x, y), BLUE, "left half at ({x}, {y})");
     }
-    for (x, y) in [(width * 3 / 4, height / 8), (width * 7 / 8, height * 7 / 8)] {
+    // Just right of the middle: a draw converted in the `NULL` target's own
+    // unscaled space would reach past it under a reduced `render.scale`.
+    for (x, y) in [
+        (width * 9 / 16, height / 2),
+        (width * 3 / 4, height / 8),
+        (width * 7 / 8, height * 7 / 8),
+    ] {
         assert_eq!(h.read_pixel(x, y), GREEN, "right half at ({x}, {y})");
     }
 }
