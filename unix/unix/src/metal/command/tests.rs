@@ -14,8 +14,9 @@
 //! `RGBA16Float` destination. The HDR tone map is checked against a float64 port of
 //! its stage, against the pass-through at a headroom of 1, and for never putting a grey
 //! below SDR while rising with the code and the headroom. Where `MetalFX` exists, the
-//! upscaled HDR present is checked for keeping white at the headroom and for adding no
-//! steps that go down to a bright gradient over what SDR scaling gives.
+//! upscaled HDR present is checked for keeping white at the headroom, for adding no
+//! steps that go down to a bright gradient over what SDR scaling gives, and for equalling
+//! the 1:1 tone map of the `Perceptual` scale with and without a gamma ramp.
 //!
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
@@ -2065,6 +2066,127 @@ fn an_upscaled_hdr_present_keeps_white_and_the_gradient_steps() {
              {sdr_down}: {presented}"
         );
     }
+    crate::metal::upscale::retire(&cache);
+}
+
+/// The upscaled HDR present equals, texel for texel, the 1:1 tone map of the `Perceptual` scale.
+///
+/// A random frame, near-black, colours and alpha included, enlarged by 4:3
+/// in each axis, at headrooms of 1, 4 and 15, without a gamma ramp and with
+/// one: every texel of the present must equal `encode_hdr_present` at 1:1
+/// from the same frame scaled by `upscale::encode` into a `BGRA8Unorm`
+/// target. The ramp must change the picture, so its pass is the one that ran.
+#[test]
+fn the_upscaled_hdr_present_tone_maps_the_perceptual_scale_texel_for_texel() {
+    use crate::metal::macdrv::attachment;
+    let queue = test_queue();
+    let device = queue.device();
+    if !crate::metal::upscale::is_available(&device) {
+        eprintln!("MetalFX unsupported, skipping the upscaled HDR present comparison");
+        return;
+    }
+    let cache = crate::metal::upscale::UpscaleCache::new();
+    let drawable = (400, 268);
+    let (src, _) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, 300, 201);
+    let scaled = texture_2d(
+        &device,
+        MTLPixelFormat::BGRA8Unorm,
+        drawable,
+        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+    );
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-perceptual-scale")));
+    assert!(crate::metal::upscale::encode(
+        &cmd,
+        &device,
+        &cache,
+        &src,
+        &scaled,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual,
+    ));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    // A ramp that moves every channel: red squared, green kept, blue inverted.
+    let view = attachment::test_address_block();
+    let layer = view + 8;
+    attachment::register(
+        view,
+        layer,
+        &attachment::AttachLatches {
+            hwnd: 0x42,
+            flags: attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let ramp: Vec<u16> = (0..=255_u32)
+        .flat_map(|code| {
+            let level = |value: u32| u16::try_from(value).expect("a 16-bit level");
+            [
+                level(code * code * 65535 / (255 * 255)),
+                level(code * 257),
+                level((255 - code) * 257),
+                u16::MAX,
+            ]
+        })
+        .collect();
+    let layer_key = u64::try_from(layer).expect("a 64-bit address");
+    // SAFETY: `set_gamma_ramp` reads the handle only as the key of the
+    // layer's table and never dereferences it; no object stands behind it.
+    let layer_handle = unsafe { MetalHandle::new(layer_key) };
+    assert!(crate::metal::gamma::set_gamma_ramp(
+        layer_handle,
+        Some(&ramp)
+    ));
+    for headroom in [1.0_f32, 4.0, 15.0] {
+        let mut plain = None;
+        for gamma_layer in [0, layer] {
+            let presented = hdr_values_at(&queue, drawable, |cmd, dst| {
+                super::encode_hdr_present_upscaled(cmd, &cache, &src, dst, headroom, gamma_layer)
+            });
+            let wanted = hdr_values_at(&queue, drawable, |cmd, dst| {
+                super::encode_hdr_present(cmd, &scaled, dst, headroom, gamma_layer)
+            });
+            if let Some(index) = presented
+                .iter()
+                .zip(&wanted)
+                .position(|(read, want)| read.map(f32::to_bits) != want.map(f32::to_bits))
+            {
+                panic!(
+                    "texel ({}, {}) at a headroom of {headroom}, ramp {}: the present reads {:?}, \
+                     the tone map of the Perceptual scale {:?}",
+                    index % drawable.0,
+                    index / drawable.0,
+                    gamma_layer != 0,
+                    presented[index],
+                    wanted[index]
+                );
+            }
+            match plain.take() {
+                None => plain = Some(presented),
+                Some(unramped) => assert!(
+                    unramped
+                        .iter()
+                        .zip(&presented)
+                        .any(|(before, after)| before.map(f32::to_bits) != after.map(f32::to_bits)),
+                    "the ramp must change the picture at a headroom of {headroom}"
+                ),
+            }
+        }
+    }
+    assert!(crate::metal::gamma::set_gamma_ramp(layer_handle, None));
+    attachment::unregister(view);
     crate::metal::upscale::retire(&cache);
 }
 
