@@ -64,8 +64,9 @@ on `main` once the nightly shows the stale pin.
 The Makefile runs two legs under the Wine `WINE_SDK` names, both against the
 builds `make install` puts there, and the Wine decides the keys they record
 under. Both legs run one build of Wine's d3d9 tests, whichever Wine runs
-them: the `{i386,x86_64}-windows/d3d9_test.exe` of wine-build's arm64 Wine
-release, under the directory `WINE_TESTS` names (The test binaries, below).
+them: the `{i386,x86_64}-windows/d3d9_test.exe` of the pinned arm64 Wine
+release (athei/mach9), under the directory `WINE_TESTS` names (The test
+binaries, below).
 
 | Target | arm64 Wine (macos-26 CI image) | x86_64 Wine (macos-15 CI image, under Rosetta, and macos-15-intel) |
 | --- | --- | --- |
@@ -189,14 +190,13 @@ redact it.
 ### The test binaries
 
 The test binaries are the `{i386,x86_64}-windows/d3d9_test.exe` of the
-pinned arm64 Wine release (athei/mach9, formerly wine-build), under its
-`lib/wine/tests`, and every leg runs that one build whichever Wine it runs
-under: a site is named by its `file:line`, which moves between Wine versions
-(the x86_64 Wine cx-26.3.0-7 ships Wine 11.0's tests, the arm64 Wine v0.4.0
-Wine 11.21's), so one
-classification list can only serve one build of the tests, and a PE test
-runs under any Wine. `WINE_TESTS` names the directory. Under the arm64 Wine
-it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
+pinned arm64 Wine release (athei/mach9), under its `lib/wine/tests`, and
+every leg runs that one build whichever Wine it runs under: a site is named
+by its `file:line`, which moves between Wine versions (the x86_64 Wine
+cx-26.3.0-7 ships Wine 11.0's tests, the arm64 Wine v0.4.0 Wine 11.21's),
+so one classification list can only serve one build of the tests, and a PE
+test runs under any Wine. `WINE_TESTS` names the directory. Under the
+arm64 Wine it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
 puts our builtin `d3d9.dll` into; under an x86_64 Wine it has no default and
 the conformance targets stop without it, and CI's x86_64-Wine images fetch
 the pinned arm64 release's `lib/wine/tests` alone for it. The binaries are
@@ -1025,8 +1025,8 @@ The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 athei/mach9 (formerly wine-build) publishes. Against Wine 11.20's,
 `dlls/d3d9/tests` changes only `device.c`: `test_present_destroyed_window`
 adds 42 lines before `test_window_position` and one call in `START_TEST`,
-so every device.c site from 14963 on moves 42 lines later,
-`test_window_position` from 15039 to 15081, `init_d3d9on12_modules` from
+so every device.c site from 14963 to `START_TEST` (old 15374) moves 42
+lines later, `test_window_position` from 15039 to 15081, `init_d3d9on12_modules` from
 15104 to 15146, `test_d3d9on12` from 15176 to 15218 and
 `test_device_vtbl_initialization_assembly_hook` from 15357 to 15399, and no
 other site moves. The new test presents, destroys the device window and
@@ -1037,8 +1037,9 @@ binaries: the arm64 Wine's six Apple keys (`i686-arm64`, `arm64x` and their
 counts, and the six keys hold every earlier count at its new line. The
 x86_64 Wine's six keys and the two `@mac2` keys were renumbered from the
 source diff alone, line numbers only. CI confirms `i686` and `x86_64` on
-macos-15 and the two `@mac2` keys through a `record_intel_baseline`
-dispatch with `intel_only`; `i686+intel`, `i686+scale`, `x86_64+intel` and
+macos-15, and the two `@mac2` keys are to be confirmed by CI's
+`record_intel_baseline` dispatch with `intel_only` before the change
+merges; `i686+intel`, `i686+scale`, `x86_64+intel` and
 `x86_64+scale` are renumbered only and unconfirmed until an x86_64-Wine
 machine records them, and what the new test reads under that Wine is
 unknown until then. The flaky and ceiling pins kept their values:
@@ -1733,6 +1734,10 @@ mode exactly as native does. The served list is ordered smallest first, as a
 driver lists it, so the pick is 640x480 wherever Wine lists it: 14946 fires
 on a display of another shape (a MacBook panel, the Intel image) and passes
 on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
+Under the arm64 Wine built from Wine 11.21 it reads 0 on a 3456x2234 panel
+too, on all six keys in every run recorded there, where Wine 11.20 read 1;
+the pin stays, since the x86_64 Wine's keys and the `@mac2` keys read 1
+when they were last recorded.
 
 14930 and 14955 fire on the `@mac2` legs only. There the desktop is already
 800x600 when the test starts, the mode `test_mode_change`, earlier in the

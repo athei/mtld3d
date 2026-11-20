@@ -24,12 +24,12 @@ inputs:
     required: true
   wine-release-arm64:
     description: >
-      wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+      Release tag (athei/mach9) of the arm64 Wine, downloaded on a cache miss.
       Read when `pe` is true.
     default: ''
   wine-release-x86_64:
     description: >
-      wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
+      Release tag (athei/mach9) of the x86_64 Wine, downloaded on a cache miss.
       Read when `pe` is true.
     default: ''
   llvm-mingw-release:

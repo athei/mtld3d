@@ -12,10 +12,10 @@ inputs:
     description: Which Wine the job's image runs, `arm64` or `x86_64`.
     required: true
   wine-release-arm64:
-    description: wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+    description: Release tag (athei/mach9) of the arm64 Wine, downloaded on a cache miss.
     required: true
   wine-release-x86_64:
-    description: wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
+    description: Release tag (athei/mach9) of the x86_64 Wine, downloaded on a cache miss.
     required: true
 
 runs:

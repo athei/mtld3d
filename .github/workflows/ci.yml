@@ -91,8 +91,9 @@ env:
   # Intel image's paravirtual device Metal aborted inside explorer.exe, so no
   # prefix booted there. It is older than cx-26.3.0-8, which needs macOS 26
   # and so would not run on the macos-15 and Intel images. Its tag has no
-  # published release, so its bundle comes from the Actions cache alone, and a
-  # cache miss fails the download.
+  # published release, so its bundle comes from the Actions cache alone: a
+  # cache miss fails the download, and the probe-metal job, which downloads
+  # with no cache, cannot fetch it on the x86_64-Wine images.
   WINE_RELEASE_X86_64: cx-26.3.0-7
   # The arm64 Wine, a full bundle: the runtime, the link libraries of every PE
   # architecture and Wine's own test binaries under lib/wine/tests, with the
