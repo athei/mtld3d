@@ -3,28 +3,21 @@
 # the Wine every leg runs under and the SDK every build takes `bin/winebuild`
 # and Wine's link archives from. `make install` installs into it (and into
 # WINE_INSTALL_DIR, below), `make test`, `make conformance` and the benchmarks
-# run under it, and `windows/shim/build.rs` reads it. Which Wine it is decides
-# the Makefile's mode (WINE_SDK_MODE, below), read once from its own
-# `lib/wine`:
+# run under it, and `windows/shim/build.rs` reads it. It is a wine-build arm64
+# Wine: it runs x86 programs through FEX, keeps mtld3d in
+# `lib/wine/d3d9/mtld3d` and loads it from there through its compatdb.so, and
+# carries the link archives of every PE architecture the builds link: i386 for
+# the i686 build, and aarch64, whose archives hold an ARM64 and an ARM64EC
+# half, for the ARM64X build. An x64 game loads the ARM64X build there. An
+# x86_64 Wine, which holds `lib/wine/x86_64-unix` instead, cannot run the
+# ARM64X build and is refused (WINE_ARM64_CHECK, below).
 #
-#   arm64    a wine-build arm64 Wine, the primary target. It runs x86 programs
-#            through FEX, keeps mtld3d in `lib/wine/d3d9/mtld3d` and loads it
-#            from there through its compatdb.so, and carries the link archives
-#            of every PE architecture: i386 and x86_64 for the x86 builds, and
-#            aarch64, whose archives hold an ARM64 and an ARM64EC half, for the
-#            ARM64X build, which this mode builds, lints, installs, tests and
-#            bundles. An x64 game loads the ARM64X build there.
-#   x86_64   an x86_64 Wine, such as a wine-build x86_64 release, which an
-#            Intel Mac runs natively and CI's Intel image runs. An x64 game
-#            loads the x86_64 build there, and the ARM64X build, which such a
-#            Wine cannot run, is not built.
-#
-# WINE_SDK_REQUIRE below lists what each has to hold; a runtime-only Wine is
+# WINE_SDK_REQUIRE below lists what it has to hold; a runtime-only Wine is
 # refused.
 #
-# The ARM64X build, which every `make` of the arm64 mode builds, also reads
-# two paths with no default, each failing the build naming it when it is unset
-# or points at the wrong thing:
+# The ARM64X build, which every `make` builds, also reads two paths with no
+# default, each failing the build naming it when it is unset or points at the
+# wrong thing:
 #
 #   LLVM_MINGW   an llvm-mingw install of release 20260826 or newer, whose
 #                `aarch64-w64-mingw32` sysroot carries the ARM64X CRT the link
@@ -34,8 +27,7 @@
 #
 # The conformance legs read one more, WINE_TESTS, the `lib/wine/tests` of
 # wine-build's arm64 Wine release, whose d3d9 test binaries every leg runs:
-# WINE_SDK's own in the arm64 mode unless it is given, and required in the
-# x86_64 mode (see D3D9_TEST_* below).
+# WINE_SDK's own unless it is given (see D3D9_TEST_* below).
 #
 # A shell still exporting the variables of the earlier two-Wine layout
 # (WINE_X86_64, WINE_ARM64, WINE_SDK_ARM64X) or its switches (EC, ARM64) would
@@ -45,10 +37,10 @@
 # them to a BASE whose Makefile predates this layout, and to no other.
 OLD_WINE_VARIABLES := $(strip $(foreach v,WINE_X86_64 WINE_ARM64 WINE_SDK_ARM64X EC ARM64,$(if $(filter environment% command%,$(origin $(v))),$(v))))
 ifneq ($(OLD_WINE_VARIABLES),)
-$(error these variables are no longer read: $(OLD_WINE_VARIABLES). WINE_SDK names the one Wine every build, install and leg uses, an arm64 or an x86_64 Wine, and the ARM64X build is built whenever it is the arm64 one; unset them and set WINE_SDK)
+$(error these variables are no longer read: $(OLD_WINE_VARIABLES). WINE_SDK names the one Wine every build, install and leg uses, an arm64 Wine, and the ARM64X build is always built; unset them and set WINE_SDK)
 endif
 ifeq ($(strip $(WINE_SDK)),)
-$(error WINE_SDK is not set; it names the Wine tree (holding bin/wine and lib/wine), an arm64 or an x86_64 Wine, that every build, install and leg uses)
+$(error WINE_SDK is not set; it names the arm64 Wine tree (holding bin/wine and lib/wine) that every build, install and leg uses)
 endif
 
 # Clone the directory tree $(1) to $(2), cheapest mechanism first. On one APFS
@@ -77,8 +69,8 @@ endef
 # `WINEPREFIX` (or `~/.wine`) so no prefix boots from scratch; each clone is
 # made once and reused, and `clean-isolated` removes them. Without the knob,
 # `make install` and every test leg keep targeting the shared trees, which is
-# how the game gets a build. `make bench-ab` and `make bench-variants` set up
-# trees of their own for every leg and refuse it.
+# how the game gets a build. `make bench-ab` sets up trees of its own for
+# every leg and refuses it.
 ISOLATED_ROOT := $(CURDIR)/.wine-isolated
 
 # Where a checkout records that it has an isolated environment: one line per
@@ -98,35 +90,33 @@ ISOLATED_REGISTRY := $(patsubst %,%/mtld3d-isolated-roots,$(shell git rev-parse 
 ISOLATED_CLEANING := $(if $(MAKECMDGOALS),$(if $(filter-out clean-isolated clean-isolated-orphans clean-bench-ab,$(MAKECMDGOALS)),,1))
 
 # Checked before the clones below are made, which the cleanup at the start of
-# either target would delete from under the Wine this invocation names.
+# the target would delete from under the Wine this invocation names.
 ifneq ($(filter 1,$(ISOLATED)),)
-ifneq ($(filter bench-ab bench-variants,$(MAKECMDGOALS)),)
-$(error `make $(filter bench-ab bench-variants,$(MAKECMDGOALS))` sets up an isolated tree of its own for every leg; run it without ISOLATED=1)
+ifneq ($(filter bench-ab,$(MAKECMDGOALS)),)
+$(error `make bench-ab` sets up an isolated tree of its own for every leg; run it without ISOLATED=1)
 endif
 endif
 
-# Sets the shell variables `host` (x86_64 or aarch64), `pe64` (the Wine
-# directory of its 64-bit builtins) and `unixdir` for the Wine root $(1), from
-# the one unix directory its `lib/wine` holds, and fails when it holds neither
-# or both, or is an arm64 Wine without the mtld3d subtree. The isolated clone's
-# record, the mode below and every install leaf read a Wine through it.
-define WINE_HOST
-host= ; for cpu in x86_64 aarch64; do [ -d "$(1)/lib/wine/$$cpu-unix" ] && host="$$host$$cpu" ; done ; \
-case "$$host" in \
-x86_64) pe64=x86_64-windows ;; \
-aarch64) pe64=aarch64-windows ; \
-	[ -d "$(1)/lib/wine/d3d9/mtld3d" ] || { echo "$(1) is an arm64 Wine without lib/wine/d3d9/mtld3d; the only arm64 layout mtld3d installs into is that of a wine-build arm64 bundle" >&2 ; exit 2 ; } ;; \
-'') echo "$(1) has neither lib/wine/x86_64-unix nor lib/wine/aarch64-unix, so it is no Wine tree to install into" >&2 ; exit 2 ;; \
-*) echo "$(1) has both lib/wine/x86_64-unix and lib/wine/aarch64-unix, so its arch is not known. A Wine has one of them; the other, when it holds nothing but mtld3d.so and its .dSYM, is left over from an earlier mtld3d install and can be removed" >&2 ; exit 2 ;; \
-esac ; unixdir=$$host-unix
+# Fails unless the Wine root $(1) is one mtld3d installs into: an arm64 Wine,
+# whose `lib/wine` holds `aarch64-unix`, with the mtld3d subtree of a
+# wine-build arm64 bundle. An x86_64 Wine is named as one, since it cannot run
+# the ARM64X build. The isolated clone's record and every install leaf read a
+# Wine through it.
+define WINE_ARM64_CHECK
+if [ ! -d "$(1)/lib/wine/aarch64-unix" ]; then \
+	if [ -d "$(1)/lib/wine/x86_64-unix" ]; then echo "$(1) is an x86_64 Wine (it holds lib/wine/x86_64-unix); mtld3d installs only into an arm64 Wine, one holding lib/wine/aarch64-unix" >&2 ; \
+	else echo "$(1) has no lib/wine/aarch64-unix, so it is no arm64 Wine tree to install into" >&2 ; fi ; \
+	exit 2 ; \
+fi ; \
+[ -d "$(1)/lib/wine/d3d9/mtld3d" ] || { echo "$(1) is an arm64 Wine without lib/wine/d3d9/mtld3d; the only arm64 layout mtld3d installs into is that of a wine-build arm64 bundle" >&2 ; exit 2 ; }
 endef
 
 # What a clone of WINE_SDK records it was taken from: the Wine's absolute path,
-# the arch WINE_HOST reads it as (`unread` for a tree it cannot read), and the
+# `aarch64` when WINE_ARM64_CHECK accepts it (`unread` otherwise), and the
 # inode and modification time of its `bin/wineserver`, which a redeploy of the
 # Wine replaces and an install into it leaves alone. Read before ISOLATED=1
 # points WINE_SDK at the clone.
-WINE_SDK_SOURCE_HOST := $(shell { $(call WINE_HOST,$(WINE_SDK)) ; echo $$host ; } 2>/dev/null)
+WINE_SDK_SOURCE_HOST := $(shell { $(call WINE_ARM64_CHECK,$(WINE_SDK)) ; echo aarch64 ; } 2>/dev/null)
 WINE_SDK_IDENTITY := $(abspath $(WINE_SDK)) $(or $(WINE_SDK_SOURCE_HOST),unread) \
 	$(or $(shell stat -f %i:%m '$(WINE_SDK)/bin/wineserver' 2>/dev/null),none)
 
@@ -135,8 +125,7 @@ ISOLATED_PREFIX_SOURCE := $(or $(WINEPREFIX),$(HOME)/.wine)
 ifneq ($(ISOLATED_CLEANING),1)
 # The clone is made once, with its record beside it, and reused only while the
 # record still names WINE_SDK as it is now: a clone of another Wine, or of this
-# one before a redeploy, would run its own Wine and decide the mode below by
-# it. A sub-make of an isolated run is handed the clone itself as WINE_SDK and
+# one before a redeploy, would build against and run its own Wine. A sub-make of an isolated run is handed the clone itself as WINE_SDK and
 # has nothing to check.
 ifneq ($(abspath $(WINE_SDK)),$(abspath $(ISOLATED_ROOT)/sdk))
 ifneq ($(wildcard $(ISOLATED_ROOT)/sdk),)
@@ -162,59 +151,25 @@ endif
 # it builds for.
 export WINE_SDK
 
-# The mode (see the top of this file), decided here and nowhere else: x86_64
-# when WINE_HOST reads WINE_SDK as an x86_64 Wine, and arm64 otherwise, so a
-# tree WINE_HOST cannot read (no Wine yet, a missing clone, an arm64 Wine
-# without the mtld3d tree) is held to the arm64 mode's WINE_SDK_REQUIRE, which
-# names what it lacks. Everything that differs by mode reads the three names
-# below it:
-#
-#   PE64_BUILD   the 64-bit build an x64 game loads from WINE_SDK, and so the
-#                one the install, the second leg of `make test` and
-#                `make conformance` and the benchmarks take: arm64x or x86_64.
-#   UNIX_ARCH    the unix `.so` WINE_SDK loads, the install leaf every leg
-#                takes: arm64 or x64.
-#   ARM64X_LEG   arm64x in the arm64 mode and empty in the x86_64 one, for the
-#                aggregates that build, lint and bundle the ARM64X build.
-WINE_SDK_HOST := $(shell { $(call WINE_HOST,$(WINE_SDK)) ; echo $$host ; } 2>/dev/null)
-WINE_SDK_MODE := $(if $(filter x86_64,$(WINE_SDK_HOST)),x86_64,arm64)
-PE64_BUILD    := $(if $(filter x86_64,$(WINE_SDK_MODE)),x86_64,arm64x)
-UNIX_ARCH     := $(if $(filter x86_64,$(WINE_SDK_MODE)),x64,arm64)
-ARM64X_LEG    := $(if $(filter arm64,$(WINE_SDK_MODE)),arm64x)
-# What WINE_SDK was read as, for messages.
-WINE_SDK_KIND_READ := $(if $(filter x86_64,$(WINE_SDK_HOST)),an x86_64 Wine,$(if $(WINE_SDK_HOST),an arm64 Wine,no Wine tree WINE_HOST can read and is taken for the arm64 mode))
-ifeq ($(WINE_SDK_MODE)$(MAKELEVEL),x86_640)
-$(info ==> WINE_SDK is an x86_64 Wine: x86_64 mode, in which the ARM64X build is not built; the legs are i686 and x86_64)
-endif
-
 # What a target that builds, lints, documents or sets up a tree from WINE_SDK
 # checks first, so that a Wine that cannot serve is named instead of surfacing
-# as a build-script, link or loader error: the three tools and the link
-# archives of each PE architecture the mode builds, and in the arm64 mode the
-# compatdb.so that loads the mtld3d tree, that tree itself and the ARM64X
-# `libntdll.a` the ARM64X link takes. A runtime-only Wine, such as CrossOver's,
-# has no winebuild or archives. One shell line that exits 2 with a message on
-# the first thing missing.
-WINE_SDK_FILES_x86_64 := lib/wine/i386-windows/libwinecrt0.a lib/wine/x86_64-windows/libwinecrt0.a
-WINE_SDK_FILES_arm64  := lib/wine/aarch64-unix/compatdb.so $(WINE_SDK_FILES_x86_64) \
+# as a build-script, link or loader error: the three tools, the link archives
+# of each PE architecture the builds link, the compatdb.so that loads the
+# mtld3d tree, that tree itself and the ARM64X `libntdll.a` the ARM64X link
+# takes. A runtime-only Wine, such as CrossOver's, has no winebuild or
+# archives, and an x86_64 Wine has no compatdb.so. One shell line that exits 2
+# with a message on the first thing missing.
+WINE_SDK_FILES := lib/wine/aarch64-unix/compatdb.so lib/wine/i386-windows/libwinecrt0.a \
 	lib/wine/aarch64-windows/libwinecrt0.a lib/wine/aarch64-windows/libntdll.a
-WINE_SDK_KIND_x86_64  := an x86_64 Wine built with its link libraries, such as a wine-build x86_64 release
-WINE_SDK_KIND_arm64   := a wine-build arm64 Wine built with its link libraries (an x86_64 Wine holds lib/wine/x86_64-unix)
+WINE_SDK_KIND  := a wine-build arm64 Wine built with its link libraries (an x86_64 Wine holds lib/wine/x86_64-unix and cannot run the ARM64X build)
 define WINE_SDK_REQUIRE
 for tool in wine wineserver winebuild; do \
-	[ -x '$(WINE_SDK)/bin/'$$tool ] || { echo "WINE_SDK=$(WINE_SDK) has no bin/$$tool; it names $(WINE_SDK_KIND_$(WINE_SDK_MODE))" >&2; exit 2; }; \
+	[ -x '$(WINE_SDK)/bin/'$$tool ] || { echo "WINE_SDK=$(WINE_SDK) has no bin/$$tool; it names $(WINE_SDK_KIND)" >&2; exit 2; }; \
 done; \
-for file in $(WINE_SDK_FILES_$(WINE_SDK_MODE)); do \
-	[ -f '$(WINE_SDK)/'$$file ] || { echo "WINE_SDK=$(WINE_SDK) holds no $$file; it names $(WINE_SDK_KIND_$(WINE_SDK_MODE)), which carries it" >&2; exit 2; }; \
-done$(WINE_SDK_TREE_REQUIRE_$(WINE_SDK_MODE))
-endef
-define WINE_SDK_TREE_REQUIRE_arm64
-; [ -d '$(WINE_SDK)/lib/wine/d3d9/mtld3d' ] || { echo "WINE_SDK=$(WINE_SDK) has no lib/wine/d3d9/mtld3d tree; it names a wine-build arm64 Wine, which loads mtld3d from there" >&2; exit 2; }
-endef
-# What a target that only the arm64 mode has checks first: the ARM64X build and
-# its lint, and the legs that run it. $(1) = what needs it.
-define ARM64_MODE_REQUIRE
-$(if $(ARM64X_LEG),true,{ echo "$(1) needs an arm64 Wine as WINE_SDK; WINE_SDK=$(WINE_SDK) is an x86_64 Wine and cannot run the ARM64X build" >&2; exit 2; })
+for file in $(WINE_SDK_FILES); do \
+	[ -f '$(WINE_SDK)/'$$file ] || { echo "WINE_SDK=$(WINE_SDK) holds no $$file; it names $(WINE_SDK_KIND), which carries it" >&2; exit 2; }; \
+done; \
+[ -d '$(WINE_SDK)/lib/wine/d3d9/mtld3d' ] || { echo "WINE_SDK=$(WINE_SDK) has no lib/wine/d3d9/mtld3d tree; it names a wine-build arm64 Wine, which loads mtld3d from there" >&2; exit 2; }
 endef
 
 # The prefix the test legs boot, named unconditionally: ISOLATED=1 points it at
@@ -272,18 +227,6 @@ PROD ?= 1
 PERF ?= 1
 ifneq ($(PROD) $(PERF),1 1)
 $(error `make bench-ab` builds both legs with PROD=1 PERF=1; PROD=$(PROD) PERF=$(PERF) would compare another profile)
-endif
-endif
-# `make bench-variants` measures one commit's production build in several
-# layouts, so it builds exactly the profile `bench-ab` does, and runs alone.
-ifneq ($(filter bench-variants,$(MAKECMDGOALS)),)
-ifneq ($(filter-out bench-variants,$(MAKECMDGOALS)),)
-$(error `make bench-variants` runs alone: its PROD=1 PERF=1 would also apply to $(filter-out bench-variants,$(MAKECMDGOALS)))
-endif
-PROD ?= 1
-PERF ?= 1
-ifneq ($(PROD) $(PERF),1 1)
-$(error `make bench-variants` builds with PROD=1 PERF=1; PROD=$(PROD) PERF=$(PERF) would measure another profile)
 endif
 endif
 ifneq ($(filter bench-host,$(MAKECMDGOALS)),)
@@ -380,45 +323,37 @@ CARGO_TOOLS ?= xwin
 NEXTEST_VERSION ?= latest
 
 PE_i386     := i686-pc-windows-msvc
+# The x64 e2e test binaries, which an arm64 Wine runs as ARM64EC processes
+# against the ARM64X build. No DLL of this checkout is built for it.
 PE_x64      := x86_64-pc-windows-msvc
 # The two halves of the ARM64X DLLs, which serve an arm64 Wine: the EC half
 # runs natively in x64 processes, the ARM64 half in arm64 ones.
 PE_arm64    := aarch64-pc-windows-msvc
 PE_arm64ec  := arm64ec-pc-windows-msvc
-# Release/Wine targets for the unix half. Wine picks the `.so` out of
-# `lib/wine/<cpu>-unix` by the arch of the Wine build that loads it, so there is
-# one artifact per Wine host ISA: aarch64 for an arm64 Wine and x86_64 for an
-# x86_64 one, whichever WINE_SDK names; the bundle carries both. Either serves
-# every PE build that Wine loads.
-UNIX_TARGET_x64    := x86_64-apple-darwin
+# Release/Wine target for the unix half. Wine picks the `.so` out of
+# `lib/wine/<cpu>-unix` by the arch of the Wine build that loads it, and the
+# arm64 Wine loads it from `aarch64-unix` for every PE build.
 UNIX_TARGET_arm64  := aarch64-apple-darwin
-UNIX_WINEDIR_x64   := x86_64-unix
 UNIX_WINEDIR_arm64 := aarch64-unix
-# Native host target for unit tests + clippy — whatever this machine is
-# (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta. Expanded
-# where it is used rather than up front, so a test runner that replays a staged
-# build (`STAGE=`, below) and has no rustc at all still parses this file.
+# Native host target for unit tests + clippy: whatever this machine is
+# (aarch64-apple-darwin on Apple Silicon). Expanded where it is used rather
+# than up front, so a test runner that replays a staged build (`STAGE=`,
+# below) and has no rustc at all still parses this file.
 UNIX_NATIVE_TARGET  = $(shell rustc +$(RUST_STABLE) -vV | sed -n 's/^host: //p')
-# The machine's own arch by the kernel's name, `arm64` or `x86_64`: which staged
-# conformance runner binary is the native one here.
-HOST_ARCH := $(shell uname -m)
 
 
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
-OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
 OUT_arm64      := windows/target/$(PE_arm64)/$(PROFILE)
 OUT_arm64ec    := windows/target/$(PE_arm64ec)/$(PROFILE)
 OUT_arm64x     := windows/target/arm64x/$(PROFILE)
-OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
 OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
-# `make stage` packs everything a test machine needs out of one build:
-# the mode's PE builds, both unix `.so` builds, the e2e test binaries per PE
-# arch, and the e2e and conformance runners for both host arches. `STAGE=<dir>`
-# then points the install, e2e and conformance targets at an unpacked stage
-# instead of a build: the OUT_* dirs become the staged ones, the build
-# prerequisites drop, and both runners are the staged binaries for this
-# machine, run against the staged test binaries.
+# `make stage` packs everything a test machine needs out of one build: the PE
+# builds, the unix `.so`, the e2e test binaries per PE arch, and the e2e and
+# conformance runners. `STAGE=<dir>` then points the install, e2e and
+# conformance targets at an unpacked stage instead of a build: the OUT_* dirs
+# become the staged ones, the build prerequisites drop, and both runners are
+# the staged binaries, run against the staged test binaries.
 # That is how CI builds once on a fast machine and fans the suites out over
 # runners that carry no toolchain, and how a slow or old machine can run the
 # suites against a build made elsewhere.
@@ -426,9 +361,7 @@ STAGE_DIR := $(CURDIR)/windows/target/stage
 STAGE_OUT := $(CURDIR)/windows/target/mtld3d-stage.tar
 ifdef STAGE
 OUT_i386       := $(STAGE)/i386-windows
-OUT_x64        := $(STAGE)/x86_64-windows
 OUT_arm64x     := $(STAGE)/aarch64-windows
-OUT_unix_x64   := $(STAGE)/$(UNIX_WINEDIR_x64)
 OUT_unix_arm64 := $(STAGE)/$(UNIX_WINEDIR_arm64)
 endif
 
@@ -459,46 +392,35 @@ XWIN := xwin --accept-license --arch $(XWIN_ARCH) \
 	--cache-dir $(XWIN_CACHE)
 
 # Wine's own d3d9 test binaries, which run against our builtin `d3d9.dll` in
-# the Wine `make install` puts it into. Every leg, under either Wine, runs one
-# test build, the one wine-build's arm64 Wine release publishes under its
-# `lib/wine/tests`: the baseline and CONFORMANCE.md name a site by its
-# `file:line`, which moves between Wine versions, so one classification list
-# can only serve one build of the tests. A PE test runs under any Wine, so the
-# x86_64 Wine runs that same build. WINE_TESTS names the directory, from the
-# environment or the command line; in the arm64 mode it defaults to WINE_SDK's
-# own `lib/wine/tests`, and the x86_64 mode, whose Wine ships another build of
-# the tests, has no default and the conformance legs refuse to run without it.
+# the Wine `make install` puts it into. Every leg runs one test build, the one
+# wine-build's arm64 Wine release publishes under its `lib/wine/tests`: the
+# baseline and CONFORMANCE.md name a site by its `file:line`, which moves
+# between Wine versions, so one classification list can only serve one build
+# of the tests. WINE_TESTS names the directory, from the environment or the
+# command line, and defaults to WINE_SDK's own `lib/wine/tests`.
 # The conformance runner takes explicit paths and knows no Wine layout, so
 # this is the only place the layout is written down. One binary per leg, one
-# runner process per binary, named by the
-# leg: the i686 leg runs the i386 binary against the i686 build, the x86_64 leg
-# (the x86_64 mode's) the x86_64 binary against the x86_64 build, and the
-# arm64x leg (the arm64 mode's) the same binary, whose process an arm64 Wine
-# runs as an ARM64EC one and which therefore loads the ARM64X build.
+# runner process per binary, named by the leg: the i686 leg runs the i386
+# binary against the i686 build, and the arm64x leg the x86_64 binary, whose
+# process the arm64 Wine runs as an ARM64EC one and which therefore loads the
+# ARM64X build.
 #
-# The leg is also the label the runner records under (`--arch`), and the
-# baseline keeps the counts of each Wine apart: the i686 leg records as `i686`
-# under an x86_64 Wine and as `i686-arm64` under the arm64 one (I686_LEG), the
-# 64-bit legs as `x86_64` and `arm64x`, so a run under one Wine never reads or
-# rewrites the other's entries.
-I686_LEG := $(if $(ARM64X_LEG),i686-arm64,i686)
-ifneq ($(ARM64X_LEG),)
+# The leg is also the label the runner records under (`--arch`): the i686 leg
+# records as `i686-arm64` (I686_LEG), the 64-bit leg as `arm64x`.
+I686_LEG := i686-arm64
 WINE_TESTS ?= $(WINE_SDK)/lib/wine/tests
-endif
-D3D9_TEST_i686       := $(WINE_TESTS)/i386-windows/d3d9_test.exe
-D3D9_TEST_i686-arm64 := $(D3D9_TEST_i686)
-D3D9_TEST_x86_64     := $(WINE_TESTS)/x86_64-windows/d3d9_test.exe
-D3D9_TEST_arm64x     := $(D3D9_TEST_x86_64)
+D3D9_TEST_i686-arm64 := $(WINE_TESTS)/i386-windows/d3d9_test.exe
+D3D9_TEST_arm64x     := $(WINE_TESTS)/x86_64-windows/d3d9_test.exe
 
 # The Wine version the tests were built from, which the baseline's `# Wine:`
 # header records and the runner holds it against (`--tests-wine-version`):
-# never the version of the Wine that runs them, since one build of the tests
-# runs under both Wines. The first line of WINE_TESTS's `VERSION`, the file
-# wine-build writes beside the tests from arm64-11.19-2 on, which CI's
-# x86_64-Wine images extract with the tests; else the `wine --version` of the
-# Wine tree WINE_TESTS lies in, when that tree has a runnable `bin/wine`
-# (WINE_SDK's own in the arm64 mode); else empty, tests without either, which
-# the runner reports as unknown. Expanded only by the conformance legs.
+# never the version of the Wine that runs them, since WINE_TESTS may name the
+# tests of another Wine than WINE_SDK. The first line of WINE_TESTS's
+# `VERSION`, the file wine-build writes beside the tests from arm64-11.19-2
+# on; else the `wine --version` of the Wine tree WINE_TESTS lies in, when that
+# tree has a runnable `bin/wine` (WINE_SDK's own by default); else empty,
+# tests without either, which the runner reports as unknown. Expanded only by
+# the conformance legs.
 WINE_TESTS_TREE    = $(abspath $(WINE_TESTS)/../../..)
 WINE_TESTS_VERSION = $(strip $(if $(wildcard $(WINE_TESTS)/VERSION),\
 	$(shell head -n 1 '$(WINE_TESTS)/VERSION'),\
@@ -514,7 +436,7 @@ tests_version_arg  = $(if $(1),--tests-wine-version '$(1)')
 DENY_WARNINGS := --config 'build.warnings="deny"'
 
 # The Wine trees `make install` and the legs install into: WINE_SDK, and the
-# game tree WINE_INSTALL_DIR names when it is set, which may be an x86_64 Wine.
+# game tree WINE_INSTALL_DIR names when it is set, an arm64 Wine as well.
 # Sorted, by absolute path, for its side effect of dropping a duplicate: under
 # ISOLATED=1 both name the same clone, a WINE_INSTALL_DIR may name WINE_SDK
 # itself, and the install loops must write each tree once.
@@ -582,37 +504,33 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 #                    (see the comment there), and the native leg spans a crate
 #                    from each workspace, so no workspace name would fit it.
 #
-# The arch suffix is the target's own spelling, i686 / x86_64 for PE and
-# x64 / arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
+# The arch suffix is the target's own spelling, i686 / arm64x for PE and
+# arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
 # suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
 # `test-unit-perf`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
-.PHONY: all windows windows-i686 windows-x86_64 windows-arm64x unix unix-x64 unix-arm64 \
-	install install-windows-i686 install-windows-x86_64 install-windows-arm64x \
-	install-unix-x64 install-unix-arm64 \
-	bundle version-check production-assert-gate mem-routine-gate stage clean-isolated clean-isolated-orphans \
+.PHONY: all windows windows-i686 windows-arm64x unix unix-arm64 \
+	install install-windows-i686 install-windows-arm64x install-unix-arm64 \
+	bundle version-check production-assert-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
-	hybrid-winebuild-check test test-unit test-e2e-i686 test-e2e-arm64x test-e2e-x86_64 test-e2e-arm64 \
-	bench bench-ab bench-variants bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
-	conformance conformance-i686 conformance-arm64x conformance-x86_64 \
-	conformance-baseline conformance-baseline-i686 conformance-baseline-arm64x conformance-baseline-x86_64 \
-	conformance-intel conformance-intel-i686 conformance-intel-arm64x conformance-intel-x86_64 \
-	conformance-scale conformance-scale-i686 conformance-scale-arm64x conformance-scale-x86_64 \
-	conformance-baseline-scale-i686 conformance-baseline-scale-arm64x conformance-baseline-scale-x86_64 \
-	conformance-baseline-intel-i686 conformance-baseline-intel-arm64x conformance-baseline-intel-x86_64 \
-	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
+	hybrid-winebuild-check test test-unit test-e2e-i686 test-e2e-arm64x test-e2e-arm64 \
+	bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
+	conformance conformance-i686 conformance-arm64x \
+	conformance-baseline conformance-baseline-i686 conformance-baseline-arm64x \
+	conformance-scale conformance-scale-i686 conformance-scale-arm64x \
+	conformance-baseline-scale-i686 conformance-baseline-scale-arm64x \
+	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-arm64x \
 	clippy-native clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
-	setup-rosetta \
 	xwin-dir fetch
 
 all: windows unix
 
-windows: windows-i686 windows-x86_64 $(ARM64X_LEG:%=windows-%)
-unix: unix-x64 unix-arm64
+windows: windows-i686 windows-arm64x
+unix: unix-arm64
 
 # Per-arch build leaves. Each PE arch and each unix arch is independent, so a
 # job (or a developer) that only needs one does not pay for the others; the
@@ -633,8 +551,7 @@ unix: unix-x64 unix-arm64
 # rather than wine/, for the case where that ordering does not hold: an
 # existing prefix, or a Wine installation we do not control. The ARM64X build
 # gets a hybrid one (`windows-arm64x`), which native ARM64 and x64 processes
-# both accept and an x86_64 Wine, whose loader takes no ARM64 placeholder,
-# never sees.
+# both accept.
 windows-i686:
 	$(WINE_SDK_REQUIRE)
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
@@ -642,20 +559,10 @@ windows-i686:
 	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -b i686-windows --dll $(OUT_i386)/mtld3d.dll
 
-windows-x86_64:
-	$(WINE_SDK_REQUIRE)
-	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
-	$(call MEM_ROUTINE_GATE,$(OUT_x64))
-	$(call EXPORT_ORDINAL_GATE,$(OUT_x64)/d3d9.dll)
-	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
-	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -b x86_64-windows --dll $(OUT_x64)/mtld3d.dll
-
-# ARM64X `d3d9.dll` and `mtld3d.dll`, built in the arm64 mode: the layout an
-# arm64 Wine keeps its own builtins in, one image under
-# `lib/wine/aarch64-windows` holding an ARM64 half for arm64 processes and an
-# ARM64EC half that x64 processes run natively, where the x64 DLLs above would
-# be emulated. 32-bit
-# processes still load the i386 DLLs. Rust has no ARM64X target, so each crate
+# ARM64X `d3d9.dll` and `mtld3d.dll`: the layout an arm64 Wine keeps its own
+# builtins in, one image under `lib/wine/aarch64-windows` holding an ARM64 half
+# for arm64 processes and an ARM64EC half that x64 processes run natively.
+# 32-bit processes still load the i386 DLLs. Rust has no ARM64X target, so each crate
 # is built once per half as a static library, and one `lld-link /machine:arm64x`
 # puts both halves into one image.
 #
@@ -765,7 +672,6 @@ $(ARM64X_LLD) -lldmingw /dll /machine:arm64x /nodefaultlib /opt:ref,icf \
 endef
 
 windows-arm64x:
-	$(call ARM64_MODE_REQUIRE,windows-arm64x)
 	$(WINE_SDK_REQUIRE)
 	$(ARM64X_REQUIRE_TARGETS)
 	$(ARM64X_REQUIRE_LINK)
@@ -790,13 +696,6 @@ windows-arm64x:
 # an MSVC `.pdb`. Run it on a copy already named `mtld3d.so`, because it
 # stamps the inner DWARF file after the input's basename and lldb looks it up
 # by that name — renaming the bundle afterwards produces one lldb won't find.
-unix-x64:
-	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_x64) \
-		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
-	cp -c $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
-	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
-	dsymutil $(OUT_unix_x64)/mtld3d.so
-
 unix-arm64:
 	cd unix && cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $(UNIX_TARGET_arm64) \
 		-p mtld3d-unix --crate-type cdylib $(FRAME_POINTERS) -- -C link-arg=-Wl,-install_name,@rpath/mtld3d.so
@@ -804,54 +703,37 @@ unix-arm64:
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
 
-# `make install` installs into every tree INSTALL_DIRS names, each getting the
-# pieces that Wine loads and nothing else: an arm64 Wine the i686 build, the
-# ARM64X build and the arm64 `mtld3d.so`, an x86_64 Wine the i686 build, the
-# x86_64 build and the x86_64 `mtld3d.so`. The x86_64 mode builds no ARM64X
-# build, so an arm64 WINE_INSTALL_DIR beside an x86_64 WINE_SDK gets the
-# x86_64 build in its `aarch64-windows` instead, which an x64 process there
-# runs emulated: every tree's PE and unix halves come from one build.
-install: install-windows-i686 install-windows-x86_64 $(ARM64X_LEG:%=install-windows-%) install-unix-x64 install-unix-arm64
+# `make install` installs into every tree INSTALL_DIRS names, each an arm64
+# Wine, the i686 build, the ARM64X build and the arm64 `mtld3d.so`.
+install: install-windows-i686 install-windows-arm64x install-unix-arm64
 
 # Per-arch install leaves, named after the build leaf each one installs: a test
-# leg installs the one PE build it exercises plus the one unix `.so` its Wine
-# loads, and only `install` (and `bundle`) covers everything.
+# leg installs the one PE build it exercises plus the unix `.so`, and only
+# `install` (and `bundle`) covers everything.
 #
-# Each leaf reads what a Wine is from the Wine itself: its `lib/wine` holds
-# `x86_64-unix` in an x86_64 Wine and `aarch64-unix` in an arm64 one
-# (WINE_HOST). It installs only what that Wine loads, and only into
-# directories the Wine already has; a missing one fails the install, which
-# never creates an arch directory. The i686 leaf installs into `i386-windows`
-# of either. A 64-bit process loads its builtins from `x86_64-windows` in an
-# x86_64 Wine and from `aarch64-windows` in an arm64 one, where an x64 program
-# runs as an ARM64EC process; an arm64 Wine never reads its `x86_64-windows`
-# and an x86_64 Wine cannot run ARM64X. So `install-unix-x64` installs into the
-# x86_64 Wines and skips the others, and the ARM64X leaf and
-# `install-unix-arm64` the other way round. The x86_64 leaf installs into the
-# x86_64 Wines in the arm64 mode, where the ARM64X build serves the arm64 ones,
-# and into every Wine in the x86_64 mode, which has no ARM64X build, so the two
-# 64-bit builds never meet in one tree. In the arm64 mode the x86_64 build
-# reaches an arm64 Wine only in the tree of its own that `test-e2e-x86_64`
-# sets up (LEG_INSTALL, below).
+# Each leaf first checks that a tree is an arm64 Wine with the mtld3d subtree
+# (WINE_ARM64_CHECK), and fails on any other, an x86_64 Wine included. It
+# installs only into directories the Wine already has; a missing one fails the
+# install, which never creates an arch directory. The i686 leaf installs into
+# `i386-windows`, the ARM64X leaf into `aarch64-windows`, from where an arm64
+# Wine loads the builtins of an x64 program, which runs as an ARM64EC process,
+# and `install-unix-arm64` into `aarch64-unix`.
 #
-# A Wine tree holds mtld3d in one of two layouts. A tree bundled with a compat
-# database keeps every Direct3D implementation in its own subtree and its
+# The Wine keeps every Direct3D implementation in its own subtree and its
 # compatdb.so picks one per process: `lib/wine/d3d9/mtld3d/<arch>` is
 # prepended to the builtin search and the default dirs carry only fake-module
 # markers (winebuild `--fake-module`, the placeholder wineboot stamps into the
-# prefix so the prepended tree's DLL loads). An older x86_64 tree loads
-# straight from the default dirs; an arm64 Wine has to be a wine-build arm64
-# bundle, which keeps the subtree. `MTLD3D_TREE` names the subtree a given root
-# uses, and each leaf writes into it, re-stamping the markers in the new
-# layout so a root whose markers an earlier install overwrote is whole again.
-# The placeholder's machine decides which module the loader accepts. In an
-# x86_64 Wine the 64-bit marker is AMD64. In an arm64 Wine's `aarch64-windows`
-# it follows the rule wine-build's bundle stamps its own markers by
-# (`hybrid_marker` in its bundle-wine.sh): a hybrid one (`-marm64x`, an ARM64
-# placeholder with ARM64EC metadata) when every tree of the family that has
-# the DLL holds an ARM64 image of it, as the ARM64X build and Wine's own
-# ARM64X builtins are, and AMD64 otherwise, as when an x86_64 pair is
-# installed there. An x64 process, which runs as ARM64EC, accepts both and
+# prefix so the prepended tree's DLL loads). `MTLD3D_TREE` names the subtree of
+# a given root, and each leaf writes into it, re-stamping the markers so a
+# root whose markers an earlier install overwrote is whole again.
+# The placeholder's machine decides which module the loader accepts. In
+# `aarch64-windows` it follows the rule wine-build's bundle stamps its own
+# markers by (`hybrid_marker` in its bundle-wine.sh): a hybrid one
+# (`-marm64x`, an ARM64 placeholder with ARM64EC metadata) when every tree of
+# the family that has the DLL holds an ARM64 image of it, as the ARM64X build
+# and Wine's own ARM64X builtins are, and AMD64 otherwise, as when another
+# tree of the family holds an x86_64 build of it. An x64 process, which runs
+# as ARM64EC, accepts both and
 # loads the module's x64 view behind an AMD64 one; behind a hybrid one the
 # view follows the main program, so a native ARM64 program can load the name
 # too (compatdb gives it Wine's own d3d9), where an AMD64 placeholder fails its
@@ -868,9 +750,7 @@ install: install-windows-i686 install-windows-x86_64 $(ARM64X_LEG:%=install-wind
 # loader ignores unsigned PEs on the builtin search path. Symbols travel with
 # each binary, the `.pdb` beside every PE and the `.dSYM` beside the `.so`, so a
 # local crash symbolicates against the installed files with no extra flags.
-define MTLD3D_TREE
-if [ -d $(1)/lib/wine/d3d9/mtld3d ]; then echo $(1)/lib/wine/d3d9/mtld3d; else echo $(1)/lib/wine; fi
-endef
+MTLD3D_TREE = $(1)/lib/wine/d3d9/mtld3d
 
 # A field of the PE image $(1), in hex: the $(4) bytes at $(2) past the start
 # of its PE header, read as od's type $(3). The PE header starts at the offset
@@ -909,8 +789,6 @@ endef
 # machine PE_MACHINE cannot read fails the install naming it, as the bundle's
 # rule does, rather than count as not ARM64 and cut native ARM64 processes
 # off the name; the failure removes PE_PAIR_INSTALL's scratch `$$stamped`.
-# PE_PAIR_INSTALL applies it to a 64-bit pair in the arm64 mode only: the
-# x86_64 mode installs no ARM64 image, so its markers are AMD64 by the rule.
 define HYBRID_MARKER_RULE
 if [ "$(1)" = aarch64-windows ]; then \
 	hybrid=1 ; \
@@ -942,7 +820,7 @@ config=$$($(call PE_LOAD_CONFIG,$(1))) || { echo "$(1), the placeholder $(WINEBU
 endef
 
 # Fails unless WINEBUILD writes hybrid placeholders, before an install leaf
-# of the arm64 mode touches any Wine: the leaves run one after another, so
+# touches any Wine: the leaves run one after another, so
 # the ARM64X one finding out last would leave the i686 pair and the unix
 # library already replaced. It stamps a scratch placeholder from one of
 # WINE_SDK's own ARM64X builtins and holds it to HYBRID_PLACEHOLDER_CHECK.
@@ -964,40 +842,33 @@ endef
 # the Wine's pair and placeholders as they were: overwriting a working AMD64
 # placeholder with a plain ARM64 one would cut every x64 program off the name.
 define PE_PAIR_INSTALL
-tree=$$($(call MTLD3D_TREE,"$(1)")) ; \
+tree="$(call MTLD3D_TREE,$(1))" ; \
 [ -d "$$tree/$(3)" ] || { echo "$$tree/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
-stamped= ; \
-if [ "$$tree" != "$(1)/lib/wine" ]; then \
-	[ -d "$(1)/lib/wine/$(3)" ] || { echo "$(1)/lib/wine/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
-	stamped=$$(mktemp -d "$${TMPDIR:-/tmp}/mtld3d-markers.XXXXXX") || exit ; \
-	for dll in d3d9 mtld3d; do \
-		target=$(4) ; \
-		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3),$(2)) ;)) \
-		$(WINEBUILD) --fake-module -o "$$stamped/$$dll.dll" -b $$target --dll "$(2)/$$dll.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
-		$(if $(ARM64X_LEG),$(if $(filter i386-windows,$(3)),,if [ "$$target" != "$(4)" ]; then $(call HYBRID_PLACEHOLDER_CHECK,$$stamped/$$dll.dll,rm -rf "$$stamped" ;) ; fi ;)) \
-	done ; \
-fi ; \
+[ -d "$(1)/lib/wine/$(3)" ] || { echo "$(1)/lib/wine/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
+stamped=$$(mktemp -d "$${TMPDIR:-/tmp}/mtld3d-markers.XXXXXX") || exit ; \
+for dll in d3d9 mtld3d; do \
+	target=$(4) ; \
+	$(if $(filter i386-windows,$(3)),,$(call HYBRID_MARKER_RULE,$(3),$(2)) ;) \
+	$(WINEBUILD) --fake-module -o "$$stamped/$$dll.dll" -b $$target --dll "$(2)/$$dll.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
+	$(if $(filter i386-windows,$(3)),,if [ "$$target" != "$(4)" ]; then $(call HYBRID_PLACEHOLDER_CHECK,$$stamped/$$dll.dll,rm -rf "$$stamped" ;) ; fi ;) \
+done ; \
 cp -c $(2)/mtld3d.dll $(2)/mtld3d.pdb $(2)/d3d9.dll $(2)/d3d9.pdb "$$tree/$(3)/" || { rm -rf "$$stamped" ; exit 1 ; } ; \
 $(WINEBUILD) --builtin "$$tree/$(3)/d3d9.dll" || { rm -rf "$$stamped" ; exit 1 ; } ; \
-if [ -n "$$stamped" ]; then \
-	rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
-	mv -f "$$stamped/d3d9.dll" "$$stamped/mtld3d.dll" "$(1)/lib/wine/$(3)/" || { rm -rf "$$stamped" ; exit 1 ; } ; \
-	rmdir "$$stamped" ; \
-fi
+rm -f "$(1)/lib/wine/$(3)/d3d9.pdb" "$(1)/lib/wine/$(3)/mtld3d.pdb" ; \
+mv -f "$$stamped/d3d9.dll" "$$stamped/mtld3d.dll" "$(1)/lib/wine/$(3)/" || { rm -rf "$$stamped" ; exit 1 ; } ; \
+rmdir "$$stamped"
 endef
 
 # $(1) = the Wine root, $(2) = the build directory of the `.so`, $(3) = the
-# Wine unix directory it goes into. In the subtree layout the default unix dir
-# carries no mtld3d.so at all, so one an earlier install left there goes.
+# Wine unix directory it goes into. The default unix dir carries no mtld3d.so
+# at all, so one an earlier install left there goes.
 define UNIX_INSTALL
-tree=$$($(call MTLD3D_TREE,"$(1)")) ; \
+tree="$(call MTLD3D_TREE,$(1))" ; \
 [ -d "$$tree/$(3)" ] || { echo "$$tree/$(3) does not exist; make install writes only into the arch directories a Wine already has" >&2 ; exit 2 ; } ; \
 cp -c $(2)/mtld3d.so "$$tree/$(3)/" || exit ; \
 rm -rf "$$tree/$(3)/mtld3d.so.dSYM" ; \
 $(call clone_tree,$(2)/mtld3d.so.dSYM,"$$tree/$(3)/mtld3d.so.dSYM") || exit ; \
-if [ "$$tree" != "$(1)/lib/wine" ]; then \
-	rm -rf "$(1)/lib/wine/$(3)/mtld3d.so" "$(1)/lib/wine/$(3)/mtld3d.so.dSYM" ; \
-fi
+rm -rf "$(1)/lib/wine/$(3)/mtld3d.so" "$(1)/lib/wine/$(3)/mtld3d.so.dSYM"
 endef
 
 # The check behind the NDEBUG wiring at the top of this file: a production
@@ -1010,8 +881,7 @@ endef
 # that fails fails the gate. `PRODUCTION_ASSERT_CHECK` names the files; every
 # production install leaf (the ARM64X one included) and `bundle` run it on what
 # they ship, and `production-assert-gate` runs it on the files
-# `ASSERT_GATE_FILES` names, the ARM64X pair among them in the arm64 mode. That
-# target refuses to run without PROD=1, because its default files would
+# `ASSERT_GATE_FILES` names, the ARM64X pair among them. That target refuses to run without PROD=1, because its default files would
 # otherwise be the `release` build, which is not held to this rule.
 PRODUCTION_ASSERT_TOOLS = $(shell rustc +$(RUST_STABLE) --print sysroot)/lib/rustlib/$(UNIX_NATIVE_TARGET)/bin
 define PRODUCTION_ASSERT_GATE
@@ -1028,56 +898,11 @@ done
 endef
 PRODUCTION_ASSERT_CHECK = $(if $(filter production,$(PROFILE)),$(call PRODUCTION_ASSERT_GATE,$(1)))
 
-ASSERT_GATE_FILES ?= $(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll $(OUT_x64)/d3d9.dll \
-	$(OUT_x64)/mtld3d.dll $(if $(ARM64X_LEG),$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll) \
-	$(OUT_unix_x64)/mtld3d.so $(OUT_unix_arm64)/mtld3d.so
+ASSERT_GATE_FILES ?= $(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll \
+	$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll $(OUT_unix_arm64)/mtld3d.so
 production-assert-gate:
 	$(if $(filter production,$(PROFILE)),,@echo "production-assert-gate: checks production builds; run it with PROD=1" >&2; exit 2)
 	$(call PRODUCTION_ASSERT_GATE,$(ASSERT_GATE_FILES))
-
-# The check behind the one rule the x86_64 d3d9.dll's own memory routines
-# (`windows/core/src/guest_mem.rs`) cannot break silently: none of them may
-# compile to a call to itself or to one of the others. Under the x64 emulator
-# such a call recurses until the stack overflows, and no CI leg runs the
-# emulator. The x86_64 link writes a linker map (`windows/d3d9/build.rs`); the
-# gate takes from it the address and size of the four exports and of every
-# function of `mtld3d_core::guest_mem`, disassembles each, and fails on any
-# direct call or jump, conditional ones included, to one of the four. The
-# route's decision (`MemRoute::decide`) and `latch` are left out on purpose: a
-# copy made while the route is being decided takes the in-image routines, so
-# those two may call the four. Functions the four reach only through the CRT or
-# an import are not in the image and not checked. `windows-x86_64` runs the gate
-# on every build, `release` and `production` alike, so every build that is
-# installed, staged or bundled has passed it; `mem-routine-gate` runs it on the
-# build `PROFILE` names. The tools are the toolchain's llvm-tools, as for
-# `PRODUCTION_ASSERT_GATE`.
-define MEM_ROUTINE_GATE
-map=$(1)/deps/d3d9.map ; dll=$(1)/d3d9.dll ; tools=$(PRODUCTION_ASSERT_TOOLS) ; \
-[ -f $$map ] || { echo "mem-routine-gate: no linker map $$map (windows/d3d9/build.rs asks the x86_64 link for one)" >&2; exit 1; } ; \
-base=$$($$tools/llvm-readobj --file-headers $$dll | sed -n 's/^ *ImageBase: \(0x[0-9A-Fa-f]*\).*/\1/p') ; \
-[ -n "$$base" ] || { echo "mem-routine-gate: cannot read the image base of $$dll" >&2; exit 1; } ; \
-funcs=$$(awk '{ name = $$0; sub(/^[0-9a-f]+ +[0-9a-f]+ +[0-9]+ +/, "", name) } \
-	$$3 != "0" { rva = $$1; size = $$2; next } \
-	$$1 == rva && name !~ /MemRoute>::(decide|latch)/ && (name ~ /^mem(cpy|move|set|cmp)$$/ || name ~ /mtld3d_core::guest_mem::/) { print rva, size, name }' $$map | sort -u) ; \
-exports= ; for export in memcpy memmove memset memcmp; do \
-	rva=$$(printf '%s\n' "$$funcs" | awk -v n=$$export '$$3 == n && NF == 3 { print $$1 }') ; \
-	[ -n "$$rva" ] || { echo "mem-routine-gate: $$map names no $$export" >&2; exit 1; } ; \
-	exports="$$exports $$(printf '0x%x' $$(( base + 0x$$rva )))" ; \
-done ; \
-printf '%s\n' "$$funcs" | while read -r rva size name; do \
-	start=$$(( base + 0x$$rva )) ; stop=$$(( start + 0x$$size )) ; \
-	code=$$($$tools/llvm-objdump -d --no-show-raw-insn --start-address=$$start --stop-address=$$stop $$dll) || { echo "mem-routine-gate: cannot disassemble $$name in $$dll" >&2; exit 1; } ; \
-	for target in $$(printf '%s\n' "$$code" | grep -oE '[[:space:]](call[a-z]*|j[a-z]+)[[:space:]]+0x[0-9a-f]+' | grep -oE '0x[0-9a-f]+$$'); do \
-		case " $$exports " in *" $$target "*) \
-			echo "mem-routine-gate: $$name in $$dll branches to the memory routine at $$target:" >&2 ; \
-			printf '%s\n' "$$code" | grep -E "(call[a-z]*|j[a-z]+)[[:space:]]+$$target" >&2 ; exit 1 ;; \
-		esac ; \
-	done ; \
-done || exit 1
-endef
-
-mem-routine-gate:
-	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 
 # The check that `d3d9.dll` $(1) exports every entry of `windows/d3d9/d3d9.def`
 # at its ordinal, under its name or under none for a `NONAME` entry, in every
@@ -1085,8 +910,8 @@ mem-routine-gate:
 # of the `.def` without a word when it does not name the symbol the compiler
 # exports (the i686 link did, until build.rs gave it decorated names), which
 # leaves the export reachable by name at whatever ordinal the linker picked.
-# Exports the `.def` does not list (`DllMain`, the x86_64 memory routines) are
-# not checked. Every PE leg runs it on the image it links.
+# Exports the `.def` does not list (`DllMain`) are not checked. Every PE leg
+# runs it on the image it links.
 define EXPORT_ORDINAL_GATE
 dll=$(1) ; tools=$(PRODUCTION_ASSERT_TOOLS) ; \
 table=$$($$tools/llvm-readobj --coff-exports $$dll) || { echo "export-ordinal-gate: cannot read the exports of $$dll" >&2; exit 1; } ; \
@@ -1107,72 +932,50 @@ endef
 
 export-ordinal-gate:
 	$(call EXPORT_ORDINAL_GATE,$(OUT_i386)/d3d9.dll)
-	$(call EXPORT_ORDINAL_GATE,$(OUT_x64)/d3d9.dll)
-	$(if $(ARM64X_LEG),$(call EXPORT_ORDINAL_GATE,$(OUT_arm64x)/d3d9.dll))
+	$(call EXPORT_ORDINAL_GATE,$(OUT_arm64x)/d3d9.dll)
 
-# The probe every install leaf of the arm64 mode waits for, which make runs
-# once however many leaves an invocation takes.
-HYBRID_CHECK_LEAF := $(if $(ARM64X_LEG),hybrid-winebuild-check)
+# The probe every install leaf waits for, which make runs once however many
+# leaves an invocation takes.
 hybrid-winebuild-check:
 	$(HYBRID_WINEBUILD_CHECK)
 
-install-windows-i686: $(if $(STAGE),,windows-i686) $(HYBRID_CHECK_LEAF)
+# The 64-bit markers in `aarch64-windows` default to AMD64 (`x86_64-windows`),
+# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies.
+install-windows-i686: $(if $(STAGE),,windows-i686) hybrid-winebuild-check
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
-		$(call WINE_HOST,$$dir) ; \
+		$(call WINE_ARM64_CHECK,$$dir) ; \
 		$(call PE_PAIR_INSTALL,$$dir,$(OUT_i386),i386-windows,i686-windows) ; \
 	done
 
-install-windows-x86_64: $(if $(STAGE),,windows-x86_64) $(HYBRID_CHECK_LEAF)
-	$(call PRODUCTION_ASSERT_CHECK,$(OUT_x64)/d3d9.dll $(OUT_x64)/mtld3d.dll)
-	for dir in $(INSTALL_DIRS); do \
-		$(call WINE_HOST,$$dir) ; \
-		$(if $(ARM64X_LEG),[ $$host = x86_64 ] || continue ;) \
-		$(call PE_PAIR_INSTALL,$$dir,$(OUT_x64),$$pe64,x86_64-windows) ; \
-	done
-
-install-windows-arm64x: $(if $(STAGE),,windows-arm64x) $(HYBRID_CHECK_LEAF)
+install-windows-arm64x: $(if $(STAGE),,windows-arm64x) hybrid-winebuild-check
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
-		$(call WINE_HOST,$$dir) ; \
-		[ $$host = aarch64 ] || continue ; \
-		$(call PE_PAIR_INSTALL,$$dir,$(OUT_arm64x),$$pe64,x86_64-windows) ; \
+		$(call WINE_ARM64_CHECK,$$dir) ; \
+		$(call PE_PAIR_INSTALL,$$dir,$(OUT_arm64x),aarch64-windows,x86_64-windows) ; \
 	done
 
-install-unix-x64: $(if $(STAGE),,unix-x64) $(HYBRID_CHECK_LEAF)
-	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_x64)/mtld3d.so)
-	for dir in $(INSTALL_DIRS); do \
-		$(call WINE_HOST,$$dir) ; \
-		[ $$host = x86_64 ] || continue ; \
-		$(call UNIX_INSTALL,$$dir,$(OUT_unix_x64),$(UNIX_WINEDIR_x64)) ; \
-	done
-
-install-unix-arm64: $(if $(STAGE),,unix-arm64) $(HYBRID_CHECK_LEAF)
+install-unix-arm64: $(if $(STAGE),,unix-arm64) hybrid-winebuild-check
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_arm64)/mtld3d.so)
 	for dir in $(INSTALL_DIRS); do \
-		$(call WINE_HOST,$$dir) ; \
-		[ $$host = aarch64 ] || continue ; \
+		$(call WINE_ARM64_CHECK,$$dir) ; \
 		$(call UNIX_INSTALL,$$dir,$(OUT_unix_arm64),$(UNIX_WINEDIR_arm64)) ; \
 	done
 
 # The install of a tree a leg sets up for itself (LEG_TREE_SETUP, below), a
 # clone of WINE_SDK, from the build directories it names rather than from the
-# OUT_* ones: the i686 pair into `i386-windows`, a 64-bit pair into the
-# directory the tree's 64-bit processes load builtins from, behind markers of
-# the rule PE_PAIR_INSTALL applies (AMD64 for the x86_64 pair, hybrid for the
-# ARM64X one in an arm64 Wine), and the `mtld3d.so` of the tree's arch. In the
-# arm64 mode it is the one way the x86_64 build reaches an arm64 Wine, which no
-# install leaf takes it to: it competes with the ARM64X build for the same file
-# names in the same directory. As for every builtin, what it installs reaches
-# only a prefix created afterwards, and every leg tree creates its own.
+# OUT_* ones: the i686 pair into `i386-windows`, the ARM64X pair into
+# `aarch64-windows`, behind markers of the rule PE_PAIR_INSTALL applies, and
+# the `mtld3d.so` into `aarch64-unix`. As for every builtin, what it installs
+# reaches only a prefix created afterwards, and every leg tree creates its own.
 # $(1) = the tree's Wine root, $(2) = the build directory of the i686 pair,
-# $(3) = that of the 64-bit pair, or empty for none, $(4) = that of the
+# $(3) = that of the ARM64X pair, or empty for none, $(4) = that of the
 # `mtld3d.so`.
 define LEG_INSTALL
-dir="$(1)" ; $(call WINE_HOST,$$dir) ; \
+dir="$(1)" ; $(call WINE_ARM64_CHECK,$$dir) ; \
 $(call PE_PAIR_INSTALL,$$dir,$(2),i386-windows,i686-windows) ; \
-$(if $(3),$(call PE_PAIR_INSTALL,$$dir,$(3),$$pe64,x86_64-windows) ; )\
-$(call UNIX_INSTALL,$$dir,$(4),$$unixdir)
+$(if $(3),$(call PE_PAIR_INSTALL,$$dir,$(3),aarch64-windows,x86_64-windows) ; )\
+$(call UNIX_INSTALL,$$dir,$(4),$(UNIX_WINEDIR_arm64))
 endef
 
 # The gate a release tag has to pass. Every shipped binary stamps `git describe`
@@ -1217,18 +1020,12 @@ version-check:
 # PE builtin-marked (drop-in for a Wine tree the user owns), while native/
 # holds the unmarked d3d9.dll for the DLL-override route (required on
 # CrossOver). The fake placeholders are the prefix markers for the custom
-# mtld3d builtin name. wine/ carries the 64-bit pair twice, the x86_64 build in
-# `x86_64-windows` for an x86_64 Wine and the ARM64X build in `aarch64-windows`
-# for an arm64 one, as `install` lays them out, and both unix arches, so the
-# same tree drops into either Wine; each loads only the directories of its own
-# arch. native/ holds the unmarked d3d9.dll of all three builds, the ARM64X one
-# for a 64-bit game on an arm64 Wine. The 64-bit prefix marker comes twice:
-# `system32/` holds the x86_64 build's, an AMD64 placeholder, the one an
-# x86_64 Wine accepts, and `system32-arm64/` the ARM64X build's hybrid one for
-# an arm64 Wine, which a native ARM64 process accepts as well as an x64 one.
-# The 32-bit marker in `syswow64/` serves both Wines. A bundle built in the
-# x86_64 mode has no ARM64X build to carry, so it holds no `aarch64-windows`
-# directory in either wine/ or native/, nor its symbols, nor `system32-arm64/`.
+# mtld3d builtin name. wine/ carries the i686 pair in `i386-windows`, the
+# ARM64X pair in `aarch64-windows` and the arm64 unix `.so`, as `install`
+# lays them out. native/ holds the unmarked d3d9.dll of both builds, the
+# ARM64X one for a 64-bit game. The 64-bit prefix marker in `system32-arm64/`
+# is the ARM64X build's hybrid one, which a native ARM64 process accepts as
+# well as an x64 one, and the 32-bit marker is in `syswow64/`.
 #
 # Two archives come out of one run: the bundle users install, and the symbols
 # that make a crash report from one of them readable.
@@ -1236,36 +1033,28 @@ bundle: all
 	$(call PRODUCTION_ASSERT_CHECK,$(ASSERT_GATE_FILES))
 	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
-	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-windows
-	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)
+	mkdir -p $(BUNDLE_STAGE)/wine/aarch64-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)
 	mkdir -p $(BUNDLE_STAGE)/native/i386-windows
-	mkdir -p $(BUNDLE_STAGE)/native/x86_64-windows
+	mkdir -p $(BUNDLE_STAGE)/native/aarch64-windows
 	mkdir -p $(BUNDLE_STAGE)/prefix-markers/syswow64
-	mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32
+	mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32-arm64
 	cp -c $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
 	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/wine/i386-windows/
-	cp -c $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
-	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
-	$(if $(ARM64X_LEG),mkdir -p $(BUNDLE_STAGE)/wine/aarch64-windows $(BUNDLE_STAGE)/native/aarch64-windows && \
-		cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/d3d9.dll $(BUNDLE_STAGE)/wine/aarch64-windows/ && \
-		cp -c $(OUT_arm64x)/d3d9.dll $(BUNDLE_STAGE)/native/aarch64-windows/ && \
-		$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/aarch64-windows/d3d9.dll)
+	cp -c $(OUT_arm64x)/mtld3d.dll         $(BUNDLE_STAGE)/wine/aarch64-windows/
+	cp -c $(OUT_arm64x)/d3d9.dll           $(BUNDLE_STAGE)/wine/aarch64-windows/
 	# Markers live outside wine/, and already carry the name they need in the
 	# prefix, so both routes are a plain copy into the matching system dir with
 	# no rename. Keeping them out of wine/ is what stops `cp -R wine/*` from
 	# dragging them onto the builtin search path, where wineboot would stamp a
 	# second, useless marker under the name "mtld3d.fake.dll".
 	cp -c $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/prefix-markers/syswow64/mtld3d.dll
-	cp -c $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
-	$(if $(ARM64X_LEG),mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32-arm64 && \
-		cp -c $(OUT_arm64x)/mtld3d.fake.dll $(BUNDLE_STAGE)/prefix-markers/system32-arm64/mtld3d.dll)
+	cp -c $(OUT_arm64x)/mtld3d.fake.dll    $(BUNDLE_STAGE)/prefix-markers/system32-arm64/mtld3d.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
-	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
-	cp -c $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
+	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/aarch64-windows/d3d9.dll
 	cp -c $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
 	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
-	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
+	cp -c $(OUT_arm64x)/d3d9.dll           $(BUNDLE_STAGE)/native/aarch64-windows/
 	cp -c $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
@@ -1277,8 +1066,7 @@ bundle: all
 	# so they carry no stamp and are not swept.
 	test -n "$(BUILD_ID)" || { echo "bundle: this build has no identity to check the binaries against" >&2; exit 1; }
 	for f in $(BUNDLE_STAGE)/wine/i386-windows/*.dll \
-	         $(BUNDLE_STAGE)/wine/x86_64-windows/*.dll$(if $(ARM64X_LEG), $(BUNDLE_STAGE)/wine/aarch64-windows/*.dll) \
-	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/mtld3d.so \
+	         $(BUNDLE_STAGE)/wine/aarch64-windows/*.dll \
 	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so ; do \
 		LC_ALL=C grep -a -q -F "$(BUILD_ID)" $$f || { echo "bundle: $$f is not stamped $(BUILD_ID); it was built at another commit, rebuild it" >&2; exit 1; } ; \
 	done
@@ -1287,53 +1075,39 @@ bundle: all
 	# arch alone, with no wine/native split: debug info has no install route, and
 	# the two d3d9.dll flavors are one binary with one `.pdb`.
 	mkdir -p $(DEBUG_STAGE)/i386-windows
-	mkdir -p $(DEBUG_STAGE)/x86_64-windows
-	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)
+	mkdir -p $(DEBUG_STAGE)/aarch64-windows
 	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)
 	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
 	cp -c $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
 	cp -c $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
-	cp -c $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
-	cp -c $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
-	$(if $(ARM64X_LEG),mkdir -p $(DEBUG_STAGE)/aarch64-windows && \
-		cp -c $(OUT_arm64x)/d3d9.pdb $(OUT_arm64x)/mtld3d.pdb $(DEBUG_STAGE)/aarch64-windows/)
-	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
+	cp -c $(OUT_arm64x)/d3d9.pdb           $(DEBUG_STAGE)/aarch64-windows/
+	cp -c $(OUT_arm64x)/mtld3d.pdb         $(DEBUG_STAGE)/aarch64-windows/
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
-	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows$(if $(ARM64X_LEG), aarch64-windows) \
-		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
+	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows aarch64-windows $(UNIX_WINEDIR_arm64)
 
 # The test hand-off (see STAGE above): the install inputs laid out exactly as
 # the OUT_* dirs hold them, the e2e test binaries per PE arch, and the e2e and
-# conformance runners for either host arch. A plain tar, since the artifact
-# store drops execute bits and the `.dSYM` directories otherwise.
+# conformance runners. A plain tar, since the artifact store drops execute
+# bits and the `.dSYM` directories otherwise. The x86_64 test binaries are the
+# x64 suite the arm64x legs run as ARM64EC processes.
 stage: all
 	rm -rf $(STAGE_DIR) $(STAGE_OUT)
-	mkdir -p $(STAGE_DIR)/i386-windows $(STAGE_DIR)/x86_64-windows$(if $(ARM64X_LEG), $(STAGE_DIR)/aarch64-windows)
-	mkdir -p $(STAGE_DIR)/$(UNIX_WINEDIR_x64) $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)
-	mkdir -p $(STAGE_DIR)/tests/i686 $(STAGE_DIR)/tests/x86_64$(if $(ARM64X_LEG), $(STAGE_DIR)/tests/aarch64)
-	mkdir -p $(STAGE_DIR)/e2e/x86_64 $(STAGE_DIR)/e2e/arm64
-	mkdir -p $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
+	mkdir -p $(STAGE_DIR)/i386-windows $(STAGE_DIR)/aarch64-windows $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)
+	mkdir -p $(STAGE_DIR)/tests/i686 $(STAGE_DIR)/tests/x86_64 $(STAGE_DIR)/tests/aarch64
+	mkdir -p $(STAGE_DIR)/e2e/arm64 $(STAGE_DIR)/conformance/arm64
 	cp -c $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
 		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
-	cp -c $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
-		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb $(STAGE_DIR)/x86_64-windows/
-	$(if $(ARM64X_LEG),cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $(OUT_arm64x)/mtld3d.fake.dll \
-		$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/d3d9.pdb $(STAGE_DIR)/aarch64-windows/)
-	cp -c $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
-	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
+	cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $(OUT_arm64x)/mtld3d.fake.dll \
+		$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/d3d9.pdb $(STAGE_DIR)/aarch64-windows/
 	cp -c $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_i386))); cp -c $$exes $(STAGE_DIR)/tests/i686/
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_x64))); cp -c $$exes $(STAGE_DIR)/tests/x86_64/
-	$(if $(ARM64X_LEG),$(XWIN_AARCH64_REQUIRE))
-	$(if $(ARM64X_LEG),$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_arm64))); cp -c $$exes $(STAGE_DIR)/tests/aarch64/)
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_x64)
+	$(XWIN_AARCH64_REQUIRE)
+	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_arm64))); cp -c $$exes $(STAGE_DIR)/tests/aarch64/
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_arm64)
-	cp -c unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/x86_64/
 	cp -c unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/arm64/
-	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_arm64)
-	cp -c unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/x86_64/
 	cp -c unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/arm64/
 	tar -cf $(STAGE_OUT) -C $(STAGE_DIR) .
 
@@ -1367,13 +1141,6 @@ stage: all
 # runs; try 0.5 and a non-dividing 0.67 too, since those catch rounding that a
 # clean fraction hides.
 #
-# INTEL=1 reruns the whole e2e suite under every `intel.*` key, i.e. with the
-# device answers an Intel/AMD Mac gives: packed 16-bit formats expanded, 32-bit
-# float filtering denied, Managed buffers with didModifyRange after each write,
-# and the 256-byte linear texture alignment. Every assertion has to hold there
-# too; a test that probes a capability asks the device and asserts the answer
-# it gets, which is also what lets the suite run on real Intel hardware.
-#
 # LOG_DIR=<absolute unix path> puts every test process's log file (and its GPU
 # traces) in one directory instead of beside each test binary, so a machine
 # that is only reachable through its artifacts (a CI runner) can hand the logs
@@ -1384,8 +1151,7 @@ stage: all
 # Abnormal exits after complete test reports also keep captured stdout, stderr
 # and exit status together in a .process-log file, without changing verdicts.
 # Ten files of each kind are kept per directory.
-INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
-MTLD3D_CONF_TEST := shaderCache.enable=false;shader.asyncCompile=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
+MTLD3D_CONF_TEST := shaderCache.enable=false;shader.asyncCompile=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
@@ -1521,9 +1287,9 @@ configure-test-prefix-session:
 	-$(WINE_SERVER) -p >/dev/null 2>&1
 	-$(WINE_LOADER) wineboot >/dev/null 2>&1
 
-test: test-unit test-e2e-i686 test-e2e-$(PE64_BUILD) $(if $(ARM64X_LEG),test-e2e-arm64)
+test: test-unit test-e2e-i686 test-e2e-arm64x test-e2e-arm64
 
-# Host-native unit tests, built for this machine's native arch (no Rosetta).
+# Host-native unit tests, built for this machine's native arch.
 # Needs no install and no wine at all, which is why it is its own leg: the
 # windows workspace singles out mtld3d-core (its other members are PE-only and
 # can't build for the host target) and must override its i686 default, and turns
@@ -1535,17 +1301,13 @@ test-unit:
 
 # The e2e suite, one leg per build a game loads from WINE_SDK: the i686
 # binaries against the i686 build (`test-e2e-i686`), and the x86_64 binaries
-# against PE64_BUILD, the ARM64X build in the arm64 mode (`test-e2e-arm64x`),
-# whose ARM64EC half their x64 processes run, and the x86_64 build in the
-# x86_64 mode (`test-e2e-x86_64`). Each installs the build it exercises plus
-# the `.so` of UNIX_ARCH into WINE_SDK (or its ISOLATED=1 clone) and boots the
-# one prefix both share: the two builds go into different directories of the
-# one tree, so the legs are independent jobs. The arm64 mode adds
-# `test-e2e-arm64`, the aarch64 binaries as native ARM64 processes against the
-# ARM64X build's ARM64 half, in a tree and prefix of its own (below). There
-# `test-e2e-x86_64` runs the x86_64 binaries against the x86_64 build,
-# emulated under the same Wine, which the ARM64X build would otherwise shadow,
-# in a tree of its own too; `make test` leaves that one out.
+# against the ARM64X build (`test-e2e-arm64x`), whose ARM64EC half their x64
+# processes run. Each installs the build it exercises plus the arm64 `.so`
+# into WINE_SDK (or its ISOLATED=1 clone) and boots the one prefix both share:
+# the two builds go into different directories of the one tree, so the legs
+# are independent jobs. `test-e2e-arm64` adds the aarch64 binaries as native
+# ARM64 processes against the ARM64X build's ARM64 half, in a tree and prefix
+# of its own (below).
 #
 # The suite is six test binaries per arch (`windows/tests/tests`: the
 # one-process suite `e2e`, and `exit_code`, `unload`, `unload_after_device`,
@@ -1567,11 +1329,9 @@ test-unit:
 # even when their windows stay hidden. Window-management tests explicitly
 # keep framed windows so that their style and teardown paths stay covered.
 #
-# The default of 4 assumes a Wine built from `cx-26-patched` at or after
-# the winemac change that releases the D3DMetal client surfaces outside the
-# window data lock. wine-build releases from `cx-26.3.0-6` on carry it, and
-# none up to `cx-26.3.0-3` does. wine-build's arm64 Wine is built from
-# `arm64-patched`, which carries the same fix.
+# The default of 4 assumes a Wine with the winemac change that releases the
+# D3DMetal client surfaces outside the window data lock. wine-build's arm64
+# Wine is built from `arm64-patched`, which carries it.
 # Without it the two locks are taken in both orders (`macdrv_DestroyWindow`
 # holds the window data and takes win32u's surface lock,
 # `update_client_surfaces` and `detach_client_surfaces` the other way
@@ -1590,11 +1350,10 @@ test-unit:
 # process is gone gets a one-second grace, not the bound: nothing it says
 # after that is the test's.
 #
-# A scaled or Intel-variant run reports the whole suite instead of stopping at
-# the first failure, and FAIL_FAST=0 asks for that on any run. The point of
-# `SCALE` and `INTEL` is to survey which assertions still hold in the reported
-# space or under the Intel answers, and one dependent test would otherwise
-# hide every later test's behaviour there. The default run keeps fail-fast:
+# A scaled run reports the whole suite instead of stopping at the first
+# failure, and FAIL_FAST=0 asks for that on any run. The point of `SCALE` is
+# to survey which assertions still hold in the reported space, and one
+# dependent test would otherwise hide every later test's behaviour there. The default run keeps fail-fast:
 # there the first failure is a regression to fix, not a survey to read.
 #
 # FILTER='<patterns>' narrows the run to the tests whose id (`<binary>::<test
@@ -1603,7 +1362,7 @@ test-unit:
 # with the word. A filter that selects nothing passes.
 JOBS ?= 4
 TIMEOUT ?= 60
-E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE)$(INTEL),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)') $(if $(LOG_DIR),--log-dir '$(LOG_DIR)')
+E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)') $(if $(LOG_DIR),--log-dir '$(LOG_DIR)')
 
 # The test binaries of one PE arch, from cargo's own account of what it built:
 # `cargo test --no-run` prints one JSON message per artifact, and the test
@@ -1647,18 +1406,18 @@ endef
 
 # From a build here the runner is built and run through cargo, from its own
 # workspace so its `.cargo/config.toml` applies; from a stage it is the staged
-# binary for this machine's arch (compare `CONFORMANCE_BIN`).
+# arm64 binary (compare `CONFORMANCE_BIN`).
 E2E_RUNNER_DIR := $(if $(STAGE),.,unix)
-E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/$(HOST_ARCH)/mtld3d-e2e,cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-e2e --)
+E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/arm64/mtld3d-e2e,cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-e2e --)
 # Builds that runner without running it, in its directory; nothing to build from a stage.
 E2E_RUNNER_BUILD := $(if $(STAGE),true,cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e)
 
-test-e2e-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
+test-e2e-i686: install-windows-i686 install-unix-arm64
 	$(MAKE) configure-test-prefix
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_i686)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) $(E2E_FLAGS) -- $$exes
 
-test-e2e-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
+test-e2e-arm64x: install-windows-arm64x install-unix-arm64
 	$(MAKE) configure-test-prefix
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) $(E2E_FLAGS) -- $$exes
@@ -1669,12 +1428,9 @@ test-e2e-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
 # tests (LEG_INSTALL, above), and `prefix`, a prefix created afresh after that
 # install, since a prefix only holds the markers for the builtins that were
 # installed when it was made. So no two layouts see each other's DLLs, and none
-# writes into WINE_SDK itself. The arm64 mode's `test-e2e-x86_64` and
-# `test-e2e-arm64` and the two layouts of `bench-variants` each take
-# `.wine-isolated/leg-<name>`, the x86_64 build taking the ARM64X build's place
-# in `aarch64-windows` in `leg-x86_64`; the
-# two legs of `bench-ab` each take the whole `.wine-isolated` of their own
-# checkout, which the run takes down first. The prefix is booted and
+# writes into WINE_SDK itself. `test-e2e-arm64` takes
+# `.wine-isolated/leg-arm64`; the two legs of `bench-ab` each take the whole
+# `.wine-isolated` of their own checkout, which the run takes down first. The prefix is booted and
 # configured by `configure-test-prefix` like every other leg's; its persistent
 # server is stopped when the leg ends, since the next run makes a new tree
 # anyway. The trees sit in a checkout's `.wine-isolated`, with or without
@@ -1706,15 +1462,7 @@ define LEG_STOP
 status=$$? ; WINEPREFIX='$(1)/prefix' '$(1)/sdk/bin/wineserver' -k >/dev/null 2>&1 ; exit $$status
 endef
 
-ifneq ($(ARM64X_LEG),)
-X86_64_LEG := $(call leg_root,x86_64)
-test-e2e-x86_64: $(if $(STAGE),,windows-i686 windows-x86_64 unix-arm64)
-	$(call LEG_TREE_SETUP,$(X86_64_LEG),$(call LEG_INSTALL,$(X86_64_LEG)/sdk,$(OUT_i386),$(OUT_x64),$(OUT_unix_arm64)))
-	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && WINEPREFIX='$(X86_64_LEG)/prefix' $(MTLD3D_TEST_ENV) \
-		$(E2E_RUNNER) --wine '$(X86_64_LEG)/sdk/bin/wine' $(E2E_FLAGS) -- $$exes; \
-		$(call LEG_STOP,$(X86_64_LEG))
-
-# The native ARM64 leg of the arm64 mode: the aarch64 test binaries, native
+# The native ARM64 leg: the aarch64 test binaries, native
 # ARM64 processes, against the ARM64 half of the ARM64X build, which the
 # arm64 Wine's compatdb gives them from arm64-11.19-2 on. It installs the
 # same build `test-e2e-arm64x` does, but in a tree of its own with a prefix
@@ -1732,16 +1480,6 @@ test-e2e-arm64: $(if $(STAGE),,windows-i686 windows-arm64x unix-arm64)
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_aarch64)); cd $(E2E_RUNNER_DIR) && WINEPREFIX='$(ARM64_LEG)/prefix' $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine '$(ARM64_LEG)/sdk/bin/wine' $(E2E_FLAGS) -- $$exes; \
 		$(call LEG_STOP,$(ARM64_LEG))
-endif
-
-# The 64-bit legs of the other mode, which this one does not run: named here
-# so that one asked for fails saying why, where a phony target with no rule
-# would pass having done nothing.
-OTHER_PE64 := $(if $(ARM64X_LEG),x86_64,arm64x)
-OTHER_MODE_LEGS := $(if $(ARM64X_LEG),,test-e2e-arm64x test-e2e-arm64) $(foreach leg,conformance conformance-intel \
-	conformance-scale conformance-baseline conformance-baseline-intel conformance-baseline-scale,$(leg)-$(OTHER_PE64))
-$(OTHER_MODE_LEGS):
-	echo "$@ runs the $(OTHER_PE64) build, which the $(WINE_SDK_MODE) mode does not test: WINE_SDK=$(WINE_SDK) is $(WINE_SDK_KIND_READ), and the mode's 64-bit leg is $(PE64_BUILD)" >&2; exit 2
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts
@@ -1751,25 +1489,22 @@ $(OTHER_MODE_LEGS):
 # baseline.txt in the crate dir.
 #
 # Two legs, like the e2e suite's in `make test`: `i686`, the i386 binary
-# against the i686 build, and the 64-bit one, the x86_64 binary against
-# PE64_BUILD: `arm64x`, the ARM64X build, in the arm64 mode and `x86_64`, the
-# x86_64 build, in the x86_64 mode. One leg per runner process, so the two
-# gates are independent jobs, each recording under its leg's name as the
-# `--arch` label. Every leg runs the same four subtests. The `-intel` legs run
-# the same binary with `--variant intel`, which turns every `intel.*` config
-# key on, and record under their own `<leg>+intel` baseline entries.
+# against the i686 build, and `arm64x`, the x86_64 binary against the ARM64X
+# build. One leg per runner process, so the two gates are independent jobs,
+# each recording under its leg's name as the `--arch` label. Every leg runs
+# the same four subtests.
 # From a build here the runner is built and run through cargo; from a stage it
-# is the staged binary for this machine's arch. The assets directory is named
+# is the staged arm64 binary. The assets directory is named
 # explicitly either way: the runner's compiled-in default is the crate path on
 # the machine that built it. The wineserver of the same Wine is named too: a
 # subtest killed at its budget is sampled, and a subtest parked waiting for a
 # server reply shows nothing of the server on its own stacks, so the server
 # that serves this prefix is sampled beside it.
-CONFORMANCE_BIN = $(if $(STAGE),$(STAGE)/conformance/$(HOST_ARCH)/mtld3d-conformance,cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance --)
+CONFORMANCE_BIN = $(if $(STAGE),$(STAGE)/conformance/arm64/mtld3d-conformance,cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance --)
 CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_LOADER) --wineserver $(WINE_SERVER) \
 	--assets $(CURDIR)/unix/conformance $(call tests_version_arg,$(WINE_TESTS_VERSION))
 
-# $(1) = the leg (i686, arm64x or x86_64), $(2) = extra runner args. Checks
+# $(1) = the leg (i686-arm64 or arm64x), $(2) = extra runner args. Checks
 # the exe up front so a bundle that predates the published test binaries says
 # so, rather than failing four times inside the runner.
 # LOG=<filter> is the RUST_LOG the test processes run under (the runner's
@@ -1781,76 +1516,56 @@ CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_LOADER) --wineserver $(WINE_S
 # beside them.
 define conformance_leg
 	$(MAKE) configure-test-prefix
-	test -n '$(WINE_TESTS)' || { echo "WINE_TESTS is not set: in the x86_64 mode the conformance legs run the d3d9 test binaries of wine-build's arm64 Wine release, the one test build every leg runs, and WINE_TESTS names its lib/wine/tests; the x86_64 Wine's own tests are another build" >&2; exit 2; }
 	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: the conformance legs run the d3d9 test binaries under WINE_TESTS=$(WINE_TESTS), the lib/wine/tests of wine-build's arm64 Wine release" >&2; exit 2; }
 	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2) $(if $(LOG),--log $(LOG))
 endef
 
-# The 64-bit leg is PE64_BUILD's: `arm64x` in the arm64 mode and `x86_64` in
-# the x86_64 mode, so each mode has the targets of its own two legs and no
-# others.
-conformance: conformance-i686 conformance-$(PE64_BUILD)
+conformance: conformance-i686 conformance-arm64x
 
-conformance-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
+conformance-i686: install-windows-i686 install-unix-arm64
 	$(call conformance_leg,$(I686_LEG))
 
-conformance-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD))
-
-conformance-intel: conformance-intel-i686 conformance-intel-$(PE64_BUILD)
-
-conformance-intel-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(I686_LEG),--variant intel)
-
-conformance-intel-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD),--variant intel)
+conformance-arm64x: install-windows-arm64x install-unix-arm64
+	$(call conformance_leg,arm64x)
 
 # The same binary at `render.scale = 0.75`, the scaled leg CI runs for one
 # arch; both legs exist as local tools and both record in the baseline.
-conformance-scale: conformance-scale-i686 conformance-scale-$(PE64_BUILD)
+conformance-scale: conformance-scale-i686 conformance-scale-arm64x
 
-conformance-scale-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
+conformance-scale-i686: install-windows-i686 install-unix-arm64
 	$(call conformance_leg,$(I686_LEG),--variant scale)
 
-conformance-scale-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD),--variant scale)
+conformance-scale-arm64x: install-windows-arm64x install-unix-arm64
+	$(call conformance_leg,arm64x,--variant scale)
 
-# Re-record the baseline. All six legs write the same baseline.txt (each
+# Re-record the baseline. All four legs write the same baseline.txt (each
 # replacing only its own entries), so they must run in sequence: hence
 # recursive make in the recipe rather than prerequisites, which `-j` could
 # interleave.
 conformance-baseline:
 	$(MAKE) conformance-baseline-i686
-	$(MAKE) conformance-baseline-$(PE64_BUILD)
-	$(MAKE) conformance-baseline-intel-i686
-	$(MAKE) conformance-baseline-intel-$(PE64_BUILD)
+	$(MAKE) conformance-baseline-arm64x
 	$(MAKE) conformance-baseline-scale-i686
-	$(MAKE) conformance-baseline-scale-$(PE64_BUILD)
+	$(MAKE) conformance-baseline-scale-arm64x
 
-conformance-baseline-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
+conformance-baseline-i686: install-windows-i686 install-unix-arm64
 	$(call conformance_leg,$(I686_LEG),--update-baseline)
 
-conformance-baseline-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD),--update-baseline)
+conformance-baseline-arm64x: install-windows-arm64x install-unix-arm64
+	$(call conformance_leg,arm64x,--update-baseline)
 
-conformance-baseline-intel-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(I686_LEG),--variant intel --update-baseline)
-
-conformance-baseline-intel-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD),--variant intel --update-baseline)
-
-conformance-baseline-scale-i686: install-windows-i686 install-unix-$(UNIX_ARCH)
+conformance-baseline-scale-i686: install-windows-i686 install-unix-arm64
 	$(call conformance_leg,$(I686_LEG),--variant scale --update-baseline)
 
-conformance-baseline-scale-$(PE64_BUILD): install-windows-$(PE64_BUILD) install-unix-$(UNIX_ARCH)
-	$(call conformance_leg,$(PE64_BUILD),--variant scale --update-baseline)
+conformance-baseline-scale-arm64x: install-windows-arm64x install-unix-arm64
+	$(call conformance_leg,arm64x,--variant scale --update-baseline)
 
 # Flap characterization: run ONE subtest REPEAT times and print a per-site flap
 # report (which sites fire deterministically vs flutter run-to-run), the
 # evidence for tagging a site `flaky` in CONFORMANCE.md, and the way to make a
 # subtest that dies one run in a few die in one sitting. Tune with ONLY (device|
-# visual|stateblock|d3d9ex), ARCH (the leg, i686 or PE64_BUILD), REPEAT
-# (default 20), VARIANT (native|intel, the `intel` legs' forced answers) and
+# visual|stateblock|d3d9ex), ARCH (the leg, i686 or arm64x), REPEAT
+# (default 20), VARIANT (native|scale, the `scale` legs' render scale) and
 # LOG (see above).
 # With MTLD3D_CONFORMANCE_RAW_DIR set, every run keeps its own raw output,
 # `<leg>-<subtest>-<n>.log`, and its process's log file beside it. ARCH is
@@ -1860,11 +1575,11 @@ ARCH ?= i686
 REPEAT ?= 20
 VARIANT ?= native
 ifneq ($(filter conformance-isolate,$(MAKECMDGOALS)),)
-ifeq ($(filter i686 $(PE64_BUILD),$(ARCH)),)
-$(error ARCH=$(ARCH): `make conformance-isolate` runs a leg of the $(WINE_SDK_MODE) mode, ARCH=i686 or ARCH=$(PE64_BUILD))
+ifeq ($(filter i686 arm64x,$(ARCH)),)
+$(error ARCH=$(ARCH): `make conformance-isolate` runs a leg of its own, ARCH=i686 or ARCH=arm64x)
 endif
 endif
-conformance-isolate: install-windows-$(ARCH) install-unix-$(UNIX_ARCH)
+conformance-isolate: install-windows-$(ARCH) install-unix-arm64
 	$(call conformance_leg,$(if $(filter i686,$(ARCH)),$(I686_LEG),$(ARCH)),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
 
 # The synthetic benchmarks (NOT part of `make test`), the `#[ignore]`d tests of
@@ -1882,8 +1597,7 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(UNIX_ARCH)
 # time in one process, through the runner's `--ignored`, against one build
 # installed into WINE_SDK the way `make test` installs it: ARCH=i686 (the
 # default, the arch the game ships) runs the i686 binary against the i686
-# build, ARCH=PE64_BUILD (arm64x in the arm64 mode, x86_64 in the x86_64 one)
-# the x86_64 binary against that build. They measure and never assert on a
+# build, ARCH=arm64x the x86_64 binary against the ARM64X build. They measure and never assert on a
 # time, so a run is red only when a device call fails.
 #
 # The layer and the benchmark binary are built with the production profile,
@@ -1892,7 +1606,7 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(UNIX_ARCH)
 # instead, and each report states the profile and whether debug assertions
 # were on. The Metal validation layer and HUD are off: both cost frame time
 # and neither is under test. MTL_CAPTURE_ENABLED is unset for the same
-# reason, here and in `bench-ab` and `bench-variants`: Metal's capture layer
+# reason, here and in `bench-ab`: Metal's capture layer
 # sits under every Metal call (docs/ARCHITECTURE.md gives its measured cost
 # beside the Ctrl+Shift+P capture). The configuration is the suite's
 # without the Main Thread Checker, then BENCH_CONFIG='key=value;key=value',
@@ -1960,22 +1674,13 @@ bin='$(ISOLATED_ROOT)/bench-bin/$(PROFILE)/deps' && rm -rf '$(ISOLATED_ROOT)/ben
 endef
 # BENCH_ARCH is the build a benchmark measures, ARCH for `make bench` and
 # `make bench-ab`, and BENCH_EXE_ARCH the arch of the benchmark binary that
-# loads it: x86_64 for the ARM64X build, and for `bench-variants`, which
-# measures the x86_64 build against the ARM64X one.
+# loads it: x86_64 for the ARM64X build.
 ifneq ($(filter bench bench-ab,$(MAKECMDGOALS)),)
-ifeq ($(filter i686 $(PE64_BUILD),$(ARCH)),)
-$(error ARCH=$(ARCH): a benchmark measures the i686 build (ARCH=i686) or the 64-bit build WINE_SDK loads, ARCH=$(PE64_BUILD) in the $(WINE_SDK_MODE) mode; `make bench-variants` measures the x86_64 build against the ARM64X one)
+ifeq ($(filter i686 arm64x,$(ARCH)),)
+$(error ARCH=$(ARCH): a benchmark measures the i686 build (ARCH=i686) or the ARM64X build (ARCH=arm64x))
 endif
 endif
-ifneq ($(filter bench-variants,$(MAKECMDGOALS)),)
-ifneq ($(origin ARCH),file)
-$(error `make bench-variants` measures the x86_64 build against the ARM64X one and takes no ARCH)
-endif
-ifeq ($(ARM64X_LEG),)
-$(error `make bench-variants` measures the x86_64 build against the ARM64X one and needs an arm64 Wine as WINE_SDK; WINE_SDK=$(WINE_SDK) is an x86_64 Wine)
-endif
-endif
-BENCH_ARCH := $(if $(filter bench-variants,$(MAKECMDGOALS)),arm64x,$(ARCH))
+BENCH_ARCH := $(ARCH)
 BENCH_EXE_ARCH := $(if $(filter arm64x,$(BENCH_ARCH)),x86_64,$(BENCH_ARCH))
 BENCH_TARGET := $(if $(filter x86_64,$(BENCH_EXE_ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(BENCH_EXE_ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
@@ -1988,7 +1693,7 @@ $(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
 	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
 	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }
 endef
-bench: install-windows-$(BENCH_ARCH) install-unix-$(UNIX_ARCH)
+bench: install-windows-$(BENCH_ARCH) install-unix-arm64
 	$(MAKE) configure-test-prefix
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call bench_stage_corpus,$(BENCH_DIR))
@@ -2022,12 +1727,11 @@ bench: install-windows-$(BENCH_ARCH) install-unix-$(UNIX_ARCH)
 # compares them against the commit they sit on.
 #
 # ARCH picks the build both legs measure, as for `make bench`: i686 (the
-# default) or PE64_BUILD. Both legs build PROD=1 PERF=1: BASE in a detached
+# default) or arm64x. Both legs build PROD=1 PERF=1: BASE in a detached
 # worktree under the main checkout's `.codex/worktrees`, kept for the next run
 # and removed by `make clean-bench-ab`, and this checkout where it is. Each
 # then runs in a tree of its own, the `.wine-isolated` of its checkout, set up
-# the way the arm64 mode's `test-e2e-x86_64` sets up its tree
-# (LEG_TREE_SETUP), in either mode: taken down,
+# the way `test-e2e-arm64` sets up its tree (LEG_TREE_SETUP): taken down,
 # cloned again from WINE_SDK on every run, given the leg's build by this
 # checkout's install steps, which a BASE older than them does not have, and a
 # prefix created afresh and configured by this checkout's
@@ -2103,27 +1807,24 @@ BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
 # The variables each leg's build sub-make is given. A BASE whose Makefile
 # predates WINE_SDK as the one Wine builds against the Wine its own variables
 # name, so it is given those as well, all naming WINE_SDK: a BASE of the
-# two-Wine layout takes an arm64 Wine as WINE_ARM64, with EC=1 for its ARM64X
-# build, and an x86_64 one as WINE_X86_64; one older still reads WINE_SDK as
-# the x86 builds' Wine and WINE_SDK_ARM64X as the ARM64X build's. A BASE that
-# reads WINE_SDK alone (BENCH_BASE_ONE_WINE, below), and the candidate, which
-# is this Makefile, refuse them and get none. A BASE whose winebuild calls name
-# no target (`-b`) cannot build against an arm64 winebuild at all.
-BENCH_OLD_LAYOUT_arm64  = WINE_ARM64='$(WINE_SDK)' WINE_SDK_ARM64X='$(WINE_SDK)' EC=1
-BENCH_OLD_LAYOUT_x86_64 = WINE_X86_64='$(WINE_SDK)'
+# two-Wine layout takes the arm64 Wine as WINE_ARM64, with EC=1 for its ARM64X
+# build; one older still reads WINE_SDK as the x86 builds' Wine and
+# WINE_SDK_ARM64X as the ARM64X build's. A BASE that reads WINE_SDK alone
+# (BENCH_BASE_ONE_WINE, below), and the candidate, which is this Makefile,
+# refuse them and get none. A BASE whose winebuild calls name no target (`-b`)
+# cannot build against an arm64 winebuild at all.
+BENCH_OLD_LAYOUT = WINE_ARM64='$(WINE_SDK)' WINE_SDK_ARM64X='$(WINE_SDK)' EC=1
 BENCH_LEG_MAKE = PROD=1 PERF=1 WINE_SDK='$(WINE_SDK)'
-BENCH_BASE_MAKE = $(BENCH_LEG_MAKE)$(if $(BENCH_BASE_ONE_WINE),, $(BENCH_OLD_LAYOUT_$(WINE_SDK_MODE)))
+BENCH_BASE_MAKE = $(BENCH_LEG_MAKE)$(if $(BENCH_BASE_ONE_WINE),, $(BENCH_OLD_LAYOUT))
 # `make` for the sub-makes that run beside each other in one bench-ab recipe
 # line. A line that names `$(MAKE)` itself runs even under `make -n`, and these
 # lines also build the benchmark binary and boot the prefixes, which a dry run
 # must only print.
 BENCH_SUBMAKE = $(MAKE)
 # What each leg's sub-make builds: the i686 build, which LEG_INSTALL always
-# installs, the 64-bit build ARCH names when it names one, the `mtld3d.so`
-# WINE_SDK loads, and its host emitter benchmark when BASE has one.
-BENCH_LEG_BUILD = windows-i686 $(if $(filter-out i686,$(BENCH_ARCH)),windows-$(BENCH_ARCH)) unix-$(UNIX_ARCH) $(if $(BENCH_HOST_RUN),bench-host-build)
-# The production build directory of the 64-bit build $(1) under a checkout $(2).
-bench_pe64_out = $(2)/windows/target/$(if $(filter arm64x,$(1)),arm64x,$(PE_x64))/production
+# installs, the ARM64X build when ARCH names it, the `mtld3d.so` WINE_SDK
+# loads, and its host emitter benchmark when BASE has one.
+BENCH_LEG_BUILD = windows-i686 $(if $(filter arm64x,$(BENCH_ARCH)),windows-arm64x) unix-arm64 $(if $(BENCH_HOST_RUN),bench-host-build)
 # Says, in a recipe's shell, that the step $(2) failed when the status $(1) is
 # not zero, and shows the end of its log $(3) in the run's directory.
 bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the end of $(BENCH_AB_OUT)/$(3):" >&2; tail -n 40 '$(BENCH_AB_OUT)/$(3)' >&2; }
@@ -2131,7 +1832,7 @@ bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the
 # runs in, holding `sdk` and `prefix`: the checkout's `.wine-isolated`, which
 # the run takes down first. Sets up the tree from that checkout's production
 # outputs.
-bench_tree_setup = $(call LEG_TREE_SETUP,$(2),$(call LEG_INSTALL,$(2)/sdk,$(1)/windows/target/$(PE_i386)/production,$(if $(filter-out i686,$(BENCH_ARCH)),$(call bench_pe64_out,$(BENCH_ARCH),$(1))),$(1)/unix/target/$(UNIX_TARGET_$(UNIX_ARCH))/production))
+bench_tree_setup = $(call LEG_TREE_SETUP,$(2),$(call LEG_INSTALL,$(2)/sdk,$(1)/windows/target/$(PE_i386)/production,$(if $(filter arm64x,$(BENCH_ARCH)),$(1)/windows/target/arm64x/production),$(1)/unix/target/$(UNIX_TARGET_arm64)/production))
 # Stops the persistent wineservers of both legs' prefixes, whatever state
 # the run left them in; a leg that has no server is left as it is.
 define BENCH_STOP_SERVERS
@@ -2217,71 +1918,6 @@ bench-ab:
 		$(BENCH_HOST_FLAGS) $(if $(BENCH_CORPUS),--corpus-dir '$(BENCH_AB_OUT)/corpus') \
 		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
 
-# `make bench-variants` measures this checkout in two layouts instead of two
-# builds: the x86_64 benchmark binary against its x86_64 build, emulated under
-# WINE_SDK, and against its ARM64X build, each in a tree of its own set up as
-# `test-e2e-x86_64` sets up its tree. It runs the `bench-ab` machinery once, in
-# a layout comparison (the runner's `--base-runtime` and the three flags beside
-# it), into `variants-<commit>-<time>/x86_64-vs-arm64x` in the directory
-# bench-ab writes to: one commit in both legs, so a binary the two layouts
-# share runs as one image and is noted, and the report names each leg's
-# runtime and DLL variant; `make bench-compare` judges the directory again the
-# same way. BENCH_SET, RUNS, BENCH_CONFIG, ACCEPT and BENCH_WAIT_IDLE mean what
-# they mean for `bench-ab`; the host emitter benchmark does not run, since no
-# layout changes it. Both legs run one Wine and differ only in our DLLs, so
-# the pair isolates what the ARM64X build buys an x64 game.
-ifneq ($(filter bench-variants,$(MAKECMDGOALS)),)
-ifeq ($(strip $(BENCH_SET)),)
-$(error BENCH_SET is wow, full or a list of test-name filters, not empty)
-endif
-BENCH_VARIANTS_STAMP := $(shell git describe --tags --always)
-BENCH_VARIANTS_OUT := $(BENCH_AB_ROOT)/variants-$(shell git rev-parse --short=12 HEAD)$(if $(shell git status --porcelain --untracked-files=no),-dirty)-$(shell date +%Y%m%d-%H%M%S)
-endif
-# $(1) = the directory, $(2) and $(3) = the base and cand trees, $(4) and $(5)
-# = their runtimes, $(6) and $(7) = their DLL variants. One layout comparison,
-# run from the runner's directory with `$$suite` set; its status is left in `$$?`.
-define bench_variant_pair
-$(E2E_RUNNER) bench-ab --out '$(1)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
-	--wait-idle $(BENCH_WAIT_IDLE) \
-	--base-wine '$(2)/sdk/bin/wine' --base-prefix '$(2)/prefix' --base-stamp '$(BENCH_VARIANTS_STAMP)' \
-	--base-runtime $(4) --base-variant $(6) \
-	--cand-wine '$(3)/sdk/bin/wine' --cand-prefix '$(3)/prefix' --cand-stamp '$(BENCH_VARIANTS_STAMP)' \
-	--cand-runtime $(5) --cand-variant $(7) \
-	--config '$(BENCH_CONF_AB)' $(BENCH_FILTERS) \
-	$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(1)/report.txt' -- $$suite
-endef
-# The two trees, and the stop of their servers.
-BENCH_VARIANT_X86_64 := $(call leg_root,x86_64)
-BENCH_VARIANT_ARM64X := $(call leg_root,arm64x)
-define BENCH_VARIANTS_STOP
-stop_servers() { for tree in '$(BENCH_VARIANT_X86_64)' '$(BENCH_VARIANT_ARM64X)'; do \
-	[ -x "$$tree/sdk/bin/wineserver" ] && WINEPREFIX="$$tree/prefix" "$$tree/sdk/bin/wineserver" -k >/dev/null 2>&1 ; \
-	done ; true ; }
-endef
-bench-variants:
-	$(WINE_SDK_REQUIRE)
-	git -C '$(BENCH_CHECKOUT)' check-ignore -q '$(BENCH_CHECKOUT)/.codex' || \
-		{ echo "make bench-variants: $(BENCH_CHECKOUT)/.codex is not ignored; add .codex/ to .git/info/exclude" >&2; exit 2; }
-	$(call clean_isolated_at,$(ISOLATED_ROOT))
-	mkdir -p '$(BENCH_VARIANTS_OUT)'
-	# The build; the installs below take it from its output directories.
-	$(BENCH_SUBMAKE) PROD=1 PERF=1 windows-i686 windows-x86_64 windows-arm64x unix-arm64 > '$(BENCH_VARIANTS_OUT)/build.log' 2>&1 || \
-		{ echo "make bench-variants: the build failed; the end of $(BENCH_VARIANTS_OUT)/build.log:" >&2; tail -n 40 '$(BENCH_VARIANTS_OUT)/build.log' >&2; exit 2; }
-	( $(call LEG_TREE_SETUP,$(BENCH_VARIANT_X86_64),$(call LEG_INSTALL,$(BENCH_VARIANT_X86_64)/sdk,$(OUT_i386),$(OUT_x64),$(OUT_unix_arm64))) ) > '$(BENCH_VARIANTS_OUT)/configure-x86_64.log' 2>&1 & x86_64=$$!; \
-		( $(call LEG_TREE_SETUP,$(BENCH_VARIANT_ARM64X),$(call LEG_INSTALL,$(BENCH_VARIANT_ARM64X)/sdk,$(OUT_i386),$(OUT_arm64x),$(OUT_unix_arm64))) ) > '$(BENCH_VARIANTS_OUT)/configure-arm64x.log' 2>&1 & arm64x=$$!; \
-		( $(BENCH_SUITE_ASSIGN) && cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER_BUILD) ); built=$$?; \
-		failed=0; for job in x86_64:$$x86_64 arm64x:$$arm64x; do \
-			wait $${job#*:} || { failed=1; echo "make bench-variants: setting up the $${job%%:*} tree failed; the end of $(BENCH_VARIANTS_OUT)/configure-$${job%%:*}.log:" >&2; tail -n 40 '$(BENCH_VARIANTS_OUT)'/configure-$${job%%:*}.log >&2; } ; \
-		done; \
-		[ $$failed -eq 0 ] && [ $$built -eq 0 ] || { $(BENCH_VARIANTS_STOP); stop_servers; exit 2; }
-	$(BENCH_VARIANTS_STOP); trap stop_servers EXIT; \
-	$(BENCH_SUITE_ASSIGN); \
-	$(BENCH_SUITE_COPY) && \
-	cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
-	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/x86_64-vs-arm64x,$(BENCH_VARIANT_X86_64),$(BENCH_VARIANT_ARM64X),arm64,arm64,x86_64,arm64x); \
-	status=$$?; \
-	echo "make bench-variants: reports under $(BENCH_VARIANTS_OUT)"; exit $$status
-
 bench-compare:
 	test -n '$(AB_DIR)' || { echo "make bench-compare needs AB_DIR=<a directory make bench-ab wrote>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-compare '$(abspath $(AB_DIR))' \
@@ -2351,11 +1987,10 @@ fmt-check:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt --check
 	cd unix && cargo +$(RUST_NIGHTLY) fmt --check
 
-clippy: clippy-pe-i686 clippy-pe-x86_64 $(ARM64X_LEG:%=clippy-pe-%) clippy-native
+clippy: clippy-pe-i686 clippy-pe-arm64x clippy-native
 
-# Four independent clippy legs (three in the x86_64 mode, which does not build
-# the ARM64X one), split by the target they lint
-# for so each is one job. No --all-targets on the whole-workspace PE runs: that
+# Three independent clippy legs, split by the target they lint for so each is
+# one job. No --all-targets on the whole-workspace PE runs: that
 # would build every member's test targets for PE, including mtld3d-core's
 # apple-only objc2 dev-deps (the Metal compile checks in `dxso/emit/tests.rs`),
 # which hard `compile_error!` off Apple. Lib/bin only there; mtld3d-tests'
@@ -2372,18 +2007,12 @@ clippy-pe-i686:
 	# reaches them.
 	cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
 
-clippy-pe-x86_64:
-	$(WINE_SDK_REQUIRE)
-	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_x64) $(DENY_WARNINGS)
-	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
-
 # The two halves of the ARM64X build, linted for the code only they compile
-# (`windows/d3d9/src/platform/win32/arm64_crt.rs`) and for the `cfg` arms the x86 targets never
-# take, in the windows workspace and in `unix/shared` (its ARM64EC clock), the
-# way `clippy-pe-i686` reaches the latter, and the e2e tests as the native
-# ARM64 leg builds them, as `clippy-pe-x86_64` lints the x86_64 ones.
+# (`windows/d3d9/src/platform/win32/arm64_crt.rs`) and for the `cfg` arms the
+# x86 target never takes, in the windows workspace and in `unix/shared` (its
+# ARM64EC clock), the way `clippy-pe-i686` reaches the latter, and the e2e tests as the native
+# ARM64 leg builds them.
 clippy-pe-arm64x:
-	$(call ARM64_MODE_REQUIRE,clippy-pe-arm64x)
 	$(WINE_SDK_REQUIRE)
 	$(ARM64X_REQUIRE_TARGETS)
 	for target in $(PE_arm64) $(PE_arm64ec); do \
@@ -2652,10 +2281,10 @@ upgrade-incompat:
 	cd unix && cargo +$(RUST_STABLE) upgrade --incompatible && cargo +$(RUST_STABLE) update
 
 # One-time bootstrap for a development machine or a CI runner. Split into leaves
-# for the same reason the test and lint targets are: a host-only leg needs
-# neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
-# stands alone and this is the everything-at-once aggregate.
-setup: setup-rust setup-nextest setup-dev setup-xwin setup-rosetta
+# for the same reason the test and lint targets are: a host-only leg needs no
+# MSVC SDK, and a lint leg needs no Wine, so each piece stands alone and this
+# is the everything-at-once aggregate.
+setup: setup-rust setup-nextest setup-dev setup-xwin
 
 setup-rust:
 	@echo "==> rustup: install $(RUST_STABLE) and $(RUST_NIGHTLY) with the cross-compile targets"
@@ -2666,7 +2295,7 @@ setup-rust:
 	# on stable.
 	rustup toolchain install $(RUST_STABLE) --profile minimal --component clippy --component llvm-tools
 	rustup target add --toolchain $(RUST_STABLE) \
-		$(PE_i386) $(PE_x64) $(PE_arm64) $(PE_arm64ec) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
+		$(PE_i386) $(PE_x64) $(PE_arm64) $(PE_arm64ec) $(UNIX_TARGET_arm64)
 	rustup toolchain install $(RUST_NIGHTLY) --profile minimal --component rustfmt
 	# `--locked`: taking every tool's own lockfile is what makes a CI runner and
 	# a laptop install the same thing.
@@ -2769,14 +2398,3 @@ setup-nextest:
 	mkdir -p $${CARGO_HOME:-$$HOME/.cargo}/bin
 	curl -LsSf https://get.nexte.st/$(NEXTEST_VERSION)/mac | tar zxf - -C $${CARGO_HOME:-$$HOME/.cargo}/bin
 	$${CARGO_HOME:-$$HOME/.cargo}/bin/cargo-nextest nextest --version
-
-# Rosetta runs an x86_64 Wine and every PE it loads on Apple Silicon; an arm64
-# Wine translates x86 code itself and needs none. A no-op where it is already
-# installed, and on an Intel Mac, where the probe just runs natively.
-setup-rosetta:
-	@if arch -x86_64 /usr/bin/true 2>/dev/null; then \
-		echo "==> rosetta: already present"; \
-	else \
-		echo "==> rosetta: installing (needed to run the x86_64 Wine)"; \
-		sudo softwareupdate --install-rosetta --agree-to-license; \
-	fi
