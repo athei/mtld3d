@@ -878,9 +878,10 @@ impl TextureInner {
 
     /// Give `level` a staging buffer again before a write lands in it.
     ///
-    /// The fresh buffer holds no pixels, so it serves only a caller that
-    /// defines every byte it will upload: a whole-level write, a level the GPU
-    /// never received, or a read back of the level. A partial CPU write goes
+    /// The fresh buffer holds a released resource's bytes, so it serves only a
+    /// caller that defines every byte it will upload: a whole-level write, a
+    /// `D3DLOCK_DISCARD` lock, or a read back of the level. A level the GPU
+    /// never received takes [`Self::ensure_zeroed_staging`]. A partial CPU write goes
     /// through [`Self::ensure_staging_for_write`] and a `LockRect`, which D3D9
     /// promises the level's current contents, through
     /// [`Self::ensure_staging_for_lock`].
@@ -924,26 +925,34 @@ impl TextureInner {
     /// holds them on the GPU alone, so the fresh pages are filled from there
     /// before the pointer goes out. The read costs a synchronous flush and blit
     /// per lock, which the warning names. `D3DLOCK_DISCARD` and a level the GPU
-    /// never received skip it and take the pages as allocated: the first
-    /// because the caller declared the old contents dead, the second because
-    /// there are none to read.
+    /// never received skip it: the first takes the pages as allocated, because
+    /// the caller declared the old contents dead, and the second takes them
+    /// zeroed, which is what the GPU holds for a level it never received.
     fn ensure_staging_for_lock(&mut self, level: usize, flags: u32) -> bool {
         if self.dropped_staging & (1u32 << level) == 0 {
             return true;
         }
-        let readback = mtld3d_core::texture_staging::released_level_lock_needs_readback(flags)
-            && self.was_uploaded[level];
-        if !readback {
-            self.ensure_staging(level);
-            mtld3d_shared::log_once_info_by!(
-                target: crate::LOG_TARGET,
-                key: self.texture_id.raw(),
-                "texture {:#x}: lock of level {level} after its staging was released hands out \
-                 uninitialised pixels; the lock discards the level's contents or the GPU never \
-                 received them",
-                self.texture_id.raw()
-            );
-            return true;
+        match mtld3d_core::texture_staging::released_level_lock_fill(
+            flags,
+            self.was_uploaded[level],
+        ) {
+            ReleasedLevelFill::AsAllocated => {
+                self.ensure_staging(level);
+                mtld3d_shared::log_once_info_by!(
+                    target: crate::LOG_TARGET,
+                    key: self.texture_id.raw(),
+                    "texture {:#x}: D3DLOCK_DISCARD lock of level {level} after its staging was \
+                     released hands out the pages as allocated; the lock discards the level's \
+                     contents",
+                    self.texture_id.raw()
+                );
+                return true;
+            }
+            ReleasedLevelFill::Zeroed => {
+                self.ensure_zeroed_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::ReadBack => {}
         }
         if self.read_released_level_back(level) {
             mtld3d_shared::log_once_warn_by!(

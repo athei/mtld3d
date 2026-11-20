@@ -1,9 +1,10 @@
 //! A texture level nothing writes samples black, whatever device memory its texture lands on.
 //!
 //! D3D9 backs a new texture with zeroed memory, so a DXT1 level that is never
-//! written reads as all-zero blocks, opaque black. Each probe follows the
-//! release of textures of its shape whose levels held a bright block, which
-//! is the memory a new texture of that shape can be given.
+//! written reads as all-zero blocks, opaque black, and so do the texels a
+//! partial write of a new level leaves alone. Each probe follows the release
+//! of textures of its shape whose levels held a bright block, which is the
+//! memory a new texture of that shape can be given.
 
 use mtld3d_tests::{
     CubeTexture, Harness, Rgba8, Surface, Texture, TexturedVertex, VolumeTexture, VolumeVertex,
@@ -525,5 +526,51 @@ fn texels_a_partial_update_texture_leaves_alone_in_a_new_default_pool_volume_sam
         sampled.iter().all(|halves| *halves == [RED_X8 & RGB, 0]),
         "default-pool volume: the half the copy left alone samples black in every round, got \
          {sampled:06x?}"
+    );
+}
+
+/// A device context of a new default-pool level maps zero where GDI draws nothing.
+///
+/// `GetDC` re-creates the level's staging from the page-box pool the
+/// released textures' levels went back to, and `ReleaseDC` uploads the whole
+/// level. GDI paints the top-left quadrant red; the other three sample black.
+#[test]
+fn a_device_context_of_a_new_default_pool_level_maps_zero_where_gdi_draws_nothing() {
+    const SIDE: u32 = PROBE_SIDE;
+    // `COLORREF` red, `0x00BBGGRR`.
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let create = || h.create_texture(SIDE, SIDE, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let sampled = probe_after_releases(
+        &h,
+        || {
+            let tex = create();
+            let source =
+                h.create_offscreen_plain_surface(SIDE, SIDE, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+            source
+                .lock_rect(0)
+                .write_u32(&vec![YELLOW_X8; (SIDE * SIDE) as usize]);
+            assert_eq!(
+                h.update_surface_hr(&source, &tex.surface_level(0)),
+                0,
+                "UpdateSurface"
+            );
+            assert_released_yellow(draw_quadrants(&h, &tex, BLACK)[0]);
+        },
+        || {
+            let probe = create();
+            let surface = probe.surface_level(0);
+            let dc = surface.dc();
+            dc.fill_block((SIDE / 2).cast_signed(), RED_COLORREF);
+            assert_eq!(dc.release(), 0, "ReleaseDC");
+            draw_quadrants(&h, &probe, CLEAR)
+        },
+    );
+    assert!(
+        sampled
+            .iter()
+            .all(|quadrants| *quadrants == [RED_X8 & RGB, 0, 0, 0]),
+        "default-pool level under GetDC: the quadrants GDI left alone sample black in every \
+         round, got {sampled:06x?}"
     );
 }
