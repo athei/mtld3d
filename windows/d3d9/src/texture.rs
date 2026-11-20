@@ -18,8 +18,9 @@ use mtld3d_core::{
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
-        LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
-        honoured_lock_flags, is_in_flight, staging_droppable_class, staging_lazy_class,
+        LockAction, MipShape, PreserveKind, ReleasedLevelFill, StagingWrite, decide_lock_action,
+        decide_staging_write, honoured_lock_flags, is_in_flight, staging_droppable_class,
+        staging_lazy_class,
     },
 };
 use mtld3d_shared::{
@@ -281,7 +282,8 @@ pub struct TextureInner {
     /// rect its `UnlockRect` publishes. The box also spans texels between the
     /// writes, which is sound only because a present staging holds every
     /// texel the GPU was given: a partial write into a released level reads
-    /// it back first ([`TextureInner::ensure_staging_for_write`]). Whole-mip
+    /// it back first, or starts from zero when the GPU was given nothing
+    /// ([`TextureInner::ensure_staging_for_write`]). Whole-mip
     /// writes reset the entry to `None`.
     pending_upload_rects: Vec<Option<DirtyRect>>,
     /// Levels whose staging was released after their upload retired (bit N = level N).
@@ -353,10 +355,12 @@ pub struct TextureInner {
     snapshot_staging: u128,
     /// Subresources whose staging still holds what the allocator handed out.
     ///
-    /// Indexed like `observed_staging`. Set at creation for the pools whose
-    /// system-memory copy D3D9 hands out zeroed, whose staging came from the
-    /// page-box pool or the allocator unwritten: a pooled box carries a
-    /// released resource's bytes. The first exposure of a subresource's
+    /// Indexed like `observed_staging`. Set at creation for staging that came
+    /// from the page-box pool or the allocator unwritten: a pooled box carries
+    /// a released resource's bytes, where D3D9 hands out a zeroed
+    /// system-memory copy and a new default-pool texture reads zero. A level
+    /// that releases its staging loses its bit with the pages
+    /// ([`Self::drop_staging`]). The first exposure of a subresource's
     /// staging, a lock, a device context, a partial write, a read as a copy
     /// source or an upload, zeroes it and clears the bit; a write that covers
     /// the whole level clears the bit without the memset. A subresource that
@@ -835,10 +839,14 @@ impl TextureInner {
     }
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
+    ///
+    /// The level's unzeroed bit goes with the pages: the placeholder is never
+    /// exposed, and the re-creation decides what its fresh pages start as.
     fn drop_staging(&mut self, level: usize) {
         let released = core::mem::replace(&mut self.staging[level], dropped_staging_placeholder());
         retire_staging(self.device_inner, released);
         self.dropped_staging |= 1u32 << level;
+        self.unzeroed_staging &= !self.observed_bit(0, level);
         self.reset_staging_coverage(level);
     }
 
@@ -964,19 +972,27 @@ impl TextureInner {
     /// level, so the level is read back from the GPU before the write lands.
     /// It then keeps its staging (`kept_staging`): a level written in part
     /// after its release is written again, and each release would cost the
-    /// same blocking read at the next write. A whole-level write and a level
-    /// the GPU never received take the pages as allocated. Returns false when
-    /// the read back fails, which rejects the write.
+    /// same blocking read at the next write. A level the GPU never received
+    /// holds zero there, so its staging starts zeroed instead, and a
+    /// whole-level write takes the pages as allocated. Returns false when the
+    /// read back fails, which rejects the write.
     fn ensure_staging_for_write(&mut self, level: usize, whole_level: bool) -> bool {
         if self.dropped_staging & (1u32 << level) == 0 {
             return true;
         }
-        if !mtld3d_core::texture_staging::released_level_write_needs_readback(
+        match mtld3d_core::texture_staging::released_level_write_fill(
             whole_level,
             self.was_uploaded[level],
         ) {
-            self.ensure_staging(level);
-            return true;
+            ReleasedLevelFill::AsAllocated => {
+                self.ensure_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::Zeroed => {
+                self.ensure_zeroed_staging(level);
+                return true;
+            }
+            ReleasedLevelFill::ReadBack => {}
         }
         if self.read_released_level_back(level) {
             self.kept_staging |= 1u32 << level;
@@ -3573,9 +3589,10 @@ pub struct TextureCreateInfo {
     pub staging: Vec<PageBox>,
     /// Whether `staging` is as the allocator handed it out and has to read zero.
     ///
-    /// True for the pools whose system-memory copy D3D9 hands out zeroed
-    /// ([`mtld3d_core::pool::system_copy_starts_zeroed`]), unless the create
-    /// filled the staging itself (an extended device's user-memory texture).
+    /// True in every pool unless the create filled the staging itself (an
+    /// extended device's user-memory texture) or allocated it zeroed. D3D9
+    /// hands out a zeroed system-memory copy, and a new default-pool texture
+    /// reads zero on the GPU, which an upload of the staging must not undo.
     /// Each subresource is zeroed at its first exposure rather than here.
     pub staging_unwritten: bool,
     pub mip_widths: Vec<u32>,

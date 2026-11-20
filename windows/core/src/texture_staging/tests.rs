@@ -1267,14 +1267,31 @@ fn a_plain_lock_of_a_released_level_reads_it_back() {
 /// A partial write into an uploaded level is the one write that reads it back.
 #[test]
 fn a_partial_write_into_an_uploaded_released_level_reads_it_back() {
-    assert!(released_level_write_needs_readback(false, true));
+    assert_eq!(
+        released_level_write_fill(false, true),
+        ReleasedLevelFill::ReadBack
+    );
 }
 
+/// A partial write into a level the GPU never received starts from zero, not a released box.
 #[test]
-fn a_whole_write_or_a_never_uploaded_level_skips_the_readback() {
-    assert!(!released_level_write_needs_readback(true, true));
-    assert!(!released_level_write_needs_readback(true, false));
-    assert!(!released_level_write_needs_readback(false, false));
+fn a_partial_write_into_a_never_uploaded_released_level_starts_from_zero() {
+    assert_eq!(
+        released_level_write_fill(false, false),
+        ReleasedLevelFill::Zeroed
+    );
+}
+
+/// A whole-level write defines every byte, so it takes the pages as allocated.
+#[test]
+fn a_whole_level_write_takes_the_pages_as_allocated() {
+    for was_uploaded in [false, true] {
+        assert_eq!(
+            released_level_write_fill(true, was_uploaded),
+            ReleasedLevelFill::AsAllocated,
+            "was_uploaded {was_uploaded}"
+        );
+    }
 }
 
 // ── staging_droppable_class ──
