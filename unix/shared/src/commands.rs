@@ -587,7 +587,7 @@ impl Command {
 ///
 /// Kept as a separate enum (and struct) from `Command` / `CommandType`
 /// so the unix side can dispatch on the correct encoder without
-/// runtime probing.
+/// runtime probing. Value 4 is unassigned.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
 pub enum BlitCommandType {
@@ -608,19 +608,6 @@ pub enum BlitCommandType {
     /// `MTLBuffers`, `src_offset` / `dst_offset` = byte offsets,
     /// `byte_size` = number of bytes to copy. Region / mip fields unused.
     CopyBufferToBuffer = 3,
-    /// `[buffer didModifyRange:NSMakeRange(offset, length)]`
-    ///
-    /// Signals to Metal that the CPU has just written `length` bytes
-    /// at `offset` into a `MTLStorageModeManaged` buffer, so the
-    /// driver knows to copy those bytes from system memory to VRAM
-    /// before the next GPU read. No-op on `MTLStorageModeShared`
-    /// (UMA Macs). Not actually a render-encoder method — the unix
-    /// dispatcher calls it directly on the buffer outside the blit
-    /// encoder, but it rides the blit-command list so it ships in the
-    /// same `SubmitFrame` thunk and gets ordered against other
-    /// frame-leading ops. `src_handle` = `MTLBuffer`, `src_offset` =
-    /// offset, `byte_size` = length. All other fields unused.
-    NotifyBufferDidModifyRange = 4,
     /// `blit.generateMipmapsForTexture(tex)`
     ///
     /// Regenerate mip levels 1..N from level 0 on the shared
@@ -880,34 +867,6 @@ impl BlitCommand {
             region_h: 0,
             dst_offset: info.dst_offset,
             byte_size: info.byte_size,
-            depth: 0,
-            bytes_per_image: 0,
-            dst_mip_level: 0,
-            dst_slice: 0,
-            src_slice: 0,
-        }
-    }
-
-    /// `[buffer didModifyRange:NSMakeRange(offset, length)]`.
-    ///
-    /// Encoded into the blit-command stream so the unix dispatcher can call
-    /// it outside any encoder right before the blit + render passes that
-    /// will read the buffer. No-op on UMA Macs (`Shared` storage).
-    #[must_use]
-    pub const fn notify_buffer_did_modify_range(buffer: u64, offset: u64, length: u64) -> Self {
-        Self {
-            cmd: BlitCommandType::NotifyBufferDidModifyRange as u32,
-            mip_level: 0,
-            src_handle: buffer,
-            dst_handle: 0,
-            src_offset: offset,
-            bytes_per_row: 0,
-            origin_x: 0,
-            origin_y: 0,
-            region_w: 0,
-            region_h: 0,
-            dst_offset: 0,
-            byte_size: length,
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: 0,

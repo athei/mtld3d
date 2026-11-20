@@ -162,14 +162,7 @@ fn log_identity() {
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
     let arch = identity::ARCH;
-    // Rosetta is named where it runs; a native process, or one the kernel
-    // would not answer for (`translated` has logged why), says the arch alone.
-    let rosetta = if crate::translation::translated() == Some(true) {
-        ", under Rosetta 2"
-    } else {
-        ""
-    };
-    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized as {arch}{rosetta}");
+    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized as {arch}");
     let Some(image) = core_foundation_image() else {
         warn!(target: LOG_TARGET, "CoreFoundation image identity unavailable");
         return;
@@ -279,12 +272,11 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
     if let Some(caps) = metal::create_command_queue(gate, params.present_debug) {
         params.device_handle = caps.device_handle;
         params.record_handle = caps.record_handle;
-        params.unified_memory = u32::from(caps.unified_memory);
         params.min_linear_texture_align = caps.min_linear_texture_align;
         info!(
             target: LOG_TARGET,
-            "created Metal device + command queue (unified_memory={}, min_linear_texture_align={})",
-            caps.unified_memory, caps.min_linear_texture_align,
+            "created Metal device + command queue (min_linear_texture_align={})",
+            caps.min_linear_texture_align,
         );
         metal::log_metal_tools();
         STATUS_SUCCESS
@@ -495,9 +487,9 @@ pub fn process_footprint() -> u64 {
 /// `malloc_zone_statistics` with a null zone sums every registered zone, so
 /// this is the whole process's `malloc`: Wine's unix side, the system
 /// frameworks and the Objective-C and Metal objects they allocate for this
-/// layer. It takes each zone's lock in turn: 10 to 25 microseconds with about
-/// 100 MB in use on the `x86_64` Wine, about 160 microseconds on the first call,
-/// so it is read once per summary window.
+/// layer. It takes each zone's lock in turn: tens of microseconds with about
+/// 100 MB in use, longer on the first call, so it is read once per summary
+/// window.
 pub fn malloc_in_use() -> u64 {
     let mut stats = libc::malloc_statistics_t {
         blocks_in_use: 0,

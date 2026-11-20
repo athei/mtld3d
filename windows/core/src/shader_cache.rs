@@ -756,7 +756,7 @@ impl PipelineRecipe {
         self.vs.kind.is_vertex()
             && self.ps.kind.is_pixel()
             // An attachmentless sibling cannot serve a depth-only pass and
-            // fails pipeline validation on Mac2. Keep useful cache records
+            // can fail pipeline validation. Keep useful cache records
             // while dropping these unused recipes from older writers.
             && (self.snapshot.has_depth()
                 || self.snapshot.has_color_output()

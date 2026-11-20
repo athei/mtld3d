@@ -6932,8 +6932,7 @@ fn blit_effect_on(
             BlitCommandType::CopyBufferToTexture
             | BlitCommandType::CopyBufferToDepth
             | BlitCommandType::CopyBufferToStencil
-            | BlitCommandType::CopyBufferToBuffer
-            | BlitCommandType::NotifyBufferDidModifyRange,
+            | BlitCommandType::CopyBufferToBuffer,
         ) => BlitEffect::Neither,
         None => {
             let raw = target.texture.raw();
@@ -7068,9 +7067,8 @@ fn pass_attaches_color(
 
 /// The texture a blit writes, if it writes one.
 ///
-/// `NotifyBufferDidModifyRange` and `CopyBufferToBuffer` carry buffer
-/// handles in `src_handle`/`dst_handle`, never texture handles, so they
-/// write no texture. An unknown variant on the wire is conservatively
+/// `CopyBufferToBuffer` carries buffer handles in `src_handle`/`dst_handle`,
+/// never texture handles, so it writes no texture. An unknown variant on the wire is conservatively
 /// treated as texture-writing. The exhaustive match makes any new
 /// `BlitCommandType` a compile error here, forcing the author to classify it.
 const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
@@ -7084,9 +7082,7 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
             | BlitCommandType::GenerateMipmaps,
         )
         | None => true,
-        Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
-            false
-        }
+        Some(BlitCommandType::CopyBufferToBuffer) => false,
     };
     if !writes_texture || blit.dst_handle == 0 {
         return None;
@@ -7113,8 +7109,7 @@ const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureK
             BlitCommandType::CopyBufferToTexture
             | BlitCommandType::CopyBufferToDepth
             | BlitCommandType::CopyBufferToStencil
-            | BlitCommandType::CopyBufferToBuffer
-            | BlitCommandType::NotifyBufferDidModifyRange,
+            | BlitCommandType::CopyBufferToBuffer,
         )
         | None => 0,
     };

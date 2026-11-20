@@ -14,9 +14,9 @@ use super::{
 
 // ── Wire-layout guards ──
 //
-// Checked at compile time on EVERY target this crate is built for — the two
-// PE arches (i686 + x86_64 `*-pc-windows-msvc`) AND both unix `.so` arches
-// (x86_64 and aarch64 Apple, which share these `repr(C)` layouts). The
+// Checked at compile time on EVERY target this crate is built for: the PE
+// arches (i686, and the arm64ec and aarch64 halves of the ARM64X build) AND
+// the aarch64 Apple unix `.so`, which share these `repr(C)` layouts. The
 // whole PE↔unix thunk protocol assumes a `repr(C)` `u64` is 8-byte aligned on
 // all of them; if a 32-bit target ever aligned `u64` to 4, every struct with a
 // `u64` after an odd run of 4-byte fields would shift and the unix handler
@@ -179,28 +179,19 @@ pub struct CreateCommandQueueParams {
     /// device with it on every later thunk. `DestroyCommandQueue` returns it
     /// and frees the record.
     pub record_handle: DeviceRecordHandle, // out
-    /// 0 / non-zero boolean: `MTLDevice.hasUnifiedMemory`.
-    ///
-    /// False on Intel/AMD non-UMA Macs; the storage-mode policy in
-    /// `mtld3d-core::storage_policy` switches CPU-visible buffers to
-    /// `Managed` and the encoder enqueues `didModifyRange:` calls when
-    /// this is 0. (Textures are always `Private`.) The PE side may
-    /// force the non-UMA answer through `intel.managedMemory`.
-    pub unified_memory: u32, // out
     /// `device.minimumLinearTextureAlignmentForPixelFormat(BGRA8Unorm)`.
     ///
-    /// 16 on Apple Silicon, 256 on AMD/Intel (Mac2). Threaded into
-    /// `pad_source_stride` so blit-staging `bytes_per_row` rounds to this
-    /// floor. The PE side may raise it to the Mac2 value through
-    /// `intel.linearAlign256`.
+    /// Threaded into `pad_source_stride` so blit-staging `bytes_per_row`
+    /// rounds to this floor.
     pub min_linear_texture_align: u32, // out
+    pub pad0: u32,
     /// `debug.presentGateFile` as a unix path, `0` = no gate.
     ///
     /// While the named file exists, the queue's presenter parks before
     /// acquiring a drawable. The bytes are valid for the call; the unix
     /// side copies them into the presenter state it creates for this queue.
     pub gate_file_ptr: u64, // in: *const u8
-    pub gate_file_len: u32,                        // in: byte count
+    pub gate_file_len: u32, // in: byte count
     /// The queue's presenter switches, `debug.presentOccluded` among them.
     pub present_debug: PresentDebugFlags, // in
 }

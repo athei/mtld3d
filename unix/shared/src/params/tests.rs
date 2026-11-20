@@ -89,9 +89,8 @@ fn present_sync_param_layouts_match_wow64() {
 #[test]
 fn create_command_queue_layout_matches_wow64() {
     use super::CreateCommandQueueParams;
-    // 8 device_handle + 8 record_handle + 4 unified_memory
-    // + 4 min_linear_texture_align + 8 gate_file_ptr + 4 gate_file_len
-    // + 4 present_debug = 40
+    // 8 device_handle + 8 record_handle + 4 min_linear_texture_align
+    // + 4 pad0 + 8 gate_file_ptr + 4 gate_file_len + 4 present_debug = 40
     assert_eq!(core::mem::align_of::<CreateCommandQueueParams>(), 8);
     assert_eq!(core::mem::size_of::<CreateCommandQueueParams>(), 40);
     assert_eq!(

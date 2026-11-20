@@ -22,10 +22,6 @@ fn resolved_configuration_preserves_nondefaults() {
     value.caps_all = !value.caps_all;
     value.main_thread_checker = !value.main_thread_checker;
     value.fail_next_submit = !value.fail_next_submit;
-    value.expand_packed16 = !value.expand_packed16;
-    value.deny_float32_filtering = !value.deny_float32_filtering;
-    value.managed_memory = !value.managed_memory;
-    value.linear_align256 = !value.linear_align256;
     value.hdr_enable = !value.hdr_enable;
     value.color_space = ColorSpacePolicy::Accurate;
     value.cursor_scale = CursorScale::Fixed(7);
@@ -58,12 +54,10 @@ fn resolved_configuration_preserves_nondefaults() {
 #[test]
 fn gpu_caps_preserve_native_overrides() {
     let value = GpuCaps {
-        unified_memory: false,
         min_linear_texture_align: 256,
         device_caps: DeviceCapsFlags::RESOLVE_NEEDS_RETIRE,
     };
     let decoded = round_trip(&value);
-    assert_eq!(decoded.unified_memory, value.unified_memory);
     assert_eq!(
         decoded.min_linear_texture_align,
         value.min_linear_texture_align

@@ -102,9 +102,9 @@ use objc2_foundation::{
     NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSNull, NSString,
 };
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSize,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice, MTLOrigin,
+    MTLPixelFormat, MTLRegion, MTLResource, MTLSize, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::{CAAction, CALayer, CAMetalLayer};
 
@@ -113,7 +113,7 @@ use super::{
     attachment::{self, Attachment},
     run_on_main_thread_async,
 };
-use crate::metal::{command, device::cpu_written_texture_storage, present, texture};
+use crate::metal::{command, present, texture};
 
 /// Log sub-target of the software cursor.
 ///
@@ -1124,7 +1124,7 @@ impl Overlay {
         // SAFETY: validated sprite dimensions on a fresh offscreen descriptor.
         unsafe { descriptor.setHeight(sprite.height as usize) };
         descriptor.setUsage(MTLTextureUsage::RenderTarget);
-        descriptor.setStorageMode(cpu_written_texture_storage(&device));
+        descriptor.setStorageMode(MTLStorageMode::Shared);
         // On the main thread: a refused create there waits for up to a quarter
         // of a second, on the paravirtual device alone
         // (`texture::retry_refused_create`).
@@ -1168,14 +1168,6 @@ impl Overlay {
         {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite encoder allocation failed");
             return None;
-        }
-        if output.storageMode() == MTLStorageMode::Managed {
-            let Some(blit) = command.blitCommandEncoder() else {
-                mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: managed image sync allocation failed");
-                return None;
-            };
-            blit.synchronizeResource(ProtocolObject::from_ref(&*output));
-            blit.endEncoding();
         }
         Some(CursorDraw {
             command,
@@ -1520,7 +1512,7 @@ fn upload_sprite_texture(
     // SAFETY: plain property setter on a fresh descriptor.
     unsafe { desc.setHeight(sprite.height as usize) };
     desc.setUsage(MTLTextureUsage::ShaderRead);
-    desc.setStorageMode(cpu_written_texture_storage(device));
+    desc.setStorageMode(MTLStorageMode::Shared);
     // On the main thread: a refused create there waits for up to a quarter of
     // a second, on the paravirtual device alone (`texture::retry_refused_create`).
     let Some(texture) = texture::new_texture(device, &desc, "mtld3d-cursor-sprite") else {

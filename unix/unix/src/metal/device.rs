@@ -12,7 +12,7 @@ use mtld3d_shared::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLPixelFormat, MTLStorageMode,
+    MTLPixelFormat,
 };
 
 use super::{
@@ -54,29 +54,8 @@ static PINNED_DEVICE: LazyLock<MetalHandle<MTLDeviceKind>> = LazyLock::new(|| {
 });
 
 /// The process's Metal device, with one retain for the caller.
-///
-/// Warns once when the system default device is no longer the pinned one,
-/// which automatic graphics switching on a dual-GPU Mac can arrange between
-/// two D3D device creations. The pinned device is kept in that case, so every
-/// object in the process-wide caches keeps belonging to the device the next
-/// command buffer encodes against.
 fn pinned_device() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
-    let device = PINNED_DEVICE.into_retained()?;
-    if let Some(current) = MTLCreateSystemDefaultDevice()
-        && current.registryID() != device.registryID()
-    {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "the system default Metal device is now {} (registry id {}), not the pinned {} \
-             (registry id {}); the pinned device is kept, since the process-wide pipeline, \
-             texture and buffer caches were built on it",
-            current.name(),
-            current.registryID(),
-            device.name(),
-            device.registryID(),
-        );
-    }
-    Some(device)
+    PINNED_DEVICE.into_retained()
 }
 
 /// Returns (`device_name`, `registry_id`, capability bits) from the process's Metal device.
@@ -89,14 +68,7 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
         DeviceCapsFlags::SAMPLER_BORDER,
         supports_sampler_border(&device),
     );
-    caps.set(
-        DeviceCapsFlags::NATIVE_PACKED16,
-        supports_native_packed16(&device),
-    );
-    caps.set(
-        DeviceCapsFlags::FLOAT32_FILTERING,
-        supports_float32_filtering(&device),
-    );
+    caps.set(DeviceCapsFlags::APPLE_GPU, is_apple_family(&device));
     caps.set(
         DeviceCapsFlags::SAMPLE_COUNT_2,
         device.supportsTextureSampleCount(2),
@@ -143,9 +115,8 @@ pub fn supports_sampler_mirror_clamp(device: &ProtocolObject<dyn MTLDevice>) -> 
 
 /// True when the Metal device is the paravirtualized one a CI runner exposes.
 ///
-/// It answers `supportsFamily:` like the Mac2 device it stands in for while
-/// implementing less than one, so a feature it is known to reject is gated on
-/// its name instead.
+/// It claims the Mac2 family while implementing less than it, so a feature it
+/// is known to reject is gated on its name instead.
 fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     is_paravirtual_name(&device.name().to_string())
 }
@@ -175,73 +146,31 @@ fn resolve_needs_retire(device: &ProtocolObject<dyn MTLDevice>) -> bool {
 /// textures, with its kernel logging the new object's id as one that already
 /// exists; requests on other threads succeed within the same second, so the
 /// refusal is not a lasting state of the device. Metal offers no query for
-/// the fault, so the device's name is the whole predicate. The name also
-/// matches the Apple-silicon virtual device of a VM, which has not shown the
-/// fault and gains only the retry's bounded wait on a create it refuses.
+/// the fault, so the device's name is the whole predicate. A device of that
+/// name that never shows the fault gains only the retry's bounded wait on a
+/// create it refuses.
 pub fn refuses_creates_transiently(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     is_paravirtual(device)
 }
 
 /// True when the device belongs to Metal's Apple GPU family.
 ///
-/// The Apple family is what an Apple Silicon Mac's GPU claims; an Intel or
-/// AMD GPU claims Mac2 only, and the paravirtualized device a CI runner
-/// exposes claims nothing. Two texture rules branch on it: which pixel
-/// formats exist natively, and whether a view that changes only transfer
-/// function or swizzle needs the `PixelFormatView` usage on its base texture.
+/// The Apple family is what an Apple Silicon Mac's GPU claims, and the
+/// virtual GPU of a macOS VM on Apple Silicon claims it too; an Intel or AMD
+/// GPU claims Mac2 only. The PE side refuses to create a device without it.
 pub fn is_apple_family(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.supportsFamily(MTLGPUFamily::Apple2)
 }
 
-/// True when the packed 16-bit pixel formats exist natively on this device.
-///
-/// `B5G6R5Unorm` / `Bgr5A1Unorm` / `Abgr4Unorm` are listed Apple-family-only
-/// in Metal's pixel-format capability table; the Mac2 Bronze driver
-/// (Intel/AMD) raises a validation abort when a texture descriptor names one.
-/// When false, the PE side backs the corresponding D3D formats with
-/// `Bgra8Unorm` and widens their texels in the GPU upload pass.
-pub fn supports_native_packed16(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    is_apple_family(device)
-}
-
-/// Storage mode for a texture the CPU writes with `replaceRegion:`.
-///
-/// `Shared` where the CPU and GPU share memory; a device without unified
-/// memory rejects `Shared` textures outright, and `Managed` is the mode that
-/// keeps a CPU-writable copy there. `replaceRegion:` carries the write across
-/// on its own for a `Managed` texture, so the caller needs nothing further.
-pub fn cpu_written_texture_storage(device: &ProtocolObject<dyn MTLDevice>) -> MTLStorageMode {
-    if device.hasUnifiedMemory() {
-        MTLStorageMode::Shared
-    } else {
-        MTLStorageMode::Managed
-    }
-}
-
-/// True when single-precision float textures sample with linear filtering.
-///
-/// The query covers exactly `R32Float` / `RG32Float` / `RGBA32Float`; the
-/// half-float formats are filterable on every family Metal's pixel-format
-/// capability table lists for macOS, so they need no query. The PE side
-/// answers `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)` for R32F / G32R32F /
-/// A32B32G32R32F with this bit.
-pub fn supports_float32_filtering(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    device.supports32BitFloatFiltering()
-}
-
 /// Snapshot of the Metal device values the PE side needs.
 ///
-/// Used to pick storage modes, alignment, and `didModifyRange:` policy.
-/// Captured once at device creation, never re-queried.
+/// Used to pick the staging alignment. Captured once at device creation,
+/// never re-queried.
 pub struct DeviceCaps {
     pub device_handle: MetalHandle<MTLDeviceKind>,
     /// The device's record, which owns the queue and its presentation state.
     pub record_handle: DeviceRecordHandle,
-    /// `MTLDevice.hasUnifiedMemory`. False on Intel/AMD discrete GPUs.
-    pub unified_memory: bool,
     /// `device.minimumLinearTextureAlignmentForPixelFormat(BGRA8Unorm)`, in bytes.
-    ///
-    /// 16 on Apple Silicon, 256 on Mac2 (AMD/Intel).
     pub min_linear_texture_align: u32,
 }
 
@@ -268,7 +197,6 @@ pub fn create_command_queue(
     if !super::presenter::spawn(&record) {
         return None;
     }
-    let unified_memory = device.hasUnifiedMemory();
     let min_linear_texture_align = u32::try_from(
         device.minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::BGRA8Unorm),
     )
@@ -286,7 +214,6 @@ pub fn create_command_queue(
     Some(DeviceCaps {
         device_handle,
         record_handle: record.into_handle(),
-        unified_memory,
         min_linear_texture_align,
     })
 }

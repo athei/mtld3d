@@ -271,7 +271,7 @@ fn read_first_pixel(
     } else {
         texture
     };
-    // A 256-byte row accommodates both Apple and Intel texture-copy alignment.
+    // A 256-byte row is past any texture-copy alignment.
     let buffer = device
         .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
         .expect("readback buffer");
@@ -382,7 +382,7 @@ fn render_target_views_preserve_usage_shape_and_role_swizzles() {
             assert_eq!(base.textureType(), sample.textureType());
             assert_eq!(base.swizzle(), super::IDENTITY_SWIZZLE);
             assert_eq!(sample.swizzle().alpha, objc2_metal::MTLTextureSwizzle::One);
-            assert_eq!(base.usage(), super::texture_usage(&device, true, true));
+            assert_eq!(base.usage(), super::texture_usage(true));
             if format.srgb_twin().is_some() {
                 assert_eq!(views.owned_handles().count(), 4);
                 let srgb = views.srgb.into_retained().expect("sRGB attachment");

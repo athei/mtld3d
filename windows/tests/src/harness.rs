@@ -278,7 +278,7 @@ pub struct HarnessConfig {
     /// `MTLD3D_CONFIG` for the one `Direct3DCreate9` this harness makes and
     /// taken out of the environment again before the call returns. The
     /// parser keeps the last entry for a key, so these win over a
-    /// `make test SCALE=<n>` or `INTEL=1` run. Empty (the default) means
+    /// `make test SCALE=<n>` run. Empty (the default) means
     /// the suite-wide configuration.
     pub config_entries: &'static str,
     /// `D3DPRESENT_PARAMETERS.Windowed`, in its wire encoding (1 = windowed).
@@ -3618,8 +3618,8 @@ impl Harness {
 
     /// Whether the device is the paravirtualized one a hosted runner exposes.
     ///
-    /// That device claims no GPU family and implements less than the Mac2
-    /// family it stands in for. Measured, not assumed, by the workflow's
+    /// That device implements less than the GPU families it claims. Measured,
+    /// not assumed, by the workflow's
     /// probe job: it hands back a texture view with a channel swizzle and
     /// then samples the view through the base texture's lanes, where every
     /// real GPU family applies the swizzle; and a later encoder of the same

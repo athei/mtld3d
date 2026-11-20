@@ -511,8 +511,7 @@ fn mip_chain_levels_and_dimensions() {
 fn low_mips_below_the_linear_alignment_sample_their_own_texels() {
     // 8x8 A8R8G8B8, full chain: 8, 4, 2 and 1 texels wide, so row pitches of
     // 32, 16, 8 and 4 bytes. The bottom two are below the 16-byte linear
-    // texture alignment a blit source must meet on Apple Silicon (every mip
-    // below 64 texels wide is, on the 256-byte Mac2 floor), which routes
+    // texture alignment a blit source must meet on Apple Silicon, which routes
     // their uploads through the GPU upload pass instead. Each level must
     // still carry exactly the texels written into it.
     let h = Harness::new();
@@ -4756,10 +4755,7 @@ fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
 fn volume_update_keeps_per_draw_content() {
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
-    let harnesses = [
-        Harness::new(),
-        Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true"),
-    ];
+    let harnesses = [Harness::new()];
     for h in &harnesses {
         let (hr, source) =
             h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
@@ -4886,10 +4882,7 @@ fn volume_lock_box_no_dirty_update_adds_no_dirty_region() {
 fn volume_whole_level_write_after_its_upload_keeps_per_draw_content() {
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
-    let harnesses = [
-        Harness::new(),
-        Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true"),
-    ];
+    let harnesses = [Harness::new()];
     for h in &harnesses {
         for lock_box in [false, true] {
             let (hr, source) =
@@ -4968,10 +4961,7 @@ fn check_volume_partial_update() {
         [0xFFFF_FFFF, 0xFF80_8080, 0, 0],
         [0xFFFF_8000, 0, 0, 0],
     ];
-    let harnesses = [
-        Harness::new(),
-        Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true"),
-    ];
+    let harnesses = [Harness::new()];
     for h in &harnesses {
         let (hr, texture) =
             h.try_create_volume_texture([4, 4, 4], 3, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
@@ -5238,48 +5228,6 @@ fn volume_staging_regular_partial_updates() {
 #[test]
 fn volume_staging_regular_cold_partial_updates() {
     let h = Harness::new();
-    check_volume_staging_partial_updates(&h, false, true);
-}
-
-/// Queued volume uploads retain the bytes each draw sampled.
-#[test]
-fn volume_staging_forced_updates() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
-    check_volume_staging_updates(&h, 4, D3DFMT_A8R8G8B8);
-}
-
-/// Converted volume uploads retain each queued version.
-#[test]
-fn volume_staging_forced_converted_updates() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
-    check_volume_staging_updates(&h, 4, D3DFMT_X8R8G8B8);
-}
-
-/// A single-slice volume retains each queued staging version.
-#[test]
-fn volume_staging_forced_single_slice_updates() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
-    check_volume_staging_updates(&h, 1, D3DFMT_A8R8G8B8);
-}
-
-/// A cold partial volume write preserves the first queued upload.
-#[test]
-fn volume_staging_forced_cold_partial_update() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
-    check_volume_staging_partial_updates(&h, false, false);
-}
-
-/// Repeated partial volume writes preserve draw versions and untouched mips.
-#[test]
-fn volume_staging_forced_partial_updates() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
-    check_volume_staging_partial_updates(&h, true, true);
-}
-
-/// Repeated cold volume writes retain every queued snapshot.
-#[test]
-fn volume_staging_forced_cold_partial_updates() {
-    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
     check_volume_staging_partial_updates(&h, false, true);
 }
 

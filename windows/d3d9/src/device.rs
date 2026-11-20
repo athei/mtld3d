@@ -96,10 +96,9 @@ use mtld3d_types::{
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND,
     D3DRTYPE_CUBETEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE,
-    D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET,
-    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid,
-    IDirect3DDevice9ExVtbl, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
-    render_state_defaults,
+    D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
+    D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9ExVtbl,
+    IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -1359,21 +1358,6 @@ impl DeviceInner {
         self.vertex_textures[slot].raw()
     }
 
-    /// Whether this device samples `texture` unfiltered whatever its stage's filters say.
-    ///
-    /// Only the single-precision float formats qualify, and only on a device
-    /// without 32-bit float filtering, which answers `D3DUSAGE_QUERY_FILTER`
-    /// with no for them. The format test runs first, so the device's answer is
-    /// read only for those three formats.
-    fn samples_unfiltered(&self, texture: &crate::texture::Direct3DTexture9) -> bool {
-        !mtld3d_core::format::supports_usage_query(
-            texture.d3d_format(),
-            D3DUSAGE_QUERY_FILTER,
-            false,
-            true,
-        ) && !crate::direct3d9::float32_filtering_supported(self.config().deny_float32_filtering)
-    }
-
     /// Store one vertex-slot sampler state and mirror the row to the encoder.
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
@@ -1382,22 +1366,14 @@ impl DeviceInner {
 
     /// Mirror vertex sampler `slot`'s whole state row to the encoder.
     ///
-    /// The row carries the filters the bound texture can take: a texture this
-    /// device cannot filter is point-sampled, so the row is pushed again when
-    /// a bind starts or ends that. It also carries the bound texture's
-    /// `SetLOD`, the level a vertex `texldl` counts from, so a bind that
-    /// changes it and a `SetLOD` on the bound texture push it again too.
+    /// The row carries the bound texture's `SetLOD`, the level a vertex
+    /// `texldl` counts from, so a bind that changes it and a `SetLOD` on the
+    /// bound texture push it again.
     fn push_vertex_sampler_row(&mut self, slot: usize) {
         let mut state = self.vertex_sampler_states[slot];
         // The spare slot 0 may hold a game's write of state 0; the copy
         // carries the texture LOD there instead.
         state[TEXTURE_LOD_SLOT] = self.vertex_texture_lod(slot);
-        if self.vertex_textures[slot]
-            .as_ref()
-            .is_some_and(|texture| self.samples_unfiltered(texture))
-        {
-            mtld3d_core::sampler_state::sample_unfiltered(&mut state);
-        }
         self.push_control(crate::device::SetVertexSamplerOp {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             state,
@@ -1415,9 +1391,6 @@ impl DeviceInner {
         slot: usize,
         tex: *mut crate::texture::Direct3DTexture9,
     ) {
-        let was_unfiltered = self.vertex_textures[slot]
-            .as_ref()
-            .is_some_and(|texture| self.samples_unfiltered(texture));
         let was_lod = self.vertex_texture_lod(slot);
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
@@ -1458,10 +1431,7 @@ impl DeviceInner {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             id,
         });
-        let unfiltered = self.vertex_textures[slot]
-            .as_ref()
-            .is_some_and(|texture| self.samples_unfiltered(texture));
-        if was_unfiltered || unfiltered || was_lod != self.vertex_texture_lod(slot) {
+        if was_lod != self.vertex_texture_lod(slot) {
             self.push_vertex_sampler_row(slot);
         }
     }
@@ -5214,7 +5184,6 @@ extern "system" fn device_create_additional_swap_chain(
             usage: D3DUSAGE_RENDERTARGET,
             multi_sample,
         },
-        dev.config().expand_packed16,
     ) else {
         warn!(
             target: LOG_TARGET,
@@ -6715,9 +6684,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    let expand_packed16 = obj.inner().config().expand_packed16;
     let Some((fmt, planar_layout)) =
-        resolve_texture_storage(format, (width, height), offscreen_plain, expand_packed16)
+        resolve_texture_storage(format, (width, height), offscreen_plain)
     else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -6734,16 +6702,14 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // A create's usage has to agree with the answer `CheckDeviceFormat` gives
     // for the same format, so a format that is not colour-renderable cannot
     // carry D3DUSAGE_RENDERTARGET; this rejects the caller that skipped the
-    // probe. Two groups fail it: the sampling-only formats, block-compressed
-    // ones included, which no D3D9 device rendered into, and the packed 16-bit
-    // members on a device that expansion-backs them, where rendering into the
-    // BGRA8 backing would break Lock/readback fidelity. Neither can be passed
+    // probe. The sampling-only formats fail it, block-compressed ones
+    // included, which no D3D9 device rendered into. They cannot be passed
     // through, because Metal's render-pipeline validation refuses a
     // non-renderable colour attachment with an abort rather than a returned
     // error: a lenient create costs the process at the first draw into the
     // texture instead of costing the application one handled failure here.
     if usage_rt
-        && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16)
+        && !mtld3d_core::format::is_render_target_format(format)
         && !mtld3d_core::format::is_null_render_target(format)
     {
         mtld3d_shared::log_once_warn_by!(
@@ -6832,8 +6798,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // first exposure, so a lock or an upload reads zero where the game
     // wrote nothing. A level no upload reaches samples whatever the device
     // gave the `MTLTexture`.
-    // Page alignment satisfies `newBufferWithBytesNoCopy:`'s contract
-    // on non-UMA Macs (Intel/AMD). Each level pops a parked box of its
+    // Page alignment satisfies `newBufferWithBytesNoCopy:`'s contract.
+    // Each level pops a parked box of its
     // padded size from the page-box pool before it falls back to the
     // allocator; the device counts both outcomes once per create.
     let mut staging: Vec<PageBox> = Vec::with_capacity(actual_levels as usize);
@@ -6955,8 +6921,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
 
 /// Storage a 2D colour create uses: the Metal mapping, plus the planar layout if it has one.
 ///
-/// Every format but the planar YUV pair answers from the device-aware format
-/// lookup. `YV12` and `NV12` are absent from that lookup on purpose, because a
+/// Every format but the planar YUV pair answers from the format lookup.
+/// `YV12` and `NV12` are absent from that lookup on purpose, because a
 /// planar level is taller than its logical height and no generic consumer of a
 /// mapping sizes for that. They are accepted here for the one create that
 /// sizes the level from the planar layout, the default-pool offscreen plain,
@@ -6966,7 +6932,6 @@ fn resolve_texture_storage(
     format: u32,
     (width, height): (u32, u32),
     offscreen_plain: bool,
-    expand_packed16: bool,
 ) -> Option<(
     FormatMapping,
     Option<mtld3d_core::planar_yuv::PlanarYuvLayout>,
@@ -6977,7 +6942,7 @@ fn resolve_texture_storage(
         return Some((mtld3d_core::format::null_texture_storage_mapping(), None));
     }
     if !mtld3d_core::stretch_rect::is_planar_yuv(format) {
-        let mapping = crate::direct3d9::map_for_device(format, expand_packed16);
+        let mapping = mtld3d_core::format::map_d3d_format(format);
         if mapping.is_none() {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "reject CreateTexture(format={format}) → INVALIDCALL (no format mapping)");
@@ -7292,12 +7257,11 @@ extern "system" fn device_create_volume_texture(
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+    if unsafe { InPtr::<Direct3DDevice9>::opt(this) }.is_none() {
         null_out(texture);
         return D3DERR_INVALIDCALL;
-    };
-    let Some(fmt) = crate::direct3d9::map_for_device(format, obj.inner().config().expand_packed16)
-    else {
+    }
+    let Some(fmt) = mtld3d_core::format::map_d3d_format(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateVolumeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -7508,12 +7472,11 @@ extern "system" fn device_create_cube_texture(
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+    if unsafe { InPtr::<Direct3DDevice9>::opt(this) }.is_none() {
         null_out(texture);
         return D3DERR_INVALIDCALL;
-    };
-    let expand_packed16 = obj.inner().config().expand_packed16;
-    let Some(fmt) = crate::direct3d9::map_for_device(format, expand_packed16) else {
+    }
+    let Some(fmt) = mtld3d_core::format::map_d3d_format(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateCubeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -7536,12 +7499,10 @@ extern "system" fn device_create_cube_texture(
     }
     // ATI1 and packed YUV retain only their CPU SCRATCH resource form. Depth
     // formats remain unsupported, and render-target cubes require a Metal
-    // renderable color format on THIS device (the packed 16-bit members drop
-    // out where they are expansion-backed).
+    // renderable color format.
     if (matches!(format, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY) && pool != D3DPOOL_SCRATCH)
         || is_depth_fmt
-        || (usage_rt
-            && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16))
+        || (usage_rt && !mtld3d_core::format::is_render_target_format(format))
     {
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -7912,9 +7873,8 @@ fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
     spec: &ColorTargetSpec,
-    expand_packed16: bool,
 ) -> Option<*mut Direct3DSurface9> {
-    let target = allocate_color_target(device_handle, device_inner, spec, expand_packed16)?;
+    let target = allocate_color_target(device_handle, device_inner, spec)?;
     let surf_ptr = Box::into_raw(Box::new(Direct3DSurface9::new_color_target(&target)));
     // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
     // surface at refcount 1.
@@ -7930,7 +7890,6 @@ fn allocate_color_target(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
     spec: &ColorTargetSpec,
-    expand_packed16: bool,
 ) -> Option<ColorTargetCreateInfo> {
     let &ColorTargetSpec {
         width,
@@ -7939,7 +7898,7 @@ fn allocate_color_target(
         usage,
         multi_sample,
     } = spec;
-    let mapping = crate::direct3d9::map_for_device(format, expand_packed16)?;
+    let mapping = mtld3d_core::format::map_d3d_format(format)?;
     if mapping.is_compressed() {
         return None;
     }
@@ -7947,26 +7906,22 @@ fn allocate_color_target(
     // for the same format, and the two usages this fn serves ask different
     // questions of it.
     //
-    // With `D3DUSAGE_RENDERTARGET` the question is the device predicate every
-    // other render-target create gate uses. Two groups fail it: the
-    // sampling-only formats, block-compressed ones included, which no D3D9
-    // device rendered into, and the packed 16-bit members on a device that
-    // expansion-backs them, where rendering into the BGRA8 backing would break
-    // Lock/readback fidelity. Neither can be passed through, because Metal
-    // refuses a colour attachment it cannot render into with an abort rather
-    // than a returned error, and this create is the last point that can answer
-    // the application with a D3D9 error instead. Nothing between here and the
+    // With `D3DUSAGE_RENDERTARGET` the question is the predicate every other
+    // render-target create gate uses. The sampling-only formats fail it,
+    // block-compressed ones included, which no D3D9 device rendered into.
+    // They cannot be passed through, because Metal refuses a colour
+    // attachment it cannot render into with an abort rather than a returned
+    // error, and this create is the last point that can answer the
+    // application with a D3D9 error instead. Nothing between here and the
     // draw catches it: `A8` (Metal's `A8Unorm`, which the format tables list as
     // sampleable only) would otherwise build a render-target surface.
     //
     // Without the usage the surface is only locked, sampled and blitted, so the
     // narrower question stands: a format whose texels are widened on the way
     // into a BGRA8 backing would pair a narrower CPU staging with a 32-bit
-    // texture through the upload and readback blits. That is the packed 16-bit
-    // family on a device without the native formats, and R8G8B8 on every
-    // device.
+    // texture through the upload and readback blits. That is R8G8B8.
     if usage & D3DUSAGE_RENDERTARGET != 0 {
-        if !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16) {
+        if !mtld3d_core::format::is_render_target_format(format) {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: u64::from(format),
@@ -8234,7 +8189,6 @@ extern "system" fn device_create_render_target(
             usage: D3DUSAGE_RENDERTARGET,
             multi_sample,
         },
-        obj.inner().config().expand_packed16,
     ) else {
         warn!(
             target: LOG_TARGET,
@@ -8751,11 +8705,9 @@ fn update_surface_into_color_target(
     // The rows go to the Metal texture as they are, so the destination's
     // storage has to be its D3D format's own layout, which every format a
     // render target or back buffer is created in has.
-    let Some(dst_mapping) =
-        crate::direct3d9::map_for_device(dst_format, dev.config().expand_packed16).filter(|m| {
-            !mtld3d_core::upload_pass::is_expanded_upload(dst_format, m.metal_pixel_format())
-        })
-    else {
+    let Some(dst_mapping) = mtld3d_core::format::map_d3d_format(dst_format).filter(|m| {
+        !mtld3d_core::upload_pass::is_expanded_upload(dst_format, m.metal_pixel_format())
+    }) else {
         return reject(
             6,
             "the destination format has no storage that takes its rows",
@@ -9614,16 +9566,13 @@ extern "system" fn device_stretch_rect(
         return D3DERR_INVALIDCALL;
     }
 
-    let expand_packed16 = dev.config().expand_packed16;
     // The planar YUV formats have no entry in the format lookup, so the
     // generic format gate would refuse them as unmappable. A pair with a
     // planar endpoint is judged by its own route below, once the rects say
     // whether the copy scales.
     let planar_endpoint = mtld3d_core::stretch_rect::is_planar_yuv(src_info.format)
         || mtld3d_core::stretch_rect::is_planar_yuv(dst_info.format);
-    if !planar_endpoint
-        && let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info, expand_packed16)
-    {
+    if !planar_endpoint && let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info) {
         return hr;
     }
     let Some((src_region, dst_region)) =
@@ -9716,7 +9665,7 @@ extern "system" fn device_stretch_rect(
     // A planar source always converts: its R8 storage holds YUV planes, not
     // the pixels of any colour format, so it never takes the 1:1 blit. It is
     // answered ahead of the lookup, which has no entry for it.
-    let cross_format = planar_endpoint || !copies_bytes(&src_info, &dst_info, expand_packed16);
+    let cross_format = planar_endpoint || !copies_bytes(&src_info, &dst_info);
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
@@ -9994,19 +9943,17 @@ fn flush_dirty_mips_for_gpu_write(
 ///
 /// Compares the *Metal* pixel formats, not the D3D codes: distinct D3D
 /// formats can share a single Metal format (e.g. A8R8G8B8 + X8R8G8B8 are both
-/// `Bgra8Unorm`, and on a device without the packed 16-bit formats A1R5G5B5
-/// and A4R4G4B4 are too). A shared storage does not make every pair a byte
-/// copy, though. A source without alpha into a destination with alpha would
-/// hand the source's padding to the destination as alpha where D3D9 writes
-/// alpha one (`exposes_padding_as_alpha`, judged on the mappings this device
-/// created), so that pair converts; the other direction stays a byte copy,
-/// since every reader of a destination without alpha ignores the alpha it
-/// carries. A packed YUV endpoint lays its bytes out in an order no other
-/// format shares (`reinterprets_packed_yuv`), so such a pair converts or is
-/// refused like a pair of two storages.
-fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packed16: bool) -> bool {
-    let src_map = crate::direct3d9::map_for_device(src.format, expand_packed16);
-    let dst_map = crate::direct3d9::map_for_device(dst.format, expand_packed16);
+/// `Bgra8Unorm`). A shared storage does not make every pair a byte copy,
+/// though. A source without alpha into a destination with alpha would hand
+/// the source's padding to the destination as alpha where D3D9 writes alpha
+/// one (`exposes_padding_as_alpha`), so that pair converts; the other
+/// direction stays a byte copy, since every reader of a destination without
+/// alpha ignores the alpha it carries. A packed YUV endpoint lays its bytes
+/// out in an order no other format shares (`reinterprets_packed_yuv`), so
+/// such a pair converts or is refused like a pair of two storages.
+fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo) -> bool {
+    let src_map = mtld3d_core::format::map_d3d_format(src.format);
+    let dst_map = mtld3d_core::format::map_d3d_format(dst.format);
     let exposes_padding = matches!(
         (&src_map, &dst_map),
         (Some(s), Some(d)) if mtld3d_core::stretch_rect::exposes_padding_as_alpha(s, d)
@@ -10020,14 +9967,9 @@ fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packe
 fn check_stretch_rect_formats(
     src: &StretchSurfaceInfo,
     dst: &StretchSurfaceInfo,
-    expand_packed16: bool,
 ) -> Result<(), i32> {
-    // Device-aware mapping, so the comparison sees the Metal formats the
-    // textures were actually created with on this device.
-    let src_mtl = crate::direct3d9::map_for_device(src.format, expand_packed16)
-        .map(|m| m.metal_pixel_format());
-    let dst_mtl = crate::direct3d9::map_for_device(dst.format, expand_packed16)
-        .map(|m| m.metal_pixel_format());
+    let src_mtl = mtld3d_core::format::map_d3d_format(src.format).map(|m| m.metal_pixel_format());
+    let dst_mtl = mtld3d_core::format::map_d3d_format(dst.format).map(|m| m.metal_pixel_format());
     // A pair `copies_bytes` accepts takes the 1:1 copy path. Any other pair
     // converts either via the render-quad path (sample src → write the dst
     // render target — needs a render-target destination) or, into an
@@ -10037,7 +9979,7 @@ fn check_stretch_rect_formats(
     // endpoint schedules an upload. Unmappable formats are always rejected.
     let convertible = src_mtl.is_some()
         && dst_mtl.is_some()
-        && (copies_bytes(src, dst, expand_packed16)
+        && (copies_bytes(src, dst)
             || dst.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET)
             || (dst
                 .flags
@@ -10296,10 +10238,10 @@ fn color_fill_render_target(
     region: DirtyRect,
     color: u32,
 ) -> i32 {
-    // Device-aware: the clear-quad pipeline's colour format must match the
-    // attachment as it was created here (BGRA8 for an expanded 16-bit target).
-    let Some(format) = crate::direct3d9::map_for_device(info.format, dev.config().expand_packed16)
-        .map(|m| m.metal_pixel_format())
+    // The clear-quad pipeline's colour format must match the attachment as it
+    // was created.
+    let Some(format) =
+        mtld3d_core::format::map_d3d_format(info.format).map(|m| m.metal_pixel_format())
     else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "ColorFill: render-target format {} unmapped → INVALIDCALL", info.format);
@@ -12360,36 +12302,10 @@ extern "system" fn device_set_sampler_state(
 /// every stage's filter setup runs, which is the only case that reports a
 /// pass count.
 fn rejected_filter_stage(dev: &DeviceInner) -> Option<i32> {
-    let float32_filtering =
-        crate::direct3d9::float32_filtering_supported(dev.config().deny_float32_filtering);
-    let native_packed16 = crate::direct3d9::native_packed16_supported(dev.config().expand_packed16);
-    let filterable = |texture: *mut Direct3DTexture9| {
-        if texture.is_null() {
-            return None;
-        }
-        // SAFETY: a non-null slot holds a live `Direct3DTexture9`; the binding
-        // owns a reference for as long as the slot does.
-        let format = unsafe { (*texture).d3d_format() };
-        Some(mtld3d_core::format::supports_usage_query(
-            format,
-            D3DUSAGE_QUERY_FILTER,
-            float32_filtering,
-            native_packed16,
-        ))
-    };
-    let fragment = (0..STAGE_COUNT).map(|stage| {
-        (
-            dev.stage_bindings().sampler_states(stage),
-            dev.stage_bindings().texture(stage),
-        )
-    });
-    let vertex = dev
-        .vertex_sampler_states
-        .iter()
-        .zip(dev.vertex_textures.iter())
-        .map(|(states, texture)| (*states, texture.raw()));
-    for (sampler, (states, texture)) in fragment.chain(vertex).enumerate() {
-        match stage_filter_verdict(&states, filterable(texture)) {
+    let fragment = (0..STAGE_COUNT).map(|stage| dev.stage_bindings().sampler_states(stage));
+    let vertex = dev.vertex_sampler_states.iter().copied();
+    for (sampler, states) in fragment.chain(vertex).enumerate() {
+        match stage_filter_verdict(&states) {
             StageFilterVerdict::Valid => {}
             StageFilterVerdict::FilterDisabled => {
                 mtld3d_shared::log_once_warn!(
@@ -12398,14 +12314,6 @@ fn rejected_filter_stage(dev: &DeviceInner) -> Option<i32> {
                      filter → UNSUPPORTEDTEXTUREFILTER"
                 );
                 return Some(D3DERR_UNSUPPORTEDTEXTUREFILTER);
-            }
-            StageFilterVerdict::TextureNotFilterable => {
-                mtld3d_shared::log_once_warn!(
-                    target: crate::LOG_TARGET,
-                    "IDirect3DDevice9::ValidateDevice: sampler {sampler} filters a texture the \
-                     device point-samples → E_FAIL"
-                );
-                return Some(E_FAIL);
             }
         }
     }
@@ -14339,9 +14247,6 @@ fn snapshot_stage_bindings(
             bound_texture_mask |= 1u8 << stage;
         }
         let mut sampler_state = dev.stage_bindings().sampler_states(stage);
-        if dev.samples_unfiltered(tex) {
-            mtld3d_core::sampler_state::sample_unfiltered(&mut sampler_state);
-        }
         // Lazy texture upload: flush any per-mip `dirty` flags before
         // capturing TextureInfo. Operations pushed by `schedule_upload`
         // precede the Draw operation on the encoder thread, so the

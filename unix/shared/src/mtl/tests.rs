@@ -15,7 +15,7 @@ use super::*;
 #[test]
 fn enum_discriminants_round_trip() {
     assert_eq!(StorageMode::from_repr(0), Some(StorageMode::Shared));
-    assert_eq!(StorageMode::from_repr(1), Some(StorageMode::Managed));
+    assert_eq!(StorageMode::from_repr(1), None);
     assert_eq!(StorageMode::from_repr(2), Some(StorageMode::Private));
     assert_eq!(StorageMode::from_repr(3), Some(StorageMode::Memoryless));
     assert_eq!(StorageMode::from_repr(4), None);

@@ -1498,9 +1498,7 @@ fn srgb_write_blends_in_linear_on_a_standalone_render_target() {
 /// submit thread when the teardown begins. The twin's destroy therefore waits
 /// behind the flush and the encoder's GPU-idle wait like every other implicit
 /// surface, and only then goes out ahead of the base texture the queue-destroy
-/// thunk releases. Each round takes a device of its own, and the second
-/// configuration repeats the teardown under the forced Intel storage answers,
-/// the hardware where a premature release is visible.
+/// thunk releases. Each round takes a device of its own.
 ///
 /// What this pins: the rounds run to completion, every call answers `D3D_OK`,
 /// the release reaches a zero refcount, and the process the suite shares is
@@ -1516,40 +1514,35 @@ fn a_device_released_after_an_srgb_write_present_tears_down_cleanly() {
     const FRAMES: u32 = 2;
     const MID_GREY: u32 = 0xFF80_8080;
 
-    for entries in ["", "intel.managedMemory=true;intel.linearAlign256=true"] {
-        for round in 0..ROUNDS {
-            let h = Harness::create(&HarnessConfig {
-                config_entries: entries,
-                ..HarnessConfig::default()
-            });
-            arm_diffuse(&h);
+    for round in 0..ROUNDS {
+        let h = Harness::new();
+        arm_diffuse(&h);
+        assert_eq!(
+            h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+            0,
+            "sRGB on (round {round})"
+        );
+        for frame in 0..FRAMES {
             assert_eq!(
-                h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+                h.begin_scene(),
                 0,
-                "sRGB on ({entries:?} round {round})"
+                "BeginScene (round {round} frame {frame})"
             );
-            for frame in 0..FRAMES {
-                assert_eq!(
-                    h.begin_scene(),
-                    0,
-                    "BeginScene (round {round} frame {frame})"
-                );
-                assert_eq!(h.clear_target(MID_GREY), 0, "clear mid-grey");
-                assert_eq!(
-                    h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(WHITE)),
-                    0,
-                    "sRGB-write draw"
-                );
-                assert_eq!(h.end_scene(), 0, "EndScene");
-                assert_eq!(h.present(), 0, "Present");
-            }
-            // No readback and no wait: either would retire the frames that the
-            // release has to carry through the teardown.
+            assert_eq!(h.clear_target(MID_GREY), 0, "clear mid-grey");
             assert_eq!(
-                h.release_device(),
+                h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(WHITE)),
                 0,
-                "the device is fully released ({entries:?} round {round})"
+                "sRGB-write draw"
             );
+            assert_eq!(h.end_scene(), 0, "EndScene");
+            assert_eq!(h.present(), 0, "Present");
         }
+        // No readback and no wait: either would retire the frames that the
+        // release has to carry through the teardown.
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the device is fully released (round {round})"
+        );
     }
 }

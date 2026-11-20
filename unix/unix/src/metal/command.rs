@@ -1863,9 +1863,8 @@ fn encode_fullscreen_pass(
 /// depth/stencil formats are excluded by Metal at runtime; PE-side
 /// `device_create_texture` already drops the autogen flag for
 /// `fmt.is_compressed()`, so this guard is defensive against future
-/// format additions. The packed 16-bit formats are both on the Apple family,
-/// the only one that has them; a device without them backs those D3D formats
-/// with `BGRA8Unorm`.
+/// format additions. The packed 16-bit formats are on the Apple family, the
+/// only one that has them.
 const fn pixel_format_supports_mipgen(fmt: MTLPixelFormat) -> bool {
     matches!(
         fmt,
@@ -2279,7 +2278,6 @@ fn encode_leading_blits(
     // command (CopyBuffer/Texture variants) was emitted. Without it
     // we'd have to scan the blit list to know whether to create the
     // blit encoder; the PE side already knows, so just trust the flag.
-    // Pure-notify frames skip encoder creation entirely.
     let mut blit = if needs_encoder {
         if let Some(b) = cmd_buf.blitCommandEncoder() {
             let label =
@@ -2319,10 +2317,12 @@ fn encode_leading_blits(
                     blit = Some(encoder);
                 }
             }
-            Some(BlitCommandType::NotifyBufferDidModifyRange) => {
-                // CPU-side flag-set on `MTLBuffer`, not an encoder
-                // call. Safe to interleave with open encoder commands;
-                // also safe outside any encoder.
+            Some(
+                kind @ (BlitCommandType::CopyBufferToTexture
+                | BlitCommandType::CopyBufferToDepth
+                | BlitCommandType::CopyBufferToStencil),
+            ) => {
+                let blit = blit.as_ref().expect("a copy command requires the encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
                 let src_buffer_handle =
                     unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
@@ -2336,31 +2336,6 @@ fn encode_leading_blits(
                 // counters advance from a command-buffer completion handler,
                 // and the prefix runs before this frame's buffers are even
                 // committed.
-                let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
-                    error!(
-                        target: LOG_TARGET,
-                        "encode_leading_blits: notify buffer handle is null",
-                    );
-                    continue;
-                };
-                mtld3d_shared::crumb!("blit:modifyrange", cmd.src_handle);
-                buffer.didModifyRange(NSRange {
-                    location: to_usize(cmd.src_offset),
-                    length: to_usize(cmd.byte_size),
-                });
-            }
-            Some(
-                kind @ (BlitCommandType::CopyBufferToTexture
-                | BlitCommandType::CopyBufferToDepth
-                | BlitCommandType::CopyBufferToStencil),
-            ) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
-                // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
-                let src_buffer_handle =
-                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
-                // SAFETY: as the notify arm above, the seq-gated destroy paths
-                // cannot free a resource this prefix names before the command
-                // buffer it encodes into has retired.
                 let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
@@ -2501,7 +2476,7 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::CopyTextureToTexture) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let blit = blit.as_ref().expect("a copy command requires the encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLTexture address.
                 let src_texture_handle =
                     unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) };
@@ -2626,11 +2601,11 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::CopyBufferToBuffer) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let blit = blit.as_ref().expect("a copy command requires the encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
                 let src_buffer_handle =
                     unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
-                // SAFETY: as the notify arm above.
+                // SAFETY: as the buffer-to-texture arm above.
                 let Some(src) = (unsafe { src_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
@@ -2664,7 +2639,9 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::GenerateMipmaps) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let blit = blit
+                    .as_ref()
+                    .expect("a mipmap command requires the encoder");
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
                 let dst_texture_handle =
                     unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
@@ -3756,7 +3733,7 @@ fn encode_readback_resolve(
 /// Synchronous texture→buffer readback into PE-addressable memory.
 ///
 /// Wraps the caller's page-aligned `dst_ptr / dst_len` via
-/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Managed), blits
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
 /// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
 /// stride, commits, and waits for completion. Only a true return guarantees
 /// the caller's memory holds the requested pixels. Metal orders this command
@@ -3809,12 +3786,8 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: null dst_ptr");
         return false;
     };
-    // Managed + `synchronizeResource:` so the GPU→CPU readback works on
-    // non-UMA Macs (Intel/AMD): the blit writes into VRAM, then the
-    // synchronize copies VRAM back to the wrapped PE pages before the
-    // CPU read on `waitUntilCompleted` return. On UMA the storage mode
-    // collapses to Shared semantics and synchronize is a no-op, so
-    // there's no Apple-Silicon overhead.
+    // `Shared`: the blit writes straight into the wrapped PE pages, which
+    // the caller reads once `waitUntilCompleted` returns.
     // SAFETY: `ptr` is the PE-supplied dst pointer (non-null by the check
     // above); `dst_len` matches its allocation; deallocator is None so the
     // PE allocation is never freed by Metal.
@@ -3822,7 +3795,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         device.newBufferWithBytesNoCopy_length_options_deallocator(
             ptr,
             to_usize(dst_len),
-            MTLResourceOptions::StorageModeManaged,
+            MTLResourceOptions::StorageModeShared,
             None,
         )
     }) else {
@@ -4013,8 +3986,6 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
             );
         }
     }
-    blit.synchronizeResource(ProtocolObject::from_ref(&*dst_buffer));
-
     blit.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();

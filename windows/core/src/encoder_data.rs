@@ -456,7 +456,7 @@ pub struct TextureInfo {
     ///
     /// Kept alongside `pixel_format` because the pair is what decides how an
     /// upload reaches the texture: the same `Bgra8Unorm` backs an
-    /// `A8R8G8B8` source verbatim and a packed 16-bit source through the
+    /// `A8R8G8B8` source verbatim and an `R8G8B8` source through the
     /// widening upload pass.
     pub d3d_format: u32,
     pub width: u32,

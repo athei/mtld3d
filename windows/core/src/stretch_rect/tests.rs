@@ -18,8 +18,7 @@
 //! their rects say, so the face pair is pinned alongside the mip pair.
 //!
 //! An X source selects the opaque-alpha decode, and only a source without alpha into a
-//! destination with alpha is a pair whose byte copy would hand the padding over as alpha,
-//! on a device with the packed 16-bit formats and on one that widens them.
+//! destination with alpha is a pair whose byte copy would hand the padding over as alpha.
 //!
 //! An L8 source selects the luminance decode, which replicates red into RGB, since a
 //! render-target L8 source is sampled through its R8 attachment base without the RRR1
@@ -299,40 +298,32 @@ fn blit_decode_follows_the_source_format() {
 fn only_a_source_without_alpha_into_one_with_alpha_exposes_padding() {
     use mtld3d_types::{D3DFMT_A4R4G4B4, D3DFMT_R5G6B5};
 
-    use crate::format::map_d3d_format_device;
-    let exposes = |src: u32, dst: u32, native_packed16: bool| {
-        let map = |format| map_d3d_format_device(format, native_packed16).expect("mapped");
+    use crate::format::map_d3d_format;
+    let exposes = |src: u32, dst: u32| {
+        let map = |format| map_d3d_format(format).expect("mapped");
         exposes_padding_as_alpha(&map(src), &map(dst))
     };
-    for native_packed16 in [true, false] {
-        for (src, dst) in [
-            (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
-            (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
-            (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
-            (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5),
-            (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4),
-        ] {
-            assert!(
-                exposes(src, dst, native_packed16),
-                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
-            );
-        }
-        // The A into X direction, a format into itself, and a pair whose ends
-        // both carry alpha or both lack it are byte copies as far as alpha goes.
-        for (src, dst) in [
-            (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8),
-            (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8),
-            (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5),
-            (D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8),
-            (D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8),
-            (D3DFMT_A8R8G8B8, D3DFMT_A1R5G5B5),
-            (D3DFMT_X1R5G5B5, D3DFMT_R5G6B5),
-        ] {
-            assert!(
-                !exposes(src, dst, native_packed16),
-                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
-            );
-        }
+    for (src, dst) in [
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
+        (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5),
+        (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4),
+    ] {
+        assert!(exposes(src, dst), "{src:#x} -> {dst:#x}");
+    }
+    // The A into X direction, a format into itself, and a pair whose ends
+    // both carry alpha or both lack it are byte copies as far as alpha goes.
+    for (src, dst) in [
+        (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8),
+        (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8),
+        (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5),
+        (D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8),
+        (D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8),
+        (D3DFMT_A8R8G8B8, D3DFMT_A1R5G5B5),
+        (D3DFMT_X1R5G5B5, D3DFMT_R5G6B5),
+    ] {
+        assert!(!exposes(src, dst), "{src:#x} -> {dst:#x}");
     }
 }
 

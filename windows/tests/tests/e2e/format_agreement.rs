@@ -5,9 +5,7 @@
 //! `CheckDeviceMultiSampleType` refuses must not create, and one they accept
 //! must. The sweeps walk every numbered `D3DFORMAT` and the FOURCC formats
 //! titles probe, through every create entry point and pool the answer speaks
-//! for, and report every disagreement at once. Under `make test INTEL=1` the
-//! same sweeps run against the answers of a device without the packed 16-bit
-//! formats or 32-bit float filtering.
+//! for, and report every disagreement at once.
 
 use mtld3d_tests::{CubeTexture, Harness, HarnessConfig, PosColorVertex, Texture, VolumeTexture};
 use mtld3d_types::{

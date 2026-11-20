@@ -131,7 +131,7 @@ use crate::{
 /// `ExtendedLinear*` tag handles gamut + OETF for the actual display).
 ///
 /// MSL language version pinned to 2.4 for parity with the rest of mtld3d
-/// (`shader.rs`) — keeps the same library working on Intel/AMD Macs.
+/// (`shader.rs`).
 const PRESENT_MSL: &str = include_str!("present.msl");
 
 /// Cached present-pass resources for the process's Metal device.

@@ -237,8 +237,8 @@ pub struct TextureInner {
     ///
     /// Each `Arc<PageBox>` holds the full mip bytes in a page-aligned +
     /// page-sized allocation so the encoder can wrap it via
-    /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
-    /// alignment for both pointer and length). The game writes through the
+    /// `newBufferWithBytesNoCopy:` (which requires page alignment for both
+    /// pointer and length). The game writes through the
     /// pointer returned by `lock_region_ptr`. The bind-time flush hands the
     /// upload a read of the `Arc` (a refcount bump, no memcpy), unless the
     /// level is in `snapshot_staging` and the box is copied out instead.
@@ -3518,10 +3518,10 @@ impl TextureInner {
 /// level's unwritten contents undefined, and the pages go out as allocated.
 ///
 /// Page-aligned because the encoder wraps the staging via
-/// `newBufferWithBytesNoCopy:`, which on non-UMA Macs (Intel/AMD)
-/// rejects misaligned pointer or length. Apple Silicon tolerates the
-/// misalignment in practice but documents the same contract; a pooled
-/// box has the same alignment and padded length as a fresh one.
+/// `newBufferWithBytesNoCopy:`, whose contract requires a page-aligned
+/// pointer and length. Apple Silicon tolerates the misalignment in practice
+/// but documents the contract; a pooled box has the same alignment and
+/// padded length as a fresh one.
 pub fn take_staging() -> StagingTake<'static> {
     crate::page_box_pool::PAGEBOX_POOL.take_staging()
 }

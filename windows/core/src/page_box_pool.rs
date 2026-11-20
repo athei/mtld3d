@@ -4,7 +4,7 @@
 //! the API thread and frees the retired one a frame later. Cycling those
 //! boxes through the global allocator lets its page-return policy
 //! decommit them, so the game's first touch of the next fresh box pays a
-//! zero-fill fault plus mapping syscalls (expensive under Wine + Rosetta).
+//! zero-fill fault plus mapping syscalls (expensive under Wine).
 //! Parking retired boxes here and popping a same-size one on the next
 //! rename keeps the pages committed and warm, and skips the allocator's
 //! free path entirely.

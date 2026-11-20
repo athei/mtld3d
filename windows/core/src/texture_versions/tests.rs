@@ -870,7 +870,7 @@ fn the_budget_is_an_eighth_of_the_working_set_under_the_ceiling() {
     assert_eq!(medium.spare_cap(), VERSION_POOL_CEILING_BYTES);
     assert_eq!(medium.pressure_above(), 8_589_938_688);
     assert_eq!(budget().spare_cap(), VERSION_POOL_CEILING_BYTES);
-    // An integrated Intel GPU's 1.5 GiB.
+    // A 1.5 GiB working set.
     let integrated = VersionBudget::from_working_set(1_610_612_736);
     assert_eq!(integrated.spare_cap(), 192 * MIB);
     // No working set reported: the ceiling and no pressure line.

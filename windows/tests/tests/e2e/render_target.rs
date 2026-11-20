@@ -990,10 +990,7 @@ fn stretch_rect_from_an_x_offscreen_plain_into_one_with_alpha_writes_opaque_alph
         }
     }
 
-    // Each source is red with its padding clear. X8R8G8B8 shares its storage
-    // with A1R5G5B5 and A4R4G4B4 on a device that widens the packed 16-bit
-    // formats (`make test INTEL=1`), where a byte copy would hand the padding
-    // over; on a device with them the pair is two storages either way.
+    // Each source is red with its padding clear; each pair is two storages.
     let fill = |format: u32| -> Vec<u8> {
         if format == D3DFMT_X1R5G5B5 {
             core::iter::repeat_n(X1_RED.to_le_bytes(), SIDE * SIDE)

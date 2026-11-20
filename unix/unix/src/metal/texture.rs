@@ -122,27 +122,18 @@ const IDENTITY_SWIZZLE: MTLTextureSwizzleChannels = MTLTextureSwizzleChannels {
 
 /// Usage bits for a texture, by what it serves.
 ///
-/// `ShaderRead` always, `RenderTarget` for an attachment. `PixelFormatView` is
-/// what a view of another pixel format needs on its base texture, and a colour
-/// texture takes such views: the sRGB twin, and the channel swizzle a format
-/// without an alpha lane samples through. An Apple-family GPU exempts a view
-/// that changes only transfer function or swizzle from the usage, and the bit
-/// would cost it lossless compression on every colour texture, so it stays
-/// off there; every other family refuses the view without it. Depth textures
-/// take no view and never carry the bit.
-fn texture_usage(
-    device: &ProtocolObject<dyn MTLDevice>,
-    render_target: bool,
-    takes_views: bool,
-) -> MTLTextureUsage {
-    let mut usage = MTLTextureUsage::ShaderRead;
+/// `ShaderRead` always, `RenderTarget` for an attachment. A colour texture
+/// takes views of another pixel format (the sRGB twin, and the channel
+/// swizzle a format without an alpha lane samples through), but an Apple GPU
+/// exempts a view that changes only transfer function or swizzle from the
+/// `PixelFormatView` usage, and the bit would cost lossless compression on
+/// every colour texture, so it is never set.
+fn texture_usage(render_target: bool) -> MTLTextureUsage {
     if render_target {
-        usage |= MTLTextureUsage::RenderTarget;
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget
+    } else {
+        MTLTextureUsage::ShaderRead
     }
-    if takes_views && !super::device::is_apple_family(device) {
-        usage |= MTLTextureUsage::PixelFormatView;
-    }
-    usage
 }
 
 /// The sRGB twin view of a colour texture, or 0 when it has none.
@@ -540,7 +531,7 @@ fn create_color_texture(
             false,
         )
     };
-    desc.setUsage(texture_usage(device, true, true));
+    desc.setUsage(texture_usage(true));
     desc.setStorageMode(MTLStorageMode::Private);
 
     let Some(texture) = new_texture(device, &desc, label) else {
@@ -568,8 +559,8 @@ fn log_texture_refused(
     log::error!(
         target: crate::LOG_TARGET,
         "{label}: newTextureWithDescriptor returned nil for {}x{} {pixel_format:?} samples={} \
-         usage={:#x} storage={} on '{}' (allocated {} B, recommended working set {} B, unified \
-         memory: {}) device={device:p} registry_id={:#x}",
+         usage={:#x} storage={} on '{}' (allocated {} B, recommended working set {} B) \
+         device={device:p} registry_id={:#x}",
         desc.width(),
         desc.height(),
         desc.sampleCount(),
@@ -578,7 +569,6 @@ fn log_texture_refused(
         device.name(),
         device.currentAllocatedSize(),
         device.recommendedMaxWorkingSetSize(),
-        device.hasUnifiedMemory(),
         device.registryID(),
     );
 }
@@ -760,7 +750,7 @@ pub fn create_msaa_companion(
     // SAFETY: objc2 typed binding; the count was validated against
     // `supportsTextureSampleCount:` before it crossed the boundary.
     unsafe { desc.setSampleCount(sample_count as usize) };
-    desc.setUsage(texture_usage(&device, true, true));
+    desc.setUsage(texture_usage(true));
     desc.setStorageMode(MTLStorageMode::Private);
 
     let Some(texture) = new_texture(&device, &desc, label) else {
@@ -978,7 +968,7 @@ pub fn create_texture(
     let is_render_target = desc
         .usage_flags
         .intersects(TextureUsage::RENDER_TARGET | TextureUsage::DEPTH_STENCIL);
-    tex_desc.setUsage(texture_usage(device, is_render_target, !is_depth));
+    tex_desc.setUsage(texture_usage(is_render_target));
 
     // Depth textures must live in private storage on Apple Silicon, regardless
     // of what the PE side requested (CPU upload of a depth texture is meaningless).
@@ -1393,7 +1383,6 @@ const fn mtl_texture_swizzle(wire: Swizzle) -> MTLTextureSwizzle {
 const fn mtl_storage_mode(wire: StorageMode) -> MTLStorageMode {
     match wire {
         StorageMode::Shared => MTLStorageMode::Shared,
-        StorageMode::Managed => MTLStorageMode::Managed,
         StorageMode::Private => MTLStorageMode::Private,
         StorageMode::Memoryless => MTLStorageMode::Memoryless,
     }

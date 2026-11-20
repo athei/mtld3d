@@ -47,7 +47,6 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache::{self, ShaderRecordRef},
     shader_compile_stats::{self, CompileStats},
-    storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
     texture_versions::{
         TexelRect, TextureVersions, UploadFootprint, VersionBudget, VersionShape,
@@ -685,9 +684,7 @@ fn submit_thread_main(
         let mut submit_exec_tsc: u64 = 0;
         let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
-            // The replay's thousands of native calls run at a pinned stack page
-            // offset, so this loop's frame cannot move them across a page boundary.
-            crate::stack_page::run_pinned(|| execute_submit(record, &params, payload, failure_ptr))
+            execute_submit(record, &params, payload, failure_ptr)
         };
         // The final CPU reader has finished with the retained command regions, and the
         // payload carrying the snapshots goes back to the encoder. GPU resource leases
@@ -712,12 +709,10 @@ bitflags::bitflags! {
     pub struct FrameEncoderFlags: u8 {
         /// Latched whenever an *encoder-bound* blit command is pushed into `frame_blit_commands`.
         ///
-        /// Encoder-bound covers any CopyBuffer/Texture variant.
-        /// `NotifyBufferDidModifyRange` does NOT flip it because the unix
-        /// dispatcher calls that one outside any encoder. Read at submit to
-        /// fill `SubmitDescription.blit_commands_need_encoder`, so the unix
-        /// side can skip `MTLBlitCommandEncoder` creation on pure-notify
-        /// frames. Reset in `begin_frame` alongside the Vec clear.
+        /// Encoder-bound covers any CopyBuffer/Texture variant. Read at
+        /// submit to fill `SubmitDescription.blit_commands_need_encoder`, so
+        /// the unix side creates an `MTLBlitCommandEncoder` only for a frame
+        /// that has one. Reset in `begin_frame` alongside the Vec clear.
         const BLIT_CMDS_NEED_ENCODER = 1 << 0;
         /// Set once the pre-warm payload has been ingested.
         ///
@@ -865,8 +860,8 @@ pub struct FrameEncoder {
     scratch: ScratchArena,
     /// Leading blit commands accumulated during the frame.
     ///
-    /// Texture uploads, GPU-side preserves, non-UMA `didModifyRange:`
-    /// notifies. Replayed inside a single `MTLBlitCommandEncoder` before
+    /// Texture uploads and GPU-side preserves. Replayed inside a single
+    /// `MTLBlitCommandEncoder` before
     /// any render pass. Stable backing for
     /// the frame-leading blit slice.
     frame_blit_commands: Vec<BlitCommand>,
@@ -1030,8 +1025,7 @@ pub struct FrameEncoder {
 
     /// Captured at encoder spawn from `MTLDevice` queries.
     ///
-    /// Drives storage-mode policy (`Shared` vs `Managed`), texture-buffer
-    /// alignment, and the `didModifyRange:` enqueue gate.
+    /// Drives texture-buffer alignment and the device-specific encoder rules.
     gpu_caps: GpuCaps,
     /// The configuration of the `IDirect3D9` behind this encoder's device.
     config: Arc<Mtld3dConfig>,
@@ -1531,8 +1525,8 @@ impl RetainedPages {
 ///    wrapper. Both kinds get queued together so any `BlitCommand`
 ///    pushed earlier in this frame referencing them outlives this
 ///    frame's submit. Destroying these synchronously races against
-///    the in-flight blit replay on Intel/AMD (Bronze driver) where
-///    Metal recycles the freed address as the wrong type.
+///    the in-flight blit replay, where Metal can recycle the freed
+///    address as the wrong type.
 /// 7. `fan_index_buffer` growth: `Buffer` + the grown-out pattern's
 ///    handle + `page_box`, `seq = current_submit_seq`, since a draw
 ///    earlier this frame may still bind it.
@@ -1652,23 +1646,6 @@ impl FrameEncoder {
             version_budget.pressure_above() >> 20,
             working_set >> 20,
         );
-        let apple = GpuCaps::apple_silicon_default();
-        if !gpu_caps.unified_memory
-            || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
-        {
-            let cfg = &config;
-            mtld3d_shared::log_once_info!(
-                target: LOG_TARGET,
-                "Intel-family GPU paths active: unified_memory={} (forced={}), \
-                 min_linear_texture_align={} (forced={}): CPU-visible buffers are Managed \
-                 with didModifyRange after every write, tiny mips take the padded staging \
-                 or the upload pass",
-                gpu_caps.unified_memory,
-                cfg.managed_memory,
-                gpu_caps.min_linear_texture_align,
-                cfg.linear_align256,
-            );
-        }
         // Spawn the dedicated submit thread. It invokes the native backend
         // for `Async` frames so the command walk and presentation
         // overlaps the encoder's next build. The work channel is cap-1 so
@@ -1893,10 +1870,10 @@ impl FrameEncoder {
         // be Private. There is deliberately no CPU-timeline `replaceRegion`
         // path — it would race a texture sampled by an in-flight frame — so no
         // texture needs a CPU-writable mode. Only the staging *buffers* (blit
-        // sources) follow `buffer_storage_mode`.
+        // sources) are `Shared`.
         let storage_mode = StorageMode::Private;
-        // Uploads that cannot ride a blit copy (a packed 16-bit source
-        // widened to BGRA8, or a mip whose row pitch is under the linear
+        // Uploads that cannot ride a blit copy (an R8G8B8 source widened
+        // to BGRA8, or a mip whose row pitch is under the linear
         // texture alignment) are written by a render pass, which needs the
         // destination to be an attachment. The predicate is a superset of
         // what the upload path selects per upload, so an upload never finds a
@@ -1956,7 +1933,7 @@ impl FrameEncoder {
             backing_ptr: if staged { 0 } else { warmup.backing_ptr },
             length: warmup.backing_len,
             id: warmup.buffer_id,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: if staged {
                 BufferKind::VbIbDevice
             } else {
@@ -2015,18 +1992,6 @@ impl FrameEncoder {
                     backing_generation: if staged { 0 } else { warmup.backing_generation },
                     last_submit_seq: current_seq,
                 });
-                // `Direct`: fresh `bytesNoCopy` wrapper — notify the
-                // GPU about every byte the CPU may have written since
-                // the backing was allocated (no-op on UMA). `Staged`:
-                // the device buffer is `Private`, never CPU-written,
-                // so no notify — its contents arrive via upload blits.
-                if !staged {
-                    self.enqueue_notify_buffer_did_modify_range(
-                        handle.raw(),
-                        0,
-                        warmup.backing_len,
-                    );
-                }
             }
             Entry::Occupied(_) => {
                 mtld3d_shared::log_once_warn!(
@@ -2084,7 +2049,6 @@ impl FrameEncoder {
         let _t =
             mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::StageUpload));
         let current_seq = self.current_submit_seq;
-        let storage_mode = buffer_storage_mode(self.gpu_caps.unified_memory);
 
         // Resolve the buffer's current device buffer + length, gating its
         // eventual destroy past this frame's upload write.
@@ -2142,13 +2106,12 @@ impl FrameEncoder {
         };
 
         // Wrap the transient snapshot as a `Shared` `bytesNoCopy` blit
-        // source. The CPU just wrote it, so notify the GPU on non-UMA
-        // before the blit reads it (no-op on UMA).
+        // source.
         let desc = BufferCreateDesc {
             backing_ptr: page_box.as_ptr() as u64,
             length: page_box.len() as u64,
             id: buffer_id.raw(),
-            storage_mode,
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::VbIb,
         };
         let mut transient = MetalHandle::<MTLBufferKind>::NULL;
@@ -2164,7 +2127,6 @@ impl FrameEncoder {
             );
             return;
         }
-        self.enqueue_notify_buffer_did_modify_range(transient.raw(), 0, u64::from(size));
 
         // Does this upload overwrite a region a draw already read this
         // frame? If so, rename rather than corrupt that draw (the blit
@@ -2263,9 +2225,7 @@ impl FrameEncoder {
     /// The transient `MTLBuffer` and its backing are still alive (holding
     /// them is the recovery queue's whole job), so the replay is the same
     /// buffer-to-buffer copy aimed at the buffer's *current* device buffer.
-    /// No second `didModifyRange` notify: nothing has written the transient
-    /// since the original upload notified it. No rename-at-overlap check
-    /// either, because this runs from `begin_frame` after
+    /// No rename-at-overlap check, because this runs from `begin_frame` after
     /// `PassState::reset_frame`, so no draw of this frame has read the
     /// destination yet.
     ///
@@ -2322,7 +2282,7 @@ impl FrameEncoder {
             backing_ptr: 0,
             length,
             id: buffer_id.raw(),
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::VbIbDevice,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -2997,7 +2957,7 @@ impl FrameEncoder {
             backing_ptr,
             length,
             id: 0,
-            storage_mode: gpu_written_buffer_storage_mode(),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::Visibility,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -3037,7 +2997,7 @@ impl FrameEncoder {
             backing_ptr: backing.as_mut_ptr() as u64,
             length,
             id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::VbIb,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -3052,9 +3012,6 @@ impl FrameEncoder {
             );
             return 0;
         }
-        // The pattern was written by the CPU before the wrap; on managed
-        // storage the GPU has to be told (no-op on UMA).
-        self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, length);
         let grown_out = core::mem::replace(
             &mut self.fan_index_buffer,
             FanIndexBuffer {
@@ -6024,12 +5981,6 @@ impl FrameEncoder {
         self.perf.bump_fan_generated();
     }
 
-    /// Count a draw whose draw path ran off its pinned stack page offset.
-    #[cfg(perf_tracking)]
-    pub const fn bump_draw_unpinned(&mut self) {
-        self.perf.bump_draw_unpinned();
-    }
-
     /// Count a `DrawIndexedPrimitiveUP` draw.
     pub const fn bump_up_indexed(&mut self) {
         self.perf.bump_up_indexed();
@@ -6244,18 +6195,10 @@ impl FrameEncoder {
                 && state.length == backing_len
                 && state.backing_generation == backing_generation
             {
-                let mtl_buffer = state.mtl_buffer;
                 if current_seq > state.last_submit_seq {
-                    // First bind of this buffer this frame — assume the
-                    // CPU may have written via Lock/Unlock since the
-                    // previous frame's notify, so notify the full range
-                    // before the GPU reads. NOOVERWRITE Lock keeps the
-                    // backing stable (cache hit) but still mutates bytes,
-                    // so cache-hit alone isn't enough to skip the notify.
                     state.last_submit_seq = current_seq;
-                    self.enqueue_notify_buffer_did_modify_range(mtl_buffer.raw(), 0, backing_len);
                 }
-                return (mtl_buffer.raw(), false);
+                return (state.mtl_buffer.raw(), false);
             }
             // Backing changed mid-frame for the same `BufferId` — the
             // expected pattern is `Draw; Lock(DISCARD|default); Draw`
@@ -6284,7 +6227,7 @@ impl FrameEncoder {
             backing_ptr,
             length: backing_len,
             id: buffer_id.raw(),
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::VbIb,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -6312,10 +6255,6 @@ impl FrameEncoder {
                 last_submit_seq: current_seq,
             },
         );
-        // Fresh wrapper around new (or renamed) backing — notify the
-        // GPU about every byte the CPU may have written since the
-        // backing was allocated. No-op on UMA via the helper's gate.
-        self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, backing_len);
         (handle.raw(), false)
     }
 
@@ -6323,10 +6262,7 @@ impl FrameEncoder {
     ///
     /// The device buffer is `StorageModePrivate` at an address Metal chose,
     /// which the 32-bit PE cannot dereference, so the only route back to the
-    /// CPU is a GPU copy into a `Shared` wrapper over PE pages. The
-    /// destination is `Shared` on every device rather than following the
-    /// storage policy: a `Managed` one holds the GPU's write in VRAM until a
-    /// synchronize, and this copy exists to be read on the CPU.
+    /// CPU is a GPU copy into a `Shared` wrapper over PE pages.
     ///
     /// The caller owns `dst_ptr`, keeps it alive past this frame's submit,
     /// and must wait for GPU completion of that submit before reading it.
@@ -6393,29 +6329,6 @@ impl FrameEncoder {
                 from_texture: false,
             });
         true
-    }
-
-    /// Append a `NotifyBufferDidModifyRange` to `frame_blit_commands`.
-    ///
-    /// The unix dispatcher will call `[buffer didModifyRange:]` before the
-    /// next GPU read. Short-circuits on UMA — Apple Silicon uses `Shared`
-    /// storage where the GPU sees CPU writes coherently, no notify needed.
-    /// Crucially this does **not** flip `frame_blit_commands_need_encoder`,
-    /// so a frame whose only blit activity is notifies skips
-    /// `MTLBlitCommandEncoder` creation on the unix side.
-    fn enqueue_notify_buffer_did_modify_range(
-        &mut self,
-        mtl_buffer: u64,
-        offset: u64,
-        length: u64,
-    ) {
-        if self.gpu_caps.unified_memory || mtl_buffer == 0 || length == 0 {
-            return;
-        }
-        self.frame_blit_commands
-            .push(BlitCommand::notify_buffer_did_modify_range(
-                mtl_buffer, offset, length,
-            ));
     }
 
     /// Drain every API-thread VB/IB retention entry for this frame.
@@ -7142,7 +7055,7 @@ impl FrameEncoder {
             backing_ptr,
             length,
             id: texture_id.raw(),
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::TexStaging,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -7210,7 +7123,7 @@ impl FrameEncoder {
             backing_ptr,
             length,
             id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::TexStaging,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -7770,22 +7683,17 @@ impl FrameEncoder {
 
         // `copyFromBuffer:toTexture:` requires `sourceBytesPerRow` to
         // be ≥ `device.minimumLinearTextureAlignmentForPixelFormat`
-        // (16 on Apple Silicon, 256 on Mac2). Bottom-of-chain mips
-        // (BC1 1×1 = 8 bytes, BGRA8 1×1 = 4 bytes, …) trip it. Apple
-        // Silicon happens to tolerate the violation today but the
-        // behaviour is officially undefined. Repack the affected rows
-        // into a transient padded MTLBuffer and aim the blit there.
+        // (16 on Apple Silicon). Bottom-of-chain mips (BC1 1×1 = 8
+        // bytes, BGRA8 1×1 = 4 bytes, …) trip it. Apple Silicon happens
+        // to tolerate the violation today but the behaviour is
+        // officially undefined. Repack the affected rows into a
+        // transient padded MTLBuffer and aim the blit there.
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
             match self.repack_blit_source_padded(job.staging().backing(), &info, num_blit_rows) {
                 Some(padded_info) => padded_info,
                 None => return false,
             }
         } else {
-            // Notify the staging MTLBuffer (no-op on UMA), only the snapshot's
-            // span of a shared chunk. The padded path notifies the transient
-            // buffer instead.
-            let (offset, length) = job.source_span();
-            self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, offset, length);
             info
         };
 
@@ -7921,7 +7829,6 @@ impl FrameEncoder {
                 None => return false,
             }
         } else {
-            self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
             info
         };
 
@@ -7982,8 +7889,7 @@ impl FrameEncoder {
     ///
     /// Serves the two upload shapes `copyFromBuffer:toTexture:` cannot take.
     /// A source narrower than the `Bgra8Unorm` texture behind it has no
-    /// verbatim copy at all: a packed 16-bit format on a device without the
-    /// native formats, or 24-bit R8G8B8 anywhere. The widening happens in the
+    /// verbatim copy at all: 24-bit R8G8B8. The widening happens in the
     /// fragment function, which writes D3D channel order and forces alpha
     /// opaque for the formats that store none. A mip whose row pitch
     /// is below `min_linear_texture_align` has no legal blit source pitch:
@@ -8028,12 +7934,6 @@ impl FrameEncoder {
         if staging_buffer_handle == 0 {
             return false;
         }
-        // Non-UMA: the game wrote these pages on the CPU. The notify rides
-        // the leading blits of the upload pass that reads these pages.
-        let notify_start = self.frame_blit_commands.len();
-        let (offset, length) = job.source_span();
-        self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, offset, length);
-
         let mip_w = (job.info().width().max(1) >> job.level()).max(1);
         let mip_h = (job.info().height().max(1) >> job.level()).max(1);
         let depth = job.depth().max(1);
@@ -8057,7 +7957,6 @@ impl FrameEncoder {
                     slice,
                     (0, 0, mip_w, mip_h),
                     slice.saturating_mul(job.slice_pitch()),
-                    notify_start,
                 );
             }
         } else {
@@ -8081,7 +7980,6 @@ impl FrameEncoder {
                 job.destination_slice(),
                 (job.origin_x(), job.origin_y(), w, h),
                 base,
-                notify_start,
             );
         }
 
@@ -8113,7 +8011,6 @@ impl FrameEncoder {
         slice: u32,
         rect: (u32, u32, u32, u32),
         base_offset: u32,
-        notify_start: usize,
     ) {
         let (x, y, w, h) = rect;
         if w == 0 || h == 0 {
@@ -8158,9 +8055,7 @@ impl FrameEncoder {
             self.end_current_pass("ordered_upload_pass");
         }
         let leading_blits = if ORDERED {
-            let mut blits = self.pass_state.take_pending_leading_blits();
-            blits.extend(self.frame_blit_commands.drain(notify_start..));
-            blits
+            self.pass_state.take_pending_leading_blits()
         } else {
             core::mem::take(&mut self.frame_blit_commands)
         };
@@ -8188,8 +8083,8 @@ impl FrameEncoder {
     /// per-mip pitch, which for tiny mips (1×1 BGRA8 = 4 bytes,
     /// 1-block BC1 = 8 bytes) is below
     /// `minimumLinearTextureAlignmentForPixelFormat:`. The Metal blit
-    /// spec says behaviour is undefined in that case. `ASi` tolerates
-    /// it today, Mac2 won't.
+    /// spec says behaviour is undefined in that case, even where a device
+    /// tolerates it.
     fn repack_blit_source_padded(
         &mut self,
         staging: &Arc<PageBox>,
@@ -8250,7 +8145,7 @@ impl FrameEncoder {
             backing_ptr: padded_ptr,
             length: padded_len,
             id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::Repack,
         };
         let mut padded_handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -8268,10 +8163,6 @@ impl FrameEncoder {
             );
             return None;
         }
-
-        // Notify the transient MTLBuffer for non-UMA. The PageBox just
-        // got its full padded region written by the memcpy above.
-        self.enqueue_notify_buffer_did_modify_range(padded_handle.raw(), 0, padded_len);
 
         // Hand both the wrapper and the PageBox to the frame's
         // retention queue — destroy fires after the GPU retires the
@@ -8531,7 +8422,7 @@ impl FrameEncoder {
             backing_ptr: staging.as_ptr() as u64,
             length: staging_len,
             id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: StorageMode::Shared,
             kind: BufferKind::Repack,
         };
         let mut staging_handle = MetalHandle::<MTLBufferKind>::NULL;
@@ -8546,8 +8437,6 @@ impl FrameEncoder {
             );
             return None;
         }
-        // Non-UMA: the CPU just wrote the staging slab; notify before the blit.
-        self.enqueue_notify_buffer_did_modify_range(staging_handle.raw(), 0, staging_len);
 
         // Retire the wrapper + PageBox after the GPU retires this frame — the
         // blit reads them at command-buffer execution. Wrapper first so Metal
@@ -10071,8 +9960,7 @@ fn submit_sync(enc: &mut FrameEncoder, frame: NativeFrame) {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
             let record = enc.record.as_ref();
             let failure_ptr = enc.runtime_failure_ptr;
-            // Pinned like the submit thread's replay, whatever the encoder's frames above.
-            crate::stack_page::run_pinned(|| execute_submit(record, &params, payload, failure_ptr))
+            execute_submit(record, &params, payload, failure_ptr)
         };
         enc.fold_submit_outcome(&outcome, submit_exec_tsc);
         (payload, outcome.status)
@@ -10249,8 +10137,6 @@ fn finalize_submit(
 /// the separate native outcome.
 /// This is the only part of submit that runs on the dedicated submit thread
 /// in `Async` mode.
-// Kept out of line so its frame sits below the gap `run_pinned` reserves.
-#[inline(never)]
 fn execute_submit(
     record: Option<&Arc<crate::metal::DeviceRecord>>,
     description: &SubmitDescription,
@@ -10407,9 +10293,7 @@ fn pass_to_descriptor(
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
         pass_flags: PassDescriptor::pack_flags(
-            leading
-                .iter()
-                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+            !leading.is_empty(),
             p.color_slice(),
             p.color_level(),
             p.depth_level(),
@@ -10474,8 +10358,7 @@ fn log_pass_depth_attach(p: &Pass) {
 /// Synthetic blit-only `PassDescriptor`.
 ///
 /// Carries an upload-prefix tail or trailing `StretchRect` blits, with no
-/// color/depth attachments or render commands. A notification-only list
-/// needs no blit encoder.
+/// color/depth attachments or render commands.
 fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
     PassDescriptor {
         color_texture: MetalHandle::NULL,
@@ -10499,14 +10382,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(
-            trailing_blits
-                .iter()
-                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
-            0,
-            0,
-            0,
-        ),
+        pass_flags: PassDescriptor::pack_flags(!trailing_blits.is_empty(), 0, 0, 0),
         reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }

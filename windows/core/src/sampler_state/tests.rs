@@ -622,30 +622,6 @@ fn forcing_point_keeps_the_filters_in_space() {
 }
 
 #[test]
-fn sampling_unfiltered_keeps_mip_selection_and_blends_nothing() {
-    let mut ss = anisotropic_state();
-    ss[D3DSAMP_MAXANISOTROPY as usize] = MAX_ANISOTROPY;
-    sample_unfiltered(&mut ss);
-    let s = snapshot_from_state(&ss, false);
-    assert_eq!(u32::from(s.min_filter), D3DTEXF_POINT, "min");
-    assert_eq!(u32::from(s.mag_filter), D3DTEXF_POINT, "mag");
-    assert_eq!(
-        u32::from(s.mip_filter),
-        D3DTEXF_POINT,
-        "a blending mip filter points"
-    );
-    assert_eq!(s.max_anisotropy, 1, "no filter is anisotropic any more");
-
-    let mut ss = linear_state();
-    ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_NONE;
-    sample_unfiltered(&mut ss);
-    assert_eq!(
-        ss[D3DSAMP_MIPFILTER as usize], D3DTEXF_NONE,
-        "mipmapping stays off"
-    );
-}
-
-#[test]
 fn fetch4_commands_are_not_lod_biases() {
     let mut states = mtld3d_types::sampler_state_defaults();
     for command in [u32::from_le_bytes(*b"GET4"), u32::from_le_bytes(*b"GET1")] {

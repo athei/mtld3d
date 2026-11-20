@@ -3785,10 +3785,10 @@ fn create_fullscreen_honors_the_requested_resolution() {
 /// window manager: a cross-thread `SendMessage` waits until the window's thread
 /// next pumps, which is that restore. A release that answered the message would
 /// destroy the back buffer, its sRGB twin and the depth texture a second time
-/// and leak their replacements, which is what ended the process on the Intel CI
-/// image. The unix side refuses a destroy of a handle that is no longer live,
-/// and a build with debug assertions ends the process at that refusal, which is
-/// what makes this test fail without the guard.
+/// and leak their replacements, which can end the process. The unix side
+/// refuses a destroy of a handle that is no longer live, and a build with
+/// debug assertions ends the process at that refusal, which is what makes this
+/// test fail without the guard.
 #[test]
 fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
     const WM_SIZE: u32 = 0x0005;

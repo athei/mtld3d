@@ -950,7 +950,7 @@ impl FrameEncoder {
     /// variant up-front so pass-finalisation (Rule H) can swap to it
     /// retroactively if every draw in the pass had `mask == 0`.
     /// Rule H keeps color when there is no depth attachment. Its unused
-    /// sibling would have no attachments, which Mac2 Metal rejects.
+    /// sibling would have no attachments, which Metal validation can reject.
     /// A successful sibling mapping stays valid as long as the pipeline
     /// cache, so a memo miss can reuse it without rebuilding the alternate
     /// snapshot and key. The sibling builds asynchronously and nothing
