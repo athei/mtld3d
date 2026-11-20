@@ -1037,9 +1037,12 @@ binaries: the arm64 Wine's six Apple keys (`i686-arm64`, `arm64x` and their
 counts, and the six keys hold every earlier count at its new line. The
 x86_64 Wine's six keys and the two `@mac2` keys were renumbered from the
 source diff alone, line numbers only. CI confirms `i686` and `x86_64` on
-macos-15, and the two `@mac2` keys are to be confirmed by CI's
-`record_intel_baseline` dispatch with `intel_only` before the change
-merges; `i686+intel`, `i686+scale`, `x86_64+intel` and
+macos-15. CI's `record_intel_baseline` dispatch with `intel_only`, run
+44803225914, recorded the two `@mac2` keys: `i686+intel@mac2` in attempt 1,
+`x86_64+intel@mac2` in attempt 2, after a GPU hang in attempt 1. They read
+every renumbered site at its count, the new test passes there too, and only
+test_fetch4 15686 read lower, 3 where 15 and 13 are pinned, which its
+cluster keeps; `i686+intel`, `i686+scale`, `x86_64+intel` and
 `x86_64+scale` are renumbered only and unconfirmed until an x86_64-Wine
 machine records them, and what the new test reads under that Wine is
 unknown until then. The flaky and ceiling pins kept their values:
