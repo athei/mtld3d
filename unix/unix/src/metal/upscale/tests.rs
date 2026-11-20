@@ -613,7 +613,7 @@ fn gpu() -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>> {
     Some(device)
 }
 
-/// Build and prepare the cache's scaler for this pair without encoding, as an upscale's lookup does.
+/// Build and prepare the cache's scaler for this pair without encoding, as a lookup does.
 ///
 /// `false` when `MetalFX` cannot serve the pair: no `MetalFX`, a geometry it
 /// does not enlarge, a scaler Metal declined, or an input usage the scaler
