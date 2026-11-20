@@ -2359,6 +2359,12 @@ impl TextureInner {
             return false;
         }
         let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
+        // The fill is the level's exposure, as any other CPU write is.
+        if whole {
+            self.staging_overwritten(0, level);
+        } else {
+            self.expose_staging(0, level);
+        }
         self.prepare_staging_write(0, level, whole);
         let Some(box_) = self.staging.get(level) else {
             return false;
