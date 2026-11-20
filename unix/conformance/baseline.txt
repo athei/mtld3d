@@ -530,6 +530,7 @@
   visual.c:22112 count=1
   visual.c:24181 count=1
   visual.c:24183 count=1
+  visual.c:24934 count=3
   visual.c:25196 count=1
   visual.c:27457 count=221
   visual.c:27598 count=5
@@ -1116,6 +1117,7 @@
   visual.c:22112 count=1
   visual.c:24181 count=1
   visual.c:24183 count=1
+  visual.c:24934 count=3
   visual.c:25196 count=1
   visual.c:27457 count=221
   visual.c:27598 count=5
@@ -1566,6 +1568,7 @@
   visual.c:22112 count=1
   visual.c:24181 count=1
   visual.c:24183 count=1
+  visual.c:24934 count=3
   visual.c:25196 count=1
   visual.c:27457 count=221
   visual.c:27598 count=5
@@ -2013,6 +2016,7 @@
   visual.c:22112 count=1
   visual.c:24181 count=1
   visual.c:24183 count=1
+  visual.c:24934 count=3
   visual.c:25196 count=1
   visual.c:27457 count=221
   visual.c:27598 count=5
