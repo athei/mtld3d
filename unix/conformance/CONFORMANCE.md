@@ -1036,8 +1036,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-25: 0 `real`, 177 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 190 unique sites in all.
+`Sites:` tokens below on 2026-11-20: 0 `real`, 178 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 191 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's and 11.21's tests keep them.
@@ -2110,6 +2110,20 @@ sit on rows 240 and 241, the two rows either side of it; under the scale
 that edge falls inside one render row and both probes read its blend
 (`0x9ca13c`) ("The scaled leg").
 
+### visual.c/test_null_format
+Sites: 24934=expected
+
+The 400x300 `small_rt` is not the back-buffer size and rasterizes unscaled,
+while the implicit depth surface is scaled with the back buffer, so the depth
+the draw through `small_rt` writes under the 640-wide viewport lands at four
+thirds of its coordinates when the scaled back buffer reads it: three probes
+past x = 400 read the drawn depth instead of the cleared one, `Expected color
+0x0000ff00 at (440, 90), got 0x00000000`, and the same at (520, 90) and
+(520, 150). Only the `+scale` keys carry it, and only because the test no
+longer skips; the draws through the `NULL` targets read as expected. The same
+pairing as `visual.c/depth_buffer_test`, whose rationale it shares. #1255
+holds a repro without a `NULL` target.
+
 ### visual.c/test_filling_convention
 Sites: 27457=expected
 
@@ -2470,3 +2484,29 @@ unadvertised and SCRATCH-only. DXT2 and DXT4 keep their format identities and
 share the DXT3 and DXT5 block encodings: the stored blocks are sampled as they
 are, with no multiply or divide by alpha, and the application chooses its
 blend factors.
+
+### device.c/test_surface_format_null and visual.c/test_null_format
+
+`NULL` is offered as a 2D render target, and a `NULL` render target 0 binds
+no colour texture, shaped after the bound depth surface, so its draws and
+region depth clears take the depth-only pass at the depth surface's extent,
+scale and sample count. A lockable `NULL` surface locks to a CPU copy, and a
+colour `Clear` through one changes nothing.
+
+test_surface_format_null (device.c:9372) skipped at its first query
+(device.c:9393) and now runs to its end: the texture and depth-match answers,
+the lockable 128x128 surface and its lock, the colour clear with no depth
+surface, and the full-chain texture create, every `ok()` passing.
+test_null_format (visual.c:24739) skipped at visual.c:24822 and now runs
+both readbacks. On the plain and `+intel` keys of the arm64 Wine every
+assertion passes; on its two `+scale` keys visual.c:24934 fails three times,
+from the draw through the 400x300 colour target, not through `NULL` (see
+`visual.c/test_null_format`). Neither test logs a Metal validation line on
+any of the six keys. The x86_64 Wine's keys and the two `@mac2` keys were not
+read here: CI's macos-15 legs read the plain `i686` and `x86_64` keys, the
+nightly Intel run reads the `@mac2` keys, and no run reads the x86_64 Wine's
+`+intel` and `+scale` keys. The site comes from the layer's own pairing of an
+unscaled target with a scaled depth surface, which no Wine takes part in, so
+`i686+scale` and `x86_64+scale` took visual.c:24934 at 3 by hand, as earlier
+edits of the x86_64 Wine's keys did; both stay unconfirmed until a run under
+that Wine. The `@mac2` keys have no `+scale` form.

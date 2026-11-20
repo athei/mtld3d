@@ -2037,6 +2037,96 @@ impl DeviceInner {
         });
     }
 
+    /// Reset the viewport and the scissor rect to a new render target 0's reported extent.
+    ///
+    /// What `SetRenderTarget(0, …)` does after the bind, as D3D9 specifies:
+    /// games rely on it, and skipping it leaves draws clipped to whatever rect
+    /// was set for the previous target.
+    fn reset_view_to_rt0(&mut self, width: u32, height: u32) {
+        self.set_viewport(mtld3d_types::D3DVIEWPORT9 {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            min_z: 0.0,
+            max_z: 1.0,
+        });
+        self.set_scissor_rect(mtld3d_core::render_state::full_target_scissor(
+            width, height,
+        ));
+        // RT swap: depth/stencil resolution may change; new RT might also
+        // already be bound as a texture on some stage (sampling-from-RT). RS
+        // carries the reset scissor; VS_CONST is internalized into `set_viewport`.
+        self.mark_snapshot_dirty(SnapshotDirty::RT_DS | SnapshotDirty::STAGES | SnapshotDirty::RS);
+    }
+
+    /// Whether render target 0 is a `NULL` surface or a level of a `NULL` texture.
+    pub fn rt0_is_null_target(&self) -> bool {
+        let rt0 = self.bound_rt.render_target(0);
+        // SAFETY: a non-null bound render target is kept live by its binding.
+        !rt0.is_null()
+            && mtld3d_core::format::is_null_render_target(unsafe { (*rt0).reported_format() })
+    }
+
+    /// The colourless binding a `NULL` render target 0 hands the encoder.
+    ///
+    /// A `NULL` target has no colour storage, so the binding carries no
+    /// texture: every pass drawn through it is a depth-only pass. Its extent,
+    /// scale and sample count are the bound depth surface's, so the viewport,
+    /// the scissor and every draw-time coordinate convert in the space of the
+    /// one attachment the pass has, and the depth surface sets the pass's
+    /// extent whatever size the `NULL` surface reports. With no depth surface
+    /// bound it carries the `NULL` surface's own extent, unscaled; no draw
+    /// runs through it then.
+    fn null_rt0_binding(&self) -> (RtBinding, mtld3d_core::render_scale::RenderScale) {
+        let ((width, height), scale, sample_count) = if self.depth_stencil_bound() {
+            let ds = self.bound_rt.depth_stencil();
+            if ds.is_null() {
+                // The implicit depth surface, which follows the back buffer.
+                (
+                    (self.backbuffer_width, self.backbuffer_height),
+                    self.render_scale,
+                    self.backbuffer_sample_count,
+                )
+            } else {
+                // SAFETY: the bound depth surface is kept live by its binding.
+                let ds = unsafe { &*ds };
+                let (extent, scale) = ds.reported_extent();
+                (extent, scale, ds.multi_sample().sample_count)
+            }
+        } else {
+            let rt0 = self.bound_rt.render_target(0);
+            // SAFETY: render target 0 is the bound `NULL` surface, kept live by
+            // its binding.
+            let (extent, _) = unsafe { &*rt0 }.reported_extent();
+            (extent, mtld3d_core::render_scale::RenderScale::IDENTITY, 1)
+        };
+        (
+            RtBinding::StandaloneColor {
+                handle: MetalHandle::NULL,
+                srgb: MetalHandle::NULL,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count,
+                format: mtld3d_shared::mtl::PixelFormat::R8Unorm,
+                has_alpha: false,
+                width,
+                height,
+            },
+            scale,
+        )
+    }
+
+    /// Hand the encoder render target 0's `NULL` binding as the depth surface now shapes it.
+    ///
+    /// Called when a `NULL` surface becomes render target 0 and whenever the
+    /// depth surface behind one changes, since the binding follows it.
+    fn rebind_null_rt0(&mut self) {
+        let (info, scale) = self.null_rt0_binding();
+        self.last_color_rt_binding = Some((info.clone(), scale));
+        self.push_color_rt_binding_op(0, info, scale);
+    }
+
     /// Unbind render target `slot` (1..=3): `SetRenderTarget(slot, NULL)`.
     ///
     /// Regenerates the mip chain of an autogen texture that was bound there,
@@ -3310,6 +3400,11 @@ impl DeviceInner {
         // The game's own bindings outlive the resize.
         self.reseed_current_frame();
         self.retarget_implicit_bindings(old_depth);
+        // A `NULL` render target 0 follows the depth surface, which the resize
+        // may have replaced.
+        if self.rt0_is_null_target() {
+            self.last_color_rt_binding = Some(self.null_rt0_binding());
+        }
         self.reassert_saved_bindings();
 
         // The viewport and scissor follow render target 0 when that is the
@@ -6515,6 +6610,24 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    // NULL exists as a render-target texture and nothing else, the shape
+    // `CheckDeviceFormat` offers it in.
+    if mtld3d_core::format::is_null_render_target(format)
+        && (offscreen_plain
+            || !mtld3d_core::format::null_render_target_usage_allowed(
+                usage,
+                mtld3d_types::D3DRTYPE_TEXTURE,
+            ))
+    {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: u64::from(usage),
+            "reject CreateTexture(format=NULL, usage={usage:#x}) → INVALIDCALL (NULL is a \
+             render target only)"
+        );
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
 
     // Past the extent the device reports, a texture Metal backs is refused:
     // Metal itself aborts the process on a descriptor past its own limit. A
@@ -6612,7 +6725,10 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // non-renderable colour attachment with an abort rather than a returned
     // error: a lenient create costs the process at the first draw into the
     // texture instead of costing the application one handled failure here.
-    if usage_rt && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16) {
+    if usage_rt
+        && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16)
+        && !mtld3d_core::format::is_null_render_target(format)
+    {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: u64::from(format),
@@ -6838,6 +6954,11 @@ fn resolve_texture_storage(
     FormatMapping,
     Option<mtld3d_core::planar_yuv::PlanarYuvLayout>,
 )> {
+    // Only a render-target texture reaches here with NULL; no draw writes the
+    // storage, since a level bound as a target binds no colour attachment.
+    if mtld3d_core::format::is_null_render_target(format) {
+        return Some((mtld3d_core::format::null_texture_storage_mapping(), None));
+    }
     if !mtld3d_core::stretch_rect::is_planar_yuv(format) {
         let mapping = crate::direct3d9::map_for_device(format, expand_packed16);
         if mapping.is_none() {
@@ -7907,6 +8028,86 @@ fn allocate_color_target(
     })
 }
 
+/// `CreateRenderTarget` for `NULL`: a render-target surface that owns no Metal texture.
+///
+/// `NULL` has no colour storage, so the surface binds no colour attachment
+/// when it is set as a render target (`DeviceInner::null_rt0_binding`). It is
+/// single-sampled only, the one count `CheckDeviceMultiSampleType` offers the
+/// format. A lockable one carries the CPU copy `LockRect` maps, at
+/// `NULL_LOCK_BYTES_PER_PIXEL` and zeroed, which no draw reads or writes.
+fn create_null_render_target(
+    device_inner: *mut DeviceInner,
+    spec: &ColorTargetSpec,
+    lockable: bool,
+    surface: *mut *mut c_void,
+) -> i32 {
+    let &ColorTargetSpec {
+        width,
+        height,
+        format,
+        usage,
+        multi_sample,
+    } = spec;
+    // The extent every other render target is held to, checked before the
+    // lockable copy is sized from it.
+    if !caps::texture_extent_fits(width, height) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject CreateRenderTarget({width}x{height}, format=NULL) → INVALIDCALL (past the {} \
+             texel extent the device reports)",
+            caps::MAX_TEXTURE_DIM
+        );
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
+    }
+    if multi_sample.sample_count > 1 {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject CreateRenderTarget(format=NULL, ms={}) → INVALIDCALL (NULL is single-sampled \
+             only)",
+            multi_sample.multi_sample_type
+        );
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
+    }
+    let staging = if lockable {
+        let pitch = linear_row_pitch(width, mtld3d_core::format::NULL_LOCK_BYTES_PER_PIXEL);
+        let bytes = (pitch as usize).saturating_mul(height as usize);
+        let Some(staging) = PageBox::try_new_zeroed(bytes) else {
+            return refuse_unallocatable_staging("CreateRenderTarget", surface);
+        };
+        Some(staging)
+    } else {
+        None
+    };
+    let surf_ptr = Box::into_raw(Box::new(Direct3DSurface9::new_color_target(
+        &ColorTargetCreateInfo {
+            device_inner,
+            metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            width,
+            height,
+            format,
+            usage,
+            render_scale: mtld3d_core::render_scale::RenderScale::IDENTITY,
+            multi_sample,
+        },
+    )));
+    if let Some(staging) = staging {
+        // SAFETY: `surf_ptr` is the freshly created surface at refcount 1; no
+        // other reference exists yet, so the exclusive borrow is sound.
+        unsafe { &mut *surf_ptr }.set_lockable_staging(staging);
+    }
+    // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
+    // surface at refcount 1.
+    unsafe { crate::com_ref::com_register_child(surf_ptr) };
+    // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
+    unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
+    D3D_OK
+}
+
 extern "system" fn device_create_render_target(
     this: *mut c_void,
     width: u32,
@@ -7965,6 +8166,20 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
+    if mtld3d_core::format::is_null_render_target(format) {
+        return create_null_render_target(
+            obj.inner_ptr(),
+            &ColorTargetSpec {
+                width,
+                height,
+                format,
+                usage: D3DUSAGE_RENDERTARGET,
+                multi_sample,
+            },
+            lockable != 0,
+            surface,
+        );
+    }
     // A `Lockable == TRUE` render target keeps its standalone renderable colour
     // texture (so `GetContainer`/`GetDesc`/`StretchRect` are unchanged) but also
     // gets a CPU staging buffer: `LockRect` maps it, `UnlockRect` uploads it to
@@ -9888,6 +10103,12 @@ fn resolve_stretch_surface(
     // caller-supplied surface pointer from a `StretchRect` thunk; the
     // caller must pass live surface wrappers.
     let s = unsafe { &*surf };
+    // A `NULL` target holds no colour, so it is neither a source nor a destination.
+    if mtld3d_core::format::is_null_render_target(s.reported_format()) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "StretchRect: a NULL render target has no colour to copy → INVALIDCALL");
+        return None;
+    }
     let parent = s.parent_texture();
     if !parent.is_null() {
         // SAFETY: `parent` is non-null (checked above) and points to a
@@ -10160,6 +10381,12 @@ extern "system" fn device_color_fill(
     // SAFETY: vtable in-param; `rect` is *const D3DRECT per the D3D9 ABI.
     let rect = unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(rect) };
     let surf = surface.cast::<Direct3DSurface9>();
+    // A `NULL` render target has no colour to fill: the call succeeds and
+    // changes nothing.
+    // SAFETY: `surf` is non-null (checked above) and the caller's live surface.
+    if mtld3d_core::format::is_null_render_target(unsafe { (*surf).reported_format() }) {
+        return D3D_OK;
+    }
     let Some(info) = resolve_stretch_surface(surf) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "ColorFill on a surface with no DEFAULT-pool backing → INVALIDCALL");
@@ -10475,6 +10702,9 @@ extern "system" fn device_set_render_target(
         );
         return D3DERR_INVALIDCALL;
     }
+    if mtld3d_core::format::is_null_render_target(desc.format) {
+        return set_null_render_target(dev, slot, surf, (desc.width, desc.height));
+    }
 
     // Capture attachment info for the encoder thread. Texture-backed
     // surfaces (from `GetSurfaceLevel` on a `D3DUSAGE_RENDERTARGET`
@@ -10604,29 +10834,36 @@ extern "system" fn device_set_render_target(
     }
     dev.last_color_rt_binding = Some((info.clone(), scale));
     dev.push_color_rt_binding_op(0, info, scale);
+    dev.reset_view_to_rt0(desc.width, desc.height);
+    D3D_OK
+}
 
-    // D3D9 spec: SetRenderTarget resets the viewport to cover the new
-    // RT's full dimensions. Games rely on this, and skipping it leaves
-    // draws clipped to whatever rect was last set, effectively
-    // rendering into a sub-rect of the new attachment.
-    dev.set_viewport(mtld3d_types::D3DVIEWPORT9 {
-        x: 0,
-        y: 0,
-        width: desc.width,
-        height: desc.height,
-        min_z: 0.0,
-        max_z: 1.0,
-    });
-    // D3D9 likewise resets the scissor rect to the new RT's full dimensions,
-    // overriding any rect set before the switch.
-    dev.set_scissor_rect(mtld3d_core::render_state::full_target_scissor(
-        desc.width,
-        desc.height,
-    ));
-    // RT swap: depth/stencil resolution may change; new RT might also
-    // already be bound as a texture on some stage (sampling-from-RT). RS
-    // carries the reset scissor; VS_CONST is internalized into `set_viewport`.
-    dev.mark_snapshot_dirty(SnapshotDirty::RT_DS | SnapshotDirty::STAGES | SnapshotDirty::RS);
+/// `SetRenderTarget` of a `NULL` surface or `NULL` texture level, already validated.
+///
+/// A `NULL` target takes no colour write. At render target 1..3 the slot
+/// binds no attachment, so a draw writes nothing there. At render target 0
+/// the encoder gets the colourless binding `DeviceInner::null_rt0_binding`
+/// shapes after the bound depth surface, and the viewport and scissor reset
+/// to the surface's own reported extent, as for any render target.
+fn set_null_render_target(
+    dev: &mut DeviceInner,
+    slot: usize,
+    surf: *mut Direct3DSurface9,
+    (width, height): (u32, u32),
+) -> i32 {
+    if let Some(old_id) = dev.cur_autogen_rt_ids[slot].take() {
+        dev.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
+    }
+    dev.bound_rt_mut().replace_render_target(slot, surf);
+    if slot != 0 {
+        dev.last_extra_rt_bindings[slot - 1] = None;
+        dev.push_control(crate::device::UnbindExtraColorOp {
+            slot: u8::try_from(slot).expect("validated extra color slot"),
+        });
+        return D3D_OK;
+    }
+    dev.rebind_null_rt0();
+    dev.reset_view_to_rt0(width, height);
     D3D_OK
 }
 
@@ -10891,6 +11128,10 @@ extern "system" fn device_set_depth_stencil_surface(
         depth_has_stencil,
         depth_sample_count,
     );
+    // A `NULL` render target 0 is shaped after the depth surface behind it.
+    if dev.rt0_is_null_target() {
+        dev.rebind_null_rt0();
+    }
     // A depth-attachment change ends the current Metal render pass; the next FF
     // draw runs on a fresh encoder, so its FF vertex constants (`vs_c`, buffer
     // 15) must be re-emitted. `SetRenderTarget` gets this for free via its
@@ -11111,7 +11352,19 @@ extern "system" fn device_clear(
         Some(list)
     };
 
-    if flags & D3DCLEAR_TARGET != 0 {
+    // A `NULL` render target 0 has no colour to clear, so the colour plane is
+    // a successful no-op; its pass carries no colour attachment for a clear
+    // to land on, render targets 1..3 included.
+    let null_rt0 = flags & D3DCLEAR_TARGET != 0 && dev.rt0_is_null_target();
+    if null_rt0
+        && (1..RENDER_TARGET_SLOTS).any(|slot| !dev.bound_rt().render_target(slot).is_null())
+    {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "Clear(TARGET) with a NULL render target 0 leaves render targets 1..3 uncleared"
+        );
+    }
+    if flags & D3DCLEAR_TARGET != 0 && !null_rt0 {
         // D3DCOLOR is ARGB; unpack to normalized float bits so the encoder
         // can fold them into a Metal `MTLLoadAction::Clear` at pass-begin.
         // D3DRS_SRGBWRITEENABLE applies to the clear colour exactly as it

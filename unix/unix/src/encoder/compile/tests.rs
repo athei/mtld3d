@@ -164,3 +164,119 @@ fn push_sends_primary_pipelines_ahead_and_siblings_with_the_libraries() {
         .collect();
     assert_eq!(order, [primary, library, sibling]);
 }
+
+/// A draw through a `NULL` render target 0 is judged by its depth and stencil planes alone.
+///
+/// Its pass attaches no colour target, so the skip test answers yes once the
+/// depth and stencil planes it draws into were cleared whole in this frame
+/// and the one before, and no while either plane was cleared in one frame
+/// only. A real render target 0 that no clear reached keeps every draw, its
+/// depth planes rebuilt or not.
+#[test]
+fn a_null_render_target_0_is_judged_by_its_depth_and_stencil_planes() {
+    use std::sync::atomic::AtomicU64;
+
+    use mtld3d_core::{
+        config::Mtld3dConfig,
+        gpu_caps::GpuCaps,
+        passes::{BackbufferContents, FrameReset},
+        render_scale::RenderScale,
+    };
+    use mtld3d_shared::{
+        clock_calibration::ClockCalibration, mtl::PixelFormat, record_handle::DeviceRecordHandle,
+    };
+    use objc2::rc::Retained;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = crate::encoder::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        crate::encoder::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+    // SAFETY: tests; opaque attachment values, never dereferenced since nothing is submitted.
+    let back_buffer = unsafe { MetalHandle::new(0x1000) };
+    // SAFETY: as above.
+    let depth = unsafe { MetalHandle::new(0x2000) };
+    // SAFETY: as above.
+    let colour = unsafe { MetalHandle::new(0x3000) };
+    enc.pass_state.reset_frame(&FrameReset {
+        backbuffer: back_buffer,
+        backbuffer_srgb: MetalHandle::NULL,
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: (640, 480),
+        backbuffer_format: PixelFormat::Bgra8Unorm,
+        backbuffer_contents: BackbufferContents::Preserved,
+        depth_texture: depth,
+        depth_size: (640, 480),
+        depth_has_stencil: true,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    let planes = ClearPlanes::DEPTH | ClearPlanes::STENCIL;
+    enc.pass_state.set_color_render_target(
+        MetalHandle::NULL,
+        640,
+        480,
+        PixelFormat::R8Unorm,
+        RenderScale::IDENTITY,
+    );
+
+    enc.cleared_targets.begin_frame();
+    enc.cleared_targets.record(depth, 0, planes);
+    assert!(!enc.targets_rebuilt(planes), "both planes cleared once");
+    enc.cleared_targets.begin_frame();
+    enc.cleared_targets.record(depth, 0, ClearPlanes::DEPTH);
+    assert!(
+        !enc.targets_rebuilt(planes),
+        "the stencil plane cleared in one frame only"
+    );
+    assert!(
+        enc.targets_rebuilt(ClearPlanes::DEPTH),
+        "the depth plane cleared in both frames"
+    );
+    enc.cleared_targets.record(depth, 0, ClearPlanes::STENCIL);
+    assert!(
+        enc.targets_rebuilt(planes),
+        "both planes cleared in both frames"
+    );
+
+    enc.pass_state.set_color_render_target(
+        colour,
+        640,
+        480,
+        PixelFormat::Bgra8Unorm,
+        RenderScale::IDENTITY,
+    );
+    assert!(
+        !enc.targets_rebuilt(planes),
+        "a colour target no clear reached keeps the draw"
+    );
+    enc.shutdown_cleanup();
+}

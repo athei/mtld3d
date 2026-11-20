@@ -12,7 +12,7 @@
 use mtld3d_tests::{Factory, Harness, HarnessConfig, Texture, TexturedVertex};
 use mtld3d_types::{
     D3D_OK, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8,
-    D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES,
+    D3DFMT_D24S8, D3DFMT_NULL, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES,
     D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_BACK_BUFFERS_MAX,
     D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_PARAMETERS,
@@ -138,6 +138,17 @@ fn a_surface_past_the_extent_limit_is_refused() {
     assert_eq!(hr, D3DERR_INVALIDCALL, "CreateRenderTarget");
     assert!(surface.is_none());
     assert_device_draws(&h, "render target");
+    // A `NULL` render target owns no Metal texture, so the device refuses it
+    // past its reported extent, lockable copy or not.
+    for (size, lockable) in [((PAST_2D_LIMIT, 16), 0), ((0x4000_0000, 1), 1)] {
+        let (hr, surface) = h.create_render_target_ms_hr(size, D3DFMT_NULL, (0, 0), lockable);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "NULL CreateRenderTarget {size:?} lockable {lockable}"
+        );
+        assert!(surface.is_none());
+    }
+    assert_device_draws(&h, "NULL render target");
     let (hr, surface) =
         h.create_depth_stencil_surface_ms_hr((16, PAST_METAL_2D_LIMIT), D3DFMT_D24S8, (0, 0));
     assert_eq!(hr, D3DERR_INVALIDCALL, "CreateDepthStencilSurface");

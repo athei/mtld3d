@@ -3724,6 +3724,11 @@ impl FrameEncoder {
         self.pass_state.rt0_dropped()
     }
 
+    /// Whether render target 0 is a `NULL` target. See `PassState::rt0_is_null_target`.
+    pub const fn rt0_is_null_target(&self) -> bool {
+        self.pass_state.rt0_is_null_target()
+    }
+
     /// The colour outputs the pixel shader encodes itself under `D3DRS_SRGBWRITEENABLE`.
     ///
     /// See `PassState::shader_srgb_encode_mask`. Read at draw time: zero

@@ -169,7 +169,30 @@ impl DeviceInner {
     /// Labels for the bound colour RT0 and depth-stencil, for dump lines.
     #[must_use]
     pub fn frame_dump_target_labels(&self) -> (String, String) {
-        let rt = match &self.last_color_rt_binding {
+        // A `NULL` target's binding carries the depth surface's shape and no
+        // texture, so it is named for what the application bound.
+        let rt = if self.rt0_is_null_target() {
+            let rt0 = self.bound_rt().render_target(0);
+            // SAFETY: render target 0 is the bound `NULL` surface, kept live
+            // by its binding.
+            let ((width, height), _) = unsafe { &*rt0 }.reported_extent();
+            format!("NULL {width}x{height}")
+        } else {
+            self.color_rt_label()
+        };
+        let ds = match &self.last_depth_binding {
+            Some((DepthBinding::Lazy(info, level, _), ..)) => {
+                format!("{:?} level={level}", info.texture_id)
+            }
+            Some((DepthBinding::Eager(..), ..)) => String::from("default"),
+            Some((DepthBinding::None, ..)) | None => String::from("none"),
+        };
+        (rt, ds)
+    }
+
+    /// The dump label of the colour binding render target 0 last sent to the encoder.
+    fn color_rt_label(&self) -> String {
+        match &self.last_color_rt_binding {
             Some((RtBinding::Backbuffer { width, height, .. }, _)) => {
                 format!("backbuffer {width}x{height}")
             }
@@ -197,15 +220,7 @@ impl DeviceInner {
                 info.texture_id, info.pixel_format
             ),
             None => String::from("none"),
-        };
-        let ds = match &self.last_depth_binding {
-            Some((DepthBinding::Lazy(info, level, _), ..)) => {
-                format!("{:?} level={level}", info.texture_id)
-            }
-            Some((DepthBinding::Eager(..), ..)) => String::from("default"),
-            Some((DepthBinding::None, ..)) | None => String::from("none"),
-        };
-        (rt, ds)
+        }
     }
 
     /// Log the assembled draw state; called once per draw while a dump runs.

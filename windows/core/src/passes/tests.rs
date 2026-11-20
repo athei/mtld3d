@@ -10135,6 +10135,94 @@ fn a_dropped_pass_attaches_the_depth_surface_alone_at_its_extent() {
     assert_eq!(s.target_extent().texture(), (1, 1));
 }
 
+// ── A `NULL` render target 0: a colour binding with no texture, shaped after the depth surface.
+
+/// `s` with a `NULL` render target 0 shaped after the frame's 640x480 depth surface at `scale`.
+fn null_over_depth(mut s: PassState, scale: RenderScale) -> PassState {
+    s.set_color_render_target(MetalHandle::NULL, BB_SIZE.0, BB_SIZE.1, RT_FORMAT, scale);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s
+}
+
+#[test]
+fn a_null_target_0_over_a_bound_depth_surface_is_left_out_scaled_or_not() {
+    let s = null_over_depth(fresh(), RenderScale::IDENTITY);
+    assert!(s.rt0_is_null_target());
+    assert!(!s.pass_binds_color());
+    assert_eq!(candidate(&s), "yes");
+    let s = null_over_depth(fresh_scaled(), RenderScale::from_percent(50));
+    assert_eq!(candidate(&s), "yes", "a depth surface render.scale reduces");
+    let mut s = null_over_depth(fresh(), RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    assert_eq!(candidate(&s), "no", "no depth surface");
+    assert!(!fresh().rt0_is_null_target(), "the back buffer");
+}
+
+#[test]
+fn a_null_target_0_keeps_the_depth_surfaces_sample_count() {
+    let mut s = null_over_depth(fresh(), RenderScale::IDENTITY);
+    s.set_depth_sample_count(4);
+    assert_eq!(
+        candidate(&s),
+        "no",
+        "a single-sampled binding over 4x depth"
+    );
+    s.set_color_msaa(MetalHandle::NULL, MetalHandle::NULL, 4);
+    assert_eq!(s.current_color_sample_count(), 4);
+    assert!(s.pass_binds_depth());
+    assert_eq!(candidate(&s), "yes");
+    // A real target without its companion still renders single-sampled.
+    let mut s = tiny_over_depth();
+    s.set_color_msaa(MetalHandle::NULL, MetalHandle::NULL, 4);
+    assert_eq!(s.current_color_sample_count(), 1);
+}
+
+#[test]
+fn a_null_target_0_attaches_no_colour_target() {
+    let mut s = null_over_depth(fresh(), RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(slot(tex(0x7300), BB_SIZE)));
+    assert_eq!(s.attached_color_targets().count(), 0);
+    assert_eq!(
+        tiny_over_depth()
+            .attached_color_targets()
+            .collect::<Vec<_>>(),
+        [(tiny(), 0)]
+    );
+}
+
+#[test]
+fn a_dropped_pass_through_a_null_target_converts_in_the_depth_surfaces_space() {
+    let mut s = null_over_depth(fresh_scaled(), RenderScale::from_percent(50));
+    s.set_rt0_dropped(true);
+    assert_eq!(s.target_scale(), RenderScale::from_percent(50));
+    assert_eq!(s.target_extent().texture(), (320, 240));
+    assert_eq!(s.effective_viewport(), (0, 0, 320, 240));
+    s.set_viewport(0, 0, 320, 240, 0.0, 1.0);
+    assert_eq!(s.effective_viewport(), (0, 0, 160, 120));
+    s.emit_command(dummy_draw());
+    let pass = s.passes().last().expect("the draw opened a pass");
+    assert_eq!(pass.color_texture(), MetalHandle::NULL);
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(pass.color_size(), (320, 240));
+    assert_eq!(pass.depth_size, (320, 240));
+}
+
+#[test]
+fn a_region_depth_clear_through_a_null_target_opens_the_pass_its_draws_continue() {
+    let mut s = null_over_depth(fresh(), RenderScale::IDENTITY);
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(!has_color, "the quads go to a pass without colour");
+    assert!(s.rt0_dropped());
+    s.set_rt0_dropped(true);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 1, "the draw continued the clear's pass");
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(s.passes()[0].depth_size, BB_SIZE);
+}
+
 #[test]
 fn ending_a_pass_clears_the_decision_with_or_without_an_open_pass() {
     let mut s = tiny_over_depth();
