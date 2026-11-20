@@ -2670,9 +2670,10 @@ impl PassState {
     ///
     /// The device binds a `NULL` surface that way, with the extent, scale and
     /// sample count of the depth surface it is drawn over. Every other target
-    /// binds a real texture but one: a back buffer Metal refused to recreate
-    /// leaves the frame's colour binding null too, and its draws then take the
-    /// same depth-only path, with no colour to lose.
+    /// binds a real texture unless Metal refused it: a back buffer that could
+    /// not be recreated, or a render-target texture whose create failed,
+    /// leaves the colour binding null too, and their draws then take the same
+    /// depth-only path, with no colour to lose.
     #[must_use]
     pub const fn rt0_is_null_target(&self) -> bool {
         self.current_color_texture.is_null()

@@ -445,8 +445,9 @@ fn emit_draw_view(
     if rt0_null && !has_depth {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "draw dropped: render target 0 has no colour texture (a NULL target, or a back buffer \
-             that could not be created) and the pass binds no depth surface"
+            "draw dropped: render target 0 has no colour texture (a NULL target, a back buffer \
+             that could not be created, or a render-target texture whose create failed) and the \
+             pass binds no depth surface"
         );
         return;
     }
