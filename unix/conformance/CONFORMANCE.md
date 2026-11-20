@@ -196,12 +196,13 @@ by its `file:line`, which moves between Wine versions (the x86_64 Wine
 cx-26.3.0-7 ships Wine 11.0's tests, the arm64 Wine v0.4.0 Wine 11.21's),
 so one classification list can only serve one build of the tests, and a PE
 test runs under any Wine. `WINE_TESTS` names the directory. Under the
-arm64 Wine it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
-puts our builtin `d3d9.dll` into; under an x86_64 Wine it has no default and
-the conformance targets stop without it, and CI's x86_64-Wine images fetch
-the pinned arm64 release's `lib/wine/tests` alone for it. The binaries are
-not vendored here: they are large and drift with the Wine version, so
-`baseline.txt` records the Wine version it was taken against instead.
+arm64 Wine it defaults to `$WINE_SDK/lib/wine/tests`, the same install
+`make install` puts our builtin `d3d9.dll` into; under an x86_64 Wine it
+has no default and the conformance targets stop without it, and CI's
+x86_64-Wine images fetch the pinned arm64 release's `lib/wine/tests` alone
+for it. The binaries are not vendored here: they are large and drift with
+the Wine version, so `baseline.txt` records the Wine version it was taken
+against instead.
 
 The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It takes
 the loader and one test binary as explicit paths (`--wine`, `--exe`, plus
@@ -1026,15 +1027,16 @@ athei/mach9 (formerly wine-build) publishes. Against Wine 11.20's,
 `dlls/d3d9/tests` changes only `device.c`: `test_present_destroyed_window`
 adds 42 lines before `test_window_position` and one call in `START_TEST`,
 so every device.c site from 14963 to `START_TEST` (old 15374) moves 42
-lines later, `test_window_position` from 15039 to 15081, `init_d3d9on12_modules` from
-15104 to 15146, `test_d3d9on12` from 15176 to 15218 and
-`test_device_vtbl_initialization_assembly_hook` from 15357 to 15399, and no
-other site moves. The new test presents, destroys the device window and
-presents three more times, and passes on every key recorded here. Recorded
-locally on an Apple Silicon machine, twice, with the release's own test
-binaries: the arm64 Wine's six Apple keys (`i686-arm64`, `arm64x` and their
-`+intel` and `+scale` forms). The two runs read the same sites at the same
-counts, and the six keys hold every earlier count at its new line. The
+lines later, `test_window_position` from 15039 to 15081,
+`init_d3d9on12_modules` from 15104 to 15146, `test_d3d9on12` from 15176 to
+15218 and `test_device_vtbl_initialization_assembly_hook` from 15357 to
+15399, and no other site moves. The new test presents, destroys the
+device window and presents three more times, and passes on every key
+recorded here. Recorded locally on an Apple Silicon machine, twice, with
+the release's own test binaries: the arm64 Wine's six Apple keys
+(`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms). The two
+runs read the same sites at the same counts, and the six keys hold every
+earlier count at its new line. The
 x86_64 Wine's six keys and the two `@mac2` keys were renumbered from the
 source diff alone, line numbers only. CI confirms `i686` and `x86_64` on
 macos-15. CI's `record_intel_baseline` dispatch with `intel_only`, run
