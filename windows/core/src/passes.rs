@@ -2335,17 +2335,22 @@ impl PassState {
     /// The subresource packs the slice in the low half and the level in the
     /// high half, the key a colour clear is remembered under. An extra target
     /// sized unlike render target 0 is attached to no pass and is left out.
+    /// A `NULL` render target 0 ([`Self::rt0_is_null_target`]) yields
+    /// nothing: every pass drawn through it is depth-only, extras included.
     pub fn attached_color_targets(
         &self,
     ) -> impl Iterator<Item = (MetalHandle<MTLTextureKind>, u32)> + '_ {
+        let attaches = !self.rt0_is_null_target();
         let rt0 = (self.current_color_texture, self.current_color_subresource);
         let extras = self
             .current_extra_color
             .iter()
             .enumerate()
-            .filter(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) != 0)
+            .filter(move |(i, slot)| {
+                attaches && slot.is_bound() && self.current_extra_present_mask & (1 << i) != 0
+            })
             .map(|(_, slot)| (slot.texture, slot.subresource));
-        core::iter::once(rt0).chain(extras)
+        attaches.then_some(rt0).into_iter().chain(extras)
     }
 
     #[must_use]
@@ -2464,7 +2469,9 @@ impl PassState {
     /// at all. `msaa` NULL with a `sample_count` above 1 is the caller saying
     /// the target is multisampled but its companion could not be created; the
     /// pass then renders single-sampled into the resolve texture, which is
-    /// visually wrong only in that it is not antialiased.
+    /// visually wrong only in that it is not antialiased. A `NULL` render
+    /// target 0 ([`Self::rt0_is_null_target`]) keeps `sample_count` without a
+    /// companion: it is the count of the depth surface it is drawn over.
     pub fn set_color_msaa(
         &mut self,
         msaa: MetalHandle<MTLTextureKind>,
@@ -2476,7 +2483,9 @@ impl PassState {
         } else {
             msaa_srgb
         };
-        let sample_count = if msaa.is_null() {
+        // A `NULL` render target 0 has no companion: its count is the depth
+        // surface's, which the passes and pipelines it draws in rasterize at.
+        let sample_count = if msaa.is_null() && !self.rt0_is_null_target() {
             1
         } else {
             sample_count.max(1)
@@ -2660,8 +2669,10 @@ impl PassState {
     /// Whether render target 0 is a `NULL` target: a colour binding with no texture.
     ///
     /// The device binds a `NULL` surface that way, with the extent, scale and
-    /// sample count of the depth surface it is drawn over, and binds a real
-    /// texture for every other target.
+    /// sample count of the depth surface it is drawn over. Every other target
+    /// binds a real texture but one: a back buffer Metal refused to recreate
+    /// leaves the frame's colour binding null too, and its draws then take the
+    /// same depth-only path, with no colour to lose.
     #[must_use]
     pub const fn rt0_is_null_target(&self) -> bool {
         self.current_color_texture.is_null()

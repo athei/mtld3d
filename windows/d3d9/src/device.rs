@@ -8048,6 +8048,18 @@ fn create_null_render_target(
         usage,
         multi_sample,
     } = spec;
+    // The extent every other render target is held to, checked before the
+    // lockable copy is sized from it.
+    if !caps::texture_extent_fits(width, height) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject CreateRenderTarget({width}x{height}, format=NULL) → INVALIDCALL (past the {} \
+             texel extent the device reports)",
+            caps::MAX_TEXTURE_DIM
+        );
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
+    }
     if multi_sample.sample_count > 1 {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,

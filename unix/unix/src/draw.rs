@@ -259,7 +259,9 @@ fn resolve_pipeline_slow(
                 if enc.skip_pending_draw(planes) {
                     return None;
                 }
-                if !*rt0_drop {
+                // A `NULL` render target 0 has no colour retry to decide on,
+                // so its draws take the placeholder like any other.
+                if !*rt0_drop || enc.rt0_is_null_target() {
                     let id = enc.defer_pipeline(
                         DeferredState::Pipeline(ticket),
                         snapshot,
@@ -443,8 +445,8 @@ fn emit_draw_view(
     if rt0_null && !has_depth {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "draw dropped: a NULL render target 0 with no depth surface has no attachment to draw \
-             into"
+            "draw dropped: render target 0 has no colour texture (a NULL target, or a back buffer \
+             that could not be created) and the pass binds no depth surface"
         );
         return;
     }
@@ -829,7 +831,7 @@ fn emit_draw_view(
                 variant: ps_variant,
             },
             planes_used(render_state, target_planes),
-            !rt0_drop,
+            !rt0_drop || rt0_null,
         )
     }) else {
         return;

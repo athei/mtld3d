@@ -2589,6 +2589,11 @@ extern "system" fn surface_lock_rect(
     if obj.inner().system_memory.is_some() {
         return systemmem_lock_rect(&obj, locked_rect, rect);
     }
+    if mtld3d_core::format::is_null_render_target(obj.inner().standalone_format) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::LockRect on a non-lockable NULL render target → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
         "IDirect3DSurface9::LockRect on a depth-stencil surface (a lockable depth format \
          included: no CPU copy of depth is kept) → INVALIDCALL"

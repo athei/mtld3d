@@ -6,20 +6,22 @@
 //! hands `LockRect` a writable buffer with a non-zero pitch, a `ColorFill` of
 //! one succeeds and changes nothing, and neither end of a `StretchRect` may be
 //! one. Bound as render target 0 it takes no colour write: a colour `Clear`
-//! through it succeeds without effect, and its draws write the depth surface
-//! alone, over the depth surface's extent rather than its own, scaled or not.
+//! through it succeeds without effect, and its draws and rect depth clears
+//! write the depth surface alone, over the depth surface's extent rather than
+//! its own, scaled or not and at the depth surface's sample count, whether the
+//! target is a surface or a texture level.
 
-use mtld3d_tests::{Harness, Rgba8, RhwVertex, TexturedVertex};
+use mtld3d_tests::{Harness, Rgba8, RhwVertex, Surface, TexturedVertex};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DERR_INVALIDCALL,
     D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_INTZ, D3DFMT_NULL,
-    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
     D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUMETEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -163,7 +165,9 @@ fn null_is_offered_as_a_single_sampled_2d_render_target() {
 /// locks to a writable buffer with a non-zero pitch and unlocks; a
 /// non-lockable one refuses the lock. `ColorFill` succeeds on either and on a
 /// level of a full-chain `NULL` render-target texture, `StretchRect` from or
-/// to one is refused, and the shapes the answers refuse do not create.
+/// to one is refused, `UpdateSurface` and `UpdateTexture` with a `NULL` source
+/// or destination are refused, and the shapes the answers refuse do not
+/// create.
 #[test]
 fn null_surfaces_and_textures_create_lock_and_fill() {
     let h = Harness::new();
@@ -227,6 +231,38 @@ fn null_surfaces_and_textures_create_lock_and_fill() {
         "level GetDesc"
     );
     assert_eq!(h.color_fill_hr(&level, BLUE), D3D_OK, "ColorFill level");
+
+    // No system-memory `NULL` resource exists, so neither update has a source
+    // of the destination's format, and a `NULL` source is in the wrong pool.
+    let sysmem =
+        h.create_offscreen_plain_surface(NULL_EDGE, NULL_EDGE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.update_surface_hr(&sysmem, &level),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface into a NULL level"
+    );
+    assert_eq!(
+        h.update_surface_hr(&sysmem, &plain),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface into a NULL surface"
+    );
+    assert_eq!(
+        h.update_surface_hr(&lockable, &colour),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface from a NULL surface"
+    );
+    let sysmem_texture = h.create_texture(128, 128, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.update_texture_hr(&sysmem_texture, &texture),
+        D3DERR_INVALIDCALL,
+        "UpdateTexture into a NULL texture"
+    );
+    let default_texture = h.create_texture(128, 128, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_texture_hr(&texture, &default_texture),
+        D3DERR_INVALIDCALL,
+        "UpdateTexture from a NULL texture"
+    );
 
     let (hr, multisampled) = h.create_render_target_ms_hr(
         (NULL_EDGE, NULL_EDGE),
@@ -458,4 +494,206 @@ fn a_null_target_over_the_back_buffer_depth_draws_in_its_space() {
     ] {
         assert_eq!(h.read_pixel(x, y), GREEN, "right half at ({x}, {y})");
     }
+}
+
+/// Edge of the depth surfaces the read-back cases draw a `NULL` target over.
+const DEPTH_EDGE: u32 = 128;
+/// [`DEPTH_EDGE`] as the vertex positions state it.
+const DEPTH_EDGE_F: f32 = 128.0;
+
+/// Probes on the left and right halves of a [`DEPTH_EDGE`] square, inside and past the `NULL` area.
+const HALF_PROBES: [(u32, u32); 4] = [(16, 16), (40, 100), (80, 16), (112, 100)];
+
+/// Bind `null` as render target 0 over `depth`, under a viewport over the whole depth surface.
+fn bind_null_over(h: &Harness, null: &Surface<'_>, depth: &Surface<'_>) {
+    assert_eq!(h.set_render_target(0, null), D3D_OK, "bind NULL");
+    assert_eq!(h.set_depth_stencil_surface(depth), D3D_OK, "bind depth");
+    assert_eq!(
+        h.set_viewport(&full_viewport(DEPTH_EDGE, DEPTH_EDGE)),
+        D3D_OK,
+        "viewport over the depth surface"
+    );
+}
+
+/// Draw a depth-0.25 quad over the left half of the depth surface through the bound target.
+fn draw_left_half(h: &Harness) {
+    arm_depth_draws(h);
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            2,
+            &rhw_quad(0.0, DEPTH_EDGE_F / 2.0, 0.0, DEPTH_EDGE_F, 0.25, GREEN)
+        ),
+        D3D_OK,
+        "depth-only draw"
+    );
+}
+
+/// Read `depth` back through a colour target of its size and sample count, at [`HALF_PROBES`].
+///
+/// A green depth-0.5 quad drawn under `ZFUNC` less over a black target shows
+/// where the depth surface holds more than 0.5 and stays black where it holds
+/// less. A multisampled target is resolved with `StretchRect` first.
+fn depth_read_back(h: &Harness, depth: &Surface<'_>, samples: u32) -> Vec<u32> {
+    let colour = if samples > 1 {
+        h.create_render_target_ms((DEPTH_EDGE, DEPTH_EDGE), D3DFMT_A8R8G8B8, (samples, 0))
+    } else {
+        h.create_render_target(DEPTH_EDGE, DEPTH_EDGE, D3DFMT_A8R8G8B8)
+    };
+    assert_eq!(
+        h.set_render_target(0, &colour),
+        D3D_OK,
+        "bind the colour target"
+    );
+    assert_eq!(h.set_depth_stencil_surface(depth), D3D_OK, "bind depth");
+    assert_eq!(h.clear_target(BLACK), D3D_OK, "clear the colour target");
+    arm_depth_draws(h);
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            2,
+            &rhw_quad(0.0, DEPTH_EDGE_F, 0.0, DEPTH_EDGE_F, 0.5, GREEN)
+        ),
+        D3D_OK,
+        "depth-tested draw"
+    );
+    let single = if samples > 1 {
+        let single = h.create_render_target(DEPTH_EDGE, DEPTH_EDGE, D3DFMT_A8R8G8B8);
+        assert_eq!(
+            h.stretch_rect(&colour, &single, D3DTEXF_NONE),
+            D3D_OK,
+            "resolve"
+        );
+        single
+    } else {
+        colour
+    };
+    let sysmem = h.create_offscreen_plain_surface(
+        DEPTH_EDGE,
+        DEPTH_EDGE,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&single, &sysmem),
+        D3D_OK,
+        "GetRenderTargetData"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((DEPTH_EDGE * pitch_px) as usize);
+    HALF_PROBES
+        .iter()
+        .map(|&(x, y)| pixels[(y * pitch_px + x) as usize])
+        .collect()
+}
+
+/// The left half holds the drawn 0.25 and the right half the cleared 1.0.
+fn assert_left_half_drawn(probes: &[u32], what: &str) {
+    assert_eq!(
+        probes,
+        [BLACK, BLACK, GREEN, GREEN],
+        "{what}: probes at {HALF_PROBES:?}"
+    );
+}
+
+/// A level of a `NULL` render-target texture draws depth only, over its depth surface's extent.
+///
+/// Level 1 of a 64x64 `NULL` texture, 32x32, is render target 0 over a
+/// 128x128 D24S8 surface: a whole depth `Clear` and a draw over the left half
+/// reach the depth surface past the level's own extent.
+#[test]
+fn a_level_of_a_null_texture_draws_depth_only_over_its_depth_surface() {
+    let h = Harness::new();
+    let depth = h.create_depth_stencil_surface(DEPTH_EDGE, DEPTH_EDGE, D3DFMT_D24S8);
+    let texture = h.create_texture(
+        NULL_EDGE,
+        NULL_EDGE,
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_NULL,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(1);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    bind_null_over(&h, &level, &depth);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, GREEN, 1.0, 0),
+        D3D_OK,
+        "clear through the NULL level"
+    );
+    draw_left_half(&h);
+    let probes = depth_read_back(&h, &depth, 1);
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_left_half_drawn(&probes, "NULL texture level");
+}
+
+/// A rect depth `Clear` through a `NULL` render target 0 reaches its rect past the target's extent.
+///
+/// A 64x64 `NULL` target over a 128x128 D24S8 surface: the whole surface is
+/// cleared to 0.25, then a rect `Clear` covering the right half, which lies
+/// entirely past the `NULL` target's area, clears it to 1.0.
+#[test]
+fn a_rect_depth_clear_through_a_null_target_reaches_past_its_extent() {
+    let h = Harness::new();
+    let depth = h.create_depth_stencil_surface(DEPTH_EDGE, DEPTH_EDGE, D3DFMT_D24S8);
+    let null = h.create_render_target(NULL_EDGE, NULL_EDGE, D3DFMT_NULL);
+    let edge = i32::try_from(DEPTH_EDGE).expect("edge fits i32");
+    assert_eq!(h.begin_scene(), D3D_OK);
+    bind_null_over(&h, &null, &depth);
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, 0.25, 0),
+        D3D_OK,
+        "whole depth clear"
+    );
+    assert_eq!(
+        h.clear_rects(
+            D3DCLEAR_ZBUFFER,
+            0,
+            1.0,
+            0,
+            &[D3DRECT {
+                x1: edge / 2,
+                y1: 0,
+                x2: edge,
+                y2: edge,
+            }]
+        ),
+        D3D_OK,
+        "rect depth clear"
+    );
+    let probes = depth_read_back(&h, &depth, 1);
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_left_half_drawn(&probes, "rect clear");
+}
+
+/// A `NULL` render target 0 over a multisampled depth surface draws at its sample count.
+///
+/// The `NULL` target is single-sampled, the 128x128 D24S8 surface four times
+/// multisampled: the depth-only pass runs at four samples, and a four-sample
+/// colour target over the same surface, resolved, reads the draw back.
+#[test]
+fn a_null_target_over_a_multisampled_depth_surface_draws_at_its_sample_count() {
+    let h = Harness::new();
+    if h.check_device_multi_sample_type(D3DFMT_D24S8, 1, D3DMULTISAMPLE_4_SAMPLES)
+        .0
+        != D3D_OK
+    {
+        return;
+    }
+    let (hr, depth) = h.create_depth_stencil_surface_ms_hr(
+        (DEPTH_EDGE, DEPTH_EDGE),
+        D3DFMT_D24S8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(hr, D3D_OK, "four-sample depth surface");
+    let depth = depth.expect("created");
+    let null = h.create_render_target(NULL_EDGE, NULL_EDGE, D3DFMT_NULL);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    bind_null_over(&h, &null, &depth);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK, "depth clear");
+    draw_left_half(&h);
+    let probes = depth_read_back(&h, &depth, D3DMULTISAMPLE_4_SAMPLES);
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_left_half_drawn(&probes, "four-sample depth");
 }
