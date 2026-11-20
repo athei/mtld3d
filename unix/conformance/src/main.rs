@@ -36,7 +36,7 @@ use std::{
     process::ExitCode,
 };
 
-use crate::model::{Baseline, Gpu, Leg, Subtest, SubtestResult};
+use crate::model::{Baseline, Leg, Subtest, SubtestResult};
 
 fn main() -> ExitCode {
     match real_main() {
@@ -80,7 +80,6 @@ fn real_main() -> Result<ExitCode, String> {
     let leg = Leg {
         arch: config.arch,
         variant: config.variant,
-        gpu: Gpu::host(),
     };
     println!(
         "Wine: {wine_version} ({leg}), tests from {}",

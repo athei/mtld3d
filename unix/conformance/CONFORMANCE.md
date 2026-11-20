@@ -1036,8 +1036,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-11-20: 0 `real`, 178 `expected`, 3 `caps`,
-7 `ceiling`, 3 `flaky`, 0 `untriaged`, 191 unique sites in all.
+`Sites:` tokens below on 2026-11-20: 0 `real`, 159 `expected`, 1 `caps`,
+5 `ceiling`, 3 `flaky`, 0 `untriaged`, 168 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's and 11.21's tests keep them.
@@ -1408,7 +1408,7 @@ baseline.
 ### device.c/test_wndproc
 Sites: 4215=expected
 Sites: 4219=expected 4244=expected 4253=expected 4289=expected
-Sites: 4294=expected 4298=ceiling 4315=ceiling 4324=ceiling 4325=ceiling
+Sites: 4294=expected 4298=ceiling 4315=ceiling
 Sites: 4336=expected 4416=expected
 Sites: 4420=expected 4428=expected 4483=expected 4521=expected 4541=expected
 Sites: 4568=expected 4547=expected 4471=flaky
@@ -1581,7 +1581,6 @@ the flag also covers (5175/5193/5234) now succeed inside their todo blocks,
 which the runner does not count.
 
 ### device.c/test_mode_change
-Sites: 5594=expected 5614=expected 5637=expected 5672=expected 5896=expected
 
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
@@ -1743,7 +1742,7 @@ also one PageBox per subresource so a face or mip can rename independently.
 Per-subresource pixel data is correct.
 
 ### device.c/test_cursor_clipping
-Sites: 14930=expected 14946=ceiling 14955=expected
+Sites: 14946=ceiling
 
 The test creates a fullscreen device at the first served mode of at least
 640x480 that differs from the desktop mode on both axes, and the cursor clip
@@ -1776,7 +1775,6 @@ from the same failed restore as the `test_mode_change` sites, so they are
 (issue #1183).
 
 ### device.c/test_window_position
-Sites: 15081=expected
 
 The test creates a fullscreen device at the monitor's size, shrinks the
 window by one pixel on each axis, and after the second such resize expects
@@ -1861,7 +1859,6 @@ is absent here). The failing cycles read the gradient across Presents —
 the same Rule B depth-store elision as z_range_test.
 
 ### visual.c/pixelshader_blending_test
-Sites: 12006=expected
 
 Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
 G32R32F) with blending on, then samples it and expects absent channels to
@@ -1881,7 +1878,7 @@ still verify stored lanes, mip and cube addressing, and view retirement.
 Physical-GPU tests additionally require the specified all-ones missing lanes.
 
 ### visual.c/test_fetch4
-Sites: 15686=ceiling 15745=expected
+Sites: 15686=ceiling
 
 Fetch4 uses native gather for point-filtered 2D L8/L16/R16F/R32F/A8 and
 INTZ/DF16/DF24 samplers. GET4 and GET1 commands through D3DSAMP_MIPMAPLODBIAS
@@ -1917,9 +1914,6 @@ The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
 device encodes its own way (0x00808000; `def1` reads the same value there).
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
-Sites: 5088=expected 5167=expected 6032=expected 18835=expected
-Sites: 18838=expected 18841=expected 18844=expected 20750=expected
-Sites: 20799=expected
 
 `@mac2` legs only, one mechanism. Every format whose D3D9 sample fills a
 lane the Metal format lacks (R32F's green and blue, G16R16's alpha, V8U8's
@@ -2018,7 +2012,6 @@ truncates (76). A ±1 GPU rounding-convention difference with no cap branch;
 mimicking refrast exactly is not feasible or desirable.
 
 ### visual.c/test_format_conversion
-Sites: 28072=caps
 
 Intel legs only. The test expects `CheckDeviceFormatConversion(YUY2,
 R5G6B5)` to answer D3D_OK, as every desktop driver does. A conversion
@@ -2029,7 +2022,6 @@ without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
 
 ### visual.c/test_blit_format_conversion
-Sites: 29219=caps
 
 Intel legs only. Test 2 creates an R5G6B5 render-target texture as the
 `StretchRect` destination without asking `CheckDeviceFormat` first. On a

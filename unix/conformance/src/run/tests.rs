@@ -50,7 +50,7 @@ use super::{
     normalize_numbers, restart_session, retry_lock, run_subtest, server_dir_for, validation_errors,
     validation_gate_failed, wineserver_pids,
 };
-use crate::model::{Arch, Gpu, Leg, Subtest, Variant};
+use crate::model::{Arch, Leg, Subtest, Variant};
 
 /// The two draw errors the mismatched-sampler-type case logged, verbatim.
 const MISMATCHED_SAMPLER: &str = "\
@@ -128,7 +128,7 @@ fn numbers_and_addresses_collapse() {
     );
 }
 
-/// The two lines the paravirtual GPU's driver printed on the Intel CI image, verbatim.
+/// The two lines a paravirtual GPU's driver printed on a hosted CI runner, verbatim.
 const DRIVER_HANG: &str = "2026-09-05 05:23:06.572 wine[86111:201735] Execution of the command \
     buffer was aborted due to an error during execution. Caused GPU Hang Error \
     (00000003:kIOAccelCommandBufferCallbackErrorHang)";
@@ -188,9 +188,8 @@ fn launch_kept(exe: PathBuf) -> Launch {
 }
 
 const LEG: Leg = Leg {
-    arch: Arch::I686,
+    arch: Arch::I686Arm64,
     variant: Variant::Native,
-    gpu: Gpu::Apple,
 };
 
 /// The framework's summary line, so a run reads as complete.
@@ -245,7 +244,7 @@ fn a_run_records_its_exit_code_and_keeps_its_log_beside_the_raw_output() {
     let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
     assert!(!run.result.crash);
 
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.trim_end()
             .ends_with("[conformance] subtest exited: code 5"),
@@ -253,7 +252,7 @@ fn a_run_records_its_exit_code_and_keeps_its_log_beside_the_raw_output() {
     );
     // The process is told the same directory as a Windows path, one
     // directory per run, so the layer's retention never prunes across runs.
-    let expected = format!("log.dir=Z:{}", dir.join("i686-device").display());
+    let expected = format!("log.dir=Z:{}", dir.join("i686-arm64-device").display());
     assert!(raw.contains(&expected), "{raw}");
 }
 
@@ -267,7 +266,7 @@ fn a_run_ended_by_a_signal_records_the_number_and_is_a_crash() {
     let dir = launch.raw_dir.clone().expect("kept");
     let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
     assert!(run.result.crash);
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.trim_end()
             .ends_with("[conformance] subtest exited: signal 11"),
@@ -286,15 +285,15 @@ fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
     let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
     assert!(run.result.crash, "a process killed at its budget is a hang");
 
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     let trailer = raw.trim_end().lines().last().expect("trailer");
     assert!(
         trailer.starts_with("[conformance] subtest TIMED OUT after 1s and was killed")
-            && trailer.contains("i686-device.sample.txt")
-            && trailer.ends_with("i686-device.wineserver-sample.txt"),
+            && trailer.contains("i686-arm64-device.sample.txt")
+            && trailer.ends_with("i686-arm64-device.wineserver-sample.txt"),
         "{trailer}"
     );
-    let sample = fs::read_to_string(dir.join("i686-device.sample.txt"))
+    let sample = fs::read_to_string(dir.join("i686-arm64-device.sample.txt"))
         .expect("sample kept beside the raw log");
     assert!(
         sample.contains("Call graph:"),
@@ -303,7 +302,7 @@ fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
     // This spawn names no wineserver, so the second file says that rather
     // than being absent: a reader must not have to tell a server that was
     // never looked for from one that was and could not be found.
-    let server = fs::read_to_string(dir.join("i686-device.wineserver-sample.txt"))
+    let server = fs::read_to_string(dir.join("i686-arm64-device.wineserver-sample.txt"))
         .expect("wineserver sample kept beside the process's");
     assert!(
         server.contains("no wineserver was sampled"),
@@ -422,7 +421,7 @@ fn a_pipe_held_past_the_exit_does_not_park_the_run() {
         !run.result.crash,
         "the subtest printed its summary and exited"
     );
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.contains("[conformance] output cut short after"),
         "a collection that stopped early has to say so: {raw}"
@@ -437,9 +436,9 @@ fn a_repeat_run_keeps_one_raw_log_per_attempt() {
     for attempt in 1..=2 {
         run_subtest(&launch, LEG, Subtest::Visual, Some(attempt)).expect("spawn sh");
     }
-    assert!(dir.join("i686-visual-1.log").is_file());
-    assert!(dir.join("i686-visual-2.log").is_file());
-    assert!(!dir.join("i686-visual.log").exists());
+    assert!(dir.join("i686-arm64-visual-1.log").is_file());
+    assert!(dir.join("i686-arm64-visual-2.log").is_file());
+    assert!(!dir.join("i686-arm64-visual.log").exists());
 }
 
 #[test]
@@ -450,7 +449,7 @@ fn nothing_is_kept_and_no_log_dir_is_named_without_a_raw_dir() {
     );
     let dir = exe.parent().expect("script dir").to_path_buf();
     run_subtest(&launch(exe), LEG, Subtest::Device, None).expect("spawn sh");
-    assert!(!dir.join("i686-device.log").exists());
+    assert!(!dir.join("i686-arm64-device.log").exists());
 }
 
 /// The failure line `test_mode_change` prints for a refused restore.
@@ -529,7 +528,7 @@ fn a_refused_mode_restore_starts_the_session_again() {
         format!("{} 1", dir.display()),
         "the tools are told the prefix and the subtests' WINEMSYNC"
     );
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.contains("[conformance] the subtest could not restore the display modes it changed, so the prefix's wineserver session was started again"),
         "{raw}"
@@ -572,7 +571,7 @@ fn a_failed_restart_is_reported_and_the_run_goes_on() {
         calls, "wineserver -k\nwineserver -w\nwineserver -p\n",
         "an end that finds no server is no failure; a start that fails stops before the boot"
     );
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.contains("restarting the prefix's wineserver session failed: `")
             && raw.contains("wineserver -p` ended with exit status: 3"),
@@ -714,7 +713,7 @@ fn without_a_wineserver_the_run_says_the_mode_stays() {
     let launch = launch_kept(exe);
     let dir = launch.raw_dir.clone().expect("kept");
     run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
-    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let raw = fs::read_to_string(dir.join("i686-arm64-device.log")).expect("raw log kept");
     assert!(
         raw.contains("the runner was given no wineserver to restart"),
         "{raw}"

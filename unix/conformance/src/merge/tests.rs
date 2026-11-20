@@ -9,20 +9,16 @@
 use std::collections::BTreeMap;
 
 use super::merge;
-use crate::model::{
-    Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant,
-};
+use crate::model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant};
 
-const I686: Leg = Leg {
-    arch: Arch::I686,
+const I686_ARM64: Leg = Leg {
+    arch: Arch::I686Arm64,
     variant: Variant::Native,
-    gpu: Gpu::Apple,
 };
 
-const X64_INTEL: Leg = Leg {
-    arch: Arch::X64,
-    variant: Variant::Intel,
-    gpu: Gpu::Apple,
+const ARM64X_SCALE: Leg = Leg {
+    arch: Arch::Arm64x,
+    variant: Variant::Scale,
 };
 
 fn site(line: u32) -> Site {
@@ -34,7 +30,7 @@ fn site(line: u32) -> Site {
 
 #[test]
 fn records_counts_and_reports_new_and_dropped_sites() {
-    let key = (I686, Subtest::Device);
+    let key = (I686_ARM64, Subtest::Device);
 
     let mut prior_sub = SubtestBaseline {
         crash: false,
@@ -62,7 +58,7 @@ fn records_counts_and_reports_new_and_dropped_sites() {
         },
     );
 
-    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    let (next, summary) = merge(&prior, I686_ARM64, &fresh, Some("new".to_owned()));
     let sub = &next.entries[&key];
     assert!(sub.crash);
     assert_eq!(sub.sites[&site(1)], 7); // refreshed
@@ -80,17 +76,17 @@ fn a_re_record_writes_the_tests_wine_version_and_keeps_the_header_when_unknown()
         wine_version: "wine-11.19".to_owned(),
         entries: BTreeMap::new(),
     };
-    let fresh = BTreeMap::from([((I686, Subtest::Device), SubtestResult::default())]);
-    let (next, _) = merge(&prior, I686, &fresh, Some("wine-11.20".to_owned()));
+    let fresh = BTreeMap::from([((I686_ARM64, Subtest::Device), SubtestResult::default())]);
+    let (next, _) = merge(&prior, I686_ARM64, &fresh, Some("wine-11.20".to_owned()));
     assert_eq!(next.wine_version, "wine-11.20");
-    let (next, _) = merge(&prior, I686, &fresh, None);
+    let (next, _) = merge(&prior, I686_ARM64, &fresh, None);
     assert_eq!(next.wine_version, "wine-11.19");
 }
 
 #[test]
 fn a_single_leg_update_keeps_the_other_legs() {
-    let mine = (I686, Subtest::Device);
-    let theirs = (X64_INTEL, Subtest::Visual);
+    let mine = (I686_ARM64, Subtest::Device);
+    let theirs = (ARM64X_SCALE, Subtest::Visual);
 
     let mut other_sites = BTreeMap::new();
     other_sites.insert(site(9), 4u32);
@@ -109,7 +105,7 @@ fn a_single_leg_update_keeps_the_other_legs() {
     let mut fresh = BTreeMap::new();
     fresh.insert(mine, SubtestResult::default());
 
-    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    let (next, summary) = merge(&prior, I686_ARM64, &fresh, Some("new".to_owned()));
     let kept = &next.entries[&theirs];
     assert!(kept.crash);
     assert_eq!(kept.sites[&site(9)], 4);
@@ -122,7 +118,7 @@ fn a_single_leg_update_keeps_the_other_legs() {
 
 #[test]
 fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
-    let key = (I686, Subtest::Device);
+    let key = (I686_ARM64, Subtest::Device);
     let mut prior = Baseline::default();
     prior.entries.insert(
         key,
@@ -136,13 +132,18 @@ fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
     let result = crate::scan::parse_subtest_output(output, false);
     assert!(result.sites.is_empty(), "a skip is not a measured failure");
     let fresh = BTreeMap::from([(key, result)]);
-    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    let (next, summary) = merge(&prior, I686_ARM64, &fresh, Some("new".to_owned()));
     assert_eq!(next.entries[&key].sites, BTreeMap::from([(site(6776), 1)]));
     assert_eq!(summary.skipped_sites, vec![site(6776)]);
     assert_eq!(summary.carried, 0, "no failures were measured");
     assert_eq!(summary.dropped_sites, vec![site(5975)]);
 
-    let (new, summary) = merge(&Baseline::default(), I686, &fresh, Some("new".to_owned()));
+    let (new, summary) = merge(
+        &Baseline::default(),
+        I686_ARM64,
+        &fresh,
+        Some("new".to_owned()),
+    );
     assert!(new.entries[&key].sites.is_empty(), "no pin to retain");
     assert_eq!(summary.skipped_sites, [] as [Site; 0]);
 
@@ -151,7 +152,7 @@ fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
         device.c:6776: Test failed: Got unexpected query result.\n"
     );
     let fresh = BTreeMap::from([(key, crate::scan::parse_subtest_output(&output, false))]);
-    let (next, summary) = merge(&prior, I686, &fresh, Some("new".to_owned()));
+    let (next, summary) = merge(&prior, I686_ARM64, &fresh, Some("new".to_owned()));
     assert_eq!(next.entries[&key].sites[&site(6776)], 2);
     assert!(
         summary.skipped_sites.is_empty(),

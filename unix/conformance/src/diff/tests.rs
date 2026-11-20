@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use super::{VersionNote, diff, same_wine_version, tests_version_note, unrecorded_legs};
 use crate::{
     classify::Classification,
-    model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
+    model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
     triage::DocSite,
 };
 
@@ -21,9 +21,8 @@ const DEVICE_SUMMARY: &str = "00dc:device: 58913 tests executed (75 marked as to
 fn key() -> (Leg, Subtest) {
     (
         Leg {
-            arch: Arch::I686,
+            arch: Arch::I686Arm64,
             variant: Variant::Native,
-            gpu: Gpu::Apple,
         },
         Subtest::Device,
     )
@@ -342,15 +341,14 @@ fn a_leg_the_baseline_never_recorded_is_named_and_its_sites_regress() {
         unrecorded_legs(&base, &current_with(&[(6776, 1)], false)),
         Vec::<Leg>::new()
     );
-    let arm64 = Leg {
-        arch: Arch::I686Arm64,
+    let arm64x = Leg {
+        arch: Arch::Arm64x,
         variant: Variant::Native,
-        gpu: Gpu::Apple,
     };
     let mut cur = current_with(&[(6776, 1)], false);
     let result = cur.remove(&key()).expect("current_with fills key()");
-    cur.insert((arm64, Subtest::Device), result);
-    assert_eq!(unrecorded_legs(&base, &cur), vec![arm64]);
+    cur.insert((arm64x, Subtest::Device), result);
+    assert_eq!(unrecorded_legs(&base, &cur), vec![arm64x]);
     let report = diff(
         &base,
         &classes_with(&[(6776, Classification::Expected)]),

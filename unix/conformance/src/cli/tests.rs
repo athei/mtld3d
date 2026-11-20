@@ -19,7 +19,7 @@ fn args(tokens: &[&str]) -> std::vec::IntoIter<String> {
 
 /// The mandatory trio, for tests exercising some other flag.
 fn base(extra: &[&str]) -> std::vec::IntoIter<String> {
-    let mut tokens = vec!["--wine", "/w", "--exe", "/e", "--arch", "i686"];
+    let mut tokens = vec!["--wine", "/w", "--exe", "/e", "--arch", "i686-arm64"];
     tokens.extend_from_slice(extra);
     args(&tokens)
 }
@@ -30,7 +30,7 @@ fn parses_flags_and_update() {
     assert!(config.update);
     assert_eq!(config.wine.to_str(), Some("/w"));
     assert_eq!(config.exe.to_str(), Some("/e"));
-    assert_eq!(config.arch, Arch::I686);
+    assert_eq!(config.arch, Arch::I686Arm64);
     assert_eq!(
         config.assets.as_deref().and_then(std::path::Path::to_str),
         Some("/a")
@@ -50,12 +50,12 @@ fn the_tests_wine_version_is_optional() {
 }
 
 #[test]
-fn variant_defaults_to_native_and_parses_intel() {
+fn variant_defaults_to_native_and_parses_scale() {
     let config = parse_args(base(&[])).unwrap();
     assert_eq!(config.variant, Variant::Native);
-    let config = parse_args(base(&["--variant", "intel"])).unwrap();
-    assert_eq!(config.variant, Variant::Intel);
-    let err = parse_args(base(&["--variant", "amd"])).unwrap_err();
+    let config = parse_args(base(&["--variant", "scale"])).unwrap();
+    assert_eq!(config.variant, Variant::Scale);
+    let err = parse_args(base(&["--variant", "intel"])).unwrap_err();
     assert!(err.contains("unknown variant"), "{err}");
 }
 
@@ -77,9 +77,9 @@ fn assets_is_none_when_absent() {
 
 #[test]
 fn each_mandatory_flag_is_required() {
-    let err = parse_args(args(&["--exe", "/e", "--arch", "i686"])).unwrap_err();
+    let err = parse_args(args(&["--exe", "/e", "--arch", "arm64x"])).unwrap_err();
     assert!(err.contains("--wine"), "{err}");
-    let err = parse_args(args(&["--wine", "/w", "--arch", "i686"])).unwrap_err();
+    let err = parse_args(args(&["--wine", "/w", "--arch", "arm64x"])).unwrap_err();
     assert!(err.contains("--exe"), "{err}");
     let err = parse_args(args(&["--wine", "/w", "--exe", "/e"])).unwrap_err();
     assert!(err.contains("--arch"), "{err}");
@@ -116,8 +116,11 @@ fn parses_only_and_repeat() {
 fn bad_subtest_and_arch_error() {
     let err = parse_args(base(&["--only", "nope"])).unwrap_err();
     assert!(err.contains("unknown subtest"), "{err}");
-    let err = parse_args(args(&["--wine", "/w", "--exe", "/e", "--arch", "arm"])).unwrap_err();
-    assert!(err.contains("unknown arch"), "{err}");
+    for retired in ["arm", "i686", "x86_64"] {
+        let err =
+            parse_args(args(&["--wine", "/w", "--exe", "/e", "--arch", retired])).unwrap_err();
+        assert!(err.contains("unknown arch"), "{err}");
+    }
 }
 
 #[test]
