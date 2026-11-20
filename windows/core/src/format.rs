@@ -6,16 +6,17 @@ use mtld3d_types::{
     D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE,
     D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE,
     D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5,
-    D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NV12,
-    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DFMT_YV12, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NULL,
+    D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F,
+    D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
+    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
+    D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
@@ -222,6 +223,7 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_INTZ => "INTZ",
         D3DFMT_DF24 => "DF24",
         D3DFMT_DF16 => "DF16",
+        D3DFMT_NULL => "NULL",
         _ => "D3DFMT_unknown",
     }
 }
@@ -362,6 +364,57 @@ pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
 /// sizes the level from the planar layout, takes this mapping.
 #[must_use]
 pub const fn planar_yuv_storage_mapping() -> FormatMapping {
+    FormatMapping {
+        metal_pixel_format: PixelFormat::R8Unorm,
+        bytes_per_pixel: 1,
+        block_width: 1,
+        block_height: 1,
+        block_bytes: 1,
+        swizzle: None,
+        has_alpha: false,
+    }
+}
+
+/// Bytes per texel of the CPU copy a lockable `NULL` render target hands to `LockRect`.
+///
+/// A `NULL` target has no colour storage, but D3D9 still hands a lock a
+/// writable buffer with a non-zero pitch; four bytes a texel is the width of
+/// the colour formats a title would otherwise have bound.
+pub const NULL_LOCK_BYTES_PER_PIXEL: u32 = 4;
+
+/// Whether `d3d_format` is `NULL`, the render-target format with no colour storage.
+///
+/// Kept out of the colour lookup, so no colour predicate
+/// ([`is_mapped_color_format`], the sampling answers) offers it: a `NULL`
+/// target is never sampled, blitted or filled.
+#[must_use]
+pub const fn is_null_render_target(d3d_format: u32) -> bool {
+    d3d_format == D3DFMT_NULL
+}
+
+/// Whether a `NULL` resource of `rtype` may carry `usage`: the one shape the format exists in.
+///
+/// A 2D render target, a surface or a texture, with `D3DUSAGE_RENDERTARGET`
+/// and no other validated usage bit (sampling, depth, mip generation, CPU
+/// access). `CheckDeviceFormat` and the create gates both ask this, so a
+/// probe and a create agree. Bits outside the validated set ride through, as
+/// for every other format.
+#[must_use]
+pub const fn null_render_target_usage_allowed(usage: u32, rtype: u32) -> bool {
+    matches!(rtype, D3DRTYPE_SURFACE | D3DRTYPE_TEXTURE)
+        && usage & D3DUSAGE_RENDERTARGET != 0
+        && usage & VALIDATED_USAGE & !D3DUSAGE_RENDERTARGET == 0
+}
+
+/// Storage behind a `NULL` render-target texture: one byte a texel that no draw writes.
+///
+/// A level of such a texture bound as a render target binds no colour
+/// texture at all, as a `NULL` surface does; the storage exists because the
+/// texture create path backs every texture it makes. Like
+/// [`planar_yuv_storage_mapping`] it is no row of the format lookup: only the
+/// render-target texture create takes it.
+#[must_use]
+pub const fn null_texture_storage_mapping() -> FormatMapping {
     FormatMapping {
         metal_pixel_format: PixelFormat::R8Unorm,
         bytes_per_pixel: 1,

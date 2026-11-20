@@ -1333,6 +1333,15 @@ extern "system" fn d3d9_check_device_format(
             D3DERR_NOTAVAILABLE
         };
     }
+    // NULL, the render-target format with no colour storage, exists as a 2D
+    // render target alone: a depth-only pass binds it as render target 0.
+    if mtld3d_core::format::is_null_render_target(check_format) {
+        return if mtld3d_core::format::null_render_target_usage_allowed(usage, rtype) {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        };
+    }
     // A query may only carry the usage bits its resource type expresses.
     // The sampling-only group (FILTER, SRGBREAD, VERTEXTEXTURE, WRAPANDMIP,
     // DYNAMIC, SOFTWAREPROCESSING) presumes a shader-resource binding, so it
@@ -1547,7 +1556,8 @@ extern "system" fn d3d9_check_depth_stencil_match(
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
         || !is_display_format(adapter_format)
-        || !is_render_target_format_on_device(rt_format, cfg.expand_packed16)
+        || !(is_render_target_format_on_device(rt_format, cfg.expand_packed16)
+            || mtld3d_core::format::is_null_render_target(rt_format))
         || !is_depth_stencil_format(ds_format)
     {
         warn!(

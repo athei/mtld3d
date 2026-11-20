@@ -1461,8 +1461,10 @@ bitflags::bitflags! {
         /// target 1..3, so the depth surface alone sets its extent. Only
         /// `set_rt0_dropped` sets it, and only right before the pass it
         /// describes is opened or continued: by a draw that leaves a lone 1x1
-        /// render target 0 unwritten, or by a region depth or stencil clear
-        /// that reaches past a colour target smaller than the depth surface.
+        /// render target 0 unwritten, by a draw or a region depth or stencil
+        /// clear through a `NULL` render target 0, or by a region depth or
+        /// stencil clear that reaches past a colour target smaller than the
+        /// depth surface.
         /// `end_current_pass` clears it, so no other opener can inherit it.
         const RT0_DROPPED = 1 << 4;
     }
@@ -2568,10 +2570,22 @@ impl PassState {
     /// pass binds (same sample count) that is larger than 1x1. Both surfaces
     /// must be unscaled, so the viewport, the scissor and every draw-time
     /// scale read stay in one space; a scaled depth surface answers
-    /// [`Rt0DropCandidate::ScaledDepth`]. The size is tested first, so every
-    /// other target answers at the first compare.
+    /// [`Rt0DropCandidate::ScaledDepth`]. After the null test the size comes
+    /// first, so every other target answers at the first compare.
+    ///
+    /// A `NULL` render target 0 ([`Self::rt0_is_null_target`]) has no colour
+    /// attachment to keep, so every pass over a depth attachment the pass binds
+    /// leaves it out, scaled or not: its binding is shaped after the depth
+    /// surface, so the two share one space.
     #[must_use]
     pub const fn rt0_drop_candidate(&self) -> Rt0DropCandidate {
+        if self.rt0_is_null_target() {
+            return if self.pass_binds_depth() {
+                Rt0DropCandidate::Yes
+            } else {
+                Rt0DropCandidate::No
+            };
+        }
         if self.current_color_logical_size.0 != 1 || self.current_color_logical_size.1 != 1 {
             return Rt0DropCandidate::No;
         }
@@ -2641,6 +2655,16 @@ impl PassState {
     pub const fn rt0_dropped(&self) -> bool {
         self.current_attachments
             .contains(CurrentAttachmentFlags::RT0_DROPPED)
+    }
+
+    /// Whether render target 0 is a `NULL` target: a colour binding with no texture.
+    ///
+    /// The device binds a `NULL` surface that way, with the extent, scale and
+    /// sample count of the depth surface it is drawn over, and binds a real
+    /// texture for every other target.
+    #[must_use]
+    pub const fn rt0_is_null_target(&self) -> bool {
+        self.current_color_texture.is_null()
     }
 
     /// Whether the open pass, or the one about to open, attaches render target 0.
@@ -4652,7 +4676,8 @@ impl PassState {
     /// Every rect lies inside the viewport. A viewport that reaches past a
     /// colour target smaller than the depth surface gets a pass without
     /// colour ([`CurrentAttachmentFlags::RT0_DROPPED`]), so the depth
-    /// surface, not the colour target, bounds what the quads reach. The next
+    /// surface, not the colour target, bounds what the quads reach, and a
+    /// `NULL` render target 0 always gets one. The next
     /// draw that needs colour ends that pass. Under `render.scale` the rects
     /// arrive in the colour target's space, which a pass without colour does
     /// not share, so a scaled colour target or depth surface keeps the pass
@@ -4664,7 +4689,11 @@ impl PassState {
         if self.current_pass_has_counting_visibility() {
             self.end_current_pass("region_depth_clear_vis");
         }
-        if !self.pass_color_covers_depth() && !self.viewport_inside_color_attachment() {
+        if self.rt0_is_null_target() {
+            // The pass a `NULL` render target 0 draws in, so the next draw
+            // continues it rather than ending it.
+            self.set_rt0_dropped(true);
+        } else if !self.pass_color_covers_depth() && !self.viewport_inside_color_attachment() {
             if self.current_color_scale.is_identity() && self.current_depth_unscaled() {
                 self.set_rt0_dropped(true);
             } else {
@@ -5054,9 +5083,11 @@ impl PassState {
     /// left out, the depth attachment's extent: the pass rasterizes that.
     #[must_use]
     pub const fn target_extent(&self) -> TargetExtent {
-        if self.rt0_dropped() {
-            // Only an unscaled depth surface lets render target 0 go, so its
-            // reported and allocated extents are one.
+        // A `NULL` render target 0 is already shaped after the depth surface,
+        // scale included, so its own extent is the depth attachment's.
+        if self.rt0_dropped() && !self.rt0_is_null_target() {
+            // Only an unscaled depth surface lets a 1x1 render target 0 go, so
+            // its reported and allocated extents are one.
             return TargetExtent::new(
                 RenderScale::IDENTITY,
                 self.current_depth_size,

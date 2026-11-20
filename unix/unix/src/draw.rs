@@ -220,7 +220,8 @@ struct PipelineRetry<'a> {
 /// build is skipped, or bound as a placeholder whose build the submission
 /// waits for; the answer is then the placeholder. A draw leaving render
 /// target 0 out waits instead, since the pass it opens is fixed by then and
-/// its failed no-colour pipeline retries with render target 0 attached.
+/// its failed no-colour pipeline retries with render target 0 attached,
+/// unless render target 0 is a `NULL` target, which has nothing to attach.
 /// `None` drops the draw.
 #[cold]
 #[inline(never)]
@@ -270,7 +271,7 @@ fn resolve_pipeline_slow(
                 enc.wait_for_compiles(&[ticket]);
                 waited = true;
             }
-            Resolution::Failed if *rt0_drop => {
+            Resolution::Failed if *rt0_drop && !enc.rt0_is_null_target() => {
                 // The pass keeps render target 0 instead, so the draw still
                 // runs, at render target 0's extent, with the pipeline that
                 // declares it.
@@ -435,8 +436,25 @@ fn emit_draw_view(
     // here: the pass is told right before it opens, because the path between
     // can still end the pass or return. A draw that writes render target 0
     // stops at the first test and any target other than a 1x1 one at the
-    // candidate's first compare.
-    let mut rt0_drop = !render_state.pipeline_rs.writes_rt0(ps_color_out_mask)
+    // candidate's first compare. A `NULL` render target 0 has no colour
+    // attachment to draw with, so its draws always leave it out, and with no
+    // depth surface they have nothing to draw into.
+    let rt0_null = enc.rt0_is_null_target();
+    if rt0_null && !has_depth {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "draw dropped: a NULL render target 0 with no depth surface has no attachment to draw \
+             into"
+        );
+        return;
+    }
+    if rt0_null && enc.current_extra_color_attachments().present_mask != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "a NULL render target 0 with render targets 1..3 bound: the draw writes depth only"
+        );
+    }
+    let mut rt0_drop = (rt0_null || !render_state.pipeline_rs.writes_rt0(ps_color_out_mask))
         && has_depth
         && match enc.rt0_drop_candidate() {
             Rt0DropCandidate::Yes => true,

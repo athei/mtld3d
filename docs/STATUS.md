@@ -79,6 +79,15 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   targets of the same pass too. Alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
+- The `NULL` FOURCC render target for depth-only passes: a surface or a
+  render-target texture with no colour storage, single-sampled, paired with
+  any depth format. Bound as render target 0 over a depth surface it takes no
+  colour write, and its draws and clears reach the depth surface's extent,
+  whatever size the `NULL` target reports. A lockable one locks to a zeroed
+  CPU buffer nothing reads, `ColorFill` of one succeeds without effect, and it
+  is no `StretchRect` source or destination. A `NULL` render target 0 with no
+  depth surface draws nothing, and with render targets 1..3 bound beside it
+  the pass writes depth only.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
   alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`, plus AMD's
   `A2M1`/`A2M0` controls through `D3DRS_POINTSIZE`. `ALPHATESTENABLE` gates

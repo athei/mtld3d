@@ -363,6 +363,70 @@ fn planar_yuv_stays_out_of_the_generic_mapping() {
     assert!(!storage.has_alpha());
 }
 
+/// `NULL` stays out of every colour predicate and exists only as a 2D render target.
+///
+/// The usage rule is the one `CheckDeviceFormat` answers with and the create
+/// gates enforce: `D3DUSAGE_RENDERTARGET` on a surface or a texture, with no
+/// other validated bit beside it.
+#[test]
+fn null_is_a_2d_render_target_and_no_colour_format() {
+    use mtld3d_types::D3DFMT_NULL;
+
+    assert!(super::is_null_render_target(D3DFMT_NULL));
+    assert!(!super::is_null_render_target(D3DFMT_A8R8G8B8));
+    assert!(!is_mapped_color_format(D3DFMT_NULL));
+    assert!(super::lookup_d3d_format(D3DFMT_NULL).is_none());
+    assert!(!super::is_render_target_format(D3DFMT_NULL));
+    assert!(!is_depth_format(D3DFMT_NULL));
+    assert!(!is_volume_texture_format(D3DFMT_NULL));
+    assert_eq!(format_name(D3DFMT_NULL), "NULL");
+    assert_eq!(surface_bytes(128, 128, D3DFMT_NULL), 0);
+
+    let allowed = super::null_render_target_usage_allowed;
+    for rtype in [D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE] {
+        assert!(allowed(D3DUSAGE_RENDERTARGET, rtype), "rtype {rtype}");
+        // A bit the runtime strips before it validates rides through.
+        assert!(
+            allowed(D3DUSAGE_RENDERTARGET | D3DUSAGE_WRITEONLY, rtype),
+            "rtype {rtype}"
+        );
+        assert!(!allowed(0, rtype), "rtype {rtype}");
+        for extra in [
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ] {
+            assert!(
+                !allowed(D3DUSAGE_RENDERTARGET | extra, rtype),
+                "rtype {rtype} usage {extra:#x}"
+            );
+        }
+    }
+    for rtype in [
+        D3DRTYPE_CUBETEXTURE,
+        D3DRTYPE_VOLUME,
+        D3DRTYPE_VOLUMETEXTURE,
+        D3DRTYPE_VERTEXBUFFER,
+        D3DRTYPE_INDEXBUFFER,
+    ] {
+        assert!(!allowed(D3DUSAGE_RENDERTARGET, rtype), "rtype {rtype}");
+    }
+
+    let storage = super::null_texture_storage_mapping();
+    assert_eq!(storage.metal_pixel_format(), PixelFormat::R8Unorm);
+    assert_eq!(storage.bytes_per_pixel(), 1);
+    assert!(storage.swizzle().is_none());
+    // The lock pitch of a lockable `NULL` surface is never zero.
+    assert_eq!(linear_row_pitch(1, super::NULL_LOCK_BYTES_PER_PIXEL), 4);
+    assert_eq!(linear_row_pitch(128, super::NULL_LOCK_BYTES_PER_PIXEL), 512);
+}
+
 #[test]
 fn volume_texture_formats_include_native_bc1_bc2_bc3() {
     for fmt in [
