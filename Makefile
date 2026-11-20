@@ -125,8 +125,9 @@ ISOLATED_PREFIX_SOURCE := $(or $(WINEPREFIX),$(HOME)/.wine)
 ifneq ($(ISOLATED_CLEANING),1)
 # The clone is made once, with its record beside it, and reused only while the
 # record still names WINE_SDK as it is now: a clone of another Wine, or of this
-# one before a redeploy, would build against and run its own Wine. A sub-make of an isolated run is handed the clone itself as WINE_SDK and
-# has nothing to check.
+# one before a redeploy, would build against and run its own Wine. A sub-make
+# of an isolated run is handed the clone itself as WINE_SDK and has nothing to
+# check.
 ifneq ($(abspath $(WINE_SDK)),$(abspath $(ISOLATED_ROOT)/sdk))
 ifneq ($(wildcard $(ISOLATED_ROOT)/sdk),)
 ISOLATED_SDK_RECORD := $(strip $(shell cat '$(ISOLATED_ROOT)/sdk.source' 2>/dev/null))
@@ -562,9 +563,9 @@ windows-i686:
 # ARM64X `d3d9.dll` and `mtld3d.dll`: the layout an arm64 Wine keeps its own
 # builtins in, one image under `lib/wine/aarch64-windows` holding an ARM64 half
 # for arm64 processes and an ARM64EC half that x64 processes run natively.
-# 32-bit processes still load the i386 DLLs. Rust has no ARM64X target, so each crate
-# is built once per half as a static library, and one `lld-link /machine:arm64x`
-# puts both halves into one image.
+# 32-bit processes still load the i386 DLLs. Rust has no ARM64X target, so
+# each crate is built once per half as a static library, and one
+# `lld-link /machine:arm64x` puts both halves into one image.
 #
 # The CRT is llvm-mingw's, because MSVC ships its ARM64 and ARM64EC libraries
 # only with Visual Studio, and xwin splats neither. `dllcrt2.o` is the DLL
@@ -881,8 +882,9 @@ endef
 # that fails fails the gate. `PRODUCTION_ASSERT_CHECK` names the files; every
 # production install leaf (the ARM64X one included) and `bundle` run it on what
 # they ship, and `production-assert-gate` runs it on the files
-# `ASSERT_GATE_FILES` names, the ARM64X pair among them. That target refuses to run without PROD=1, because its default files would
-# otherwise be the `release` build, which is not held to this rule.
+# `ASSERT_GATE_FILES` names, the ARM64X pair among them. That target refuses
+# to run without PROD=1, because its default files would otherwise be the
+# `release` build, which is not held to this rule.
 PRODUCTION_ASSERT_TOOLS = $(shell rustc +$(RUST_STABLE) --print sysroot)/lib/rustlib/$(UNIX_NATIVE_TARGET)/bin
 define PRODUCTION_ASSERT_GATE
 for f in $(1); do \
@@ -939,8 +941,6 @@ export-ordinal-gate:
 hybrid-winebuild-check:
 	$(HYBRID_WINEBUILD_CHECK)
 
-# The 64-bit markers in `aarch64-windows` default to AMD64 (`x86_64-windows`),
-# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies.
 install-windows-i686: $(if $(STAGE),,windows-i686) hybrid-winebuild-check
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
@@ -948,6 +948,8 @@ install-windows-i686: $(if $(STAGE),,windows-i686) hybrid-winebuild-check
 		$(call PE_PAIR_INSTALL,$$dir,$(OUT_i386),i386-windows,i686-windows) ; \
 	done
 
+# The 64-bit markers in `aarch64-windows` default to AMD64 (`x86_64-windows`),
+# which HYBRID_MARKER_RULE replaces with the hybrid one where it applies.
 install-windows-arm64x: $(if $(STAGE),,windows-arm64x) hybrid-winebuild-check
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
@@ -1289,11 +1291,11 @@ configure-test-prefix-session:
 
 test: test-unit test-e2e-i686 test-e2e-arm64x test-e2e-arm64
 
-# Host-native unit tests, built for this machine's native arch.
-# Needs no install and no wine at all, which is why it is its own leg: the
-# windows workspace singles out mtld3d-core (its other members are PE-only and
-# can't build for the host target) and must override its i686 default, and turns
-# on its `disk-cache` feature so the shader cache's tests run; the unix workspace
+# Host-native unit tests, built for this machine's native arch. Needs no
+# install and no wine at all, which is why it is its own leg: the windows
+# workspace singles out mtld3d-core (its other members are PE-only and can't
+# build for the host target) and must override its i686 default, and turns on
+# its `disk-cache` feature so the shader cache's tests run; the unix workspace
 # already defaults to the host, so just run all of it.
 test-unit:
 	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
@@ -1353,8 +1355,9 @@ test-unit:
 # A scaled run reports the whole suite instead of stopping at the first
 # failure, and FAIL_FAST=0 asks for that on any run. The point of `SCALE` is
 # to survey which assertions still hold in the reported space, and one
-# dependent test would otherwise hide every later test's behaviour there. The default run keeps fail-fast:
-# there the first failure is a regression to fix, not a survey to read.
+# dependent test would otherwise hide every later test's behaviour there.
+# The default run keeps fail-fast: there the first failure is a regression to
+# fix, not a survey to read.
 #
 # FILTER='<patterns>' narrows the run to the tests whose id (`<binary>::<test
 # path>`, e.g. `e2e::msaa::resolve_counts_edge_pixels`) contains any of the
@@ -1430,11 +1433,12 @@ test-e2e-arm64x: install-windows-arm64x install-unix-arm64
 # installed when it was made. So no two layouts see each other's DLLs, and none
 # writes into WINE_SDK itself. `test-e2e-arm64` takes
 # `.wine-isolated/leg-arm64`; the two legs of `bench-ab` each take the whole
-# `.wine-isolated` of their own checkout, which the run takes down first. The prefix is booted and
-# configured by `configure-test-prefix` like every other leg's; its persistent
-# server is stopped when the leg ends, since the next run makes a new tree
-# anyway. The trees sit in a checkout's `.wine-isolated`, with or without
-# ISOLATED=1, so `make clean-isolated` takes them down.
+# `.wine-isolated` of their own checkout, which the run takes down first. The
+# prefix is booted and configured by `configure-test-prefix` like every other
+# leg's; its persistent server is stopped when the leg ends, since the next
+# run makes a new tree anyway.
+# The trees sit in a checkout's `.wine-isolated`, with or without ISOLATED=1,
+# so `make clean-isolated` takes them down.
 leg_root = $(ISOLATED_ROOT)/leg-$(1)
 # A sub-make named through a variable, so that `make -n` prints it rather than
 # running it: a line that names `$(MAKE)` itself runs even under `-n`, and these
@@ -1597,8 +1601,8 @@ conformance-isolate: install-windows-$(ARCH) install-unix-arm64
 # time in one process, through the runner's `--ignored`, against one build
 # installed into WINE_SDK the way `make test` installs it: ARCH=i686 (the
 # default, the arch the game ships) runs the i686 binary against the i686
-# build, ARCH=arm64x the x86_64 binary against the ARM64X build. They measure and never assert on a
-# time, so a run is red only when a device call fails.
+# build, ARCH=arm64x the x86_64 binary against the ARM64X build. They measure
+# and never assert on a time, so a run is red only when a device call fails.
 #
 # The layer and the benchmark binary are built with the production profile,
 # the one that ships, since `release` compiles in debug assertions whose
@@ -1672,16 +1676,15 @@ define BENCH_SUITE_COPY
 bin='$(ISOLATED_ROOT)/bench-bin/$(PROFILE)/deps' && rm -rf '$(ISOLATED_ROOT)/bench-bin' && mkdir -p "$$bin" && cp -c "$$suite" "$$bin/" && \
 	suite="$$bin/$$(basename "$$suite")"
 endef
-# BENCH_ARCH is the build a benchmark measures, ARCH for `make bench` and
-# `make bench-ab`, and BENCH_EXE_ARCH the arch of the benchmark binary that
-# loads it: x86_64 for the ARM64X build.
+# ARCH is the build `make bench` and `make bench-ab` measure, and
+# BENCH_EXE_ARCH the arch of the benchmark binary that loads it: x86_64 for
+# the ARM64X build.
 ifneq ($(filter bench bench-ab,$(MAKECMDGOALS)),)
 ifeq ($(filter i686 arm64x,$(ARCH)),)
 $(error ARCH=$(ARCH): a benchmark measures the i686 build (ARCH=i686) or the ARM64X build (ARCH=arm64x))
 endif
 endif
-BENCH_ARCH := $(ARCH)
-BENCH_EXE_ARCH := $(if $(filter arm64x,$(BENCH_ARCH)),x86_64,$(BENCH_ARCH))
+BENCH_EXE_ARCH := $(if $(filter arm64x,$(ARCH)),x86_64,$(ARCH))
 BENCH_TARGET := $(if $(filter x86_64,$(BENCH_EXE_ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(BENCH_EXE_ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
 BENCH_CONF := shaderCache.enable=false;color.hdr.enable=false
@@ -1693,7 +1696,7 @@ $(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
 	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
 	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }
 endef
-bench: install-windows-$(BENCH_ARCH) install-unix-arm64
+bench: install-windows-$(ARCH) install-unix-arm64
 	$(MAKE) configure-test-prefix
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call bench_stage_corpus,$(BENCH_DIR))
@@ -1824,7 +1827,7 @@ BENCH_SUBMAKE = $(MAKE)
 # What each leg's sub-make builds: the i686 build, which LEG_INSTALL always
 # installs, the ARM64X build when ARCH names it, the `mtld3d.so` WINE_SDK
 # loads, and its host emitter benchmark when BASE has one.
-BENCH_LEG_BUILD = windows-i686 $(if $(filter arm64x,$(BENCH_ARCH)),windows-arm64x) unix-arm64 $(if $(BENCH_HOST_RUN),bench-host-build)
+BENCH_LEG_BUILD = windows-i686 $(if $(filter arm64x,$(ARCH)),windows-arm64x) unix-arm64 $(if $(BENCH_HOST_RUN),bench-host-build)
 # Says, in a recipe's shell, that the step $(2) failed when the status $(1) is
 # not zero, and shows the end of its log $(3) in the run's directory.
 bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the end of $(BENCH_AB_OUT)/$(3):" >&2; tail -n 40 '$(BENCH_AB_OUT)/$(3)' >&2; }
@@ -1832,7 +1835,7 @@ bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the
 # runs in, holding `sdk` and `prefix`: the checkout's `.wine-isolated`, which
 # the run takes down first. Sets up the tree from that checkout's production
 # outputs.
-bench_tree_setup = $(call LEG_TREE_SETUP,$(2),$(call LEG_INSTALL,$(2)/sdk,$(1)/windows/target/$(PE_i386)/production,$(if $(filter arm64x,$(BENCH_ARCH)),$(1)/windows/target/arm64x/production),$(1)/unix/target/$(UNIX_TARGET_arm64)/production))
+bench_tree_setup = $(call LEG_TREE_SETUP,$(2),$(call LEG_INSTALL,$(2)/sdk,$(1)/windows/target/$(PE_i386)/production,$(if $(filter arm64x,$(ARCH)),$(1)/windows/target/arm64x/production),$(1)/unix/target/$(UNIX_TARGET_arm64)/production))
 # Stops the persistent wineservers of both legs' prefixes, whatever state
 # the run left them in; a leg that has no server is left as it is.
 define BENCH_STOP_SERVERS
@@ -1871,7 +1874,7 @@ BENCH_HOST_AB := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep 
 BENCH_BASE_ONE_WINE := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^OLD_WINE_VARIABLES :=' && echo 1)
 # The ARM64X leg builds BASE's own `windows-arm64x`, which a BASE from before
 # the leg existed does not have.
-ifeq ($(BENCH_ARCH),arm64x)
+ifeq ($(ARCH),arm64x)
 ifeq ($(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^windows-arm64x:' && echo 1),)
 $(error ARCH=arm64x make bench-ab: BASE $(BENCH_BASE_SHORT) has no windows-arm64x target, so it has no ARM64X build to compare against)
 endif
@@ -2010,8 +2013,9 @@ clippy-pe-i686:
 # The two halves of the ARM64X build, linted for the code only they compile
 # (`windows/d3d9/src/platform/win32/arm64_crt.rs`) and for the `cfg` arms the
 # x86 target never takes, in the windows workspace and in `unix/shared` (its
-# ARM64EC clock), the way `clippy-pe-i686` reaches the latter, and the e2e tests as the native
-# ARM64 leg builds them.
+# ARM64EC clock), the way `clippy-pe-i686` reaches the latter, and the e2e
+# tests as the two legs of the ARM64X build run them: the aarch64 binaries of
+# the native ARM64 leg and the x86_64 ones of the arm64x legs.
 clippy-pe-arm64x:
 	$(WINE_SDK_REQUIRE)
 	$(ARM64X_REQUIRE_TARGETS)
@@ -2020,6 +2024,7 @@ clippy-pe-arm64x:
 		( cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $$target $(DENY_WARNINGS) ) || exit ; \
 	done
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_arm64) --all-targets $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
 
 # Everything that lints for this machine's own arch: mtld3d-core's test targets
 # (the only place `#[cfg(test)]` blocks in the windows workspace are linted),

@@ -623,7 +623,7 @@ class InstallLayoutTests(FakeWineTestCase):
                          "aarch64-windows")
 
     def test_a_leftover_x86_64_unix_dir_is_left_alone(self):
-        # An earlier install into a Wine of both arches left one behind; the
+        # An older bundle's `wine/` tree, copied in whole, carried one; the
         # Wine is read by its `aarch64-unix`, and nothing goes into the other.
         leftover = self.arm64 / "lib/wine/x86_64-unix"
         leftover.mkdir()
