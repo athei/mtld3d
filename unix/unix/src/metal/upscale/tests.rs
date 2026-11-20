@@ -914,7 +914,7 @@ fn encode_then_finishes_from_the_source_format_at_the_destination_extent() {
                 enlarged.pixelFormat(),
                 (enlarged.width(), enlarged.height()),
                 enlarged.usage().contains(MTLTextureUsage::ShaderRead),
-                core::ptr::eq(finished, &*dst),
+                core::ptr::eq(finished, &raw const *dst),
             ));
             true
         },

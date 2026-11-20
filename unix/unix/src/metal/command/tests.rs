@@ -2024,24 +2024,15 @@ fn an_upscaled_hdr_present_keeps_white_and_the_gradient_steps() {
     );
     let sdr_down = down_steps(&sdr_upscaled_row(&queue, &cache, &gradient, drawable));
     for headroom in [4.0_f32, 15.0] {
-        let measure = |encode: fn(
-            &ProtocolObject<dyn MTLCommandBuffer>,
-            &crate::metal::upscale::UpscaleCache,
-            &ProtocolObject<dyn MTLTexture>,
-            &ProtocolObject<dyn MTLTexture>,
-            f32,
-        ) -> bool| {
-            let run = |src: &ProtocolObject<dyn MTLTexture>| {
-                hdr_values_at(&queue, drawable, |cmd, dst| {
-                    encode(cmd, &cache, src, dst, headroom)
-                })
-            };
-            (run(&white), middle_row(&run(&gradient), drawable))
-        };
         let (white_wanted, gradient_wanted) =
-            measure(|cmd, _, src, dst, peak| super::encode_hdr_present(cmd, src, dst, peak, 0));
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                super::encode_hdr_present(cmd, src, dst, headroom, 0)
+            });
         let wanted = white_wanted[0][0];
-        let (white_read, gradient_read) = measure(present_upscaled);
+        let (white_read, gradient_read) =
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                present_upscaled(cmd, &cache, src, dst, headroom)
+            });
         let presented = UpscaleErrors::new(
             &white_read,
             wanted,
@@ -2049,7 +2040,10 @@ fn an_upscaled_hdr_present_keeps_white_and_the_gradient_steps() {
             &gradient_read,
             &gradient_wanted,
         );
-        let (white_read, gradient_read) = measure(tone_mapped_then_scaled);
+        let (white_read, gradient_read) =
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                tone_mapped_then_scaled(cmd, &cache, src, dst, headroom)
+            });
         let hdr_mode = UpscaleErrors::new(
             &white_read,
             wanted,
@@ -2147,6 +2141,25 @@ impl core::fmt::Display for UpscaleErrors {
     }
 }
 
+/// Run `encode` on the white and the gradient frame into HDR drawables of `extent`.
+///
+/// Returns every texel of the white frame and the gradient's middle row.
+fn white_and_gradient(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    white: &ProtocolObject<dyn MTLTexture>,
+    gradient: &ProtocolObject<dyn MTLTexture>,
+    extent: (usize, usize),
+    encode: impl Fn(
+        &ProtocolObject<dyn MTLCommandBuffer>,
+        &ProtocolObject<dyn MTLTexture>,
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> bool,
+) -> (Vec<[f32; 4]>, Vec<f32>) {
+    let white = hdr_values_at(queue, extent, |cmd, dst| encode(cmd, white, dst));
+    let gradient = hdr_values_at(queue, extent, |cmd, dst| encode(cmd, gradient, dst));
+    (white, middle_row(&gradient, extent))
+}
+
 /// The present's upscaled HDR route, which must reach `MetalFX` rather than its fallback.
 fn present_upscaled(
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -2228,7 +2241,9 @@ fn sdr_upscaled_row(
     );
     let row = width * 4;
     texture_bytes(queue, &dst)[height / 2 * row..(height / 2 + 1) * row]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|texel| f32::from(texel[2]))
         .collect()
 }
