@@ -573,10 +573,17 @@ fn the_slice_an_update_texture_from_a_shallower_volume_leaves_alone_samples_blac
 /// A first `D3DLOCK_DISCARD` lock of a new dynamic default-pool level hands out zero.
 ///
 /// The lock covers the whole level and its upload does too, so the block
-/// columns the write after it leaves alone sample black.
+/// columns the write after it leaves alone sample black. A round counts only
+/// when the probe's lock lands on the staging of a texture the round
+/// released, the bytes a missing zero would hand out; a dynamic texture
+/// keeps the box its create took, and a whole-level lock of a level no
+/// upload reads points at the box's start.
 #[test]
 fn a_first_discard_lock_of_a_new_dynamic_default_pool_level_hands_out_zero() {
-    let yellow = dxt1_solid_block(YELLOW_565);
+    // Rounds tried before the precondition fails: another test's release can
+    // put the box the probe takes into the pool.
+    const ATTEMPTS: usize = 16;
+    let (row_bytes, yellow) = dxt1_level_bytes(PROBE_SIDE, 0, dxt1_solid_block(YELLOW_565));
     let rows = (PROBE_SIDE / 4) as usize;
     let column = dxt1_solid_block(RED_565).repeat(rows);
     let h = Harness::new();
@@ -590,21 +597,46 @@ fn a_first_discard_lock_of_a_new_dynamic_default_pool_level_hands_out_zero() {
             D3DPOOL_DEFAULT,
         )
     };
-    let sampled = probe_after_releases(
-        &h,
-        || {
-            let tex = create();
-            lock_dxt1_level(&h, &tex, 0, yellow);
-            assert_released_yellow(draw_quadrants(&h, &tex, BLACK)[0]);
-        },
-        || {
-            let probe = create();
+    let mut sampled = Vec::with_capacity(ROUNDS);
+    for _ in 0..ATTEMPTS {
+        if sampled.len() == ROUNDS {
+            break;
+        }
+        let released: Vec<usize> = (0..RELEASED_PER_ROUND)
+            .map(|_| {
+                let tex = create();
+                let bits = {
+                    let mut locked = tex.lock_rect(0, 0);
+                    locked.write_u8_rect(row_bytes, rows, &yellow);
+                    locked.bits_ptr().addr()
+                };
+                assert_released_yellow(draw_quadrants(&h, &tex, BLACK)[0]);
+                drop(tex);
+                assert_eq!(
+                    h.present(),
+                    0,
+                    "the Present that retires the released texture"
+                );
+                bits
+            })
+            .collect();
+        let probe = create();
+        let bits = {
+            let mut locked = probe.lock_rect(0, D3DLOCK_DISCARD);
             // The first block of every block row: the first block column.
-            probe
-                .lock_rect(0, D3DLOCK_DISCARD)
-                .write_u8_rect(8, rows, &column);
-            draw_2d(&h, &probe, CLEAR, BLOCK_COLUMNS)
-        },
+            locked.write_u8_rect(8, rows, &column);
+            locked.bits_ptr().addr()
+        };
+        if !released.contains(&bits) {
+            continue;
+        }
+        sampled.push(draw_2d(&h, &probe, CLEAR, BLOCK_COLUMNS).map(|pixel| pixel & RGB));
+    }
+    assert_eq!(
+        sampled.len(),
+        ROUNDS,
+        "precondition: in {ROUNDS} of {ATTEMPTS} rounds the probe took a released texture's \
+         staging"
     );
     assert!(
         sampled.iter().all(|columns| *columns == [RED_RGB, 0, 0, 0]),
