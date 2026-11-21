@@ -10,4 +10,5 @@
 # `-C force-frame-pointers=yes` to the rustflags.
 
 [env]
-MACOSX_DEPLOYMENT_TARGET = "15.0"
+# The arm64 Wine that loads the `.so` runs on macOS 26 and later only.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

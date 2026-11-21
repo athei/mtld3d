@@ -803,7 +803,8 @@ impl Overlay {
         // the compositor blends the whole window onto the game.
         layer.setOpaque(false);
         // This layer hosts immutable images and never acquires or presents a
-        // Metal drawable. Keep CAMetalLayer's HDR controls for macOS 15 too.
+        // Metal drawable. It is a CAMetalLayer so it takes the game layer's
+        // pixel format, colorspace and EDR flag as they are.
         // No implicit animation on anything written here: without this, the
         // layer having no delegate, every position or bounds write would ease
         // over Core Animation's default quarter second.

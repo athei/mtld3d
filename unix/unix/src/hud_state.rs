@@ -10,8 +10,8 @@
 //! drawing it; the encoder adds its live figures as volatile metadata
 //! ([`HudReporter`], with the rows themselves in `mtld3d_core::hud_stats`).
 //!
-//! The framework is opened at runtime rather than linked: macOS 15 and 26 do
-//! not carry it, and an SDK older than macOS 27 has nothing to link against.
+//! The framework is opened at runtime rather than linked: macOS 26 does not
+//! carry it, and an SDK older than macOS 27 has nothing to link against.
 
 use std::sync::{
     Once,
