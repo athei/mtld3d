@@ -146,10 +146,10 @@ under *Advanced Settings*, and mtld3d needs `arm64`, which runs CrossOver's
 arm64 Wine. It is the `WineArch` key under `[Bottle]` in the bottle's
 `cxbottle.conf`. An existing arm64 bottle also needs the *CrossOver Preview*
 switch on under *Advanced Settings*, the `Preview` key under `[Bottle]`:
-CrossOver Preview's `wine` refuses to start a bottle without it. Otherwise
-choose *File > New Bottle…* and a *New Bottle Type* that ends in *(arm64)*,
-such as *Windows 10 (arm64)*. The *(Intel)* types run CrossOver's x86_64 Wine,
-which cannot load mtld3d.
+CrossOver Preview's `wine` refuses to start a bottle without it. Without an
+arm64 bottle, choose *File > New Bottle…* and a *New Bottle Type* that ends in
+*(arm64)*, such as *Windows 10 (arm64)*. The *(Intel)* types run CrossOver's
+x86_64 Wine, which cannot load mtld3d.
 
 All blocks below run in one terminal, in the bundle's directory, because they
 share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
