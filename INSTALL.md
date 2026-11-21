@@ -141,21 +141,25 @@ directory, and the builtin pair comes from a directory in the bottle that the
 game's launch adds to the DLL search path. Nothing is written into
 `CrossOver Preview.app`.
 
-A bottle's architecture is the `WineArch` key under `[Bottle]` in its
-`cxbottle.conf`. `arm64` runs CrossOver's arm64 Wine. `win64`, the default,
-runs its x86_64 Wine, which cannot load mtld3d.
+The CrossOver Preview window shows a bottle's architecture as *Bottle Type*
+under *Advanced Settings*, and mtld3d needs `arm64`, which runs CrossOver's
+arm64 Wine. It is the `WineArch` key under `[Bottle]` in the bottle's
+`cxbottle.conf`. An existing arm64 bottle needs nothing more. Otherwise choose
+*File > New Bottle…* and a *New Bottle Type* that ends in *(arm64)*, such as
+*Windows 10 (arm64)*. The *(Intel)* types run CrossOver's x86_64 Wine, which
+cannot load mtld3d.
 
 All blocks below run in one terminal, in the bundle's directory, because they
 share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
-for the bottle's name:
+for the bottle's name, as the window lists it under *Bottles*:
 
 ```sh
 CX="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
 NAME=MyBottle
 ```
 
-An existing arm64 bottle needs nothing more. Otherwise create one from the
-command line, from `win10_64` or another 64-bit template:
+The command line creates the same bottle, from `win10_64` or another 64-bit
+template:
 
 ```sh
 "$CX/bin/cxbottle" --create --bottle "$NAME" --template win10_64 --winearch arm64
@@ -206,45 +210,102 @@ Then set the DLL override:
 
 ### Launching the game
 
-Outside `CrossOver Preview.app`, Wine finds `mtld3d.dll` and `mtld3d.so` only
-through `WINEDLLPATH`, so every launch has to add the bottle's `mtld3d`
-directory to it. CrossOver's `wine` script sets `WINEDLLPATH` to CrossOver's
-own directories on every launch, after it applies `[EnvironmentVariables]`
-from `cxbottle.conf`. Only the `--env` option, or the `CX_ENV` variable when
-`--env` is absent, is applied after it. `cxbottle.conf` has no key that adds a
+mtld3d's files live in the bottle, not in the app, so Wine finds `mtld3d.dll`
+and `mtld3d.so` only through `WINEDLLPATH`, and every launch has to add the
+bottle's `mtld3d` directory to it. CrossOver's `wine` script sets
+`WINEDLLPATH` to CrossOver's own directories on every launch, after it applies
+`[EnvironmentVariables]` from `cxbottle.conf`. Only a launch's *Environment
+variables* field (the `--env` option), or the `CX_ENV` variable when that field
+is empty, is applied after it. `cxbottle.conf` has no key that adds a
 directory, and a `WINEDLLPATH` under `HKCU\Environment` in the bottle never
 reaches the loader. CrossOver's directories stay first in the value: they hold
 its builtins, and its `wine` script keeps `$CX/lib/wine` there so the loader
 finds `ntdll.so`.
 
+Print the line that sets the value:
+
 ```sh
 DLLS="$CX/lib/wine/aarch64-windows:$CX/lib/wine/i386-windows:$CX/lib/wine:$BOTTLE/mtld3d"
+echo "WINEDLLPATH='$DLLS'"
 ```
 
-From the terminal, launch the game, or the launcher that starts it, with that
-value:
+Every process the game starts inherits the value. A launch without it gets
+CrossOver's value instead, finds no `mtld3d.dll` and fails to load the native
+`d3d9.dll`.
+
+#### Double-click on a launcher
+
+To give every launch from CrossOver Preview the value, put it into `CX_ENV`
+for the login session. Then quit CrossOver Preview and open it again: it reads
+the variable only when it starts.
+
+```sh
+launchctl setenv CX_ENV "WINEDLLPATH='$DLLS'"
+```
+
+A double-click on a launcher in the CrossOver Preview window then loads
+mtld3d, and so does opening the launcher's app in `~/Applications/CrossOver`
+or *Bottle > Run Command…* with an empty *Environment variables* field.
+
+- `CX_ENV` applies to every bottle. Launches in an arm64 bottle without
+  mtld3d, and in an *(Intel)* bottle, behave as they do without it.
+- It holds one bottle's `mtld3d` directory. Launch a game in another bottle
+  with the *Environment variables* field, as below.
+- Any text in a launch's *Environment variables* field replaces `CX_ENV`. To
+  add a variable to such a launch, enter the printed line first, then a space
+  and the variable.
+
+`launchctl setenv` lasts until logout. A LaunchAgent sets `CX_ENV` at every
+login. Loading it sets it now as well, and CrossOver Preview needs the same
+restart:
+
+```sh
+AGENT="$HOME/Library/LaunchAgents/local.mtld3d.cx-env.plist"
+plutil -create xml1 "$AGENT"
+plutil -insert Label -string local.mtld3d.cx-env "$AGENT"
+plutil -insert RunAtLoad -bool YES "$AGENT"
+plutil -insert ProgramArguments -array "$AGENT"
+for arg in /bin/launchctl setenv CX_ENV "WINEDLLPATH='$DLLS'"; do
+  plutil -insert ProgramArguments -string "$arg" -append "$AGENT"
+done
+launchctl bootstrap "gui/$(id -u)" "$AGENT"
+```
+
+To remove the LaunchAgent and `CX_ENV`, run this, then quit CrossOver Preview
+and open it again:
+
+```sh
+launchctl bootout "gui/$(id -u)/local.mtld3d.cx-env"
+rm -f "$HOME/Library/LaunchAgents/local.mtld3d.cx-env.plist"
+launchctl unsetenv CX_ENV
+```
+
+#### Launching with the value each time
+
+Without `CX_ENV`, a double-click on a launcher does not load mtld3d. Paste the
+printed line, quotes included, into the *Environment variables* field of the
+launch instead:
+
+- For an installed program, select its launcher and click *Run With Options*,
+  or right-click it and choose *Run with Options…*, then click *Run*.
+- For any `.exe`, choose *Bottle > Run Command…* and enter the `.exe` in
+  *Command*, in double quotes and followed by its arguments, then click
+  *Run*.
+
+Neither window keeps the field: *Run With Options* opens empty the next time,
+and a launcher made with *Save Command as a Launcher* starts without it.
+
+From the terminal, launch the game, or the launcher that starts it, with the
+same value:
 
 ```sh
 "$CX/bin/wine" --bottle "$NAME" --env "WINEDLLPATH='$DLLS'" "$GAME_DIR/MyGame.exe"
 ```
 
-From the CrossOver Preview window, a double-click on a launcher starts the
-game without the value, so mtld3d does not load. Print the value instead:
-
-```sh
-echo "WINEDLLPATH='$DLLS'"
-```
-
-and paste the printed line, quotes included, into the *Environment
-variables* field on every launch:
-
-- For an installed program, *Run With Options* on its launcher.
-- For any `.exe`, *Bottle > Run Command*, with the `.exe` in *Command*.
-
-Every process the game starts inherits the value. A launch without it gets
-CrossOver's value instead, finds no `mtld3d.dll` and fails to load the native
-`d3d9.dll`. With `--debugmsg +loaddll` added to a terminal launch, Wine names
-the cause:
+To see why a launch did not load mtld3d, tick *Create log file* in either
+window and enter `+loaddll` under *Additional Wine logging channels*, or add
+`--debugmsg +loaddll` to a terminal launch. The log, which the window writes
+to `~/Library/Logs/CrossOver Preview`, names the cause:
 `Library mtld3d.dll (which is needed by L"C:\\windows\\system32\\d3d9.dll") not found`.
 A 32-bit game prints the same `system32` path, which WoW64 maps to
 `syswow64`.
@@ -271,7 +332,8 @@ also be set through the `MTLD3D_CONFIG` environment variable
 
 `RUST_LOG=mtld3d=warn` is the single logging switch for the whole project. On
 stock Wine, export both in the environment that launches the game. On
-CrossOver Preview, set them under `[EnvironmentVariables]` in `cxbottle.conf`.
+CrossOver Preview, set them under `[EnvironmentVariables]` in `cxbottle.conf`,
+or after the `WINEDLLPATH` line in a launch's *Environment variables* field.
 
 ## Troubleshooting
 
@@ -316,7 +378,7 @@ Check, in order:
 3. `mtld3d.so` is in `aarch64-unix`, whatever the arch of the game.
 4. On CrossOver Preview, the launch added the bottle's `mtld3d` directory to
    `WINEDLLPATH`, as in [Launching the game](#launching-the-game). A
-   double-click on a launcher does not.
+   double-click on a launcher does only while `CX_ENV` is set.
 
 The game's `Logs/gx.log` stays empty in this crash. An empty `Loaded Modules`
 section only means the game directory has no usable `dbghelp.dll`.
