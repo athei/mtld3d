@@ -610,15 +610,15 @@ CI pins one Wine, the arm64 Wine of a Mach9 release (`WINE_RELEASE_ARM64`),
 and runs on one image, macos-26: the e2e legs `i686`, `x86_64` (the matrix
 name of the leg that runs `test-e2e-arm64x`, the x64 suite against the
 ARM64X build) and the native ARM64 `aarch64`, the conformance legs `i686` and
-`arm64x`, and one scaled leg of each suite. Every conformance leg runs that release's `d3d9_test.exe`.
-CI compiles on three machines and replays everywhere else. One job builds
-the stage (`make stage`: the i686 and ARM64X builds, the arm64 unix `.so`,
-the e2e test binaries of every leg, the e2e and conformance runners), which
-serves every leg. `check` runs formatting and audit first, then
-documentation, Clippy (the ARM64X halves included) and unit tests, as steps
-of one job, and `check-perf` runs the `PERF=1` Clippy and unit-test legs of
-`make check` in parallel with it, since those build into a target directory
-of their own. A cache is saved only when its key missed, so a pull request's
+`arm64x`, and one scaled leg of each suite. Every conformance leg runs that
+release's `d3d9_test.exe`. CI compiles on three machines and replays everywhere
+else. One job builds the stage (`make stage`: the i686 and ARM64X builds, the
+arm64 unix `.so`, the e2e test binaries of every leg, the e2e and conformance
+runners), which serves every leg. `check` runs formatting and audit first, then
+documentation, Clippy (the ARM64X halves included) and unit tests, as steps of
+one job, and `check-perf` runs the `PERF=1` Clippy and unit-test legs of
+`make check` in parallel with it, since those build into a target directory of
+their own. A cache is saved only when its key missed, so a pull request's
 run saves only what main's caches lack, and `cache-cleanup.yml` deletes a
 pull request's caches when it closes. Production bundles are built by the
 release job only, also on macos-26, so they carry the ARM64X pair beside the

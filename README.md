@@ -77,7 +77,8 @@ yet, what never will be, and the divergences from D3D9 kept on purpose.
 - An arm64 Wine, which runs x86 games through FEX and loads an ARM64X build
   of mtld3d into 64-bit games. The primary target is the Wine engine of
   [Mach9](https://github.com/athei/mach9) v0.4.0, the release CI pins. An
-  arm64 bottle of CrossOver Preview also works. An x86_64 Wine cannot load mtld3d.
+  arm64 bottle of CrossOver Preview also works. An x86_64 Wine cannot load
+  mtld3d.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
 
 ## Installation

@@ -198,9 +198,9 @@ and the conformance targets tell the runner that version: the first line of
 `$WINE_TESTS/VERSION`, which the release writes beside the tests in
 arm64-11.19-2 or any later Mach9 release (the `wine --version` string of
 their build), else the `wine --version` of the Wine tree `WINE_TESTS` lies
-in when that tree has a runnable `bin/wine`, as `WINE_SDK` does. Tests with neither have no known
-version: the run skips the comparison with the header and a re-record keeps
-it.
+in when that tree has a runnable `bin/wine`, as `WINE_SDK` does. Tests with
+neither have no known version: the run skips the comparison with the header
+and a re-record keeps it.
 
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#reading-a-test-run) explains how to
 read a test run, and

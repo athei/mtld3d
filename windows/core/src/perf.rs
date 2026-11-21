@@ -188,16 +188,15 @@ const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 /// booking, 12 to 17 ns as measured under Rosetta and not re-measured on
 /// the arm64 Wine), so a `PERF=1` build that times every call of every
 /// frame runs its API thread about half again slower than the production
-/// build. Timing whole frames keeps every timed frame
-/// exact (nesting, exclusive time, the rows that are a parent less its
-/// children) and leaves the others at production cost but for the few
-/// once-a-frame timers. The summary takes its timer rows from the timed
-/// frames and its counts from every frame, so nothing is scaled. The gaps
-/// between timed frames are drawn at random, so a workload that cycles
-/// through a few frame shapes is not timed on one of them only. A
-/// benchmark's two-second window holds thousands of frames, so it keeps a
-/// few hundred timed ones; a game at 60 frames a second keeps about eight a
-/// window.
+/// build. Timing whole frames keeps every timed frame exact (nesting,
+/// exclusive time, the rows that are a parent less its children) and leaves
+/// the others at production cost but for the few once-a-frame timers. The
+/// summary takes its timer rows from the timed frames and its counts from
+/// every frame, so nothing is scaled. The gaps between timed frames are
+/// drawn at random, so a workload that cycles through a few frame shapes is
+/// not timed on one of them only. A benchmark's two-second window holds
+/// thousands of frames, so it keeps a few hundred timed ones; a game at 60
+/// frames a second keeps about eight a window.
 #[cfg(perf_tracking)]
 const FRAME_SAMPLE_PERIOD: u8 = 16;
 
