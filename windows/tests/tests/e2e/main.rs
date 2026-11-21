@@ -60,6 +60,7 @@ mod multi_device;
 mod multithreaded;
 mod no_color_passes;
 mod non_uma;
+mod null_target;
 mod one_off_passes;
 mod packed10;
 mod panic_report;

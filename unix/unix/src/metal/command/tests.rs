@@ -11,7 +11,12 @@
 //! `MetalFX` route ends with, at matching odd extents must give back the source byte for
 //! byte. A ramp pass that cannot be encoded must leave the plain copy on the destination,
 //! and the HDR pass-through must write the linear values of the source into an
-//! `RGBA16Float` destination.
+//! `RGBA16Float` destination. The HDR tone map is checked against a float64 port of
+//! its stage, against the pass-through at a headroom of 1, and for never putting a grey
+//! below SDR while rising with the code and the headroom. Where `MetalFX` exists, the
+//! upscaled HDR present is checked for keeping white at the headroom, for adding no
+//! steps that go down to a bright gradient over what SDR scaling gives, and for equalling
+//! the 1:1 tone map of the `Perceptual` scale with and without a gamma ramp.
 //!
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
@@ -53,6 +58,7 @@ use objc2_metal::{
     MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStorageMode, MTLTexture,
     MTLTextureDescriptor, MTLTextureUsage,
 };
+use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
@@ -1229,7 +1235,7 @@ fn readback_completion_preserves_driver_error_details() {
     assert!(inspected, "a failed readback must inspect its driver error");
 }
 
-/// A failed upscale after HDR preflight must still convert the original SDR frame.
+/// A tone map failing after the HDR upscale encoded still converts the original SDR frame.
 #[test]
 fn hdr_upscale_failure_reencodes_the_original_source() {
     use objc2_metal::{MTLClearColor, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
@@ -1281,14 +1287,14 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         &dst,
         2.0,
         0,
-        |_| {
+        |_, _, _| {
             invoked.set(true);
             false
         }
     ));
     assert!(
         invoked.get(),
-        "the failure must occur after successful preflight"
+        "the failure must come after the scaler encoded"
     );
     crate::metal::upscale::retire_evicted(&cmd, &cache);
     cmd.commit();
@@ -1812,6 +1818,620 @@ fn the_hdr_passthrough_writes_linear_values_onto_a_float_destination() {
     }
 }
 
+/// The tone map's output against a float64 port of the stage at reference points.
+///
+/// The port is the BT.2446 stage step for step in `f64`: the sRGB decode,
+/// Method A at `L_HDR = min(max(headroom, 1) × 203, 10000)` with
+/// `L_SDR = 100`, the smooth maximum in ln luminance of `Y × 203` and Method
+/// A (`max(a, b) + k h² / 4`, `h = max(k − |a − b|, 0) / k`,
+/// `k = min(0.12, L_HDR / 203 − 1)`), one PQ ratio on I, Ct and Cp, ST 2084,
+/// and the output divided by 203. The sources are 16-bit sRGB codes: 30235 is
+/// linear 0.18 (mid grey), 65535 white, (48192, 35199, 25465) linear
+/// (0.5, 0.25, 0.125). White reaches the headroom up to PQ's 10000 nits,
+/// 49.26 × SDR white, and a headroom of 60 or an infinite one stops there
+/// with every channel finite, a saturated blue included.
+#[test]
+fn the_hdr_tone_map_matches_its_reference_values() {
+    const GREY: [u16; 4] = [30235, 30235, 30235, 65535];
+    const WHITE: [u16; 4] = [65535; 4];
+    const COLOUR: [u16; 4] = [48192, 35199, 25465, 65535];
+    const BLUE: [u16; 4] = [0, 0, 65535, 65535];
+    let cases: [([u16; 4], f32, [f32; 3]); 14] = [
+        (GREY, 2.0, [0.193_365; 3]),
+        (GREY, 5.0, [0.378_151; 3]),
+        (GREY, 15.0, [0.833_174; 3]),
+        (GREY, 60.0, [1.916_529; 3]),
+        (GREY, f32::INFINITY, [1.916_529; 3]),
+        (WHITE, 1.5, [1.5; 3]),
+        (WHITE, 5.0, [5.0; 3]),
+        (WHITE, 15.0, [15.0; 3]),
+        (WHITE, 60.0, [49.261_257; 3]),
+        (COLOUR, 2.0, [0.564_657, 0.279_665, 0.138_375]),
+        (COLOUR, 5.0, [1.216_523, 0.565_387, 0.260_549]),
+        (COLOUR, 15.0, [3.011_8, 1.286_592, 0.538_12]),
+        (BLUE, 60.0, [0.699_825, 0.0, 18.197_902]),
+        (BLUE, f32::INFINITY, [0.699_825, 0.0, 18.197_902]),
+    ];
+    let queue = test_queue();
+    for (texel, headroom, expected) in cases {
+        let bytes: Vec<u8> = texel
+            .iter()
+            .flat_map(|channel| channel.to_le_bytes())
+            .collect();
+        let src = uploaded(
+            &queue,
+            MTLPixelFormat::RGBA16Unorm,
+            (4, 4),
+            &bytes.repeat(16),
+        );
+        let values = hdr_values(&queue, &src, |cmd, dst| {
+            super::encode_hdr_present(cmd, &src, dst, headroom, 0)
+        });
+        for (channel, wanted) in expected.into_iter().enumerate() {
+            let read = values[0][channel];
+            assert!(
+                (read - wanted).abs() <= wanted.mul_add(4.0e-3, 1.0e-4),
+                "{texel:?} at a headroom of {headroom}: channel {channel} reads {read}, the \
+                 reference is {wanted}"
+            );
+        }
+    }
+}
+
+/// At a headroom of 1 the BT.2446 stage gives the pass-through's picture.
+///
+/// The present takes the pass-through stage up to a headroom of 1 and the
+/// BT.2446 stage above it, so the two have to agree there for the switch
+/// to make no step. Every 8-bit grey code and a row of colours run through
+/// both; they agree within the rounding of a half.
+#[test]
+fn the_hdr_tone_map_at_a_headroom_of_one_is_the_sdr_picture() {
+    let queue = test_queue();
+    // Row 0 is every grey code, row 1 a colour per code: BGRA bytes.
+    let greys = (0..=255_u8).flat_map(|code| [code, code, code, 255]);
+    let colours = (0..=255_u8).flat_map(|code| [code / 2, 255 - code, code, 255]);
+    let bytes: Vec<u8> = greys.chain(colours).collect();
+    let src = uploaded(&queue, MTLPixelFormat::BGRA8Unorm, (256, 2), &bytes);
+    let resources = crate::metal::present::ensure_resources(&queue.device()).expect("pipelines");
+    let passthrough = hdr_values(&queue, &src, |cmd, dst| {
+        super::encode_hdr_present(cmd, &src, dst, 1.0, 0)
+    });
+    let tone_mapped = hdr_values(&queue, &src, |cmd, dst| {
+        super::encode_present_pass(
+            cmd,
+            &src,
+            dst,
+            &super::PresentStage {
+                plain: resources.bt2446,
+                ramp: None,
+                uniforms: Some(crate::metal::present::hdr_uniforms(1.0)),
+                gamma_layer: 0,
+            },
+        )
+    });
+    for (index, (sdr, hdr)) in passthrough.iter().zip(&tone_mapped).enumerate() {
+        for (channel, (read, wanted)) in hdr.iter().zip(sdr).take(3).enumerate() {
+            assert!(
+                (read - wanted).abs() <= wanted.mul_add(2.0e-3, 1.0e-5),
+                "texel {index} channel {channel}: BT.2446 at a headroom of 1 reads {read}, the \
+                 pass-through {wanted}"
+            );
+        }
+    }
+}
+
+/// The tone map never puts a grey below SDR and rises with both the code and the headroom.
+///
+/// Every 8-bit grey code, from a headroom of 1 (the pass-through) to 2 in
+/// steps of 0.05, and at 3, 5, 15 and 60. No code reads below its SDR value
+/// or below the code under it or below itself at the headroom before, and
+/// over 1 to 2 no code rises by more than white does per step (0.05; the
+/// float64 port's largest is 0.05005), so the switch from the pass-through
+/// stage makes no step. The tolerances are the rounding of a half.
+#[test]
+fn the_hdr_tone_map_never_darkens_and_rises_with_code_and_headroom() {
+    let queue = test_queue();
+    let bytes: Vec<u8> = (0..=255_u8)
+        .flat_map(|code| [code, code, code, 255])
+        .collect();
+    let src = uploaded(&queue, MTLPixelFormat::BGRA8Unorm, (256, 1), &bytes);
+    let headrooms = (0..=20_u8)
+        .map(|step| f32::from(step).mul_add(0.05, 1.0))
+        .chain([3.0, 5.0, 15.0, 60.0]);
+    let mut previous: Option<(f32, Vec<f32>)> = None;
+    for headroom in headrooms {
+        let values: Vec<f32> = hdr_values(&queue, &src, |cmd, dst| {
+            super::encode_hdr_present(cmd, &src, dst, headroom, 0)
+        })
+        .iter()
+        .map(|texel| texel[0])
+        .collect();
+        for (code, &value) in (0..=255_u8).zip(&values) {
+            let encoded = f32::from(code) / 255.0;
+            let sdr = if encoded <= 0.040_45 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            };
+            assert!(
+                value >= sdr.mul_add(-2.0e-3, sdr) - 1.0e-6,
+                "code {code} at a headroom of {headroom} reads {value}, under its SDR {sdr}"
+            );
+        }
+        for (code, pair) in values.windows(2).enumerate() {
+            assert!(
+                pair[1] >= pair[0].mul_add(-1.0e-3, pair[0]),
+                "code {} at a headroom of {headroom} reads {}, under code {code}'s {}",
+                code + 1,
+                pair[1],
+                pair[0]
+            );
+        }
+        if let Some((last_headroom, last)) = &previous {
+            for (code, (now, before)) in values.iter().zip(last).enumerate() {
+                assert!(
+                    *now >= before.mul_add(-1.0e-3, *before),
+                    "code {code} reads {now} at a headroom of {headroom}, {before} at \
+                     {last_headroom}"
+                );
+                if headroom <= 2.0 {
+                    assert!(
+                        now - before <= 0.053,
+                        "code {code} rises from {before} to {now} between a headroom of \
+                         {last_headroom} and {headroom}"
+                    );
+                }
+            }
+        }
+        previous = Some((headroom, values));
+    }
+}
+
+/// An upscaled HDR present keeps white at the headroom and a bright gradient's steps.
+///
+/// `MetalFX` enlarges an SDR frame 2x into an HDR drawable at headrooms of 4
+/// and 15. Flat white must read within 0.5 % of the tone map at drawable
+/// resolution without `MetalFX`, away from the outer [`WHITE_MARGIN`] texels,
+/// where the scaler writes 254 for 255 in SDR as well. Codes 204 to 255 must
+/// have no more steps that go down along a row than `Perceptual` scaling of
+/// the same SDR frame has. The gradient's error against the tone map at
+/// drawable resolution is printed beside the same figures for the order that
+/// tone-maps at render size and scales the float result in `HDR` mode.
+#[test]
+fn an_upscaled_hdr_present_keeps_white_and_the_gradient_steps() {
+    let queue = test_queue();
+    let device = queue.device();
+    if !crate::metal::upscale::is_available(&device) {
+        eprintln!("MetalFX unsupported, skipping the upscaled HDR present measurement");
+        return;
+    }
+    let cache = crate::metal::upscale::UpscaleCache::new();
+    let source = (52 * GRADIENT_COLUMNS_PER_CODE, 8);
+    let drawable = (source.0 * 2, source.1 * 2);
+    let white = uploaded(
+        &queue,
+        MTLPixelFormat::BGRA8Unorm,
+        source,
+        &[255_u8; 4].repeat(source.0 * source.1),
+    );
+    let row: Vec<u8> = (204..=255_u8)
+        .flat_map(|code| [code, code, code, 255].repeat(GRADIENT_COLUMNS_PER_CODE))
+        .collect();
+    let gradient = uploaded(
+        &queue,
+        MTLPixelFormat::BGRA8Unorm,
+        source,
+        &row.repeat(source.1),
+    );
+    let sdr_down = down_steps(&sdr_upscaled_row(&queue, &cache, &gradient, drawable));
+    for headroom in [4.0_f32, 15.0] {
+        let (white_wanted, gradient_wanted) =
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                super::encode_hdr_present(cmd, src, dst, headroom, 0)
+            });
+        let wanted = white_wanted[0][0];
+        let (white_read, gradient_read) =
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                present_upscaled(cmd, &cache, src, dst, headroom)
+            });
+        let presented = UpscaleErrors::new(
+            &white_read,
+            wanted,
+            drawable,
+            &gradient_read,
+            &gradient_wanted,
+        );
+        let (white_read, gradient_read) =
+            white_and_gradient(&queue, &white, &gradient, drawable, |cmd, src, dst| {
+                tone_mapped_then_scaled(cmd, &cache, src, dst, headroom)
+            });
+        let hdr_mode = UpscaleErrors::new(
+            &white_read,
+            wanted,
+            drawable,
+            &gradient_read,
+            &gradient_wanted,
+        );
+        eprintln!(
+            "headroom {headroom}, white {wanted}: present {presented}; tone map then HDR-mode \
+             scale {hdr_mode}; SDR Perceptual {sdr_down} steps down"
+        );
+        assert!(
+            presented.white_error <= 5.0e-3,
+            "white at a headroom of {headroom}: {presented}"
+        );
+        assert!(
+            presented.down <= sdr_down,
+            "the gradient at a headroom of {headroom} has more steps down than SDR's \
+             {sdr_down}: {presented}"
+        );
+    }
+    crate::metal::upscale::retire(&cache);
+}
+
+/// The upscaled HDR present equals, texel for texel, the 1:1 tone map of the `Perceptual` scale.
+///
+/// A random frame, near-black, colours and alpha included, enlarged by 4:3
+/// in each axis, at headrooms of 1, 4 and 15, without a gamma ramp and with
+/// one: every texel of the present must equal `encode_hdr_present` at 1:1
+/// from the same frame scaled by `upscale::encode` into a `BGRA8Unorm`
+/// target. The ramp must change the picture, so its pass is the one that ran.
+#[test]
+fn the_upscaled_hdr_present_tone_maps_the_perceptual_scale_texel_for_texel() {
+    use crate::metal::macdrv::attachment;
+    let queue = test_queue();
+    let device = queue.device();
+    if !crate::metal::upscale::is_available(&device) {
+        eprintln!("MetalFX unsupported, skipping the upscaled HDR present comparison");
+        return;
+    }
+    let cache = crate::metal::upscale::UpscaleCache::new();
+    let drawable = (400, 268);
+    let (src, _) = random_source(&queue, MTLPixelFormat::BGRA8Unorm, 300, 201);
+    let scaled = texture_2d(
+        &device,
+        MTLPixelFormat::BGRA8Unorm,
+        drawable,
+        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+    );
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-perceptual-scale")));
+    assert!(crate::metal::upscale::encode(
+        &cmd,
+        &device,
+        &cache,
+        &src,
+        &scaled,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual,
+    ));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    // A ramp that moves every channel: red squared, green kept, blue inverted.
+    let view = attachment::test_address_block();
+    let layer = view + 8;
+    attachment::register(
+        view,
+        layer,
+        &attachment::AttachLatches {
+            hwnd: 0x42,
+            flags: attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let ramp: Vec<u16> = (0..=255_u32)
+        .flat_map(|code| {
+            let level = |value: u32| u16::try_from(value).expect("a 16-bit level");
+            [
+                level(code * code * 65535 / (255 * 255)),
+                level(code * 257),
+                level((255 - code) * 257),
+                u16::MAX,
+            ]
+        })
+        .collect();
+    let layer_key = u64::try_from(layer).expect("a 64-bit address");
+    // SAFETY: `set_gamma_ramp` reads the handle only as the key of the
+    // layer's table and never dereferences it; no object stands behind it.
+    let layer_handle = unsafe { MetalHandle::new(layer_key) };
+    assert!(crate::metal::gamma::set_gamma_ramp(
+        layer_handle,
+        Some(&ramp)
+    ));
+    for headroom in [1.0_f32, 4.0, 15.0] {
+        let mut plain = None;
+        for gamma_layer in [0, layer] {
+            let presented = hdr_values_at(&queue, drawable, |cmd, dst| {
+                super::encode_hdr_present_upscaled(cmd, &cache, &src, dst, headroom, gamma_layer)
+            });
+            let wanted = hdr_values_at(&queue, drawable, |cmd, dst| {
+                super::encode_hdr_present(cmd, &scaled, dst, headroom, gamma_layer)
+            });
+            if let Some(index) = presented
+                .iter()
+                .zip(&wanted)
+                .position(|(read, want)| read.map(f32::to_bits) != want.map(f32::to_bits))
+            {
+                panic!(
+                    "texel ({}, {}) at a headroom of {headroom}, ramp {}: the present reads {:?}, \
+                     the tone map of the Perceptual scale {:?}",
+                    index % drawable.0,
+                    index / drawable.0,
+                    gamma_layer != 0,
+                    presented[index],
+                    wanted[index]
+                );
+            }
+            match plain.take() {
+                None => plain = Some(presented),
+                Some(unramped) => assert!(
+                    unramped
+                        .iter()
+                        .zip(&presented)
+                        .any(|(before, after)| before.map(f32::to_bits) != after.map(f32::to_bits)),
+                    "the ramp must change the picture at a headroom of {headroom}"
+                ),
+            }
+        }
+    }
+    assert!(crate::metal::gamma::set_gamma_ramp(layer_handle, None));
+    attachment::unregister(view);
+    crate::metal::upscale::retire(&cache);
+}
+
+/// Source columns per code of the measured gradient.
+///
+/// Four, so that the 2x enlargement has a flat run between two codes. At one
+/// column per code the scaler sharpens every step into a zigzag in SDR as
+/// well, and a count of the steps that go down measures that instead.
+const GRADIENT_COLUMNS_PER_CODE: usize = 4;
+
+/// Texels at each edge of the drawable that the white check leaves out.
+const WHITE_MARGIN: usize = 4;
+
+/// What an upscaled HDR present reads against the tone map at drawable resolution.
+struct UpscaleErrors {
+    /// The largest relative error of a white texel inside [`WHITE_MARGIN`].
+    white_error: f64,
+    /// The gradient row's mean relative error.
+    mean: f64,
+    /// The gradient row's root-mean-square relative error.
+    rms: f64,
+    /// The gradient row's largest relative error.
+    max: f64,
+    /// Steps along the gradient row whose value goes down.
+    down: usize,
+}
+
+impl UpscaleErrors {
+    /// Compare a white frame against `wanted` and a gradient row against its reference.
+    fn new(
+        white: &[[f32; 4]],
+        wanted: f32,
+        (width, height): (usize, usize),
+        gradient: &[f32],
+        reference: &[f32],
+    ) -> Self {
+        let white_error = white
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let (x, y) = (index % width, index / width);
+                (WHITE_MARGIN..width - WHITE_MARGIN).contains(&x)
+                    && (WHITE_MARGIN..height - WHITE_MARGIN).contains(&y)
+            })
+            .map(|(_, texel)| (f64::from(texel[0]) / f64::from(wanted) - 1.0).abs())
+            .fold(0.0, f64::max);
+        let errors: Vec<f64> = gradient
+            .iter()
+            .zip(reference)
+            .map(|(read, wanted)| f64::from(*read) / f64::from(*wanted) - 1.0)
+            .collect();
+        let count = f64::from(u32::try_from(errors.len()).expect("one short row"));
+        Self {
+            white_error,
+            mean: errors.iter().sum::<f64>() / count,
+            rms: (errors.iter().map(|error| error * error).sum::<f64>() / count).sqrt(),
+            max: errors.iter().fold(0.0, |max, error| error.abs().max(max)),
+            down: down_steps(gradient),
+        }
+    }
+}
+
+impl core::fmt::Display for UpscaleErrors {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "white {:.3} %, gradient mean {:+.3} % rms {:.3} % max {:.3} %, {} steps down",
+            self.white_error * 100.0,
+            self.mean * 100.0,
+            self.rms * 100.0,
+            self.max * 100.0,
+            self.down
+        )
+    }
+}
+
+/// Run `encode` on the white and the gradient frame into HDR drawables of `extent`.
+///
+/// Returns every texel of the white frame and the gradient's middle row.
+fn white_and_gradient(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    white: &ProtocolObject<dyn MTLTexture>,
+    gradient: &ProtocolObject<dyn MTLTexture>,
+    extent: (usize, usize),
+    encode: impl Fn(
+        &ProtocolObject<dyn MTLCommandBuffer>,
+        &ProtocolObject<dyn MTLTexture>,
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> bool,
+) -> (Vec<[f32; 4]>, Vec<f32>) {
+    let white = hdr_values_at(queue, extent, |cmd, dst| encode(cmd, white, dst));
+    let gradient = hdr_values_at(queue, extent, |cmd, dst| encode(cmd, gradient, dst));
+    (white, middle_row(&gradient, extent))
+}
+
+/// The present's upscaled HDR route, which must reach `MetalFX` rather than its fallback.
+fn present_upscaled(
+    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+    cache: &crate::metal::upscale::UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+) -> bool {
+    let scaled = std::cell::Cell::new(false);
+    let encoded = super::encode_hdr_present_upscaled_with(
+        cmd,
+        cache,
+        src,
+        dst,
+        peak,
+        0,
+        |cmd, enlarged, drawable| {
+            scaled.set(true);
+            super::encode_hdr_present(cmd, enlarged, drawable, peak, 0)
+        },
+    );
+    assert!(
+        scaled.get(),
+        "the upscaled HDR present must go through MetalFX"
+    );
+    encoded
+}
+
+/// Tone-map at render size, then scale the float result in `HDR` mode.
+fn tone_mapped_then_scaled(
+    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+    cache: &crate::metal::upscale::UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+) -> bool {
+    let scratch = texture_2d(
+        &cmd.device(),
+        MTLPixelFormat::RGBA16Float,
+        (src.width(), src.height()),
+        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+    );
+    super::encode_hdr_present(cmd, src, &scratch, peak, 0)
+        && crate::metal::upscale::encode(
+            cmd,
+            &cmd.device(),
+            cache,
+            &scratch,
+            dst,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+        )
+}
+
+/// The middle row's red codes after `Perceptual` scaling of `src` into a `BGRA8Unorm` drawable.
+fn sdr_upscaled_row(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    cache: &crate::metal::upscale::UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    (width, height): (usize, usize),
+) -> Vec<f32> {
+    let dst = drawable_shaped(queue, MTLPixelFormat::BGRA8Unorm, width, height);
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-sdr-upscale")));
+    assert!(crate::metal::upscale::encode(
+        &cmd,
+        &queue.device(),
+        cache,
+        src,
+        &dst,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual,
+    ));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    let row = width * 4;
+    texture_bytes(queue, &dst)[height / 2 * row..(height / 2 + 1) * row]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|texel| f32::from(texel[2]))
+        .collect()
+}
+
+/// The red channel of the middle row of a frame of `width` by `height` texels.
+fn middle_row(values: &[[f32; 4]], (width, height): (usize, usize)) -> Vec<f32> {
+    values[height / 2 * width..(height / 2 + 1) * width]
+        .iter()
+        .map(|texel| texel[0])
+        .collect()
+}
+
+/// How many steps along `row` go down.
+fn down_steps(row: &[f32]) -> usize {
+    row.windows(2).filter(|pair| pair[1] < pair[0]).count()
+}
+
+/// Run `encode` into an `RGBA16Float` destination of `src`'s size and read every texel.
+fn hdr_values(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>, &ProtocolObject<dyn MTLTexture>) -> bool,
+) -> Vec<[f32; 4]> {
+    hdr_values_at(queue, (src.width(), src.height()), encode)
+}
+
+/// Run `encode` into an `RGBA16Float` destination of `extent` and read every texel.
+///
+/// The destination is Private and render-target only, like the float
+/// drawable of an EDR layer. Every channel must be a finite half.
+fn hdr_values_at(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    (width, height): (usize, usize),
+    encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>, &ProtocolObject<dyn MTLTexture>) -> bool,
+) -> Vec<[f32; 4]> {
+    let dst = drawable_shaped(queue, MTLPixelFormat::RGBA16Float, width, height);
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-tone-map")));
+    assert!(encode(&cmd, &dst), "the HDR pass must encode");
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    texture_bytes(queue, &dst)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|texel| {
+            let halves = texel.as_chunks::<2>().0;
+            core::array::from_fn(|channel| {
+                let bits = u16::from_le_bytes(halves[channel]);
+                assert_ne!(
+                    bits & 0x7c00,
+                    0x7c00,
+                    "channel {channel} is not a finite half"
+                );
+                half_to_f32(bits)
+            })
+        })
+        .collect()
+}
+
 /// A finite IEEE half's value.
 fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
@@ -1824,9 +2444,9 @@ fn half_to_f32(bits: u16) -> f32 {
     sign * normal
 }
 
-/// Bytes per texel of the two drawable formats.
+/// Bytes per texel of the two drawable formats and the 16-bit test sources.
 fn bytes_per_texel(format: MTLPixelFormat) -> usize {
-    if format == MTLPixelFormat::RGBA16Float {
+    if format == MTLPixelFormat::RGBA16Float || format == MTLPixelFormat::RGBA16Unorm {
         8
     } else {
         4

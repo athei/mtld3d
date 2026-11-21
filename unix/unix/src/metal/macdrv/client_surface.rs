@@ -43,7 +43,7 @@ use mtld3d_shared::mtl::ClientSurfaceRequest;
 use objc2::{
     ClassType, Encode, MainThreadMarker,
     rc::Retained,
-    runtime::{AnyClass, AnyObject, Ivar},
+    runtime::{AnyClass, AnyObject, Ivar, NSObjectProtocol},
 };
 use objc2_quartz_core::CAMetalLayer;
 
@@ -70,7 +70,7 @@ pub enum LayerClass {
     Bypassed,
     /// The layer already presents through `CAMetalLayer`'s own `nextDrawable`.
     Plain,
-    /// The layer is some other subclass, which is left as it is.
+    /// The layer is some other subclass, or the hook class under an observer's, left as it is.
     Foreign,
     /// The layer is the hook class and keeps it: nothing here can present its client surface.
     Hooked,
@@ -84,8 +84,10 @@ type SurfaceFn = unsafe extern "C" fn(*mut c_void);
 /// Only a layer whose class is exactly the hook class changes: that class
 /// adds no instance variables and overrides nothing but `nextDrawable`, so
 /// the object is laid out as its superclass and only the method lookup
-/// moves. A layer of any other class, such as one a key-value observer has
-/// subclassed, keeps its class and is reported as [`LayerClass::Foreign`].
+/// moves. A layer is classed by the class it reports, so one a key-value
+/// observer has subclassed counts as the class observed: a plain layer is
+/// [`LayerClass::Plain`], and a hook layer keeps the observer's subclass and
+/// is reported as [`LayerClass::Foreign`], as a layer of any other class is.
 /// A Wine without the hook class has nothing to bypass.
 ///
 /// The override is what has Wine show the client surface, and size it to the
@@ -262,19 +264,34 @@ fn can_replace_hook(can_present: bool, host: Option<&'static AnyClass>) -> bool 
 }
 
 /// [`bypass_present_hook`] against a hook class the caller names.
+///
+/// The layer is judged by the class it reports through `-class`, which
+/// `isMemberOfClass:` compares: a key-value observer's subclass reports the
+/// class it observes, so a plain layer under an observer is still plain. Only
+/// an object whose own class is `hook` changes class; a hook layer under an
+/// observer keeps the observer's subclass, which a class change would remove.
 fn bypass_hook_class(layer: &CAMetalLayer, hook: &AnyClass) -> LayerClass {
-    let object: &AnyObject = layer.as_ref();
-    let class = object.class();
-    if class == CAMetalLayer::class() {
+    if layer.isMemberOfClass(CAMetalLayer::class()) {
         return LayerClass::Plain;
     }
+    let object: &AnyObject = layer.as_ref();
+    let class = object.class();
     if class != hook {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "present: the metal layer is a {:?}, not {HOOK_LAYER_CLASS:?}; it keeps its class and \
-             its nextDrawable",
-            class.name(),
-        );
+        if layer.isMemberOfClass(hook) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: the metal layer is a {HOOK_LAYER_CLASS:?} under the subclass {:?}, as a \
+                 key-value observer makes; it keeps that class and the hook's nextDrawable",
+                class.name(),
+            );
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: the metal layer is a {:?}, not {HOOK_LAYER_CLASS:?}; it keeps its class \
+                 and its nextDrawable",
+                class.name(),
+            );
+        }
         return LayerClass::Foreign;
     }
     // SAFETY: the object's class is exactly `hook`, a subclass of

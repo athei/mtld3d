@@ -872,6 +872,17 @@ impl Direct3DSurface9 {
         self.inner().live_format()
     }
 
+    /// D3D9 format `GetDesc` reports: the surface's own, or its parent texture's.
+    pub fn reported_format(&self) -> u32 {
+        let parent = self.parent_texture();
+        if parent.is_null() {
+            return self.inner().live_format();
+        }
+        // SAFETY: `parent` is non-null (checked above) and a surface keeps its
+        // parent texture alive while it is live.
+        unsafe { &*parent }.d3d_format()
+    }
+
     /// `D3DPOOL_*` the standalone surface was created with.
     ///
     /// Only meaningful when `parent_texture()` is null; texture-backed surfaces
@@ -938,6 +949,28 @@ impl Direct3DSurface9 {
     /// answer from here rather than re-deriving it from the device.
     pub fn render_scale(&self) -> RenderScale {
         self.inner().live_render_scale()
+    }
+
+    /// The extent `GetDesc` reports, with the scale the Metal texture behind it is rasterized at.
+    ///
+    /// For a standalone or implicit surface that is the surface's own pair;
+    /// for a texture level, the level's extent and the parent texture's scale.
+    pub fn reported_extent(&self) -> ((u32, u32), RenderScale) {
+        let inner = self.inner();
+        if inner.parent_texture.is_null() {
+            return (
+                (inner.live_width(), inner.live_height()),
+                inner.live_render_scale(),
+            );
+        }
+        // SAFETY: `parent_texture` is non-null (checked) and points to a live
+        // `Direct3DTexture9` whose refcount keeps it alive while this surface is.
+        let tex = unsafe { &*inner.parent_texture }.inner();
+        let level = inner.mip_level as usize;
+        (
+            (tex.mip_width(level), tex.mip_height(level)),
+            tex.render_scale(),
+        )
     }
 
     /// Mip level inside the parent texture.
@@ -2546,6 +2579,11 @@ extern "system" fn surface_lock_rect(
     if obj.inner().system_memory.is_some() {
         return systemmem_lock_rect(&obj, locked_rect, rect);
     }
+    if mtld3d_core::format::is_null_render_target(obj.inner().standalone_format) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::LockRect on a non-lockable NULL render target → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
         "IDirect3DSurface9::LockRect on a depth-stencil surface (a lockable depth format \
          included: no CPU copy of depth is kept) → INVALIDCALL"
@@ -3049,8 +3087,15 @@ fn systemmem_lock_rect(
     }
     inner.expose_system_memory();
     let full_w = inner.standalone_width;
-    let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
-        return D3DERR_INVALIDCALL;
+    // A lockable `NULL` render target has no format mapping: its CPU copy is a
+    // linear one at `NULL_LOCK_BYTES_PER_PIXEL`, as `CreateRenderTarget` sized it.
+    let fmt = if mtld3d_core::format::is_null_render_target(inner.standalone_format) {
+        None
+    } else {
+        let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
+            return D3DERR_INVALIDCALL;
+        };
+        Some(fmt)
     };
     // Standalone SYSTEMMEM/SCRATCH surfaces accept ANY lock rect and return
     // pBits at the RAW, unclamped origin `top*pitch + left*bpp` — the XP
@@ -3069,8 +3114,13 @@ fn systemmem_lock_rect(
     // bytes-per-pixel row stride, rounded up to a 4-byte boundary (D3D9 reports
     // a 4-byte-aligned pitch and the backing buffer is sized to match).
     let to_i = |v: u32| isize::try_from(v).unwrap_or(isize::MAX);
-    let bpp = fmt.bytes_per_pixel();
-    let (pitch, offset) = if bpp == 0 {
+    let bpp = fmt.as_ref().map_or(
+        mtld3d_core::format::NULL_LOCK_BYTES_PER_PIXEL,
+        mtld3d_core::format::FormatMapping::bytes_per_pixel,
+    );
+    let (pitch, offset) = if let Some(fmt) = fmt.as_ref()
+        && bpp == 0
+    {
         let bw = fmt.block_width().max(1);
         let bh = fmt.block_height().max(1);
         let bb = fmt.block_bytes();

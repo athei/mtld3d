@@ -79,6 +79,14 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   targets of the same pass too. Alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
+- The `NULL` FOURCC render target for depth-only passes: a surface or a
+  render-target texture with no colour storage, single-sampled, paired with
+  any depth format. Bound as render target 0 over a depth surface it takes no
+  colour write, and its draws and clears reach the depth surface's extent and
+  run at its sample count, whatever size the `NULL` target reports. A lockable
+  one locks to a zeroed CPU buffer nothing reads, `ColorFill` of one and a
+  colour `Clear` through one succeed without effect, and it is no
+  `StretchRect` source or destination.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
   alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`, plus AMD's
   `A2M1`/`A2M0` controls through `D3DRS_POINTSIZE`. `ALPHATESTENABLE` gates
@@ -168,6 +176,12 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
+- A `NULL` render target 0 beside real render targets 1..3, or with no depth
+  surface: its passes attach the depth surface alone, so draws through it
+  write no colour to render targets 1..3 and a `Clear(D3DCLEAR_TARGET)`
+  leaves them uncleared, and with no depth surface its draws are dropped.
+  D3D9 defines neither shape; a reference driver renders into the extra
+  targets at their extent. Each case is warned once.
 - Additional swap chains: `CreateAdditionalSwapChain` checks the swap
   effect, the back-buffer count and the presentation interval as
   `CreateDevice` and `Reset` do, for the kind of device it is called on,
@@ -329,6 +343,11 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   undefined values. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
+- A `D3DLOCK_DISCARD` lock of a DEFAULT-pool texture level, cube face or
+  offscreen plain surface whose pages an upload still reads hands out fresh
+  pages that hold a released resource's bytes, and the whole level uploads,
+  so texels the caller leaves unwritten sample those bytes. D3D9 leaves the
+  contents after `D3DLOCK_DISCARD` undefined. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy. `buffer.drawTimeUpload` keeps it

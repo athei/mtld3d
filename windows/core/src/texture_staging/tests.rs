@@ -30,6 +30,13 @@ use crate::{
 };
 
 const DEFAULT_FLAGS: u32 = 0;
+/// The flags a lock passes without `D3DLOCK_DISCARD`.
+const NON_DISCARD_LOCK_FLAGS: [u32; 4] = [
+    DEFAULT_FLAGS,
+    D3DLOCK_READONLY,
+    D3DLOCK_NOOVERWRITE,
+    mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE,
+];
 const NO_USAGE: u32 = 0;
 const RETIRED_SEQ: u64 = 10;
 const IN_FLIGHT_SEQ: u64 = 20;
@@ -1255,26 +1262,56 @@ fn block_aligned_lock_origin_is_unchanged_under_division() {
 }
 
 #[test]
-fn a_plain_lock_of_a_released_level_reads_it_back() {
-    assert!(released_level_lock_needs_readback(DEFAULT_FLAGS));
-    assert!(released_level_lock_needs_readback(D3DLOCK_READONLY));
-    assert!(released_level_lock_needs_readback(D3DLOCK_NOOVERWRITE));
-    assert!(released_level_lock_needs_readback(
-        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE
-    ));
+fn a_plain_lock_of_an_uploaded_released_level_reads_it_back() {
+    for flags in NON_DISCARD_LOCK_FLAGS {
+        assert_eq!(
+            released_level_lock_fill(flags, true),
+            ReleasedLevelFill::ReadBack,
+            "flags {flags:#x}"
+        );
+    }
+}
+
+/// A plain lock of a level the GPU never received hands out zero, not a released box.
+#[test]
+fn a_plain_lock_of_a_never_uploaded_released_level_starts_from_zero() {
+    for flags in NON_DISCARD_LOCK_FLAGS {
+        assert_eq!(
+            released_level_lock_fill(flags, false),
+            ReleasedLevelFill::Zeroed,
+            "flags {flags:#x}"
+        );
+    }
 }
 
 /// A partial write into an uploaded level is the one write that reads it back.
 #[test]
 fn a_partial_write_into_an_uploaded_released_level_reads_it_back() {
-    assert!(released_level_write_needs_readback(false, true));
+    assert_eq!(
+        released_level_write_fill(false, true),
+        ReleasedLevelFill::ReadBack
+    );
 }
 
+/// A partial write into a level the GPU never received starts from zero, not a released box.
 #[test]
-fn a_whole_write_or_a_never_uploaded_level_skips_the_readback() {
-    assert!(!released_level_write_needs_readback(true, true));
-    assert!(!released_level_write_needs_readback(true, false));
-    assert!(!released_level_write_needs_readback(false, false));
+fn a_partial_write_into_a_never_uploaded_released_level_starts_from_zero() {
+    assert_eq!(
+        released_level_write_fill(false, false),
+        ReleasedLevelFill::Zeroed
+    );
+}
+
+/// A whole-level write defines every byte, so it takes the pages as allocated.
+#[test]
+fn a_whole_level_write_takes_the_pages_as_allocated() {
+    for was_uploaded in [false, true] {
+        assert_eq!(
+            released_level_write_fill(true, was_uploaded),
+            ReleasedLevelFill::AsAllocated,
+            "was_uploaded {was_uploaded}"
+        );
+    }
 }
 
 // ── staging_droppable_class ──
@@ -1291,15 +1328,21 @@ fn plain_default_pool_texture_is_droppable() {
 }
 
 #[test]
-fn discard_is_the_only_flag_that_skips_the_readback() {
-    assert!(!released_level_lock_needs_readback(D3DLOCK_DISCARD));
+fn discard_is_the_only_flag_that_takes_the_pages_as_allocated() {
     // Companion bits ride along with DISCARD without reviving the read.
-    assert!(!released_level_lock_needs_readback(
-        D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE
-    ));
-    assert!(!released_level_lock_needs_readback(
-        D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK
-    ));
+    for flags in [
+        D3DLOCK_DISCARD,
+        D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
+        D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK,
+    ] {
+        for was_uploaded in [false, true] {
+            assert_eq!(
+                released_level_lock_fill(flags, was_uploaded),
+                ReleasedLevelFill::AsAllocated,
+                "flags {flags:#x}, was_uploaded {was_uploaded}"
+            );
+        }
+    }
 }
 
 #[test]

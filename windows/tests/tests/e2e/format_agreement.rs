@@ -16,9 +16,9 @@ use mtld3d_types::{
     D3DFMT_ATOC, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8,
     D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32_LOCKABLE, D3DFMT_D32F_LOCKABLE,
     D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5,
-    D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_INTZ, D3DFMT_NV12, D3DFMT_R5G6B5, D3DFMT_RESZ,
-    D3DFMT_UYVY, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
-    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES,
+    D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_INTZ, D3DFMT_NULL, D3DFMT_NV12, D3DFMT_R5G6B5,
+    D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES,
     D3DMULTISAMPLE_8_SAMPLES, D3DMULTISAMPLE_NONE, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_LIGHTING,
     D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILREF, D3DRS_ZENABLE,
@@ -51,10 +51,11 @@ const fn fourcc(code: [u8; 4]) -> u32 {
 
 /// The FOURCC formats the sweeps walk besides the numbered ones.
 ///
-/// The block-compressed and YUV formats, the vendor depth formats, and the
-/// vendor codes titles probe for without the layer serving them (`ATI2`,
-/// `RAWZ`, `NULL`, `INST`, `NVDB`, `A2M0`, `A2M1`, the packed RGBG pair and
-/// `MET1`).
+/// The block-compressed and YUV formats, the vendor depth formats, `NULL`
+/// (the render target with no colour storage, served as a 2D render target
+/// alone), and the vendor codes titles probe for without the layer serving
+/// them (`ATI2`, `RAWZ`, `INST`, `NVDB`, `A2M0`, `A2M1`, the packed RGBG pair
+/// and `MET1`).
 const FOURCCS: [u32; 24] = [
     D3DFMT_DXT1,
     D3DFMT_DXT2,
@@ -71,7 +72,7 @@ const FOURCCS: [u32; 24] = [
     D3DFMT_DF16,
     D3DFMT_DF24,
     fourcc(*b"RAWZ"),
-    fourcc(*b"NULL"),
+    D3DFMT_NULL,
     fourcc(*b"INST"),
     fourcc(*b"NVDB"),
     fourcc(*b"A2M0"),

@@ -9,13 +9,16 @@
 //! half-resolution frame comes back materially sharper than the compositor's
 //! own scaling would give. The drawable is framebuffer-only, which the scaler
 //! cannot write, so the scaler writes a Private output of the drawable's
-//! extent and format and an exact copy pass carries it onto the drawable.
+//! extent and a render pass carries it onto the drawable: an exact copy in
+//! SDR, the tone map in HDR.
 //!
-//! In SDR the scaler runs on the game's `BGRA8Unorm` back buffer in
-//! `Perceptual` colour-processing mode, which is what an sRGB-encoded 8-bit
-//! surface wants. In HDR the present shader tone-maps first, at render
-//! resolution, and the scaler runs on that `RGBA16Float` result in `HDR` mode —
-//! the mode built for values beyond `[0, 1]`.
+//! The scaler runs on the game's back buffer in `Perceptual` colour-processing
+//! mode, which is what an sRGB-encoded 8-bit surface wants, in SDR and in HDR
+//! alike. In HDR it writes the enlarged frame in the back buffer's own format,
+//! and the present shader's tone map is the pass that carries it onto the
+//! float drawable ([`encode_then`]). Scaling the tone-mapped float frame in
+//! `HDR` mode instead loses precision in exactly the range the tone map adds;
+//! the HDR present in `command.rs` gives the measurement.
 //!
 //! Two cases it does not serve. **A drawable smaller than the back buffer**:
 //! the spatial scaler only enlarges, which is why `render.scale` is capped at
@@ -84,8 +87,12 @@ struct ScalerKey {
 ///
 /// A scaler is not a cheap thing to hold: measured on an M-series GPU, one at
 /// `1920x1200 → 2560x1600` costs **~16 MiB** of device memory for its
-/// intermediates. Steady-state play needs two at most (the present pair and
-/// the HDR float scratch), so this never evicts during a game. What it bounds
+/// intermediates. Steady-state play needs one: the back buffer is always
+/// `BGRA8Unorm`, so the SDR present (output in the `BGRA8Unorm` drawable's
+/// format) and the HDR present (output in the back buffer's) of one geometry
+/// build the same key and share one entry and its output. A second entry per
+/// geometry would take a back-buffer format other than the SDR drawable's, so
+/// this never evicts during a game. What it bounds
 /// is a *window being resized*, which walks through a new geometry for every
 /// size the user rests at: twelve of them in forty seconds of dragging,
 /// measured, which unbounded is ~190 MiB that never comes back. The bound is
@@ -94,17 +101,18 @@ struct ScalerKey {
 ///
 /// The drawable-sized Private output each scaler writes is bounded apart from
 /// this: only the entry the latest lookup landed on keeps one
-/// (`detach_other_outputs`), so a device holds at most one, about 60 MiB for
-/// an `RGBA16Float` drawable at `3456x2234`, plus the detached ones waiting
-/// for the next command buffer of its queue to complete.
+/// (`detach_other_outputs`), so a device holds at most one, about 30 MiB for
+/// a `BGRA8Unorm` output at `3456x2234` and twice that for a 64-bit format,
+/// plus the detached ones waiting for the next command buffer of its queue to
+/// complete.
 const MAX_CACHED_SCALERS: usize = 8;
 
 /// Scratch targets one device keeps alive at once.
 ///
 /// Steady-state play needs a handful: the readback resolve at the reported
-/// back-buffer size in each format a read-back asks for, and the gamma and
-/// HDR present paths at render size. What this bounds is a window being
-/// resized while `render.scale` is below 1 and a ramp or HDR is on: every
+/// back-buffer size in each format a read-back asks for, and the SDR gamma
+/// path at render size. What this bounds is a window being resized while
+/// `render.scale` is below 1 and an SDR ramp is on: every
 /// size the window rests at asks for a render-size target, a Private texture
 /// of the frame's full extent that would otherwise stay until the device goes.
 const MAX_CACHED_SCRATCH: usize = 8;
@@ -225,14 +233,15 @@ impl ScalerSlot {
         drop(unsafe { Retained::from_raw(self.output) });
     }
 
-    /// Prepare a compatible output without encoding any work.
+    /// Prepare a compatible output in `format` without encoding any work.
     fn prepare(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         src: &ProtocolObject<dyn MTLTexture>,
         dst: &ProtocolObject<dyn MTLTexture>,
+        format: MTLPixelFormat,
     ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
-        self.prepare_with(device, src, dst, create_output)
+        self.prepare_with(device, src, dst, format, create_output)
     }
 
     fn prepare_with(
@@ -240,9 +249,11 @@ impl ScalerSlot {
         device: &ProtocolObject<dyn MTLDevice>,
         src: &ProtocolObject<dyn MTLTexture>,
         dst: &ProtocolObject<dyn MTLTexture>,
+        format: MTLPixelFormat,
         create: impl FnOnce(
             &ProtocolObject<dyn MTLDevice>,
             &ProtocolObject<dyn MTLTexture>,
+            MTLPixelFormat,
             MTLTextureUsage,
         ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
@@ -261,7 +272,7 @@ impl ScalerSlot {
         // The destination is a framebuffer-only drawable, which the scaler
         // cannot write, so the scaler always writes the intermediate.
         if self.output.is_null() {
-            let output = create(device, dst, output_usage)?;
+            let output = create(device, dst, format, output_usage)?;
             self.output = Retained::into_raw(output);
         }
         // SAFETY: the cache holds the intermediate's canonical retain, and
@@ -275,20 +286,22 @@ fn usage_supports(actual: MTLTextureUsage, required: MTLTextureUsage) -> bool {
     actual == MTLTextureUsage::Unknown || actual.contains(required)
 }
 
-/// Create the scaler's Private output at the destination's exact extent and format.
+/// Create the scaler's Private output at the destination's exact extent, in `format`.
 ///
 /// `usage` is what the scaler writes it with; shader reads are added for the
-/// copy pass that carries it onto the destination.
+/// pass that carries it onto the destination.
 fn create_output(
     device: &ProtocolObject<dyn MTLDevice>,
     dst: &ProtocolObject<dyn MTLTexture>,
+    format: MTLPixelFormat,
     usage: MTLTextureUsage,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     let usage = usage | MTLTextureUsage::ShaderRead;
-    // SAFETY: typed constructor; dimensions and format come from a live destination.
+    // SAFETY: typed constructor; dimensions come from a live destination and
+    // the format from a live texture.
     let desc = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            dst.pixelFormat(),
+            format,
             dst.width(),
             dst.height(),
             false,
@@ -299,15 +312,15 @@ fn create_output(
     let Some(texture) = super::texture::new_texture(device, &desc, "mtld3d-upscale-output") else {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
             "upscale: Private output allocation failed for {}x{} {:?} usage {:?}; present shader stretches instead",
-            dst.width(), dst.height(), dst.pixelFormat(), usage);
+            dst.width(), dst.height(), format, usage);
         return None;
     };
     texture.setLabel(Some(&objc2_foundation::NSString::from_str(
         "mtld3d-upscale-output",
     )));
     log::info!(target: LOG_TARGET,
-        "present: MetalFX Private output {}x{} {:?}, destination storage {:?} usage {:?}",
-        dst.width(), dst.height(), dst.pixelFormat(), dst.storageMode(), dst.usage());
+        "present: MetalFX Private output {}x{} {:?}, destination {:?} storage {:?} usage {:?}",
+        dst.width(), dst.height(), format, dst.pixelFormat(), dst.storageMode(), dst.usage());
     Some(texture)
 }
 
@@ -345,25 +358,52 @@ pub fn encode(
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> bool {
-    encode_with(cmd_buf, device, cache, src, dst, mode, copy_output)
+    scaler_key(src, dst, dst.pixelFormat(), mode)
+        .is_some_and(|key| encode_with(cmd_buf, device, cache, src, dst, key, copy_output))
 }
 
-fn encode_with(
+/// Encode a `MetalFX` spatial upscale of `src` in its own format, then `finish` it onto `dst`.
+///
+/// [`encode`] with `finish` in place of the exact copy: the scaler writes a
+/// Private intermediate at `dst`'s extent in `src`'s format, and `finish`
+/// (command buffer, intermediate, `dst`) is the pass that carries it onto
+/// `dst`. The HDR present scales the SDR frame in `Perceptual` mode this way
+/// and tone-maps the enlarged frame onto the float drawable.
+///
+/// Returns `false` when `MetalFX` cannot serve this pair or `finish` fails.
+/// The scaler may have encoded by then, so the caller's fallback has to write
+/// every pixel of `dst` itself.
+pub fn encode_then(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
     cache: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
-    copy: impl FnOnce(
+    finish: impl FnOnce(
         &ProtocolObject<dyn MTLCommandBuffer>,
         &ProtocolObject<dyn MTLTexture>,
         &ProtocolObject<dyn MTLTexture>,
     ) -> bool,
 ) -> bool {
-    let Some(key) = scaler_key(src, dst, mode) else {
-        return false;
-    };
+    scaler_key(src, dst, src.pixelFormat(), mode)
+        .is_some_and(|key| encode_with(cmd_buf, device, cache, src, dst, key, finish))
+}
+
+/// Encode the scaler for `key`, then `finish` from its intermediate onto `dst`.
+fn encode_with(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    cache: &UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    key: ScalerKey,
+    finish: impl FnOnce(
+        &ProtocolObject<dyn MTLCommandBuffer>,
+        &ProtocolObject<dyn MTLTexture>,
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> bool,
+) -> bool {
     if !supported(device) {
         return false;
     }
@@ -377,12 +417,12 @@ fn encode_with(
     let Some(slot) = scaler_in(&mut cache, device, key) else {
         return false;
     };
-    // `prepare` may create the output texture under `scalers`, here and in
-    // `can_scale`; a retried refusal (paravirtual only) holds the lock for up
-    // to 255 ms, stalling the presenter's other `scalers` takers,
-    // `retire_evicted` on the submit thread and device teardown that long at
-    // most. The create takes no other lock, so nothing deadlocks.
-    let Some(output) = slot.prepare(device, src, dst) else {
+    // `prepare` may create the output texture under `scalers`; a retried
+    // refusal (paravirtual only) holds the lock for up to 255 ms, stalling the
+    // presenter's other `scalers` takers, `retire_evicted` on the submit thread
+    // and device teardown that long at most. The create takes no other lock,
+    // so nothing deadlocks.
+    let Some(output) = slot.prepare(device, src, dst, MTLPixelFormat(key.output_format)) else {
         return false;
     };
     // SAFETY: the cache mutex holds the scaler's canonical retain through encode.
@@ -399,17 +439,30 @@ fn encode_with(
     unsafe { scaler.setColorTexture(None) };
     // SAFETY: nullable property write on the live scaler after encoding.
     unsafe { scaler.setOutputTexture(None) };
-    let encoded = copy(cmd_buf, &output, dst);
+    // `finish` runs under `scalers` too, and so do the locks it takes:
+    // - the exact copy takes `READBACK_PIPELINES` and compiles its
+    //   nearest-texel pipeline on the first upscaled SDR present per format;
+    // - the HDR present's tone map reads the present pipelines' `OnceLock`s
+    //   and, with a ramp, takes `GAMMA_PIPELINES`, compiling the gamma
+    //   pipeline on the first present that needs one, and the gamma `TABLES`;
+    // - both reach the present library's `OnceLock`, and the logger.
+    // A present that compiles holds `scalers` for the compile, stalling
+    // `retire_evicted` on the submit thread that long. No code takes
+    // `scalers` while holding `READBACK_PIPELINES`, `GAMMA_PIPELINES` or
+    // `TABLES`, so the order is `scalers` first, and a lock added inside a
+    // `finish` pass keeps it.
+    let encoded = finish(cmd_buf, &output, dst);
     log::debug!(target: "mtld3d::unix::present",
         "MetalFX encoded={encoded} {}x{} -> {}x{} {:?}, destination storage {:?} usage {:?}",
-        src.width(), src.height(), dst.width(), dst.height(), mode, dst.storageMode(), dst.usage());
+        src.width(), src.height(), dst.width(), dst.height(), key.mode, dst.storageMode(),
+        dst.usage());
     let evicted = take_evicted(&mut cache);
     drop(cache);
     release_when_retired(cmd_buf, evicted, take_evicted_scratch(cache_ref));
     encoded
 }
 
-/// Schedule pending evictions even when presentation falls back after preflight.
+/// Schedule pending evictions even when a lookup that made them encoded nothing.
 pub fn retire_evicted(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, cache: &UpscaleCache) {
     let evicted = cache.scalers.lock().map_or_else(
         |_| {
@@ -482,44 +535,11 @@ fn take_evicted_scratch(cache: &UpscaleCache) -> Vec<u64> {
     )
 }
 
-/// Whether [`encode`] would serve this pair, without encoding anything.
-///
-/// The HDR present path has to tone-map into a scratch texture *before* the
-/// upscale can run, and a scaler that declines after that point would strand
-/// the tone-mapped frame: the fallback tone-maps the back buffer again,
-/// straight to the drawable. Asking first keeps that fallback free.
-///
-/// Builds and caches this device's scaler on the way, so the [`encode`] that
-/// follows a `true` answer is a hash lookup.
-pub fn can_scale(
-    device: &ProtocolObject<dyn MTLDevice>,
-    cache: &UpscaleCache,
-    src: &ProtocolObject<dyn MTLTexture>,
-    dst: &ProtocolObject<dyn MTLTexture>,
-    mode: MTLFXSpatialScalerColorProcessingMode,
-) -> bool {
-    let Some(key) = scaler_key(src, dst, mode) else {
-        return false;
-    };
-    if !supported(device) {
-        return false;
-    }
-    // `prepare` may create the output under `scalers`; see `encode_with` for how
-    // long a retried refusal can hold it.
-    let Ok(mut cache) = cache.scalers.lock() else {
-        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
-            "upscale: scaler cache lock poisoned during preflight; present shader stretches instead");
-        return false;
-    };
-    scaler_in(&mut cache, device, key)
-        .and_then(|slot| slot.prepare(device, src, dst))
-        .is_some()
-}
-
-/// The key this pair scales under, or `None` when `MetalFX` cannot serve it.
+/// The key this pair scales under, its output in `output_format`; `None` when `MetalFX` cannot.
 fn scaler_key(
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
+    output_format: MTLPixelFormat,
     mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> Option<ScalerKey> {
     let (in_w, in_h) = (src.width(), src.height());
@@ -538,7 +558,7 @@ fn scaler_key(
         output_width: truncate(out_w),
         output_height: truncate(out_h),
         color_format: src.pixelFormat().0,
-        output_format: dst.pixelFormat().0,
+        output_format: output_format.0,
         mode,
     })
 }
@@ -662,8 +682,8 @@ pub fn is_supported(device_handle: MetalHandle<MTLDeviceKind>) -> bool {
 /// [`is_supported`] for a device already in hand.
 ///
 /// Present-time callers reach the device through `cmd_buf.device()` and hold no
-/// handle. They ask this before allocating anything a declined scaler would
-/// orphan.
+/// handle. The present asks this to pick its route, so a GPU without `MetalFX`
+/// never reaches the scaler path.
 pub fn is_available(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     supported(device)
 }
@@ -688,9 +708,8 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     unsafe { desc.setColorTextureFormat(MTLPixelFormat(key.color_format)) };
     // SAFETY: scalar property write; the format came from a live texture.
     unsafe { desc.setOutputTextureFormat(MTLPixelFormat(key.output_format)) };
-    // `Perceptual` for the sRGB-encoded BGRA8 back buffer, `HDR` for the
-    // tone-mapped float scratch the HDR present path feeds in. The caller
-    // picks; there is no format-sniffing here.
+    // The caller picks the mode; there is no format-sniffing here. Both
+    // presents pass `Perceptual`, since both scale the gamma-encoded frame.
     // SAFETY: scalar property write on an owned descriptor.
     unsafe { desc.setColorProcessingMode(key.mode) };
     // `inputContentWidth`/`inputContentHeight` are left at their defaults:
@@ -783,10 +802,10 @@ fn take_scalers(cache: &mut ScalerCache) -> Vec<ScalerSlot> {
 /// blit, and each read the other's frame (#445). A cache per device gives
 /// each one a texture of its own.
 ///
-/// Two callers share the cache: the readback resolve wants a `BGRA8Unorm`
-/// target at the reported back-buffer size, the HDR present path wants an
-/// `Rgba16Float` one at render size, so the format is what tells their
-/// entries apart.
+/// Two callers share the cache: the readback resolve wants a target at the
+/// reported back-buffer size in the format the read-back asks for, the SDR
+/// gamma path a `BGRA8Unorm` one at render size, so the size and the format
+/// are what tell their entries apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScratchKey {
     width: u32,

@@ -24,12 +24,12 @@ inputs:
     required: true
   wine-release-arm64:
     description: >
-      wine-build release tag of the arm64 Wine, downloaded on a cache miss.
+      Release tag (athei/mach9) of the arm64 Wine, downloaded on a cache miss.
       Read when `pe` is true.
     default: ''
   wine-release-x86_64:
     description: >
-      wine-build release tag of the x86_64 Wine, downloaded on a cache miss.
+      Release tag (athei/mach9) of the x86_64 Wine, downloaded on a cache miss.
       Read when `pe` is true.
     default: ''
   llvm-mingw-release:
@@ -204,7 +204,7 @@ runs:
       run: |
         mkdir -p "$HOME/wine-sdk"
         curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
-          "https://github.com/athei/wine-build/releases/download/${{ steps.wine.outputs.tag }}/${{ steps.wine.outputs.asset }}"
+          "https://github.com/athei/mach9/releases/download/${{ steps.wine.outputs.tag }}/${{ steps.wine.outputs.asset }}"
         tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
 
     # The ARM64X build's toolchain, which only the arm64 mode reads: the
