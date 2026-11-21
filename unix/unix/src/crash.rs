@@ -67,14 +67,8 @@
 //! thread without one is reported in full here and ends the process, so the
 //! report leads with the fault that caused it.
 //!
-//! A trap `CoreFoundation` raises itself (`SIGILL` on a deliberate `ud2`, the
-//! way the framework halts on a run-loop timer it refuses to reschedule) names
-//! its condition in a string and nothing else, while the object it was checking
-//! is in `rbx`. The terminal report of such a trap therefore adds the first
-//! words of that object, each copied by the kernel rather than dereferenced and
-//! annotated with the image and symbol `dladdr` resolves it to, so the object's
-//! class, callout and context read as their owners without the handler assuming
-//! any layout.
+//! The register offsets the report reads are `__darwin_mcontext64`'s arm64
+//! layout, so they exist for `aarch64` alone and another arch fails to build.
 //!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
@@ -1026,19 +1020,23 @@ const FRAME_CAP: c_int = 64;
 /// Byte offset of the saved stack pointer within `__darwin_mcontext64`.
 ///
 /// `__sp`, which follows `__x[29]`, `__fp`, `__lr`.
+#[cfg(target_arch = "aarch64")]
 const SP_OFFSET: usize = 264;
 
 /// Byte offset of the register carrying a called method's first argument.
 ///
 /// `__x0` is the AAPCS64 first argument, i.e. a COM call's `this`.
+#[cfg(target_arch = "aarch64")]
 const ARG0_OFFSET: usize = 16;
 
 /// Byte offset of the register carrying a native call's first argument.
 ///
 /// `__x0`, which is what a framework or the Objective-C runtime was handed.
+#[cfg(target_arch = "aarch64")]
 const NATIVE_ARG0_OFFSET: usize = 16;
 
 /// Byte offset of `__lr`, where `BLR` leaves the return address.
+#[cfg(target_arch = "aarch64")]
 const LR_OFFSET: usize = 256;
 
 /// Label for the first-argument register in the fault report.
@@ -1061,6 +1059,7 @@ const fn caller_pc(ctx: *mut c_void) -> u64 {
 /// 0x30 in `ucontext_t`. `__pc` follows the 16-byte exception state and 32
 /// thread-state `u64`s (272).
 const fn fault_pc(ctx: *mut c_void) -> u64 {
+    #[cfg(target_arch = "aarch64")]
     const PC_OFFSET: usize = 272;
 
     if ctx.is_null() {

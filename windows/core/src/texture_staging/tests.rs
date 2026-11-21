@@ -1697,10 +1697,10 @@ fn off_grid_empty_and_over_a_chunk_boxes_are_declined() {
 fn a_large_box_snapshots_whenever_it_fits_a_chunk() {
     // 200x200 four-byte texels: 800-byte rows, 160 000 bytes on a 16-byte
     // pitch and 204 800 on a 256-byte one, both under a 256 KiB chunk.
-    let apple = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 16).expect("fits a chunk");
-    assert_eq!((apple.pitch, apple.len), (800, 160_000));
-    let intel = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 256).expect("fits a chunk");
-    assert_eq!((intel.pitch, intel.len), (1024, 204_800));
+    let narrow_align = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 16).expect("fits a chunk");
+    assert_eq!((narrow_align.pitch, narrow_align.len), (800, 160_000));
+    let wide_align = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 256).expect("fits a chunk");
+    assert_eq!((wide_align.pitch, wide_align.len), (1024, 204_800));
     // 255 rows of 256 texels fill all but one row of a chunk.
     let edge = layout(rect(0, 0, 256, 255), (1, 1), 4, 1024, 256).expect("fits a chunk");
     assert_eq!(

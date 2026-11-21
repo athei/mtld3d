@@ -112,7 +112,6 @@ fn an_upload_read_holds_the_chunk_until_the_upload_counter_retires() {
 fn an_unstamped_use_never_retires() {
     let (draw, upload) = (AtomicU64::new(u64::MAX - 1), AtomicU64::new(u64::MAX - 1));
     let params = SubmitDescription {
-        blit_commands_need_encoder: false,
         upload_pass_count: 0,
         present_layer: mtld3d_shared::MetalHandle::NULL,
         present_texture: mtld3d_shared::MetalHandle::NULL,

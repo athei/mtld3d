@@ -476,7 +476,7 @@ pub enum OpSubDetail {
     RLookup,
     /// `Binds`: shader-constant slot `*_changed` `memcmp` + `set_*_bytes`.
     BCbind,
-    /// `Binds`: vertex-source bind — VB `MTLBuffer` wrap + notify + draw-range.
+    /// `Binds`: vertex-source bind, the VB `MTLBuffer` wrap and draw-range.
     BVbib,
     /// `Binds`: index-buffer wrap + the `draw{,_indexed}_primitives` command.
     BDraw,
@@ -5552,11 +5552,7 @@ impl<'a> Summary<'a> {
                         "const memcmp+bytes",
                         OpSubDetail::BCbind as usize,
                     ),
-                    (
-                        "│  │  ├─ vbib",
-                        "VB/IB wrap + notify",
-                        OpSubDetail::BVbib as usize,
-                    ),
+                    ("│  │  ├─ vbib", "VB/IB wrap", OpSubDetail::BVbib as usize),
                     (
                         "│  │  ├─ draw",
                         "draw cmd emit",

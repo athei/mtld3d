@@ -742,7 +742,6 @@ fn a_failed_submission_ends_the_frame_latency_wait() {
     assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
     // An upload prefix longer than the pass list fails the encode on the CPU.
     let description = SubmitDescription {
-        blit_commands_need_encoder: false,
         upload_pass_count: 1,
         present_layer: MetalHandle::NULL,
         present_texture: MetalHandle::NULL,

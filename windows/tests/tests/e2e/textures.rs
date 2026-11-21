@@ -4755,49 +4755,47 @@ fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
 fn volume_update_keeps_per_draw_content() {
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
-    let harnesses = [Harness::new()];
-    for h in &harnesses {
-        let (hr, source) =
-            h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
-        assert_eq!(hr, 0);
-        let source = source.expect("source");
-        let (hr, destination) =
-            h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
-        assert_eq!(hr, 0);
-        let destination = destination.expect("destination");
-        source.write_u32(0, &[RED; 64]);
-        assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
-        assert_eq!(h.set_volume_texture(0, &destination), 0);
-        h.select_texture_stage(0);
-        point_clamp(h);
+    let h = &Harness::new();
+    let (hr, source) =
+        h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0);
+    let source = source.expect("source");
+    let (hr, destination) =
+        h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0);
+    let destination = destination.expect("destination");
+    source.write_u32(0, &[RED; 64]);
+    assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+    assert_eq!(h.set_volume_texture(0, &destination), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    assert_pixel_eq(sample_volume_depth(h, 0.875), RED, "primed volume");
+    source.write_u32(0, &[BLUE; 64]);
+    h.render_once(BLACK, |d| {
         assert_eq!(
-            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                2,
+                &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
+            ),
             0
         );
-        assert_pixel_eq(sample_volume_depth(h, 0.875), RED, "primed volume");
-        source.write_u32(0, &[BLUE; 64]);
-        h.render_once(BLACK, |d| {
-            assert_eq!(
-                d.draw_primitive_up(
-                    D3DPT_TRIANGLELIST,
-                    2,
-                    &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
-                ),
-                0
-            );
-            assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
-            assert_eq!(
-                d.draw_primitive_up(
-                    D3DPT_TRIANGLELIST,
-                    2,
-                    &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
-                ),
-                0
-            );
-        });
-        let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
-        assert_eq!(pixels, [RED, BLUE], "volume draws bracketing UpdateTexture");
-    }
+        assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                2,
+                &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
+            ),
+            0
+        );
+    });
+    let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+    assert_eq!(pixels, [RED, BLUE], "volume draws bracketing UpdateTexture");
 }
 
 /// Bind `volume` on stage 0 for `sample_volume_depth` with point filtering.
@@ -4882,69 +4880,64 @@ fn volume_lock_box_no_dirty_update_adds_no_dirty_region() {
 fn volume_whole_level_write_after_its_upload_keeps_per_draw_content() {
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
-    let harnesses = [Harness::new()];
-    for h in &harnesses {
-        for lock_box in [false, true] {
-            let (hr, source) =
-                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
-            assert_eq!(hr, 0);
-            let source = source.expect("source");
-            let pool = if lock_box {
-                D3DPOOL_MANAGED
-            } else {
-                D3DPOOL_DEFAULT
-            };
-            let (hr, destination) =
-                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, pool);
-            assert_eq!(hr, 0);
-            let destination = destination.expect("destination");
-            if lock_box {
-                destination.write_u32(0, &[RED; 64]);
-            } else {
-                source.write_u32(0, &[RED; 64]);
-                assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
-                source.write_u32(0, &[BLUE; 64]);
-            }
-            assert_eq!(h.set_volume_texture(0, &destination), 0);
-            h.select_texture_stage(0);
-            point_clamp(h);
+    let h = &Harness::new();
+    for lock_box in [false, true] {
+        let (hr, source) =
+            h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        assert_eq!(hr, 0);
+        let source = source.expect("source");
+        let pool = if lock_box {
+            D3DPOOL_MANAGED
+        } else {
+            D3DPOOL_DEFAULT
+        };
+        let (hr, destination) = h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(hr, 0);
+        let destination = destination.expect("destination");
+        if lock_box {
+            destination.write_u32(0, &[RED; 64]);
+        } else {
+            source.write_u32(0, &[RED; 64]);
+            assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+            source.write_u32(0, &[BLUE; 64]);
+        }
+        assert_eq!(h.set_volume_texture(0, &destination), 0);
+        h.select_texture_stage(0);
+        point_clamp(h);
+        assert_eq!(
+            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+            0
+        );
+        h.render_once(BLACK, |d| {
             assert_eq!(
-                h.set_fvf(
-                    D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
                 ),
                 0
             );
-            h.render_once(BLACK, |d| {
-                assert_eq!(
-                    d.draw_primitive_up(
-                        D3DPT_TRIANGLELIST,
-                        2,
-                        &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
-                    ),
-                    0
-                );
-                if lock_box {
-                    destination.write_u32(0, &[BLUE; 64]);
-                } else {
-                    assert_eq!(d.update_volume_texture_hr(&source, &destination), 0);
-                }
-                assert_eq!(
-                    d.draw_primitive_up(
-                        D3DPT_TRIANGLELIST,
-                        2,
-                        &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
-                    ),
-                    0
-                );
-            });
-            let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+            if lock_box {
+                destination.write_u32(0, &[BLUE; 64]);
+            } else {
+                assert_eq!(d.update_volume_texture_hr(&source, &destination), 0);
+            }
             assert_eq!(
-                pixels,
-                [RED, BLUE],
-                "volume draws bracketing a whole-level write, LockBox={lock_box}"
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
+                ),
+                0
             );
-            assert_eq!(h.clear_texture(0), 0);
-        }
+        });
+        let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+        assert_eq!(
+            pixels,
+            [RED, BLUE],
+            "volume draws bracketing a whole-level write, LockBox={lock_box}"
+        );
+        assert_eq!(h.clear_texture(0), 0);
     }
 }
 
@@ -4961,103 +4954,101 @@ fn check_volume_partial_update() {
         [0xFFFF_FFFF, 0xFF80_8080, 0, 0],
         [0xFFFF_8000, 0, 0, 0],
     ];
-    let harnesses = [Harness::new()];
-    for h in &harnesses {
-        let (hr, texture) =
-            h.try_create_volume_texture([4, 4, 4], 3, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
-        assert_eq!(hr, 0);
-        let texture = texture.expect("managed volume");
-        for (level, colors) in COLORS.iter().enumerate() {
-            let width = 4 >> level;
-            let texels: Vec<_> = colors[..width]
-                .iter()
-                .flat_map(|color| core::iter::repeat_n(*color, width * width))
-                .collect();
-            texture.write_u32(u32::try_from(level).expect("three levels"), &texels);
-        }
-        assert_eq!(h.set_volume_texture(0, &texture), 0);
-        h.select_texture_stage(0);
-        point_clamp(h);
-        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
-        assert_eq!(
-            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
-            0
-        );
-        assert_pixel_eq(sample_volume_depth(h, 0.875), COLORS[0][3], "primed volume");
-        h.render_once(BLACK, |d| {
-            for (index, (left, right)) in [(-1.0, -0.333), (-0.333, 0.333), (0.333, 1.0)]
-                .into_iter()
-                .enumerate()
-            {
-                if index == 1 {
-                    texture.write_box_u32(
-                        0,
-                        &D3DBOX {
-                            left: 2,
-                            top: 2,
-                            right: 4,
-                            bottom: 4,
-                            front: 2,
-                            back: 4,
-                        },
-                        &[BLUE; 8],
-                    );
-                }
-                assert_eq!(
-                    d.draw_primitive_up(
-                        D3DPT_TRIANGLELIST,
-                        2,
-                        &volume_sample_quad(left, right, [0.875, 0.875, 0.875]),
-                    ),
-                    0
+    let h = &Harness::new();
+    let (hr, texture) =
+        h.try_create_volume_texture([4, 4, 4], 3, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let texture = texture.expect("managed volume");
+    for (level, colors) in COLORS.iter().enumerate() {
+        let width = 4 >> level;
+        let texels: Vec<_> = colors[..width]
+            .iter()
+            .flat_map(|color| core::iter::repeat_n(*color, width * width))
+            .collect();
+        texture.write_u32(u32::try_from(level).expect("three levels"), &texels);
+    }
+    assert_eq!(h.set_volume_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    assert_pixel_eq(sample_volume_depth(h, 0.875), COLORS[0][3], "primed volume");
+    h.render_once(BLACK, |d| {
+        for (index, (left, right)) in [(-1.0, -0.333), (-0.333, 0.333), (0.333, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 {
+                texture.write_box_u32(
+                    0,
+                    &D3DBOX {
+                        left: 2,
+                        top: 2,
+                        right: 4,
+                        bottom: 4,
+                        front: 2,
+                        back: 4,
+                    },
+                    &[BLUE; 8],
                 );
             }
-        });
-        assert_eq!(
-            [
-                h.read_pixel(100, 240),
-                h.read_pixel(320, 240),
-                h.read_pixel(540, 240)
-            ],
-            [COLORS[0][3], BLUE, BLUE],
-            "partial volume versions"
-        );
-        for (level, colors) in COLORS.iter().enumerate() {
             assert_eq!(
-                h.set_sampler_state(
-                    0,
-                    D3DSAMP_MAXMIPLEVEL,
-                    u32::try_from(level).expect("three levels")
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &volume_sample_quad(left, right, [0.875, 0.875, 0.875]),
                 ),
                 0
             );
-            let depth = 4 >> level;
-            for (slice, color) in colors[..depth].iter().enumerate() {
-                let w = (f32::from(u8::try_from(slice).expect("four slices")) + 0.5)
-                    / f32::from(u8::try_from(depth).expect("four slices"));
-                for u in [0.125, 0.875] {
-                    for v in [0.125, 0.875] {
-                        h.render_once(BLACK, |d| {
-                            assert_eq!(
-                                d.draw_primitive_up(
-                                    D3DPT_TRIANGLELIST,
-                                    2,
-                                    &volume_sample_quad(-1.0, 1.0, [u, v, w])
-                                ),
-                                0
-                            );
-                        });
-                        let expected = if level == 0 && slice >= 2 && u > 0.5 && v > 0.5 {
-                            BLUE
-                        } else {
-                            *color
-                        };
-                        assert_pixel_eq(
-                            h.read_pixel(320, 240),
-                            expected,
-                            &format!("mip {level} slice {slice} uv {u},{v}"),
+        }
+    });
+    assert_eq!(
+        [
+            h.read_pixel(100, 240),
+            h.read_pixel(320, 240),
+            h.read_pixel(540, 240)
+        ],
+        [COLORS[0][3], BLUE, BLUE],
+        "partial volume versions"
+    );
+    for (level, colors) in COLORS.iter().enumerate() {
+        assert_eq!(
+            h.set_sampler_state(
+                0,
+                D3DSAMP_MAXMIPLEVEL,
+                u32::try_from(level).expect("three levels")
+            ),
+            0
+        );
+        let depth = 4 >> level;
+        for (slice, color) in colors[..depth].iter().enumerate() {
+            let w = (f32::from(u8::try_from(slice).expect("four slices")) + 0.5)
+                / f32::from(u8::try_from(depth).expect("four slices"));
+            for u in [0.125, 0.875] {
+                for v in [0.125, 0.875] {
+                    h.render_once(BLACK, |d| {
+                        assert_eq!(
+                            d.draw_primitive_up(
+                                D3DPT_TRIANGLELIST,
+                                2,
+                                &volume_sample_quad(-1.0, 1.0, [u, v, w])
+                            ),
+                            0
                         );
-                    }
+                    });
+                    let expected = if level == 0 && slice >= 2 && u > 0.5 && v > 0.5 {
+                        BLUE
+                    } else {
+                        *color
+                    };
+                    assert_pixel_eq(
+                        h.read_pixel(320, 240),
+                        expected,
+                        &format!("mip {level} slice {slice} uv {u},{v}"),
+                    );
                 }
             }
         }

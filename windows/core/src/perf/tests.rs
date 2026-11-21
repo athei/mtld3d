@@ -667,7 +667,7 @@ fn summary_golden_layout() {
         "│  ├─ samplers          0.15 ms   (1500 ns/draw)      texture+sampler bind  peak  0.15 ms\n",
         "│  ├─ binds             0.20 ms   (2000 ns/draw)      consts + VB/IB + draw peak  0.20 ms\n",
         "│  │  ├─ cbind          0.12 ms   (1200 ns/draw)      const memcmp+bytes    peak  0.12 ms\n",
-        "│  │  ├─ vbib           0.05 ms   ( 500 ns/draw)      VB/IB wrap + notify   peak  0.05 ms\n",
+        "│  │  ├─ vbib           0.05 ms   ( 500 ns/draw)      VB/IB wrap            peak  0.05 ms\n",
         "│  │  ├─ draw           0.02 ms   ( 200 ns/draw)      draw cmd emit         peak  0.02 ms\n",
         "│  │  └─ resid          0.01 ms   ( 100 ns/draw)      deref + glue          peak  0.01 ms\n",
         "│  ├─ tex_raw           0.01 ms   ( 100 ns/draw)      texture blit upload   peak  0.01 ms\n",

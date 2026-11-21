@@ -218,20 +218,16 @@ impl UploadView<'_> {
         }
     }
     /// Bytes the upload reads from its source: the snapshot's rows, or the whole staging.
-    pub(super) fn source_span(&self) -> (u64, u64) {
-        let whole = (0, self.staging().backing().len() as u64);
-        let Some(offset) = self.snapshot_offset() else {
-            return whole;
-        };
+    pub(super) fn source_len(&self) -> u64 {
+        if self.snapshot_offset().is_none() {
+            return self.staging().backing().len() as u64;
+        }
         // A compressed source counts block rows.
         let block_height = mtld3d_core::format::map_d3d_format(self.src_d3d_format())
             .filter(|_| self.bytes_per_pixel() == 0)
             .map_or(1, |format| format.block_height());
         let rows = self.region_h().div_ceil(block_height);
-        (
-            u64::from(offset),
-            u64::from(self.src_pitch()) * u64::from(rows),
-        )
+        u64::from(self.src_pitch()) * u64::from(rows)
     }
     pub(super) const fn upload_generation(&self) -> u32 {
         match self {

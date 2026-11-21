@@ -12,8 +12,7 @@ use mtld3d_shared::{
 };
 
 use super::{
-    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, RetainedPages,
-    destroy_resources_bulk,
+    FrameEncoder, PendingResourceRetention, RetainedPages, destroy_resources_bulk,
     upload_view::{TextureView, UploadView},
 };
 
@@ -132,9 +131,6 @@ impl FrameEncoder {
                     seq: self.current_submit_seq,
                     from_texture: true,
                 });
-        }
-        if !ordered {
-            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
         self.blit_retention.hold(
             PageBoxRead::new(std::sync::Arc::clone(job.staging().backing())),

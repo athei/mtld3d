@@ -680,13 +680,7 @@ fn encode_frame(
         if !blits.is_empty() {
             let encoded = {
                 let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
-                encode_leading_blits(
-                    &cmd_buf,
-                    blits,
-                    params.blit_commands_need_encoder,
-                    BlitSite::FrameLeading,
-                    &mut ctx,
-                )
+                encode_leading_blits(&cmd_buf, blits, BlitSite::FrameLeading, &mut ctx)
             };
             if !encoded {
                 return false;
@@ -1141,13 +1135,7 @@ fn encode_upload_cmd_buf(
     if !blits.is_empty() {
         let encoded = {
             let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
-            encode_leading_blits(
-                &upload_cb,
-                blits,
-                params.blit_commands_need_encoder,
-                BlitSite::FrameLeading,
-                ctx,
-            )
+            encode_leading_blits(&upload_cb, blits, BlitSite::FrameLeading, ctx)
         };
         if !encoded {
             return None;
@@ -2267,34 +2255,25 @@ fn copy_texture_to_buffer_reject(
 fn encode_leading_blits(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     blits: &[BlitCommand],
-    needs_encoder: bool,
     site: BlitSite,
     ctx: &mut EncodeContext<'_>,
 ) -> bool {
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
-    mtld3d_shared::crumb!("blit:enter", blits.len() as u64, u64::from(needs_encoder),);
-    // `needs_encoder` is set on the PE side whenever an encoder-bound
-    // command (CopyBuffer/Texture variants) was emitted. Without it
-    // we'd have to scan the blit list to know whether to create the
-    // blit encoder; the PE side already knows, so just trust the flag.
-    let mut blit = if needs_encoder {
-        if let Some(b) = cmd_buf.blitCommandEncoder() {
-            let label =
-                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
-            b.setLabel(Some(&label));
-            Some(b)
-        } else {
-            error!(
-                target: LOG_TARGET,
-                "encode_leading_blits: blitCommandEncoder() returned nil (count={})",
-                blits.len(),
-            );
-            return false;
-        }
-    } else {
-        None
+    mtld3d_shared::crumb!("blit:enter", blits.len() as u64);
+    // Every caller hands a non-empty list, and every command but a depth
+    // transfer (which ends the encoder and opens its own) encodes into it.
+    let Some(first) = cmd_buf.blitCommandEncoder() else {
+        error!(
+            target: LOG_TARGET,
+            "encode_leading_blits: blitCommandEncoder() returned nil (count={})",
+            blits.len(),
+        );
+        return false;
     };
+    let label = objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
+    first.setLabel(Some(&label));
+    let mut blit = Some(first);
 
     for (i, cmd) in blits.iter().enumerate() {
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
@@ -2706,13 +2685,7 @@ fn encode_pass(
                 pass.leading_blits_count as usize,
             )
         };
-        if !encode_leading_blits(
-            cmd_buf,
-            blits,
-            pass.leading_blits_need_encoder(),
-            BlitSite::Pass(pass_idx),
-            ctx,
-        ) {
+        if !encode_leading_blits(cmd_buf, blits, BlitSite::Pass(pass_idx), ctx) {
             return false;
         }
     }

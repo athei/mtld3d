@@ -125,11 +125,10 @@ fn frame_param_layouts_match_wow64() {
 
 #[test]
 fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
-    assert_eq!(PassDescriptor::pack_flags(false, 0, 0, 0), 0);
-    assert_eq!(PassDescriptor::pack_flags(true, 0, 0, 0), 1);
+    assert_eq!(PassDescriptor::pack_flags(0, 0, 0), 0);
     assert_eq!(
-        PassDescriptor::pack_flags(true, 5, 9, 3),
-        1 | (5 << 1) | (9 << 12) | (3 << 16)
+        PassDescriptor::pack_flags(5, 9, 3),
+        (5 << 1) | (9 << 12) | (3 << 16)
     );
     assert_eq!(core::mem::size_of::<PassDescriptor>(), 208);
 }
@@ -169,15 +168,13 @@ fn pass_descriptor_flags_round_trip_every_volume_depth_plane() {
     // `MaxVolumeExtent` (2048) planes deep.
     assert_eq!(PassDescriptor::MAX_COLOR_SLICE, 2047);
     for slice in [0, 7, 8, 9, 15, 255, 256, 2047] {
-        let pass = pass_with_flags(PassDescriptor::pack_flags(true, slice, 15, 15));
+        let pass = pass_with_flags(PassDescriptor::pack_flags(slice, 15, 15));
         assert_eq!(pass.color_slice(), slice);
         assert_eq!(pass.color_level(), 15);
         assert_eq!(pass.depth_level(), 15);
-        assert!(pass.leading_blits_need_encoder());
-        let pass = pass_with_flags(PassDescriptor::pack_flags(false, slice, 0, 0));
+        let pass = pass_with_flags(PassDescriptor::pack_flags(slice, 0, 0));
         assert_eq!(pass.color_slice(), slice);
         assert_eq!((pass.color_level(), pass.depth_level()), (0, 0));
-        assert!(!pass.leading_blits_need_encoder());
     }
 }
 

@@ -707,13 +707,6 @@ bitflags::bitflags! {
     /// Assorted per-`FrameEncoder` boolean state.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct FrameEncoderFlags: u8 {
-        /// Latched whenever an *encoder-bound* blit command is pushed into `frame_blit_commands`.
-        ///
-        /// Encoder-bound covers any CopyBuffer/Texture variant. Read at
-        /// submit to fill `SubmitDescription.blit_commands_need_encoder`, so
-        /// the unix side creates an `MTLBlitCommandEncoder` only for a frame
-        /// that has one. Reset in `begin_frame` alongside the Vec clear.
-        const BLIT_CMDS_NEED_ENCODER = 1 << 0;
         /// Set once the pre-warm payload has been ingested.
         ///
         /// Gates lazy file opening on first miss-compile so no records are
@@ -865,7 +858,7 @@ pub struct FrameEncoder {
     /// any render pass. Stable backing for
     /// the frame-leading blit slice.
     frame_blit_commands: Vec<BlitCommand>,
-    /// Assorted encoder booleans (`BLIT_CMDS_NEED_ENCODER` / `CACHE_READY` / `CACHE_DISABLED`).
+    /// Assorted encoder booleans (`CACHE_READY` / `CACHE_DISABLED` and others).
     ///
     /// See [`FrameEncoderFlags`].
     flags: FrameEncoderFlags,
@@ -2197,7 +2190,6 @@ impl FrameEncoder {
                     byte_size: u64::from(size),
                 },
             ));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_vbib_staging_upload();
 
         // Hold the transient wrapper + backing until this frame's submit is
@@ -2262,7 +2254,6 @@ impl FrameEncoder {
                     byte_size: u64::from(retry.size),
                 },
             ));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_vbib_staging_upload();
         true
     }
@@ -2327,7 +2318,6 @@ impl FrameEncoder {
             fetch.forget_source();
         }
         self.frame_blit_commands.clear();
-        self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
         // A mid-frame flush does not end the D3D9 frame, so its clears still
         // stand for the draws after it.
@@ -6157,10 +6147,10 @@ impl FrameEncoder {
             if state.is_staged {
                 // Draws bind the persistent `Private` device buffer; the
                 // `backing_ptr`/`backing_len` args describe the CPU staging
-                // and are irrelevant here. No notify — the device buffer's
-                // contents arrive via the staging-upload blit, not CPU
-                // writes. Track the draw seq so release-retention gates the
-                // device buffer's destroy past this frame's GPU read.
+                // and are irrelevant here: the device buffer's contents
+                // arrive via the staging-upload blit, not CPU writes. Track
+                // the draw seq so release-retention gates the device
+                // buffer's destroy past this frame's GPU read.
                 if current_seq > state.last_submit_seq {
                     state.last_submit_seq = current_seq;
                 }
@@ -6315,7 +6305,6 @@ impl FrameEncoder {
                     byte_size: length.min(dst_len),
                 },
             ));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         // The wrapper is this frame's alone. Retention gates its destroy on
         // the submit that carries the copy, the same gate every other
         // mid-frame wrapper rides.
@@ -7474,9 +7463,6 @@ impl FrameEncoder {
             self.versioned_handles.insert(old_handle);
             self.versioned_handles.insert(fresh.raw());
         }
-        if !ordered {
-            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
-        }
 
         // Earlier commands retain their original aliases through GPU
         // retirement; the drain parks the version once that has passed.
@@ -7509,7 +7495,6 @@ impl FrameEncoder {
         }
         self.frame_blit_commands
             .push(BlitCommand::generate_mipmaps(state.views.linear.raw()));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.texture_versions.note_mip_regeneration(texture_id);
     }
 
@@ -7556,7 +7541,6 @@ impl FrameEncoder {
         if let Some(outcome) = self.try_texture_upload_pass::<ORDERED>(job, texture_handle) {
             return outcome;
         }
-        let notify_start = self.frame_blit_commands.len();
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.staging().backing().len() as u64;
         if backing_length == 0 {
@@ -7718,13 +7702,9 @@ impl FrameEncoder {
         if ORDERED {
             self.flush_pending_clears();
             self.end_current_pass("ordered_upload");
-            for notify in self.frame_blit_commands.drain(notify_start..) {
-                self.pass_state.push_pending_leading_blit(notify);
-            }
             self.pass_state.push_pending_leading_blit(command);
         } else {
             self.frame_blit_commands.push(command);
-            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
         // Counts every successful blit-path upload (padded subset
         // included) — the total texture uploads per frame.
@@ -7745,7 +7725,7 @@ impl FrameEncoder {
     /// The gauge counts the bytes the copy reads: the whole staging, or a
     /// snapshot's span of its shared chunk.
     fn hold_upload_source(&mut self, job: &UploadView<'_>) {
-        let bytes = usize::try_from(job.source_span().1).expect("an upload source fits usize");
+        let bytes = usize::try_from(job.source_len()).expect("an upload source fits usize");
         self.blit_retention
             .hold(PageBoxRead::new(Arc::clone(job.staging().backing())), bytes);
     }
@@ -7834,7 +7814,6 @@ impl FrameEncoder {
 
         self.frame_blit_commands
             .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
         self.hold_upload_source(job);
         true
@@ -8061,9 +8040,6 @@ impl FrameEncoder {
         };
         self.pass_state
             .push_upload_pass_with_order::<ORDERED>(&target, &cmds, leading_blits);
-        if !ORDERED {
-            self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
-        }
         self.upload_pass_commands = cmds;
     }
 
@@ -8245,7 +8221,6 @@ impl FrameEncoder {
         };
         self.frame_blit_commands
             .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
     }
 
@@ -10090,9 +10065,6 @@ fn finalize_submit(
     payload.trailing_blits = trailing_blits;
 
     let params = SubmitDescription {
-        blit_commands_need_encoder: enc
-            .flags
-            .contains(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER),
         upload_pass_count,
         present_layer: if no_present {
             MetalHandle::NULL
@@ -10292,12 +10264,7 @@ fn pass_to_descriptor(
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(
-            !leading.is_empty(),
-            p.color_slice(),
-            p.color_level(),
-            p.depth_level(),
-        ),
+        pass_flags: PassDescriptor::pack_flags(p.color_slice(), p.color_level(), p.depth_level()),
         reserved: 0,
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
@@ -10382,7 +10349,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(!trailing_blits.is_empty(), 0, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(0, 0, 0),
         reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
