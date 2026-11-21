@@ -12,85 +12,46 @@ Because our `d3d9.dll` is installed as a Wine *builtin* (`make install`), runnin
 ## Running
 
 ```
-make conformance                # diff both legs (i686, and arm64x or x86_64) vs baseline.txt
+make conformance                # diff both legs (i686 and arm64x) vs baseline.txt
 make conformance-i686           # one leg, one runner process (what CI runs)
-make conformance-arm64x         # the x86_64 binary against the ARM64X build (arm64 Wine)
-make conformance-x86_64         # the x86_64 binary against the x86_64 build (x86_64 Wine)
-make conformance-intel          # both legs under the intel.* config keys
-make conformance-intel-i686     # one leg under the intel.* keys
+make conformance-arm64x         # the x86_64 binary against the ARM64X build
 make conformance-scale          # both legs at render.scale = 0.75
-make conformance-scale-i686     # one leg at render.scale = 0.75 (what CI runs, on one image)
-make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
+make conformance-scale-i686     # one leg at render.scale = 0.75 (what CI runs)
+make conformance-baseline       # (re)record the four legs of baseline.txt in sequence
 ```
 
-A leg is one build under one Wine, one variant and one GPU family. The build
-and the Wine are named by the runner's `--arch` label, and each Wine has keys
-of its own (The two Wines, below): `i686` and `x86_64` under an x86_64 Wine,
-`i686-arm64` and `arm64x` under the arm64 Wine. The `intel`
-variant (`--variant intel`) runs the same binary with every `intel.*` key of
-`mtld3d.conf` turned on, so the suite sees the answers an Intel/AMD Mac gives:
-packed 16-bit formats expanded, 32-bit float filtering denied, Managed
-buffers, the 256-byte linear texture alignment. Its results record under
-`[<arch>+intel/<subtest>]` entries of the same `baseline.txt`. The GPU family
-is read from the machine, not chosen: an Apple Silicon Mac records the plain
-entries, an Intel/AMD Mac records `[<leg>@mac2/<subtest>]` entries, because
-the GPU underneath still decides what the suite sees past the forced answers
-(a tile-based Apple GPU elides depth stores and merges hidden overdraw before
-the visibility counter, encodes special floats its own way, and its validation
-layer applies different texture rules). The `scale` variant (`--variant
-scale`) runs the same binary at `render.scale = 0.75`, so every frame is
-rasterized on a smaller grid and read back through the resolve that brings it
-up to the reported size; its results record under `[<arch>+scale/<subtest>]`
-and CI runs it on one image and one arch, like the scaled end-to-end leg.
+A leg is one build under the arm64 Wine and one variant. The build is named
+by the runner's `--arch` label (The legs, below): `i686-arm64` or `arm64x`.
+The `scale` variant (`--variant scale`) runs the same binary at
+`render.scale = 0.75`, so every frame is rasterized on a smaller grid and
+read back through the resolve that brings it up to the reported size; its
+results record under `[<arch>+scale/<subtest>]` entries of the same
+`baseline.txt`, and CI runs it on one arch, like the scaled end-to-end leg.
 The sites share the classifications below whatever the leg, since a site's
-nature does not depend on the leg that hit it. On the Apple family the two keys that only change a code path and no
-answer, `intel.managedMemory` and `intel.linearAlign256`, must move no count
-at all, and a site that fails only under the variant is expected to trace to
-one of the two caps keys. The `@mac2` entries are recorded by CI, whose
-Intel image is the one Mac2 machine the project runs on: dispatch the
-workflow with `record_intel_baseline` (and `intel_only`, so only the Intel
-legs run) and copy the `@mac2` sections out of the `baseline-mac2-<arch>`
-artifacts (`make conformance-baseline` on an Apple Silicon machine leaves
-them untouched, the merge being leg-scoped). Pull requests do not run the
-Intel image, so a change that fixes a site updates the Apple entries and
-leaves the site's `@mac2` pin above the new count; the next nightly Intel run
-then fails on a stale baseline, not a regression. The fix is that same
-dispatch, `record_intel_baseline` with `intel_only`, best made on the pull
-request's branch before it merges so the `@mac2` sections land with it, or
-on `main` once the nightly shows the stale pin.
+nature does not depend on the leg that hit it.
 
-### The two Wines
+### The legs
 
-The Makefile runs two legs under the Wine `WINE_SDK` names, both against the
-builds `make install` puts there, and the Wine decides the keys they record
-under. Both legs run one build of Wine's d3d9 tests, whichever Wine runs
-them: the `{i386,x86_64}-windows/d3d9_test.exe` of the pinned arm64 Wine
-release (athei/mach9), under the directory `WINE_TESTS` names (The test
-binaries, below).
+The Makefile runs two legs under the arm64 Wine `WINE_SDK` names, both
+against the builds `make install` puts there. Both legs run one build of
+Wine's d3d9 tests: the `{i386,x86_64}-windows/d3d9_test.exe` of the pinned
+Mach9 release (athei/mach9), under the directory `WINE_TESTS` names (The
+test binaries, below).
 
-| Target | arm64 Wine (macos-26 CI image) | x86_64 Wine (macos-15 CI image, under Rosetta, and macos-15-intel) |
+| Target | What it runs | Key |
 | --- | --- | --- |
-| `conformance-i686` | the i386 binary against the i686 build, as `i686-arm64` | the same, as `i686` |
-| 64-bit leg | `conformance-arm64x`: the x86_64 binary against the ARM64X build, as `arm64x` | `conformance-x86_64`: the x86_64 binary against the x86_64 build, as `x86_64` |
+| `conformance-i686` | the i386 binary against the i686 build | `i686-arm64` |
+| `conformance-arm64x` | the x86_64 binary against the ARM64X build | `arm64x` |
 
-The `-intel` and `-scale` legs and the baseline targets follow the same two
-(`conformance-baseline-arm64x`, `conformance-intel-i686` and the like), each
-recording under its key's `+intel` or `+scale` form, `ARCH` takes `i686` or
-the 64-bit leg's name for `conformance-isolate`, and a leg of the other Wine
-stops saying why.
+The `-scale` legs and the baseline targets follow the same two
+(`conformance-baseline-arm64x`, `conformance-scale-i686` and the like), each
+recording under its key's `+scale` form, and `ARCH` takes `i686` or `arm64x`
+for `conformance-isolate`.
 
-Baseline keys are per Wine. The same i686 build reads other counts under the
-arm64 Wine's x86 translator than under Rosetta, and the two Wines carry
-their own Wine version, so a run under one Wine reads and writes only that
-Wine's keys: `make conformance-baseline` on the arm64 Wine rewrites the
-`i686-arm64` and `arm64x` sections and never touches `i686` or `x86_64`,
-which serve the x86_64 Wine and its two CI images, macos-15 and
-macos-15-intel. `i686-arm64` keeps the runner's `<arch>[+variant][@gpu]`
-grammar: the arch part names the build and the Wine together, as `arm64x`
-already does, so no new axis is needed and every existing key parses as
-before. A key with no entries yet makes its
-leg's run report every failing site as new and fail, and the runner says so
-in one line naming the key and `make conformance-baseline`. The header's
+A key keeps the runner's `<arch>[+variant]` grammar. A key with no entries
+yet makes its leg's run report every failing site as new and fail, and the
+runner says so in one line naming the key and `make conformance-baseline`.
+The header's
 `Wine:` line is one for the file and names the build of the tests every
 section was recorded against, `wine-11.21-54-g501796b0ed`: the version of
 the Wine the tests were built from, never of the Wine that runs them. The
@@ -98,15 +59,14 @@ Makefile tells the runner that version (`--tests-wine-version`) from the
 first of these that answers:
 
 1. the first line of `$WINE_TESTS/VERSION`. This file is the contract with
-   wine-build: a release that publishes the tests writes it into
+   Mach9: a release that publishes the tests writes it into
    `lib/wine/tests`, holding the `wine --version` string of the build the
    tests came from, so a directory of tests extracted alone still says
-   which build it is. wine-build writes it from arm64-11.19-2 on;
+   which build it is. The release writes it from arm64-11.19-2 on;
 2. the `wine --version` of the Wine tree `WINE_TESTS` lies in
    (`$WINE_TESTS/../../../bin/wine`), when that tree has a runnable
-   `bin/wine`. In the arm64 mode's default this is `WINE_SDK`'s own;
-3. nothing, for tests with neither; CI's x86_64-Wine images extract the
-   tests with their `VERSION`, so every CI image compares.
+   `bin/wine`. In the default this is `WINE_SDK`'s own;
+3. nothing, for tests with neither.
 
 A run compares the header with that version and warns when they differ, and
 `make conformance-baseline` writes it into the header. Two `git describe`
@@ -131,8 +91,9 @@ GPU-hang line (`kIOAccelCommandBufferCallbackErrorHang`, or the
 drops afterwards) stops the subtest at once and ends the leg: exit code 3, no
 verdict, no baseline write. Every count after that line is a read off a GPU
 that runs nothing, and waiting out the subtest's budget would only make the
-same non-verdict cost minutes. On the Intel CI image the paravirtual GPU stays
-hung for the rest of the machine's life, so the later subtests would hang too.
+same non-verdict cost minutes. On the macos-26 CI image the paravirtual GPU
+stays hung for the rest of the machine's life, so the later subtests would
+hang too.
 The job marks the leg with a `GPU hang` annotation, and the answer is a re-run
 of the failed jobs, which lands them on fresh runners; CI does that once by
 itself (`CONTRIBUTING.md`, "Pull requests", says when).
@@ -190,17 +151,13 @@ redact it.
 ### The test binaries
 
 The test binaries are the `{i386,x86_64}-windows/d3d9_test.exe` of the
-pinned arm64 Wine release (athei/mach9), under its `lib/wine/tests`, and
-every leg runs that one build whichever Wine it runs under: a site is named
-by its `file:line`, which moves between Wine versions (the x86_64 Wine
-cx-26.3.0-7 ships Wine 11.0's tests, the arm64 Wine v0.4.0 Wine 11.21's),
-so one classification list can only serve one build of the tests, and a PE
-test runs under any Wine. `WINE_TESTS` names the directory. Under the
-arm64 Wine it defaults to `$WINE_SDK/lib/wine/tests`, the same install
-`make install` puts our builtin `d3d9.dll` into; under an x86_64 Wine it
-has no default and the conformance targets stop without it, and CI's
-x86_64-Wine images fetch the pinned arm64 release's `lib/wine/tests` alone
-for it. The binaries are not vendored here: they are large and drift with
+pinned Mach9 release (athei/mach9), under its `lib/wine/tests`, and every
+leg runs that one build: a site is named by its `file:line`, which moves
+between Wine versions (v0.4.0 ships Wine 11.21's tests), so one
+classification list can only serve one build of the tests. `WINE_TESTS`
+names the directory. It defaults to `$WINE_SDK/lib/wine/tests`, the same
+install `make install` puts our builtin `d3d9.dll` into. The binaries are
+not vendored here: they are large and drift with
 the Wine version, so `baseline.txt` records the Wine version it was taken
 against instead.
 
@@ -208,7 +165,7 @@ The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It takes
 the loader and one test binary as explicit paths (`--wine`, `--exe`, plus
 `--arch` as the label to record under) and resolves nothing itself: every Wine
 location lives in the Makefile. One invocation therefore covers one leg,
-which is what lets the 32-bit and 64-bit gates, and the native and Intel
+which is what lets the 32-bit and 64-bit gates, and the native and scaled
 variants, be separate CI jobs, and `--update-baseline` rewrites only its own
 leg's entries. It runs each
 subtest as its own process, so a crash in one cannot poison another's counts,
@@ -242,9 +199,8 @@ run that ends on a GPU hang restarts nothing, since the leg ends with it.
 
 Ending the server ends every process of the session, every other run in that
 prefix included, so this happens only where the restore was refused, which is
-on a display below 60 Hz (the condition is under `device.c/test_mode_change`):
-the Intel CI image's 30 Hz display, and as well a Mac driving an external
-display at 59.94 Hz or 50 Hz. On a display at 60 Hz or above the restore
+on a display below 60 Hz (the condition is under `device.c/test_mode_change`),
+such as a Mac driving an external display at 59.94 Hz or 50 Hz. On a display at 60 Hz or above the restore
 works and no run restarts anything. The tests of the same subtest that run
 after the refused restore still run on the mode it left; the runner cannot
 reach into a running subtest.
@@ -810,14 +766,13 @@ transferred depth rather than its packed code.
 A multisampled RESZ into any other destination, and a depth-to-depth
 `StretchRect` out of a multisampled surface, take the same transfer: sample
 zero of depth and of the common stencil plane, written by compute and blit
-work. Neither uses a render-pass depth resolve, whose destination the Intel CI
-image's paravirtual device leaves reading what an earlier pass stored there
+work. Neither uses a render-pass depth resolve, whose destination a
+paravirtual device can leave reading what an earlier pass stored there
 (resz_test 17772 and 17910 read the INTZ's clear through one). Every transfer
 lands a clear still waiting for a pass first, so a `Clear` issued just before
 it is what it reads.
 
-Both architectures and all local variants pass device.c:13854. Hosted Mac2
-recordings also pass on both architectures; its obsolete pins are removed.
+Both architectures and both variants pass device.c:13854.
 
 ## Managed 2D dirty publication coverage
 
@@ -833,9 +788,8 @@ rectangles union to one bounding box per mip, and overlapping partial locks
 may modify bytes an earlier queued upload still reads. This change neither
 adds exact disjoint-region tracking nor changes that partial-lock policy.
 
-Sites 19258, 19265 and 19280 pass on both architectures in the local normal,
-Intel and scale variants and in both hosted Mac2 recordings. Their obsolete
-baseline pins are removed.
+Sites 19258, 19265 and 19280 pass on both architectures in the native and
+scale variants.
 
 ## Premultiplied texture-alpha blending
 
@@ -1038,8 +992,8 @@ Wine test source, the raw actual-vs-expected failure messages
 re-checked before retagging. Current classifications, counted from the
 `Sites:` tokens below on 2026-11-20: 0 `real`, 159 `expected`, 1 `caps`,
 5 `ceiling`, 3 `flaky`, 0 `untriaged`, 168 unique sites in all.
-The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
-11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
+The 2026-07-20 audit recorded every subtest-leg of Wine 11.0's tests
+`crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's and 11.21's tests keep them.
 (2026-11-20: every leg moved to Wine 11.21's tests, the build v0.4.0 of
 athei/mach9 (formerly wine-build) publishes. Against Wine 11.20's,
@@ -1052,21 +1006,10 @@ lines later, `test_window_position` from 15039 to 15081,
 15399, and no other site moves. The new test presents, destroys the
 device window and presents three more times, and passes on every key
 recorded here. Recorded locally on an Apple Silicon machine, twice, with
-the release's own test binaries: the arm64 Wine's six Apple keys
-(`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms). The two
-runs read the same sites at the same counts, and the six keys hold every
-earlier count at its new line. The
-x86_64 Wine's six keys and the two `@mac2` keys were renumbered from the
-source diff alone, line numbers only. CI confirms `i686` and `x86_64` on
-macos-15. CI's `record_intel_baseline` dispatch with `intel_only`, run
-44803225914, recorded the two `@mac2` keys: `i686+intel@mac2` in attempt 1,
-`x86_64+intel@mac2` in attempt 2, after a GPU hang in attempt 1. They read
-every renumbered site at its count, the new test passes there too, and only
-test_fetch4 15686 read lower, 3 where 15 and 13 are pinned, which its
-cluster keeps; `i686+intel`, `i686+scale`, `x86_64+intel` and
-`x86_64+scale` are renumbered only and unconfirmed until an x86_64-Wine
-machine records them, and what the new test reads under that Wine is
-unknown until then. The flaky and ceiling pins kept their values:
+the release's own test binaries: the arm64 Wine's keys (`i686-arm64`,
+`arm64x` and their `+scale` forms). The two runs read the same sites at the
+same counts, and the keys hold every earlier count at its new line. The
+flaky and ceiling pins kept their values:
 test_wndproc 4471 and 4476 and test_cursor_clipping 14946 read 0 on every
 key recorded here, and test_fetch4 15686 read 3, all tolerated.)
 (2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
@@ -1076,58 +1019,21 @@ every key and its cluster left this document. Linear table fog with
 below it unfogged and one at or above it fully fogged, so
 `fog_special_test` 18390 left every key and its cluster went too; vertex
 fog with an equal start and end still fogs everything, which its cases 0 to
-3 check. The two sites were removed from all fourteen sections by hand.
-For the arm64 Wine's six Apple keys the edit was checked against a local
-re-record on an Apple Silicon machine, which read neither site and differed
-from the edit only in the header's tests build and in the flaky and ceiling
-pins, both kept as they were. On the x86_64 Wine no run was made here. CI
-confirms the plain `i686` and `x86_64` keys on macos-15, and the two
-`@mac2` keys are to be confirmed by CI's `record_intel_baseline` dispatch
-with `intel_only` before the change merges; no CI run reads `i686+intel`,
-`x86_64+intel`, `i686+scale` or `x86_64+scale`, which stay unconfirmed
-until a local x86_64-Wine run. Removing the sites there is still safe:
-both are fixed-function and pixel-stage MSL that `mtld3d-core` emits the
-same way under either Wine, the `intel.*` keys change neither the texgen,
-the fog nor the A8R8G8B8 back buffer both tests read, and the arm64 Wine's
-`+intel` and `+scale` re-records read both sites at zero, the fog probes
-included, ten pixels either side of the step.)
+3 check. The two sites were removed from every section by hand, and the
+edit was checked against a local re-record on an Apple Silicon machine,
+which read neither site and differed from the edit only in the header's
+tests build and in the flaky and ceiling pins, both kept as they were. The
+`+scale` re-records read both sites at zero, the fog probes included, ten
+pixels either side of the step.)
 (2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
 `Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
 multisampled back buffer, and a plain device's refused `Reset` leaves it
 needing another, so test_lockable_backbuffer 13133, 13136 and 13141 and
 test_swapchain_multisample_reset 13288 and 13290 pass and both clusters left
-this document. The arm64 Wine's six keys were recorded locally on an Apple
+this document. The arm64 Wine's keys were recorded locally on an Apple
 Silicon machine and moved by those five sites alone; the re-record's drop of
 the flaky test_wndproc 4471 and 4476 and its lower test_fetch4 15686 reads
-were not taken, as their clusters say. The fix is a check of the present
-parameters on the API thread, before any Wine, translator or GPU takes part
-and independent of the `intel.*` answers and `render.scale`, so the five
-sites were taken out of the x86_64 Wine's six keys and the two `@mac2` keys
-by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
-macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
-CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
-so those four stay unconfirmed until a local run under the x86_64 Wine.)
-(2026-10-25: the runner starts the prefix's session again after a subtest
-that reports a refused display-mode restore (see `device.c/test_mode_change`),
-so the `@mac2` subtests after `device` run on the display's own 3840x2160 at
-30 Hz. The eleven `d3d9ex.c/test_wndproc` sites joined both `@mac2` d3d9ex
-keys at the counts the other keys read (that cluster lists them). No other
-`@mac2` site moved. Recorded by the `record_intel_baseline` dispatch with
-`intel_only`, run 40166000744: `i686+intel@mac2` in attempt 1,
-`x86_64+intel@mac2` in attempt 2. Only the d3d9ex lines were taken: the
-artifacts predate the lockable back-buffer check (#1184) and the sphere-map
-and table-fog fixes (#1187), so they still carry device.c 13133 to 13290
-and visual.c 18390 and 29162. test_fetch4 15686 keeps its higher pins.)
-(2026-10-24: since every size is served, smallest first, the mode
-`test_mode_change` leaves in the registry on the `@mac2` legs, where its
-restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
-runs on a 4:3 desktop on the Intel image's 16:9 display.
-`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15081
-joined both `@mac2` device keys at one, `expected` like the
-`test_mode_change` sites whose failed restore they follow, and
-`d3d9ex.c/test_wndproc` skips its mode tests there, so its eleven sites left
-both `@mac2` d3d9ex keys. CI's `record_intel_baseline` dispatch with
-`intel_only` recorded the two keys; nothing else moved.)
+were not taken, as their clusters say.)
 (2026-10-24: a 32-bit device sets the creating thread's x87 control word
 to single precision, round to nearest and every exception masked, unless
 `D3DCREATE_FPU_PRESERVE` is passed, as D3D9 does, so test_fpu_setup 5037
@@ -1146,94 +1052,43 @@ projection, which now covers only an adapter of vendor 0x10de and device
 0x0041, and the one on the `test_texture_transform_flags` check of a
 projected `D3DTTFF_COUNT1` coordinate. The runner counts a failure inside a
 todo block apart and never gates on it, so the first adds
-`fog_special_test` 18390, `real`, at four on every Apple key; the checks
+`fog_special_test` 18390, `real`, at four on every key; the checks
 under the other two pass. A `stretchrect_test` check whose `==` bound
 tighter than its `?:` now compares what it meant to and passes for the
 runner: on tests 7, 9, 15, 17, 23, 25 and 31 it is still under
 `todo_wine_if` and prints `Test succeeded inside todo block`, which the
 runner does not count. The pin move also brings a loadable d3d12.dll (from
-arm64-11.19-3 on), so `init_d3d9on12_modules` 15146 reads 1 on every arm64
-Wine key; on the x86_64 Wine it still reads 1 on the `x86_64` keys and 0 on
-the `i686` ones. Recorded locally on an Apple Silicon machine: the arm64
-Wine's six keys (`i686-arm64`, `arm64x` and their `+intel` and `+scale`
-forms) under arm64-11.20-1, and the x86_64 Wine's six Apple keys (`i686`,
-`x86_64` and their `+intel` and `+scale` forms) under cx-26.3.0-7 through
-Rosetta, the Wine CI's macos-15 image runs. CI's `record_intel_baseline`
-dispatch with `intel_only` on the branch recorded the two `@mac2` keys (see
-"Running"): they add 18390 at four and renumber the two moved sites like
-the Apple keys, and nothing else moved. The flaky and ceiling pins kept
-their values: test_wndproc 4471 and 4476 read 0 on every key recorded here,
-4324 and 4325 read 0 on `i686` and `i686+intel`, and test_fetch4 15686 read
-3 to 9, all tolerated.)
-(2026-10-18: every leg moved to Wine 11.19's tests, and the Apple-family
-sections of both Wines, 48 subtest-legs, were recorded against them; the
-`Sites:` tokens and the line numbers in the prose moved with the source. The
-two Wines then read the same sites at the same counts on every key, except
-`init_d3d9on12_modules` 15146, which only the x86_64 Wine's 64-bit legs
-read, and the flaky and ceiling pins the cluster prose names. The 11.19 tests
-add eight sites in five clusters: the six `real` ones of
-`test_lockable_backbuffer`, `test_swapchain_multisample_reset` and
-`test_generated_texcoords`, the `expected` 15399 of
-`test_device_vtbl_initialization_assembly_hook` and the `caps` 29219 of
-`test_blit_format_conversion`. Two of them end their subtest in a fault, so
-every i686 `device` leg and every `+intel` `visual` leg records `crash=1`;
-both are the subtest's last test and the clusters say why. The desktop-mode
-`ceiling` pins of `test_reset`, `test_mode_change`, `test_cursor_clipping`
-and test_wndproc 4157/4227, which read zero on both Wines, left the
-baseline. CI's `record_intel_baseline` dispatch recorded both `@mac2` keys
-on the 11.19 tests the same day: against their Wine 11.0 sections they add
-the same new sites the Apple legs add (15399 on `i686+intel@mac2` only, the
-test being i386-only) and the same two `crash=1`, and nothing else moved but
-the line numbers. test_fetch4 15686 read lower in every recording of that
-day, 3 to 9 where 13 to 17 were pinned; its cluster keeps the higher pins,
-so the earlier values were put back on every key, the arm64 Wine's keys
-taking those of the x86_64 Wine key of the same build and variant.)
+arm64-11.19-3 on), so `init_d3d9on12_modules` 15146 reads 1 on every key.
+Recorded locally on an Apple Silicon machine: the arm64 Wine's keys
+(`i686-arm64`, `arm64x` and their `+scale` forms) under arm64-11.20-1. The
+flaky and ceiling pins kept their values: test_wndproc 4471 and 4476 read 0
+on every key recorded here, and test_fetch4 15686 read 3 to 9, all
+tolerated.)
+(2026-10-18: every leg moved to Wine 11.19's tests, and every section was
+recorded against them; the `Sites:` tokens and the line numbers in the
+prose moved with the source. The 11.19 tests add seven sites in four
+clusters: the six `real` ones of `test_lockable_backbuffer`,
+`test_swapchain_multisample_reset` and `test_generated_texcoords`, and the
+`expected` 15399 of `test_device_vtbl_initialization_assembly_hook`. One of
+them ends its subtest in a fault, so every i686 `device` leg records
+`crash=1`; it is the subtest's last test and its cluster says why. The
+desktop-mode `ceiling` pins of `test_reset`, `test_mode_change`,
+`test_cursor_clipping` and test_wndproc 4157/4227, which read zero, left the
+baseline. test_fetch4 15686 read lower in every recording of that day, 3 to
+9 where 13 to 17 were pinned; its cluster keeps the higher pins, so the
+earlier values were put back on every key.)
 (2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
 extended devices and runs every test, adding the same 64 sites, 63
-`expected` and 1 `caps`, on each of the six Apple-family legs. The site set
-held over 20 isolated runs per architecture with no crash; that repeat ran on
-the native legs only, not the `+intel` caps legs. The Intel CI dispatch on
-the branch recorded both `@mac2` `d3d9ex` legs with the same 64 sites at the
-same counts, so none of them is `@mac2`-only.)
-(2026-10-05: test_wndproc 4298 moved from `expected` to `ceiling`, and
-4324/4325 joined it, pinned at one on the `i686` and `i686+intel` device
-legs; the cluster says why.)
-(2026-09-30: the adapter mode table stopped leaving out sizes more than 15 %
-from the desktop's aspect, which made 640x480 a settable mode on the Intel CI
-image: its display runs 3840x2160 and user32 lists 640x480 for it, so a
-fullscreen request for that size used to follow the window and now sets the
-mode. The six `test_get_display_mode` sites 14394 to 14407 and the four
-`test_multisample_get_front_buffer_data` sites 17215 to 17229, which asked
-for a 640x480 fullscreen device and read 3200x1800 back or had a 640x480
-read-back refused, left the `@mac2` legs and their clusters left this
-document. That display lists 25 sizes; it is not single-mode as the
-2026-09-05 note below says.)
-(2026-09-05: the two answers a device
-without the packed 16-bit formats derives from its render-target answer,
-`CheckDeviceType` for a 16-bit back buffer and the `AUTOGENMIPMAP` probe, were
-made to follow it, so device.c:3622 and device.c:7923 dropped off the Intel
-legs and their clusters left the audit; `ValidateDevice` learnt the sampler
-filter rules the same day and device.c:8177 went with them.)
+`expected` and 1 `caps`, on every leg. The site set held over 20 isolated
+runs per architecture with no crash.)
+(2026-10-05: test_wndproc 4298 moved from `expected` to `ceiling`; the
+cluster says why.)
 (2026-09-05: the `scale` legs added 32
 visual.c sites in eleven clusters, every one `expected` for the one reason
 "The scaled leg" below gives; they carry no device.c site of their own since
 #408. The `resz_test` site they also carried, 17994, was `real` and is fixed:
 a lockable render target created at the reported back-buffer size declined the
-scale while the depth-stencil bound with it took it, issue #407.) (2026-09-05: the `@mac2` legs, recorded
-on the Intel CI image, added 22 sites, every one `expected` and every one a
-property of that machine, its single-mode display or the GPU family, in the
-`test_mode_change`, `test_get_display_mode`, swizzle-format, `test_fetch4`,
-`fp_special_test`, `test_multisample_get_front_buffer_data` and
-`multisampled_depth_buffer_test` clusters; the eight `@mac2` subtest-legs are
-`crash=0` too.) (2026-09-04: the Intel legs, which run every subtest
-under the `intel.*` config keys, added device.c:3622, 7923 and 8177 as `real`
-(issues #362, #363; all three are fixed and gone) and visual.c:28072 as
-`caps`; no site moved under the two keys that change only a code path,
-`intel.managedMemory` and `intel.linearAlign256`. On the Apple family the
-`ceiling` and `flaky` pins of the native device legs are carried on the Intel
-legs at the same counts, since the environment they depend on is the same; the
-`@mac2` legs, recorded on the Intel CI image, carry their own counts, see the
-family paragraph under "Running".) (2026-08-27: device.c:15146 moved from `expected`
+scale while the depth-stencil bound with it took it, issue #407.) (2026-08-27: device.c:15146 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
 newly-running `srgbtexture_test` passes. 2026-08-28: honouring
@@ -1258,10 +1113,9 @@ in the same `Reset` then added 5971 and 5974, the same window-procedure
 decision test_wndproc already records, and the cluster comes back for them.
 2026-09-24: both multisampled depth resolves (RESZ and the depth-to-depth
 `StretchRect`) copy through a depth transfer instead of a render pass with a
-depth resolve attachment, so the paravirtual device's resolve fault no longer
-reaches multisampled_depth_buffer_test and its `@mac2` cluster (17378, 17524)
-leaves the document; test_multisample_mismatch 21007 and 21010 pass on the
-`@mac2` legs as well.) Only two tags change what the gate tolerates:
+depth resolve attachment, so a paravirtual device's resolve fault no longer
+reaches multisampled_depth_buffer_test.) Only two tags change what the gate
+tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
@@ -1415,7 +1269,7 @@ Sites: 4568=expected 4547=expected 4471=flaky
 Sites: 4476=flaky
 
 4157/4227, the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
-before any D3D9 object is involved, pass on both Wines now that the mode the
+before any D3D9 object is involved, pass now that the mode the
 test picks from `EnumAdapterModes` is one user32 accepts, and carry no pin.
 A fullscreen create activates the focus window as native does, one
 `SetWindowPos` to `HWND_TOP` without `SWP_NOACTIVATE` before the window is
@@ -1449,28 +1303,20 @@ message-observation counts; unlike `flaky`, it still rejects counts above
 the pin. This changes no focus or activation behavior and does not establish
 that the message contract is fixed.
 
-4298, 4324 and 4325 move together now and then on i686: in one iteration
-4298 passes, and 4324/4325, the desktop mode read back after the hidden
-device window loses focus, fail, so the device reads `4298 2 -> 1`,
-`4324 0 -> 1` and `4325 0 -> 1`. That happened on 2026-09-13 and again on
-2026-10-04, the second time with no other Wine session on the machine, in
-one of about a hundred local i686 device runs between 2026-10-01 and
-2026-10-05. None of the 985 i686 device legs CI ran between 2026-09-21 and
-2026-10-05 showed it, and neither local run kept a raw capture. The reading
+4298, 4324 and 4325 can move together on i686: in one iteration 4298
+passes, and 4324/4325, the desktop mode read back after the hidden device
+window loses focus, fail, so the device reads `4298 2 -> 1`, `4324 0 -> 1`
+and `4325 0 -> 1`. It was seen in about one of a hundred local i686 device
+runs and in none of the i686 device legs CI ran, and no run kept a raw
+capture. The reading
 the counts allow, which is conjecture: a deactivation that macdrv delivers
 late restores the registry mode before 4298 reads it, the app is then
 inactive when the test's `Reset` sets the device's mode again, and the
 second `SetForegroundWindow(GetDesktopWindow())` changes no activation, so
 no `WM_ACTIVATEAPP(FALSE)` arrives to restore it. 4298 stays the decision
 recorded above; `ceiling` keeps its pin of two and tolerates one. 4324 and
-4325 are pinned at one on the `i686` and `i686+intel` device legs (the
-second carries the native leg's pins). Every other leg carries no pin, the
-arm64 Wine's `i686-arm64` legs included, which read zero in every run so
-far, and a first read there is a new site. A read of two, both iterations
-failing to restore the registry mode on focus loss, still fails the gate. A
-re-record on a run where they read zero drops the 4324/4325 pins from both
-legs, and they must be put back by hand, as they were after the 2026-10-18
-re-record onto the 11.19 tests.
+4325 carry no pin: the `i686-arm64` legs read zero in every run so far, so
+a first read there is a new site.
 
 4253/4294/4420/4483 are the kept device-loss divergence, not an unwritten
 stub: no exclusive mode is ever taken, so nothing is ever lost, and
@@ -1503,13 +1349,10 @@ line moves only with that decision.
 
 4471/4476 are flaky macdrv window-message timing sites;
 mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths. Both are
-pinned at one on the x86_64 Wine's native and `+intel` device legs (`i686`,
-`i686+intel`, `x86_64`, `x86_64+intel`), put back by hand after the
-2026-10-18 re-record read them as zero, and on all six device legs of the
-arm64 Wine (`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms).
-They flap there too: in the runs of 2026-10-18, 4476 read one in four of the
-five native `arm64x` device runs, and at least once on `arm64x+scale`,
-`arm64x+intel` and `i686-arm64+scale`, reading zero only in the runs that
+pinned at one on all four device legs (`i686-arm64`, `arm64x` and their
+`+scale` forms). They flap there: in the runs of 2026-10-18, 4476 read one
+in four of the five native `arm64x` device runs, and at least once on
+`arm64x+scale` and `i686-arm64+scale`, reading zero only in the runs that
 recorded those sections, and 4471 read one once on `i686-arm64`. A re-record
 that reads them as zero drops the pins, and they are put back by hand: the
 tolerance applies only to a site its leg's section holds, so without a pin a
@@ -1524,8 +1367,8 @@ reporting it at 2188/2190) and the Win32 half (2127/2128, 2180/2181,
 2251/2252 reading the mode back from `GetSystemMetrics(SM_CXSCREEN)`).
 2235/2238/2239 are the test's own `ChangeDisplaySettingsW` call, before any
 D3D9 object is involved; it succeeds now that the mode it picks from
-`EnumAdapterModes` is one user32 accepts. All five pass on both Wines, so
-the cluster carries no site.
+`EnumAdapterModes` is one user32 accepts. All five pass, so the cluster
+carries no site.
 
 The fullscreen Resets to a mode user32 rejects (32x32, 801x600) return
 INVALIDCALL, for a reason that has nothing to do with the resolution: each
@@ -1585,45 +1428,39 @@ which the runner does not count.
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
 The whole cluster passes since a fullscreen device sets and restores the
-mode and the test's own CDS calls pick a mode user32 accepts, on both Wines.
+mode and the test's own CDS calls pick a mode user32 accepts.
 5548/5550 (the back buffer must keep the size a fullscreen create asked for
 across an external mode change) pass because the back buffer honors the
 request and never follows the window. 5594/5614/5637/5672/5896 ("Failed to
-restore display modes") fire on the `@mac2` legs only, where win32u refuses
-the modes the test hands back. The test saves each display's
+restore display modes") fail only on a display below 60 Hz, where win32u
+refuses the modes the test hands back. The test saves each display's
 `ENUM_CURRENT_SETTINGS` mode and restores it with
 `ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)`, and win32u
 matches that mode, its refresh rate included, against the display's mode
 list (`find_display_mode` in `dlls/win32u/sysparams.c`). Under
 `EmulateModeset` the list is win32u's own: every size at 60 Hz, and the
 display's own rate as well only when it is above 60 (`get_virtual_modes`,
-the same in Wine 11.0 and 11.20). The Intel CI image's display runs
-3840x2160 at 30 Hz, so the saved mode is no mode of its list and every
-restore returns `DISP_CHANGE_BADMODE`; the layer's log there reads "host
-3840x2160@30Hz on a 3840x2160 display; 25 sizes settable of 75 enumerated
-modes", 25 sizes at three depths and one rate. The condition is the rate
-winemac reports, which it truncates to whole hertz and reads as 60 when the
-display gives none (`winemac.drv/display.c`): a rate from 2 to 59 is refused
-(59.94 reads 59), a rate of 60 matches the 60 Hz entries, a rate above 60 is
-listed, and `find_display_mode` ignores a requested rate of 1 or 0. So any
-display below 60 Hz refuses the restore, an external 50 Hz or 59.94 Hz one on
-an Apple Silicon Mac too; the displays the Apple keys were recorded on run
-at 60 Hz or above (a 120 Hz panel lists 60 and 120), and the restore passes
-on every Apple key. The device's own restores pass on that image too, since
-they apply the registry mode without a `DEVMODE`, which win32u does not
-match against the list. A Wine defect rather than ours, and desktop mode
-switching is out of scope, so `expected`. Listing the display's own rate
-below 60 Hz too, in wine-build's Wine, would let the restore pass and take
-these five sites and the three below that follow from them off the `@mac2`
-keys (issue #1183).
+the same in Wine 11.0 and 11.20). On a display below 60 Hz the saved mode is
+no mode of that list and every restore returns `DISP_CHANGE_BADMODE`. The
+condition is the rate winemac reports, which it truncates to whole hertz and
+reads as 60 when the display gives none (`winemac.drv/display.c`): a rate
+from 2 to 59 is refused (59.94 reads 59), a rate of 60 matches the 60 Hz
+entries, a rate above 60 is listed, and `find_display_mode` ignores a
+requested rate of 1 or 0. So any display below 60 Hz refuses the restore,
+such as an external 50 Hz or 59.94 Hz one; the displays the keys were
+recorded on run at 60 Hz or above (a 120 Hz panel lists 60 and 120), and the
+restore passes on every key. The device's own restores pass on such a
+display too, since they apply the registry mode without a `DEVMODE`, which
+win32u does not match against the list. A Wine defect rather than ours, and
+desktop mode switching is out of scope. Listing the display's own rate below
+60 Hz too, in Mach9's Wine, would let the restore pass (issue #1183).
 
 A failed restore leaves the mode the test's own `CDS_UPDATEREGISTRY` calls
 wrote in the registry, and the session serves it as the desktop to every
 later test of the subtest. The test takes that mode from the served list,
-which is ordered smallest first: on the Intel image it is 800x600, the
-second size of at least 640x480 there. So the `@mac2` legs run the rest of
-the `device` subtest on a 4:3 desktop on a 16:9 display, which is what
-`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15081 read.
+which is ordered smallest first, so the rest of the `device` subtest runs on
+a desktop of another shape than the display, which is what
+`test_cursor_clipping` and `test_window_position` then read.
 The runner starts the prefix's session again once the subtest has ended (see
 "The test binaries" under Running), so the later subtests start from the
 display's own mode.
@@ -1667,7 +1504,7 @@ against a populated depth buffer, read as zero/non-zero) is unaffected.
 Wine first times 1,000 query BEGIN/END pairs. If that loop takes more than
 70 ms, device.c:6702 prints `Tests skipped: Test loop took too long (...)`,
 ending with `skipping large query tests.`, and jumps to cleanup before 6776.
-An Intel CI run measured 100 ms and took that branch. The scanner recognizes
+A CI run measured 100 ms and took that branch. The scanner recognizes
 that exact site and message shape, including the elapsed time above 70 ms,
 as evidence that 6776 did not run. The mapping must be reviewed with the
 baseline's source locations when Wine changes. The classification remains
@@ -1724,9 +1561,7 @@ CheckDepthStencilMatch(..., D3DFMT_D32): native returns NOTAVAILABLE; we
 return D3D_OK because D32 genuinely maps to Depth32Float and works. We
 advertise MORE than native here, deliberately; not an omitted-cap (`caps`)
 case, and our answer is truthful for our backend. 12690 is the R5G6B5
-render-target row of that check, so it fires on the native legs only: on the
-Intel legs R5G6B5 is no render target and the answer is the NOTAVAILABLE the
-test expects.
+render-target row of that check.
 
 
 ### device.c/test_miptree_layout
@@ -1755,44 +1590,31 @@ letterbox bars inside the clip: 640x480 on a 3456x2234 panel reads
 "(-51,0)-(691,480)". That is win32u's mapping, not ours; the device sets the
 mode exactly as native does. The served list is ordered smallest first, as a
 driver lists it, so the pick is 640x480 wherever Wine lists it: 14946 fires
-on a display of another shape (a MacBook panel, the Intel image) and passes
-on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
-Under the arm64 Wine built from Wine 11.21 it reads 0 on a 3456x2234 panel
-too, on all six keys in every run recorded there, where Wine 11.20 read 1;
-the pin stays, since the x86_64 Wine's keys and the `@mac2` keys read 1
-when they were last recorded.
+on a display of another shape (a MacBook panel) and passes on the CI
+runner's 4:3 virtual display, hence `ceiling` at 1 on every leg. Under the
+arm64 Wine built from Wine 11.21 it reads 0 on a 3456x2234 panel too, on
+every key in every run recorded there, where Wine 11.20 read 1; the pin
+keeps the count Wine 11.20 read, which `ceiling` tolerates down to 0.
 
-14930 and 14955 fire on the `@mac2` legs only. There the desktop is already
-800x600 when the test starts, the mode `test_mode_change`, earlier in the
-same process, leaves in the registry when its restore fails (see that
-cluster; the runner's restart of the session comes after the process), and
-win32u maps the clip with no fullscreen window the same way: on the Intel
-image's 3840x2160 display it reads "(-133,0)-(933,600)" against
-"(0,0)-(800,600)", before the create and again after the release. They read
-1 on every run of the Intel image and appear on no Apple key, and they come
-from the same failed restore as the `test_mode_change` sites, so they are
-`expected` like those and go with the Wine fix for that restore
-(issue #1183).
+14930 and 14955 pass while the desktop has the display's shape when the
+test starts. A desktop of another shape, as a refused restore in
+`test_mode_change` earlier in the same process leaves it (see that cluster;
+the runner's restart of the session comes after the process), fails both:
+win32u maps the clip with no fullscreen window the same way, so the clip
+reads the letterboxed rect before the create and again after the release.
+They go with the Wine fix for that restore (issue #1183).
 
 ### device.c/test_window_position
 
 The test creates a fullscreen device at the monitor's size, shrinks the
 window by one pixel on each axis, and after the second such resize expects
-the window to keep that rect once events are processed. It fires on the
-`@mac2` legs only, where the desktop is the 800x600 mode `test_mode_change`
-leaves behind earlier in the same process (see that cluster), which win32u
-scales onto the 3840x2160 display by 3.6 with bars at both sides: the
-window comes back from the event round trip one pixel lower,
-"(0,1)-(799,600)" for "(0,0)-(799,599)", the same size. The failure message
-prints the monitor rect, not the rect the test expects, so the log reads
-"Expect window rect (0,0)-(800,600)". The device sets no mode here, the
-request being the desktop's own size, and a window the layer re-covered the
-monitor with would read "(0,0)-(800,600)". That the pixel is lost rounding
-the window's frame through the 3.6 scale is conjecture. With a desktop of
-the display's shape it passes, as it did on the Intel image while the mode
-left behind was 3200x1800. It reads 1 on every run of the Intel image and
-comes from the same failed restore as the `test_mode_change` sites, so it is
-`expected` like those and goes with the Wine fix for that restore
+the window to keep that rect once events are processed. It passes with a
+desktop of the display's shape. A desktop of another shape, as a refused
+restore in `test_mode_change` earlier in the same process leaves it (see
+that cluster), is scaled onto the display with bars at its sides, and the
+window comes back from the event round trip one pixel off, which 15081 then
+reads; that the pixel is lost rounding the window's frame through that
+scale is conjecture. It goes with the Wine fix for that restore
 (issue #1183).
 
 ### device.c/init_d3d9on12_modules
@@ -1803,14 +1625,10 @@ counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
 Metal. Ceiling, not expected, because the site only fires where the Wine
 build ships a loadable d3d12.dll: the win_skip sits after the three
 LoadLibrary calls, and a failed load takes a plain `skip()` that counts
-nothing. wine-build's arm64 Wine ships a d3d12.dll that both the i386 and
-the x86_64 test process load from arm64-11.19-3 on (vkd3d-proton, in the
-dxmt tree its default rules select), so every arm64 Wine key reads 1:
-`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms. On the x86_64
-Wine (cx-26.3.0-7) only the 64-bit test process loads one, so its `x86_64`
-keys read 1 and its `i686` keys 0. Not test-source drift: every leg runs the
-same build of the tests, so the difference is the Wine's own d3d12.
-Exporting a stub `Direct3DCreate9On12` would not clear it: with the export
+nothing. Mach9's arm64 Wine ships a d3d12.dll that both the i386 and the
+x86_64 test process load from arm64-11.19-3 on (vkd3d-proton, in the dxmt
+tree its default rules select), so every key reads 1: `i686-arm64`,
+`arm64x` and their `+scale` forms. Exporting a stub `Direct3DCreate9On12` would not clear it: with the export
 present, `test_d3d9on12` expects `S_OK` from the device's `QueryInterface`
 for `IDirect3DDevice9On12` at 15270 and calls through the returned pointer
 at 15271, so the test would crash on the NULL interface.
@@ -1865,17 +1683,9 @@ G32R32F) with blending on, then samples it and expects absent channels to
 read as 1.0. L8 is the other case: the test expects green and blue to repeat
 the luminance (visual.c:11870, 0x00181818 blended), which the RRR1 swizzle of
 its R8 sampling view gives. Render targets now keep separate attachment and
-sampling views, including both linear and sRGB roles for X8 formats. Native
-Apple GPUs apply the sampling swizzle while stored channels retain their
-blended values.
-
-The remaining failure is the Mac2 Paravirtual device's ignored texture-view
-swizzle, shared with ordinary sampled textures below. It reads absent colour
-lanes as zero despite reporting the requested view swizzle, and L8 there
-reads its luminance in red only, with green and blue zero. The E2E controls
-compare those lanes with an ordinary same-format texture on that device and
-still verify stored lanes, mip and cube addressing, and view retirement.
-Physical-GPU tests additionally require the specified all-ones missing lanes.
+sampling views, including both linear and sRGB roles for X8 formats. Apple
+GPUs apply the sampling swizzle while stored channels retain their blended
+values, so the test passes.
 
 ### visual.c/test_fetch4
 Sites: 15686=ceiling
@@ -1886,7 +1696,7 @@ set and clear a latch; numeric bias writes preserve it. Gather honors projected
 coordinates and reads the base mip, including texldb/texldd/texldl. DF16/DF24
 raw reads now return (depth, 0, 0, 1), while INTZ broadcasts depth.
 
-The basic gather and DF raw-depth checks pass on local and `@mac2` legs.
+The basic gather and DF raw-depth checks pass on every leg.
 
 15686 keeps its existing ceilings. The test writes only four bytes of each
 format texture, so projected L16/R16F samples can read unwritten texels. ATI1
@@ -1894,40 +1704,18 @@ is outside the supported Fetch4 format set and keeps ordinary sampling, with
 alpha one rather than a fourth gathered texel. A8R8G8B8 also keeps ordinary
 sampling; its unwritten texels can have alpha one rather than the expected zero.
 These cases account for the remaining format-site failures. Keep the higher pins
-because counts vary with allocation contents. 15745 (`@mac2` legs only) is the
-3D section's `L8` volume texture, which reads its green and blue lanes through
-the channel swizzle the paravirtual device ignores (the swizzle cluster above):
-the sample carries red alone there.
+because counts vary with allocation contents.
 
 ### visual.c/fp_special_test
 Sites: 16481=expected
 
 VS special-float ops on NaN/±inf: the test accepts four distinct vendor
 results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
-GPU-defined, not spec-mandated. The one failure left on the Apple family is
-the `def1` case, a `def` constant holding a NaN moved into the output: our
+GPU-defined, not spec-mandated. The one failure left is the `def1` case, a `def` constant holding a NaN moved into the output: our
 Metal GPU produces a fifth valid IEEE result matching no vendor's encoding
 (0x008000ff). Matching a specific vendor is neither feasible nor desirable.
 No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
 returns its source, the zero vector the test's hardware gives, so it passes.
-The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
-device encodes its own way (0x00808000; `def1` reads the same value there).
-
-### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
-
-`@mac2` legs only, one mechanism. Every format whose D3D9 sample fills a
-lane the Metal format lacks (R32F's green and blue, G16R16's alpha, V8U8's
-and V16U16's blue and alpha, X8R8G8B8's alpha, L8's green and blue) is handed out as a
-texture view with a channel swizzle. The paravirtual device on the Intel CI
-image creates that view, reports the swizzle on it, and samples through the
-base texture's lanes anyway, measured in the workflow's probe job; every
-real GPU family applies the swizzle. So R32F reads its missing lanes as
-zero (5088), G16R16 its alpha as zero (5167), V8U8 and V16U16 their blue
-as a stored lane (20750 and 20799, which count both formats' rows, and the
-four V16U16 volume probes 18835, 18838, 18841 and 18844), and the autogen
-X8R8G8B8 chain its padding byte as alpha (6032). A device limitation with no D3D9-side answer, so `expected`;
-none of these fire on the Apple family, and a real Intel/AMD Mac is expected
-to read zero here.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20928=expected 20931=expected 21007=expected 21010=expected
@@ -1959,9 +1747,7 @@ incorrectly reported `X8R8G8B8`. That descriptor defect was `real`, including on
 the mixed sites whose remaining assertions observe undefined contents.
 
 Reporting the requested `A8R8G8B8` format lets the helper read pixels. Sites
-22103, 22114 and 22120 pass on both architectures across the Apple GPU legs
-and the Intel/AMD `@mac2` runners. Their baseline pins have been removed. Sites
-22101 and 22112 return actual colours from the shared backing rather than a
+22103, 22114 and 22120 pass on both architectures. Sites 22101 and 22112 return actual colours from the shared backing rather than a
 rotating chain, so only their by-design remainder is classified `expected`.
 That shared backing is the kept divergence "Every back-buffer index of a swap
 chain is one surface" above.
@@ -2010,29 +1796,6 @@ Sites: 27950=expected
 FLOAT→unorm rounding at exactly .5: Metal rounds 76.5 up (77), refrast
 truncates (76). A ±1 GPU rounding-convention difference with no cap branch;
 mimicking refrast exactly is not feasible or desirable.
-
-### visual.c/test_format_conversion
-
-Intel legs only. The test expects `CheckDeviceFormatConversion(YUY2,
-R5G6B5)` to answer D3D_OK, as every desktop driver does. A conversion
-destination has to be renderable, since the StretchRect quad draws into it,
-and on a device without the packed 16-bit formats R5G6B5 is no render target,
-so the answer is NOTAVAILABLE. That is the conformant answer for a device
-without the capability; the same rule is pinned by the e2e
-`check_format_conversion` test, which asks the device first.
-
-### visual.c/test_blit_format_conversion
-
-Intel legs only. Test 2 creates an R5G6B5 render-target texture as the
-`StretchRect` destination without asking `CheckDeviceFormat` first. On a
-device without the packed 16-bit formats R5G6B5 is no render target, the
-same rule as `test_format_conversion` above, so the create answers
-`D3DERR_INVALIDCALL` (`CreateTexture`'s render-target gate) and the
-conversion is not run, which is the conformant answer for a device without
-the capability. The test then uses the texture it did not get and faults, so
-the `+intel` `visual` legs record `crash=1`; it is the last test of the
-subtest, and its remaining two rows do not run there. On the native legs all
-five conversions pass.
 
 ### visual.c/get_rt_readback
 Sites: 199=expected
@@ -2212,12 +1975,12 @@ focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from
 `CheckDeviceState` after the focus loss, the occlusion decision above.
 
-On the `@mac2` legs d3d9ex runs on the display's own mode because the
-runner starts the prefix's session again after `device.c/test_mode_change`
-leaves 800x600 behind (see that cluster). On 800x600 the served list holds
-no pair of other sizes the test's pick accepts and the test skips its mode
-tests at 2838 ("Could not find adequate modes"). Every key, the `@mac2`
-ones included, reads:
+d3d9ex runs on the display's own mode even after a refused restore in
+`device.c/test_mode_change`, because the runner starts the prefix's session
+again after it (see that cluster). On a desktop as small as 800x600 the
+served list holds no pair of other sizes the test's pick accepts and the
+test skips its mode tests at 2838 ("Could not find adequate modes"). Every
+key reads:
 
 | Count | Sites |
 | --- | --- |
@@ -2361,9 +2124,8 @@ Q8W8V8U8 textures use native RGBA8Snorm storage with four signed channels.
 The negative Q channel follows signed normalization, including a floor of
 minus one for both minimum encodings. The legacy R200 exception in Wine's
 signed-format alpha test is not an emulated target. All four lanes are
-stored, so sampling needs no conversion and no view swizzle, and the
-Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
-fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
+stored, so sampling needs no conversion and no view swizzle. Render-target
+and sRGB capabilities
 stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
 level with no generated chain. DYNAMIC creation in the MANAGED and the SCRATCH
 pool is rejected for every format and every texture type, the way D3D9 rejects
@@ -2374,8 +2136,7 @@ formats of the fixed-function bump-environment stages.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
 NOAUTOGEN and unavailable render/sRGB policies. All four lanes are
-stored and no view swizzle applies, so nothing here depends on the mechanism
-that fails the V8U8 and V16U16 rows on the `@mac2` legs. Upstream Wine has no
+stored and no view swizzle applies. Upstream Wine has no
 Q16 positive row in test_signed_formats; existing mode/conversion references
 do not establish signed pixel correctness. Dedicated end-to-end tests pin
 all four signed16 lanes, alpha, eight-byte transport and float32 sampling
@@ -2395,9 +2156,7 @@ and texture-level destinations, and the upload the GPU samples.
 A2R10G10B10 textures and CPU surfaces are creatable, stored as native
 BGR10A2Unorm. D3D9 packs blue in the low ten bits, then green, red and the
 two alpha bits, which is that Metal format's layout, so locks expose the
-native words and sampling needs no conversion and no view swizzle. Every
-lane is stored, so nothing here depends on the mechanism that fails the V8U8
-and V16U16 rows on the `@mac2` legs.
+native words and sampling needs no conversion and no view swizzle.
 
 The A2R10G10B10 row of test_getdc used to skip because neither the SYSTEMMEM
 surface nor the MANAGED texture could be created. It now runs and passes:
@@ -2420,8 +2179,7 @@ A2B10G10R10 textures and CPU surfaces are creatable, stored as native
 RGB10A2Unorm. D3D9 packs red in the low ten bits, then green, blue and the
 two alpha bits, which is that Metal format's layout and the mirror of
 A2R10G10B10, so locks expose the native words and sampling needs no
-conversion and no view swizzle. Every lane is stored, so nothing here depends
-on the mechanism that fails the V8U8 and V16U16 rows on the `@mac2` legs.
+conversion and no view swizzle.
 
 Upstream names the format twice. test_display_modes (device.c:2616) expects
 EnumAdapterModes to answer INVALIDCALL, and it still does: the format stays
@@ -2458,8 +2216,7 @@ volume_dxtn_test (visual.c:18636) skipped its DXT1, DXT3 and DXT5 rows on the
 VOLUMETEXTURE query and now runs them: three skips fewer and the row's eight
 readbacks at visual.c:18679 per format on every visual leg, all expected to
 pass, including the scaled legs (the back buffer is read at reported
-coordinates) and the `@mac2` legs (BC formats store every lane and carry no
-view swizzle). test_volume_blocks (device.c:10709) takes its supported branch
+coordinates). test_volume_blocks (device.c:10709) takes its supported branch
 for the five DXT rows, where DEFAULT, SYSTEMMEM and MANAGED creates of every
 block-aligned size now succeed as device.c:10756 expects; its pitch, offset
 and misaligned-box checks already ran against the SCRATCH volume. A
@@ -2490,15 +2247,7 @@ test_surface_format_null (device.c:9372) skipped at its first query
 the lockable 128x128 surface and its lock, the colour clear with no depth
 surface, and the full-chain texture create, every `ok()` passing.
 test_null_format (visual.c:24739) skipped at visual.c:24822 and now runs
-both readbacks. On the plain and `+intel` keys of the arm64 Wine every
-assertion passes; on its two `+scale` keys visual.c:24934 fails three times,
-from the draw through the 400x300 colour target, not through `NULL` (see
-`visual.c/test_null_format`). Neither test logs a Metal validation line on
-any of the six keys. The x86_64 Wine's keys and the two `@mac2` keys were not
-read here: CI's macos-15 legs read the plain `i686` and `x86_64` keys, the
-nightly Intel run reads the `@mac2` keys, and no run reads the x86_64 Wine's
-`+intel` and `+scale` keys. The site comes from the layer's own pairing of an
-unscaled target with a scaled depth surface, which no Wine takes part in, so
-`i686+scale` and `x86_64+scale` took visual.c:24934 at 3 by hand, as earlier
-edits of the x86_64 Wine's keys did; both stay unconfirmed until a run under
-that Wine. The `@mac2` keys have no `+scale` form.
+both readbacks. On the plain keys every assertion passes; on the two
+`+scale` keys visual.c:24934 fails three times, from the draw through the
+400x300 colour target, not through `NULL` (see `visual.c/test_null_format`).
+Neither test logs a Metal validation line on any of the four keys.
