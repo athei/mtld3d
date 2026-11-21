@@ -1508,6 +1508,76 @@ fn rule_a_reset_frame_re_arms_dontcare() {
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
 }
 
+fn next_frame_reset() -> FrameReset {
+    FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    }
+}
+
+#[test]
+fn rule_a_backbuffer_read_in_an_earlier_frame_still_discards_on_first_use() {
+    // A post-process chain (or a `StretchRect` source) reads the back buffer
+    // in frame N. Under the discard swap effect its contents are undefined
+    // again at frame N+1, so that read must not cost the next frame's first
+    // pass its `DontCare`, neither at pass open nor in the finalize revert.
+    let copy = tex(0x4400);
+    let mut s = fresh();
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(copy, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(Command::set_fragment_texture(backbuffer().raw(), 0));
+    s.emit_command(dummy_draw());
+    s.note_color_read_back(backbuffer());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.reset_frame(&next_frame_reset());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    s.finalize_load_actions();
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn rule_a_sampled_game_target_still_loads_after_a_frame_boundary() {
+    // The counterpart: a game render target keeps its contents across frames,
+    // so the back-buffer exemption must not reach it.
+    let rt = tex(0x4500);
+    let mut s = fresh();
+    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.reset_frame(&next_frame_reset());
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_a_backbuffer_under_flip_loads_even_when_unsampled() {
+    let mut s = fresh();
+    let mut reset = next_frame_reset();
+    reset.backbuffer_contents = BackbufferContents::Preserved;
+    s.reset_frame(&reset);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
 #[test]
 fn rule_a_depth_wider_than_the_rt_loads_on_first_use() {
     // D3D9 only requires the depth-stencil surface to be at least as large as
