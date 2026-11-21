@@ -17,7 +17,7 @@ make conformance-i686           # one leg, one runner process (what CI runs)
 make conformance-arm64x         # the x86_64 binary against the ARM64X build
 make conformance-scale          # both legs at render.scale = 0.75
 make conformance-scale-i686     # one leg at render.scale = 0.75 (what CI runs)
-make conformance-baseline       # (re)record the four legs of baseline.txt in sequence
+make conformance-baseline       # re-record the four legs of baseline.txt in turn
 ```
 
 A leg is one build under the arm64 Wine and one variant. The build is named
@@ -43,20 +43,21 @@ test binaries, below).
 | `conformance-i686` | the i386 binary against the i686 build | `i686-arm64` |
 | `conformance-arm64x` | the x86_64 binary against the ARM64X build | `arm64x` |
 
+The `-arm64` suffix of `i686-arm64` names the arm64 Wine as part of the arch,
+so the key keeps the runner's `<arch>[+variant]` grammar.
+
 The `-scale` legs and the baseline targets follow the same two
 (`conformance-baseline-arm64x`, `conformance-scale-i686` and the like), each
 recording under its key's `+scale` form, and `ARCH` takes `i686` or `arm64x`
 for `conformance-isolate`.
 
-A key keeps the runner's `<arch>[+variant]` grammar. A key with no entries
-yet makes its leg's run report every failing site as new and fail, and the
-runner says so in one line naming the key and `make conformance-baseline`.
-The header's
-`Wine:` line is one for the file and names the build of the tests every
-section was recorded against, `wine-11.21-54-g501796b0ed`: the version of
-the Wine the tests were built from, never of the Wine that runs them. The
-Makefile tells the runner that version (`--tests-wine-version`) from the
-first of these that answers:
+A key with no entries yet makes its leg's run report every failing site as
+new and fail, and the runner says so in one line naming the key and `make
+conformance-baseline`. The header's `Wine:` line is one for the file and
+names the build of the tests every section was recorded against,
+`wine-11.21-54-g501796b0ed`: the version of the Wine the tests were built
+from, never of the Wine that runs them. The Makefile tells the runner that
+version (`--tests-wine-version`) from the first of these that answers:
 
 1. the first line of `$WINE_TESTS/VERSION`. This file is the contract with
    Mach9: a release that publishes the tests writes it into
@@ -91,12 +92,11 @@ GPU-hang line (`kIOAccelCommandBufferCallbackErrorHang`, or the
 drops afterwards) stops the subtest at once and ends the leg: exit code 3, no
 verdict, no baseline write. Every count after that line is a read off a GPU
 that runs nothing, and waiting out the subtest's budget would only make the
-same non-verdict cost minutes. On the macos-26 CI image the paravirtual GPU
-stays hung for the rest of the machine's life, so the later subtests would
-hang too.
-The job marks the leg with a `GPU hang` annotation, and the answer is a re-run
-of the failed jobs, which lands them on fresh runners; CI does that once by
-itself (`CONTRIBUTING.md`, "Pull requests", says when).
+same non-verdict cost minutes. A hosted runner's paravirtual GPU has stayed
+hung for the rest of the machine's life, so the later subtests would hang
+too. The job marks the leg with a `GPU hang` annotation, and the answer is a
+re-run of the failed jobs, which lands them on fresh runners; CI does that
+once by itself (`CONTRIBUTING.md`, "Pull requests", says when).
 A hang on a real GPU is worth a look on its own (a shader that hangs the GPU is
 a bug), but the leg has to run again for its counts either way.
 
@@ -157,9 +157,8 @@ between Wine versions (v0.4.0 ships Wine 11.21's tests), so one
 classification list can only serve one build of the tests. `WINE_TESTS`
 names the directory. It defaults to `$WINE_SDK/lib/wine/tests`, the same
 install `make install` puts our builtin `d3d9.dll` into. The binaries are
-not vendored here: they are large and drift with
-the Wine version, so `baseline.txt` records the Wine version it was taken
-against instead.
+not vendored here: they are large and drift with the Wine version, so
+`baseline.txt` records the Wine version it was taken against instead.
 
 The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It takes
 the loader and one test binary as explicit paths (`--wine`, `--exe`, plus
@@ -200,10 +199,14 @@ run that ends on a GPU hang restarts nothing, since the leg ends with it.
 Ending the server ends every process of the session, every other run in that
 prefix included, so this happens only where the restore was refused, which is
 on a display below 60 Hz (the condition is under `device.c/test_mode_change`),
-such as a Mac driving an external display at 59.94 Hz or 50 Hz. On a display at 60 Hz or above the restore
-works and no run restarts anything. The tests of the same subtest that run
-after the refused restore still run on the mode it left; the runner cannot
-reach into a running subtest.
+such as a Mac driving an external display at 59.94 Hz or 50 Hz. On a display
+at 60 Hz or above the restore works and no run restarts anything. The tests
+of the same subtest that run after the refused restore still run on the mode
+it left; the runner cannot reach into a running subtest. The baseline
+assumes a display at 60 Hz or faster: on a 50 Hz or 59.94 Hz display a local
+run fails device.c 5594, 5614, 5637, 5672 and 5896 (`test_mode_change`),
+14930 and 14955 (`test_cursor_clipping`) and 15081
+(`test_window_position`), because the restore is refused.
 
 The layer's validation *errors* are reported, deduplicated, as
 `metal-validation:` lines; its *warnings* are ignored. A warning is a
@@ -1009,9 +1012,9 @@ recorded here. Recorded locally on an Apple Silicon machine, twice, with
 the release's own test binaries: the arm64 Wine's keys (`i686-arm64`,
 `arm64x` and their `+scale` forms). The two runs read the same sites at the
 same counts, and the keys hold every earlier count at its new line. The
-flaky and ceiling pins kept their values:
-test_wndproc 4471 and 4476 and test_cursor_clipping 14946 read 0 on every
-key recorded here, and test_fetch4 15686 read 3, all tolerated.)
+flaky and ceiling pins kept their values: test_wndproc 4471 and 4476 and
+test_cursor_clipping 14946 read 0 on every key recorded here, and
+test_fetch4 15686 read 3, all tolerated.)
 (2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
 `m = 2 * length(R + (0, 0, -1))`, so `test_generated_texcoords` 29162 left
 every key and its cluster left this document. Linear table fog with
@@ -1088,10 +1091,11 @@ visual.c sites in eleven clusters, every one `expected` for the one reason
 "The scaled leg" below gives; they carry no device.c site of their own since
 #408. The `resz_test` site they also carried, 17994, was `real` and is fixed:
 a lockable render target created at the reported back-buffer size declined the
-scale while the depth-stencil bound with it took it, issue #407.) (2026-08-27: device.c:15146 moved from `expected`
-to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
-the SRGBTEXTURE decode landing the same day changed no site counts — the
-newly-running `srgbtexture_test` passes. 2026-08-28: honouring
+scale while the depth-stencil bound with it took it, issue #407.)
+(2026-08-27: device.c:15146 moved from `expected` to `ceiling`, it fires
+only where the Wine build ships a loadable d3d12.dll; the SRGBTEXTURE decode
+landing the same day changed no site counts: the newly-running
+`srgbtexture_test` passes. 2026-08-28: honouring
 `D3DCREATE_NOWINDOWCHANGES` dropped test_window_style 5211, and test_wndproc
 4547 was re-derived from the raw capture and corrected from `real` to
 `expected`. Multisampling then moved the counts in both directions. Four
@@ -1303,20 +1307,19 @@ message-observation counts; unlike `flaky`, it still rejects counts above
 the pin. This changes no focus or activation behavior and does not establish
 that the message contract is fixed.
 
-4298, 4324 and 4325 can move together on i686: in one iteration 4298
-passes, and 4324/4325, the desktop mode read back after the hidden device
-window loses focus, fail, so the device reads `4298 2 -> 1`, `4324 0 -> 1`
-and `4325 0 -> 1`. It was seen in about one of a hundred local i686 device
-runs and in none of the i686 device legs CI ran, and no run kept a raw
-capture. The reading
-the counts allow, which is conjecture: a deactivation that macdrv delivers
-late restores the registry mode before 4298 reads it, the app is then
-inactive when the test's `Reset` sets the device's mode again, and the
-second `SetForegroundWindow(GetDesktopWindow())` changes no activation, so
-no `WM_ACTIVATEAPP(FALSE)` arrives to restore it. 4298 stays the decision
-recorded above; `ceiling` keeps its pin of two and tolerates one. 4324 and
-4325 carry no pin: the `i686-arm64` legs read zero in every run so far, so
-a first read there is a new site.
+4298, 4324 and 4325 moved together under the x86_64 Wine's `i686` key, in
+about one of a hundred local i686 device runs, and never under the arm64
+Wine: in one iteration 4298 passed, and 4324/4325, the desktop mode read back
+after the hidden device window loses focus, failed, so the device read
+`4298 2 -> 1`, `4324 0 -> 1` and `4325 0 -> 1`. No run kept a raw capture.
+The reading the counts allow, which is conjecture: a deactivation that
+macdrv delivers late restores the registry mode before 4298 reads it, the
+app is then inactive when the test's `Reset` sets the device's mode again,
+and the second `SetForegroundWindow(GetDesktopWindow())` changes no
+activation, so no `WM_ACTIVATEAPP(FALSE)` arrives to restore it. 4298 stays
+the decision recorded above; `ceiling` keeps its pin of two and tolerates
+one. 4324 and 4325 carry no pin: `i686-arm64` reads them as zero, so a read
+of one there is a new site.
 
 4253/4294/4420/4483 are the kept device-loss divergence, not an unwritten
 stub: no exclusive mode is ever taken, so nothing is ever lost, and
@@ -1504,7 +1507,7 @@ against a populated depth buffer, read as zero/non-zero) is unaffected.
 Wine first times 1,000 query BEGIN/END pairs. If that loop takes more than
 70 ms, device.c:6702 prints `Tests skipped: Test loop took too long (...)`,
 ending with `skipping large query tests.`, and jumps to cleanup before 6776.
-A CI run measured 100 ms and took that branch. The scanner recognizes
+A hosted CI run measured 100 ms and took that branch. The scanner recognizes
 that exact site and message shape, including the elapsed time above 70 ms,
 as evidence that 6776 did not run. The mapping must be reviewed with the
 baseline's source locations when Wine changes. The classification remains
@@ -1589,12 +1592,12 @@ into the mode, so a mode of another aspect than the display's has its
 letterbox bars inside the clip: 640x480 on a 3456x2234 panel reads
 "(-51,0)-(691,480)". That is win32u's mapping, not ours; the device sets the
 mode exactly as native does. The served list is ordered smallest first, as a
-driver lists it, so the pick is 640x480 wherever Wine lists it: 14946 fires
-on a display of another shape (a MacBook panel) and passes on the CI
-runner's 4:3 virtual display, hence `ceiling` at 1 on every leg. Under the
-arm64 Wine built from Wine 11.21 it reads 0 on a 3456x2234 panel too, on
-every key in every run recorded there, where Wine 11.20 read 1; the pin
-keeps the count Wine 11.20 read, which `ceiling` tolerates down to 0.
+driver lists it, so the pick is 640x480 wherever Wine lists it. Under Wine
+11.20 14946 fired on a display of another shape (a MacBook panel) and passed
+on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
+Under the arm64 Wine built from Wine 11.21 it reads 0 on a 3456x2234 panel
+as well, on every key in every run recorded there; the pin keeps the count
+Wine 11.20 read, which `ceiling` tolerates down to 0.
 
 14930 and 14955 pass while the desktop has the display's shape when the
 test starts. A desktop of another shape, as a refused restore in
@@ -1628,10 +1631,11 @@ LoadLibrary calls, and a failed load takes a plain `skip()` that counts
 nothing. Mach9's arm64 Wine ships a d3d12.dll that both the i386 and the
 x86_64 test process load from arm64-11.19-3 on (vkd3d-proton, in the dxmt
 tree its default rules select), so every key reads 1: `i686-arm64`,
-`arm64x` and their `+scale` forms. Exporting a stub `Direct3DCreate9On12` would not clear it: with the export
-present, `test_d3d9on12` expects `S_OK` from the device's `QueryInterface`
-for `IDirect3DDevice9On12` at 15270 and calls through the returned pointer
-at 15271, so the test would crash on the NULL interface.
+`arm64x` and their `+scale` forms. Exporting a stub `Direct3DCreate9On12`
+would not clear it: with the export present, `test_d3d9on12` expects `S_OK`
+from the device's `QueryInterface` for `IDirect3DDevice9On12` at 15270 and
+calls through the returned pointer at 15271, so the test would crash on the
+NULL interface.
 
 ### device.c/test_d3d9on12
 Sites: 15218=expected
@@ -1711,11 +1715,12 @@ Sites: 16481=expected
 
 VS special-float ops on NaN/±inf: the test accepts four distinct vendor
 results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
-GPU-defined, not spec-mandated. The one failure left is the `def1` case, a `def` constant holding a NaN moved into the output: our
-Metal GPU produces a fifth valid IEEE result matching no vendor's encoding
-(0x008000ff). Matching a specific vendor is neither feasible nor desirable.
-No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
-returns its source, the zero vector the test's hardware gives, so it passes.
+GPU-defined, not spec-mandated. The one failure left is the `def1` case, a
+`def` constant holding a NaN moved into the output: our Metal GPU produces a
+fifth valid IEEE result matching no vendor's encoding (0x008000ff).
+Matching a specific vendor is neither feasible nor desirable. No capability
+involved (old `caps` tag incoherent). `nrm` of a zero vector returns its
+source, the zero vector the test's hardware gives, so it passes.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20928=expected 20931=expected 21007=expected 21010=expected
@@ -1726,9 +1731,10 @@ pass whose attachments disagree on sample count, so mtld3d drops the
 mismatched depth attachment; the draws land but the depth test does not
 gate them. The pipelines and clear quads built for such a pass declare no
 depth or stencil format either, since Metal rejects a pipeline that names a
-format the pass has no attachment for. D3D9 never defined the case: every assertion here carries a second accepted colour under
-`broken()`, and the comments in the test record that AMD and Nvidia disagree
-about whether the draw happens at all.
+format the pass has no attachment for. D3D9 never defined the case: every
+assertion here carries a second accepted colour under `broken()`, and the
+comments in the test record that AMD and Nvidia disagree about whether the
+draw happens at all.
 
 ### visual.c/test_flip
 Sites: 22101=expected 22112=expected
@@ -1747,8 +1753,9 @@ incorrectly reported `X8R8G8B8`. That descriptor defect was `real`, including on
 the mixed sites whose remaining assertions observe undefined contents.
 
 Reporting the requested `A8R8G8B8` format lets the helper read pixels. Sites
-22103, 22114 and 22120 pass on both architectures. Sites 22101 and 22112 return actual colours from the shared backing rather than a
-rotating chain, so only their by-design remainder is classified `expected`.
+22103, 22114 and 22120 pass on both architectures. Sites 22101 and 22112
+return actual colours from the shared backing rather than a rotating chain,
+so only their by-design remainder is classified `expected`.
 That shared backing is the kept divergence "Every back-buffer index of a swap
 chain is one surface" above.
 
@@ -2125,20 +2132,20 @@ The negative Q channel follows signed normalization, including a floor of
 minus one for both minimum encodings. The legacy R200 exception in Wine's
 signed-format alpha test is not an emulated target. All four lanes are
 stored, so sampling needs no conversion and no view swizzle. Render-target
-and sRGB capabilities
-stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
-level with no generated chain. DYNAMIC creation in the MANAGED and the SCRATCH
-pool is rejected for every format and every texture type, the way D3D9 rejects
-it, rather than for the signed and packed ten-bit formats alone or for volumes
-alone. X8L8V8U8 and L6V5U5 remain separate capabilities. V8U8, V16U16 and
-Q8W8V8U8 2D textures answer `D3DUSAGE_QUERY_LEGACYBUMPMAP`, the source
-formats of the fixed-function bump-environment stages.
+and sRGB capabilities stay absent; AUTOGEN texture/cube requests preserve
+usage but use one actual level with no generated chain. DYNAMIC creation in
+the MANAGED and the SCRATCH pool is rejected for every format and every
+texture type, the way D3D9 rejects it, rather than for the signed and packed
+ten-bit formats alone or for volumes alone. X8L8V8U8 and L6V5U5 remain
+separate capabilities. V8U8, V16U16 and Q8W8V8U8 2D textures answer
+`D3DUSAGE_QUERY_LEGACYBUMPMAP`, the source formats of the fixed-function
+bump-environment stages.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
-NOAUTOGEN and unavailable render/sRGB policies. All four lanes are
-stored and no view swizzle applies. Upstream Wine has no
-Q16 positive row in test_signed_formats; existing mode/conversion references
-do not establish signed pixel correctness. Dedicated end-to-end tests pin
+NOAUTOGEN and unavailable render/sRGB policies. All four lanes are stored
+and no view swizzle applies. Upstream Wine has no Q16 positive row in
+test_signed_formats; existing mode/conversion references do not establish
+signed pixel correctness. Dedicated end-to-end tests pin
 all four signed16 lanes, alpha, eight-byte transport and float32 sampling
 precision. This feature does not claim a Wine positive-pixel skip reduction.
 
