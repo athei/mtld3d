@@ -144,22 +144,25 @@ game's launch adds to the DLL search path. Nothing is written into
 The CrossOver Preview window shows a bottle's architecture as *Bottle Type*
 under *Advanced Settings*, and mtld3d needs `arm64`, which runs CrossOver's
 arm64 Wine. It is the `WineArch` key under `[Bottle]` in the bottle's
-`cxbottle.conf`. An existing arm64 bottle needs nothing more. Otherwise choose
-*File > New Bottle…* and a *New Bottle Type* that ends in *(arm64)*, such as
-*Windows 10 (arm64)*. The *(Intel)* types run CrossOver's x86_64 Wine, which
-cannot load mtld3d.
+`cxbottle.conf`. An existing arm64 bottle also needs the *CrossOver Preview*
+switch on under *Advanced Settings*, the `Preview` key under `[Bottle]`:
+CrossOver Preview's `wine` refuses to start a bottle without it. Otherwise
+choose *File > New Bottle…* and a *New Bottle Type* that ends in *(arm64)*,
+such as *Windows 10 (arm64)*. The *(Intel)* types run CrossOver's x86_64 Wine,
+which cannot load mtld3d.
 
 All blocks below run in one terminal, in the bundle's directory, because they
 share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
-for the bottle's name, as the window lists it under *Bottles*:
+for the bottle's name, as the window lists it under *Bottles*. Keep the
+quotes: a name can hold spaces, as the default *New Bottle* does.
 
 ```sh
 CX="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
-NAME=MyBottle
+NAME="MyBottle"
 ```
 
-The command line creates the same bottle, from `win10_64` or another 64-bit
-template:
+Instead of *File > New Bottle…*, the command line creates the same bottle,
+from `win10_64` or another 64-bit template:
 
 ```sh
 "$CX/bin/cxbottle" --create --bottle "$NAME" --template win10_64 --winearch arm64
@@ -257,9 +260,12 @@ or *Bottle > Run Command…* with an empty *Environment variables* field.
 
 `launchctl setenv` lasts until logout. A LaunchAgent sets `CX_ENV` at every
 login. Loading it sets it now as well, and CrossOver Preview needs the same
-restart:
+restart. To run the block again, for another bottle for example, run the
+removal block below first: `launchctl bootstrap` fails while the agent is
+loaded.
 
 ```sh
+mkdir -p "$HOME/Library/LaunchAgents"
 AGENT="$HOME/Library/LaunchAgents/local.mtld3d.cx-env.plist"
 plutil -create xml1 "$AGENT"
 plutil -insert Label -string local.mtld3d.cx-env "$AGENT"
@@ -288,9 +294,9 @@ launch instead:
 
 - For an installed program, select its launcher and click *Run With Options*,
   or right-click it and choose *Run with Options…*, then click *Run*.
-- For any `.exe`, choose *Bottle > Run Command…* and enter the `.exe` in
-  *Command*, in double quotes and followed by its arguments, then click
-  *Run*.
+- For any `.exe`, choose *Bottle > Run Command…* and enter its Windows path
+  in *Command*, in double quotes and followed by its arguments, such as
+  `"C:\Program Files\MyGame\MyGame.exe"`, then click *Run*.
 
 Neither window keeps the field: *Run With Options* opens empty the next time,
 and a launcher made with *Save Command as a Launcher* starts without it.
@@ -378,7 +384,7 @@ Check, in order:
 3. `mtld3d.so` is in `aarch64-unix`, whatever the arch of the game.
 4. On CrossOver Preview, the launch added the bottle's `mtld3d` directory to
    `WINEDLLPATH`, as in [Launching the game](#launching-the-game). A
-   double-click on a launcher does only while `CX_ENV` is set.
+   double-click on a launcher does so only while `CX_ENV` is set.
 
 The game's `Logs/gx.log` stays empty in this crash. An empty `Loaded Modules`
 section only means the game directory has no usable `dbghelp.dll`.
