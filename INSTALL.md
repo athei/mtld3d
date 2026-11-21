@@ -143,12 +143,22 @@ game's launch adds to the DLL search path. Nothing is written into
 
 A bottle's architecture is the `WineArch` key under `[Bottle]` in its
 `cxbottle.conf`. `arm64` runs CrossOver's arm64 Wine. `win64`, the default,
-runs its x86_64 Wine, which cannot load mtld3d. Create an arm64 bottle from
-the command line, from `win10_64` or another 64-bit template:
+runs its x86_64 Wine, which cannot load mtld3d.
+
+All blocks below run in one terminal, in the bundle's directory, because they
+share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
+for the bottle's name:
 
 ```sh
 CX="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
-"$CX/bin/cxbottle" --create --bottle MyBottle --template win10_64 --winearch arm64
+NAME=MyBottle
+```
+
+An existing arm64 bottle needs nothing more. Otherwise create one from the
+command line, from `win10_64` or another 64-bit template:
+
+```sh
+"$CX/bin/cxbottle" --create --bottle "$NAME" --template win10_64 --winearch arm64
 ```
 
 Set `GAME_DIR` to the directory holding the game `.exe`. The builtin-marked
@@ -157,7 +167,7 @@ CrossOver's own builtin.
 
 ```sh
 tar -xf mtld3d.tar.xz
-BOTTLE="$HOME/Library/Application Support/CrossOver/Bottles/MyBottle"
+BOTTLE="$HOME/Library/Application Support/CrossOver/Bottles/$NAME"
 GAME_DIR="$BOTTLE/drive_c/Program Files/MyGame"
 WIN="$BOTTLE/drive_c/windows"
 cp -R wine/. "$BOTTLE/mtld3d"
@@ -191,26 +201,53 @@ cp native/aarch64-windows/d3d9.dll "$WIN/system32/"
 Then set the DLL override:
 
 ```sh
-"$CX/bin/wine" --bottle MyBottle reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
+"$CX/bin/wine" --bottle "$NAME" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
 ```
 
-The bottle's `wine` sets `WINEDLLPATH` on every launch to CrossOver's own
-directories, after it applies `[EnvironmentVariables]` from `cxbottle.conf`,
-and `cxbottle.conf` has no key that adds a directory to it. The one value it
-applies after its own is the `--env` option (or `CX_ENV`). Launch the game, or
-the launcher that starts it, with the `mtld3d` directory appended to
-CrossOver's directories, which have to stay listed:
+### Launching the game
+
+Outside `CrossOver Preview.app`, Wine finds `mtld3d.dll` and `mtld3d.so` only
+through `WINEDLLPATH`, so every launch has to add the bottle's `mtld3d`
+directory to it. CrossOver's `wine` script sets `WINEDLLPATH` to CrossOver's
+own directories on every launch, after it applies `[EnvironmentVariables]`
+from `cxbottle.conf`. Only the `--env` option, or the `CX_ENV` variable when
+`--env` is absent, is applied after it. `cxbottle.conf` has no key that adds a
+directory, and a `WINEDLLPATH` under `HKCU\Environment` in the bottle never
+reaches the loader. CrossOver's directories stay first in the value: they hold
+its builtins, and its `wine` script keeps `$CX/lib/wine` there so the loader
+finds `ntdll.so`.
 
 ```sh
 DLLS="$CX/lib/wine/aarch64-windows:$CX/lib/wine/i386-windows:$CX/lib/wine:$BOTTLE/mtld3d"
-"$CX/bin/wine" --bottle MyBottle --env "WINEDLLPATH='$DLLS'" "$GAME_DIR/MyGame.exe"
 ```
 
-Every process the game starts inherits the value. A launch through the
-bottle's `wine` without this `--env` gets CrossOver's value instead, finds no
-`mtld3d.dll` and fails to load the native `d3d9.dll`. With
-`--debugmsg +loaddll` added to the launch, Wine names the cause:
+From the terminal, launch the game, or the launcher that starts it, with that
+value:
+
+```sh
+"$CX/bin/wine" --bottle "$NAME" --env "WINEDLLPATH='$DLLS'" "$GAME_DIR/MyGame.exe"
+```
+
+From the CrossOver Preview window, a double-click on a launcher starts the
+game without the value, so mtld3d does not load. Print the value instead:
+
+```sh
+echo "WINEDLLPATH='$DLLS'"
+```
+
+and paste the printed line, quotes included, into the *Environment
+variables* field on every launch:
+
+- For an installed program, *Run With Options* on its launcher.
+- For any `.exe`, *Bottle > Run Command*, with the `.exe` in *Command*.
+
+Every process the game starts inherits the value. A launch without it gets
+CrossOver's value instead, finds no `mtld3d.dll` and fails to load the native
+`d3d9.dll`. With `--debugmsg +loaddll` added to a terminal launch, Wine names
+the cause:
 `Library mtld3d.dll (which is needed by L"C:\\windows\\system32\\d3d9.dll") not found`.
+A 32-bit game prints the same `system32` path, which WoW64 maps to
+`syswow64`.
 
 - Any Graphics setting is fine, including *Auto*: the switch and the database
   *Auto* consults only redirect Wine's builtin search, which `d3d9=native`
@@ -277,6 +314,9 @@ Check, in order:
    `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` in that directory
    came from `native/`, not `wine/`.
 3. `mtld3d.so` is in `aarch64-unix`, whatever the arch of the game.
+4. On CrossOver Preview, the launch added the bottle's `mtld3d` directory to
+   `WINEDLLPATH`, as in [Launching the game](#launching-the-game). A
+   double-click on a launcher does not.
 
 The game's `Logs/gx.log` stays empty in this crash. An empty `Loaded Modules`
 section only means the game directory has no usable `dbghelp.dll`.
