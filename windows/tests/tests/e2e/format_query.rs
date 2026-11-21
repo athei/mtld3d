@@ -18,8 +18,7 @@ use mtld3d_types::{
 ///
 /// The spread is what makes the rules below rules: colour attachments
 /// with and without an sRGB twin, sampled formats with and without one, the
-/// signed and packed-ten-bit families, and the two packed 16-bit members
-/// whose render-target answer depends on the device.
+/// signed and packed-ten-bit families, and the two packed 16-bit members.
 const FORMATS: [(u32, &str); 31] = [
     (D3DFMT_A8R8G8B8, "A8R8G8B8"),
     (D3DFMT_X8R8G8B8, "X8R8G8B8"),
@@ -127,8 +126,7 @@ fn dynamic_usage_in_the_default_pool_is_accepted() {
 /// render target linear (R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the
 /// floats), so a format answers yes when the device renders into it and it
 /// is one of the four, and no otherwise. The render-target half is read from
-/// the device's own `D3DUSAGE_RENDERTARGET` answer, so the case holds on a GPU
-/// family without the native packed 16-bit formats too.
+/// the device's own `D3DUSAGE_RENDERTARGET` answer.
 #[test]
 fn srgb_write_queries_answer_the_render_target_question() {
     let h = Harness::factory_only();

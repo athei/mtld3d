@@ -7,7 +7,7 @@ use mtld3d_tests::{
     VolumeVertex, assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8,
     D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
@@ -913,9 +913,6 @@ fn get_render_target_data_into_a_new_system_memory_level_leaves_its_padding_zero
     const SIZE: (u32, u32) = (33, 3100);
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
     let h = Harness::new();
-    if r5g6b5_render_target_denied(&h, SIZE) {
-        return;
-    }
     let released = {
         let tex = h.create_texture(SIZE.0, SIZE.1, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
         let mut locked = tex.lock_rect(0, 0);
@@ -947,9 +944,6 @@ fn get_render_target_data_into_a_new_system_memory_surface_leaves_its_padding_ze
     const SIZE: (u32, u32) = (33, 3100);
     let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
     let h = Harness::new();
-    if r5g6b5_render_target_denied(&h, SIZE) {
-        return;
-    }
     let released = {
         let surface =
             h.create_offscreen_plain_surface(SIZE.0, SIZE.1, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
@@ -973,29 +967,6 @@ fn get_render_target_data_into_a_new_system_memory_surface_leaves_its_padding_ze
         "precondition: the allocator handed the released surface's memory back"
     );
     check_read_back_padding(&locked, width, height);
-}
-
-/// Whether the device denies R5G6B5 render targets, checking that the create is rejected to match.
-///
-/// A device without Metal's packed 16-bit pixel formats does not advertise
-/// them as render targets and rejects the create, which leaves nothing to read
-/// back. That contract is pinned in `expand16`.
-fn r5g6b5_render_target_denied(h: &Harness, (width, height): (u32, u32)) -> bool {
-    if h.check_device_format(
-        D3DFMT_X8R8G8B8,
-        D3DUSAGE_RENDERTARGET,
-        D3DRTYPE_SURFACE,
-        D3DFMT_R5G6B5,
-    ) == D3D_OK
-    {
-        return false;
-    }
-    assert_ne!(
-        h.create_render_target_hr(width, height, D3DFMT_R5G6B5),
-        D3D_OK,
-        "a 16-bit render target is rejected where the caps deny it"
-    );
-    true
 }
 
 /// Check a 33-texel-wide R5G6B5 read back of red: 68-byte rows, red pixels, zero padding.
