@@ -4,20 +4,15 @@ mtld3d is a Wine-side translation layer that ships a D3D9 implementation backed 
 
 ```
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(i386 PE)  (i386 PE)  (i386 PE)  (Mach-O, Wine's own arch)
+(i386 PE)  (i386 PE)  (i386 PE)  (Mach-O arm64)
 
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(x64 PE)   (x64 PE)   (x64 PE)   (Mach-O, Wine's own arch)
+(x64 PE)   (ARM64X)   (ARM64X)   (Mach-O arm64)
 ```
 
-The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), so it is built and shipped for both `x86_64-apple-darwin` and `aarch64-apple-darwin`. An x86_64 Wine loads the first, with the PE side translated by Rosetta 2; an arm64 Wine loads the second and translates the PE side itself (FEX).
+The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), and mtld3d runs only under an arm64 Wine, so it is built and shipped for `aarch64-apple-darwin`. The arm64 Wine translates the x86 code of the PE side itself (FEX).
 
-A third chain serves an arm64 Wine without translating the PE side of an x64 game, and is the one an x64 game loads there. Every build against the arm64 Wine makes `d3d9.dll` and `mtld3d.dll` a second time as ARM64X images, the form an arm64 Wine keeps its own builtins in under `lib/wine/aarch64-windows`: one image with an ARM64EC half, which an x64 process runs as native code beside the emulated code of the game, and an ARM64 half for arm64 processes. A 32-bit game still loads the i386 chain, and an x86_64 Wine the x64 one. The build links llvm-mingw's CRT rather than MSVC's, and `windows-arm64x` in the Makefile says what that takes.
-
-```
-test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(x64 PE)   (ARM64X)   (ARM64X)   (Mach-O arm64, arm64 Wine only)
-```
+An x64 game loads `d3d9.dll` and `mtld3d.dll` as ARM64X images, the form an arm64 Wine keeps its own builtins in under `lib/wine/aarch64-windows`: one image with an ARM64EC half, which an x64 process runs as native code beside the emulated code of the game, and an ARM64 half for arm64 processes. A 32-bit game loads the i386 chain. The ARM64X build links llvm-mingw's CRT rather than MSVC's, and `windows-arm64x` in the Makefile says what that takes.
 
 - `d3d9.dll`: D3D9 API implementation. COM vtables, caps, state management
   and application-facing memory. Calls the native runtime through its internal
@@ -73,7 +68,7 @@ frame time, compilation stalls and memory pressure.
 
 ## Workspaces and crates
 
-Two Cargo workspaces, one per target platform: `windows/` builds the PE side for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, and against the arm64 Wine also for `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`, the two halves of the ARM64X images, as static libraries the Makefile links into one; `unix/` builds the Mach-O side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (the latter is also the native test target). Open each in its own editor window for rust-analyzer to work.
+Two Cargo workspaces, one per target platform: `windows/` builds the PE side for `i686-pc-windows-msvc`, and for `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`, the two halves of the ARM64X images, as static libraries the Makefile links into one, and the x64 end-to-end tests for `x86_64-pc-windows-msvc`; `unix/` builds the Mach-O side for `aarch64-apple-darwin`, which is also the native test target. Open each in its own editor window for rust-analyzer to work.
 
 | Crate               | Workspace  | Output                                                 |
 |---------------------|------------|--------------------------------------------------------|
@@ -90,13 +85,9 @@ Two Cargo workspaces, one per target platform: `windows/` builds the PE side for
 
 `mtld3d-shared` is the crate every linkage unit depends on, primarily for the PE/Unix wire format: the fixed frame records (`command_header`, `encoder_wire`, `encoder_protocol`), the `Thunks` enum, param structs and typed `mtl::` wire values. It also defines the `Command` struct the native encoder builds for the submit thread, which does not cross the boundary. Pure data and pure-Rust helpers only, no FFI and no `#[link]`, so both workspaces can depend on it cleanly. The internal crates are path dependencies and are not published to crates.io.
 
-## CRT calls from an x64 guest on an arm64 Wine
+## CRT calls
 
-An arm64 Wine keeps its builtins, the CRT among them, as ARM64X images, so the x86_64 `d3d9.dll` in an x64 process there calls a `ucrtbase.dll` and a `vcruntime140.dll` whose code is native. Every such call leaves the x86 emulator and re-enters it, about 25 ns each under FEX, more than the work of a small copy. The calls that land on the hot path are the memory routines the compiler emits for every copy, fill and comparison it does not inline (`memcpy`, `memmove`, `memset`, `memcmp`), and `fmaf` for every `mul_add`, since neither PE baseline has FMA.
-
-So the x86_64 `d3d9.dll` defines the four memory routines itself (`windows/d3d9/src/platform/win32/guest_mem.rs`, over `mtld3d_core::guest_mem`), and the PE side writes a product and a sum where it would write `mul_add`. The first call to any of the four latches a route for the process. When the x64 emulator (`xtajit64.dll`) is loaded, copies up to 512 bytes, fills and comparisons run in the image with 16- and 32-byte SSE moves, and a longer copy goes to `ucrtbase.dll`, where one crossing costs less than the copy and the copy runs natively. Everywhere else, Rosetta included, every call goes to `ucrtbase.dll`: there is no crossing to save, and Rosetta runs the CRT's x86 routines faster than the in-image ones at mid sizes. The latch never blocks: a call made while the first one is asking the host, whether on another thread or from inside the query, takes the in-image routines, which are correct on every route. Each export only reads the latch and either jumps to the CRT's routine or tail-calls the in-image one, which is kept out of line, so a forwarded call pays no stack frame: five to eight instructions on top of the CRT's. None of the in-image code may compile to a call to one of the four, which under the emulator would recurse until the stack overflows; `MEM_ROUTINE_GATE` in the Makefile disassembles every x86_64 build's routines, found through the linker map the link writes, and fails the build if one branches to another. `d3d9.dll` logs the route it latched right after its identity line. The four also appear in the DLL's export table, as every `#[no_mangle]` item of a `cdylib` does; nothing imports them from there.
-
-The i686 `d3d9.dll` keeps the CRT's routines: a 32-bit process on an arm64 Wine loads i386 builtins, which the translator runs like the game's own code. The ARM64X build keeps them too, since its own code is native. So does `mtld3d.dll` on every architecture: its per-call path is a forward to Wine's unix-call dispatcher, which makes no CRT call, and it copies memory only while it loads.
+Every PE build calls the CRT's memory routines (`memcpy`, `memmove`, `memset`, `memcmp`) for the copies, fills and comparisons the compiler does not inline. The i686 `d3d9.dll` runs in a 32-bit process, which loads i386 builtins that the translator runs like the game's own code, so a CRT call leaves no emulated code. The ARM64X build's own code is native, and so is the arm64 Wine's ARM64X CRT it calls. `mtld3d.dll`'s per-call path is a forward to Wine's unix-call dispatcher, which makes no CRT call, and it copies memory only while it loads.
 
 ## Threading model
 
@@ -997,7 +988,7 @@ AppKit's views, windows and screens belong to the main thread, and the layer tou
 
 ### The Metal HUD rows
 
-On macOS 27 and later, a game run with `MTL_HUD_ENABLED=1` shows a section of its own in Metal's performance HUD, under the State Reporters caption, which the HUD fixes for every reporter outside Apple's own: a header row with `mtld3d` and the release identity, the same `v0.11.0-73-g5b164ca` string the log's first line carries, and the device's live figures below it. The first attached layer reports the identity through `SRStateReporter` as the label of the domain `mtld3d` (`unix/unix/src/hud_state.rs`), and every game layer names that domain in its `developerHUDProperties` under `MTL_HUD_STATE_REPORTER_DOMAINS`, which is what puts the rows on screen without the HUD's configuration panel. The layer keeps whatever HUD properties it already had and never sets `mode`, so the rows appear only where the HUD already does, and a value of `MTL_HUD_STATE_REPORTER_DOMAINS` in the environment is carried into the layer's list (`ALL` or `*` is left as it is) rather than replaced. Domains compare case-sensitively, so a list that names the domain the layer used before, `MTLD3D`, no longer shows anything of it and gains `mtld3d` like any other list. The configuration panel, opened from the HUD's menu-bar menu or by triple-clicking the overlay, hides the rows for the rest of the run. `StateReporting` is opened at runtime; on macOS 15 and 26 the log carries `hud state: the Metal HUD rows require macOS 27` once and nothing else changes. On macOS 27 it carries `hud state: reported <identity> under mtld3d`, `hud state: the game layer's HUD shows the mtld3d row (…)` and, once the HUD has loaded, `hud state: the HUD is loaded, reporting live rows under mtld3d`, once each.
+On macOS 27 and later, a game run with `MTL_HUD_ENABLED=1` shows a section of its own in Metal's performance HUD, under the State Reporters caption, which the HUD fixes for every reporter outside Apple's own: a header row with `mtld3d` and the release identity, the same `v0.11.0-73-g5b164ca` string the log's first line carries, and the device's live figures below it. The first attached layer reports the identity through `SRStateReporter` as the label of the domain `mtld3d` (`unix/unix/src/hud_state.rs`), and every game layer names that domain in its `developerHUDProperties` under `MTL_HUD_STATE_REPORTER_DOMAINS`, which is what puts the rows on screen without the HUD's configuration panel. The layer keeps whatever HUD properties it already had and never sets `mode`, so the rows appear only where the HUD already does, and a value of `MTL_HUD_STATE_REPORTER_DOMAINS` in the environment is carried into the layer's list (`ALL` or `*` is left as it is) rather than replaced. Domains compare case-sensitively, so a list that names the domain the layer used before, `MTLD3D`, no longer shows anything of it and gains `mtld3d` like any other list. The configuration panel, opened from the HUD's menu-bar menu or by triple-clicking the overlay, hides the rows for the rest of the run. `StateReporting` is opened at runtime; on macOS 26 the log carries `hud state: the Metal HUD rows require macOS 27` once and nothing else changes. On macOS 27 it carries `hud state: reported <identity> under mtld3d`, `hud state: the game layer's HUD shows the mtld3d row (…)` and, once the HUD has loaded, `hud state: the HUD is loaded, reporting live rows under mtld3d`, once each.
 
 The figures are volatile metadata, one row per key, which the HUD indents by two spaces and sorts by key with `compare:`. The keys and values are built in `mtld3d_core::hud_stats`:
 
@@ -1170,7 +1161,6 @@ in its row, and every family carries the suffixes its row names.
 | `metal_capture_layer_count` | 1 when Metal's capture layer was loaded as the encoder started (`MTL_CAPTURE_ENABLED=1`), 0 otherwise; the grid adds a line under its header in a window measured with it. The layer sits under every Metal call, so the submit and GPU rows of such a window are not comparable with one without it. |
 | `metal_allocated_bytes` | `metal alloc`: the `MTLDevice`'s `currentAllocatedSize`, sampled at the summary. The device is the process's one device, so it counts every Metal allocation of the process, not this layer's alone. |
 | `passes_total`, `commands_total`, `draws_total`, `pipeline_memo_hits_total`, `pipeline_memo_calls_total`, `fan_generated_total`, `up_indexed_total`, `up_oversized_total` | `Commands / passes`. |
-| `draw_unpinned_total` | No summary row: draws whose draw path ran off its pinned stack page offset (`unix/unix/src/stack_page.rs`), 0 unless the pin broke. |
 | `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
 | `inverse_bypass_total`, `inverse_hit_total`, `inverse_recompute_total` | The `inverse-view` rows, summed over the window's reset epochs. |
 | `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |
