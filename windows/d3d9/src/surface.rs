@@ -23,8 +23,8 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, com_ref::ComUnknown, device::DeviceInner,
-    encoder::ResampledUpload, null_out, private_data::PrivateDataStore, texture::Direct3DTexture9,
-    unix_call::unix_call,
+    encoder::ResampledUpload, null_out, platform::SurfaceDc, private_data::PrivateDataStore,
+    texture::Direct3DTexture9, unix_call::unix_call,
 };
 
 static DIRECT3D_SURFACE9_VTBL: IDirect3DSurface9Vtbl = IDirect3DSurface9Vtbl {
@@ -124,7 +124,7 @@ pub enum ImplicitKind {
 pub struct DcLockState {
     map_count: u32,
     dc_in_use: bool,
-    held_dc: GdiDc,
+    held_dc: SurfaceDc,
     holder: (u32, u32),
 }
 
@@ -133,7 +133,7 @@ impl Default for DcLockState {
         Self {
             map_count: 0,
             dc_in_use: false,
-            held_dc: GdiDc::NULL,
+            held_dc: SurfaceDc::NULL,
             holder: (u32::MAX, 0),
         }
     }
@@ -150,9 +150,18 @@ impl DcLockState {
     /// Called at resource teardown (a cube texture finalizing with a face's DC
     /// never released) so the memory DC + DIB do not leak.
     pub fn teardown(&mut self) {
-        teardown_gdi_dc(self.held_dc);
+        crate::platform::destroy_surface_dc(self.held_dc);
         *self = Self::default();
     }
+}
+
+/// The pixel store and geometry a `GetDC` wraps.
+pub struct SurfaceDcSource {
+    pub memory: *mut u8,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
 }
 
 /// A surface's multisample configuration as D3D9 states it and Metal needs it.
@@ -1337,25 +1346,6 @@ struct SurfaceInner {
     state_owner_texture: *mut Direct3DTexture9,
 }
 
-/// The GDI objects backing an outstanding `GetDC`.
-///
-/// A memory DC and its DIB section, both produced by
-/// `D3DKMTCreateDCFromMemory` so the DIB aliases the surface's own pixel store
-/// directly (no separate GDI-allocated bits, no seed or write-back copy). Torn
-/// down as a pair by `D3DKMTDestroyDCFromMemory`. All-null when no DC is held.
-#[derive(Clone, Copy)]
-struct GdiDc {
-    dc: *mut c_void,
-    bitmap: *mut c_void,
-}
-
-impl GdiDc {
-    const NULL: Self = Self {
-        dc: core::ptr::null_mut(),
-        bitmap: core::ptr::null_mut(),
-    };
-}
-
 impl SurfaceInner {
     /// Raw pointer to the effective resource-wide `DcLockState` for this surface.
     ///
@@ -1833,7 +1823,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         // A standalone surface released while a `GetDC` is still outstanding
         // (the app skipped `ReleaseDC`) would leak its memory DC + DIB; tear
         // them down.
-        teardown_gdi_dc(inner.dc_lock.held_dc);
+        crate::platform::destroy_surface_dc(inner.dc_lock.held_dc);
     }
     // Release the internal texture an owned offscreen-plain surface holds. The
     // surface took over the texture's single create-ref, so this drops it to
@@ -3460,47 +3450,6 @@ fn parse_surface_rect(rect: *const c_void, full_w: u32, full_h: u32) -> (u32, u3
     (x, y, right - x, bottom - y)
 }
 
-// ── GDI FFI (IDirect3DSurface9::GetDC / ReleaseDC over a memory-backed DC) ──
-
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn CreateCompatibleDC(dc: *mut c_void) -> *mut c_void;
-    fn DeleteDC(dc: *mut c_void) -> i32;
-    fn D3DKMTCreateDCFromMemory(desc: *mut D3DKMT_CREATEDCFROMMEMORY) -> u32;
-    fn D3DKMTDestroyDCFromMemory(desc: *const D3DKMT_DESTROYDCFROMMEMORY) -> u32;
-}
-
-/// Win32 `D3DKMT_CREATEDCFROMMEMORY`: wraps an existing pixel store, no copy.
-///
-/// The pixel store is wrapped in a memory DC + DIB section. Unlike
-/// `CreateDIBSection`, the kernel side (`NtGdiDdDDICreateDCFromMemory`) leaves
-/// `biSizeImage` 0 and stores `biHeight` as `-Height` (top-down), which
-/// `GetObject` flips back to `+Height` — matching the `DIBSECTION` values GDI
-/// reports for such a DIB. `#[repr(C)]` matches the documented struct; `h_dc` /
-/// `h_bitmap` are filled by the call.
-// The field names mirror the canonical Win32 SDK names verbatim.
-#[repr(C)]
-struct D3DKMT_CREATEDCFROMMEMORY {
-    p_memory: *mut c_void,
-    format: u32,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    h_device_dc: *mut c_void,
-    p_color_table: *const c_void,
-    h_dc: *mut c_void,
-    h_bitmap: *mut c_void,
-}
-
-/// Win32 `D3DKMT_DESTROYDCFROMMEMORY`: the teardown counterpart.
-///
-/// Destroys the DC + DIB pair produced by [`D3DKMT_CREATEDCFROMMEMORY`].
-#[repr(C)]
-struct D3DKMT_DESTROYDCFROMMEMORY {
-    h_dc: *mut c_void,
-    h_bitmap: *mut c_void,
-}
-
 /// Per-format GDI mapping for `GetDC`.
 ///
 /// The DIB bit count and, for 16-bit `BI_BITFIELDS` formats, the R/G/B channel
@@ -3863,39 +3812,20 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     let Ok(pitch) = u32::try_from(px.src_pitch) else {
         return D3DERR_INVALIDCALL;
     };
-
-    // Wrap the pixel store resolved above in a memory DC + DIB via
-    // `D3DKMTCreateDCFromMemory`. Unlike `CreateDIBSection`, the
-    // kernel leaves `biSizeImage` 0 and stores a negative top-down `biHeight`,
-    // matching the `DIBSECTION` values GDI reports for such a DIB. `h_device_dc`
-    // is a throwaway template DC deleted right after the call.
-    // SAFETY: `CreateCompatibleDC(NULL)` is the documented form for a memory DC
-    // compatible with the screen; null on failure is tolerated (template only —
-    // `D3DKMTCreateDCFromMemory` reports the real failure via its status).
-    let device_dc = unsafe { CreateCompatibleDC(core::ptr::null_mut()) };
-    let mut desc = D3DKMT_CREATEDCFROMMEMORY {
-        p_memory: px.bits.cast::<c_void>(),
-        format: px.d3d_format,
-        width: px.width,
-        height: px.height,
-        pitch,
-        h_device_dc: device_dc,
-        p_color_table: core::ptr::null(),
-        h_dc: core::ptr::null_mut(),
-        h_bitmap: core::ptr::null_mut(),
-    };
-    // SAFETY: `&mut desc` is a live, aligned `D3DKMT_CREATEDCFROMMEMORY`; the call
-    // fills `h_dc` / `h_bitmap` on success and returns a non-zero NTSTATUS on
-    // failure. `p_memory` stays valid for the DC's lifetime (surface store).
-    let status = unsafe { D3DKMTCreateDCFromMemory(&raw mut desc) };
-    if !device_dc.is_null() {
-        // SAFETY: `device_dc` is the live template memory DC created above; it has
-        // served its purpose (the created DC is `desc.h_dc`) and is deleted here.
-        unsafe { DeleteDC(device_dc) };
-    }
-    if status != 0 || desc.h_dc.is_null() {
+    // SAFETY: `px.bits` is the non-null store `dc_pixels` resolved, `height`
+    // rows of `pitch` bytes; the surface owns it, and the pin below keeps a
+    // texture level's staging until the DC is destroyed.
+    let Some(dc) = (unsafe {
+        crate::platform::create_surface_dc(&SurfaceDcSource {
+            memory: px.bits,
+            format: px.d3d_format,
+            width: px.width,
+            height: px.height,
+            pitch,
+        })
+    }) else {
         return D3DERR_INVALIDCALL;
-    }
+    };
 
     // The DC now maps the level, so nothing may release the staging under it
     // until `ReleaseDC` drops the pin.
@@ -3903,17 +3833,14 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state; the prior
     // immutable borrow above ended, so this exclusive deref does not alias it.
     let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
-    dc_lock.held_dc = GdiDc {
-        dc: desc.h_dc,
-        bitmap: desc.h_bitmap,
-    };
+    dc_lock.held_dc = dc;
     dc_lock.dc_in_use = true;
     dc_lock.holder = (inner.cube_face, inner.mip_level);
     // A `GetDC` counts toward the resource map count (per D3D9), so a
     // subsequent `GetDC`/`LockRect` on any face is rejected until `ReleaseDC`.
     dc_lock.map_count += 1;
     // Written only on success; `hdc` is non-null (checked above).
-    crate::write_out(hdc, desc.h_dc);
+    crate::write_out(hdc, dc.handle());
     D3D_OK
 }
 
@@ -3942,7 +3869,7 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
         let subresource = (inner.cube_face, inner.mip_level);
         // SAFETY: `dc_lock_ptr` returns the live resource-wide state.
         let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
-        if !dc_lock.dc_in_use || hdc != dc_lock.held_dc.dc || dc_lock.holder != subresource {
+        if !dc_lock.dc_in_use || hdc != dc_lock.held_dc.handle() || dc_lock.holder != subresource {
             return D3DERR_INVALIDCALL;
         }
         dc_lock.held_dc
@@ -3978,7 +3905,7 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
             crate::texture::publish_render_target_write(texture, dev);
         }
     }
-    teardown_gdi_dc(held);
+    crate::platform::destroy_surface_dc(held);
     // The DC's DIB aliased a lockable render target's CPU staging, so whatever
     // GDI drew is in the staging alone: push it to the colour texture the way
     // `UnlockRect` does, or the next read-back overwrites it with the pixels
@@ -4002,30 +3929,10 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state; the prior
     // borrows ended, so this exclusive deref does not alias them.
     let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
-    dc_lock.held_dc = GdiDc::NULL;
+    dc_lock.held_dc = SurfaceDc::NULL;
     dc_lock.dc_in_use = false;
     // The DC's contribution to the resource map count is released; no face can
     // be mapped while a DC is held, so the count returns to zero.
     dc_lock.map_count = dc_lock.map_count.saturating_sub(1);
     D3D_OK
-}
-
-/// Tear down the GDI objects of an outstanding `GetDC`.
-///
-/// Destroy the memory DC and its DIB section as a pair via
-/// `D3DKMTDestroyDCFromMemory` (the counterpart to the
-/// `D3DKMTCreateDCFromMemory` that produced them). A no-op on a [`GdiDc::NULL`]
-/// (no DC held).
-fn teardown_gdi_dc(held: GdiDc) {
-    if held.dc.is_null() {
-        return;
-    }
-    let desc = D3DKMT_DESTROYDCFROMMEMORY {
-        h_dc: held.dc,
-        h_bitmap: held.bitmap,
-    };
-    // SAFETY: `held.dc` + `held.bitmap` are the live DC / DIB pair produced by
-    // `D3DKMTCreateDCFromMemory` at `GetDC`; `&desc` is a live, aligned struct
-    // read only for the duration of the call.
-    unsafe { D3DKMTDestroyDCFromMemory(&raw const desc) };
 }

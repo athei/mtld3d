@@ -29,8 +29,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mtld3d_core::capture_chord::{self, CAPTURE_KEY};
-
 /// A chord press not yet taken by a `Present`.
 ///
 /// The resource is process-wide: `GetAsyncKeyState` reads the one keyboard
@@ -40,31 +38,11 @@ use mtld3d_core::capture_chord::{self, CAPTURE_KEY};
 /// early with `D3DERR_DEVICENOTRESET` or a send failure, can take it too.
 static CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn GetAsyncKeyState(vkey: i32) -> i16;
-}
-
-fn key_down(vkey: i32) -> bool {
-    // SAFETY: `GetAsyncKeyState` is a thread-safe Win32 syscall taking an
-    // `int vkey`; every caller passes a valid virtual-key constant.
-    unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
-}
-
 /// Poll the chord once per present, firing when P goes down with Control and Shift held.
 ///
 /// Idempotent across frames where P is held down.
 pub fn poll() {
-    /// The capture key's state at the previous poll, by any device.
-    ///
-    /// The resource is process-wide: the keyboard `GetAsyncKeyState` reads is
-    /// one for every device, so one latch turns one press into one request.
-    static CAPTURE_KEY_DOWN_LAST: AtomicBool = AtomicBool::new(false);
-    let down = key_down(CAPTURE_KEY);
-    let was_down = CAPTURE_KEY_DOWN_LAST.swap(down, Ordering::Relaxed);
-    let pressed =
-        capture_chord::chord_pressed(was_down, down, |modifier| key_down(modifier.virtual_key()));
-    if pressed {
+    if crate::platform::capture_hotkey_pressed() {
         CAPTURE_REQUESTED.store(true, Ordering::Release);
     }
 }

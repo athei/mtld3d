@@ -60,7 +60,8 @@ PE_JOIN_EXEMPT='^windows/tests/|/tests(\.rs$|/)'
 # thread, which a thunk holding the lock sends synchronous messages to.
 API_LOCK_FILES='windows/d3d9/src/device.rs
 windows/d3d9/src/device/extended.rs
-windows/d3d9/src/cursor.rs
+windows/d3d9/src/device/cursor.rs
+windows/d3d9/src/platform/win32/cursor.rs
 windows/d3d9/src/texture.rs
 windows/d3d9/src/surface.rs
 windows/d3d9/src/vertex_buffer.rs
@@ -78,9 +79,16 @@ API_LOCK_EXEMPT='cursor_wnd_proc'
 # `mtld3d_shared::ffi_boundary`. The vectored exception handler is the one
 # `extern "system" fn` whose pointers come from the system instead.
 APP_POINTER_DIR=windows/d3d9/src
-APP_POINTER_EXEMPT='windows/d3d9/src/crash.rs'
+APP_POINTER_EXEMPT='windows/d3d9/src/platform/win32/crash.rs'
 APP_POINTER_INPTR="InPtr(Mut)?(::)?<('[a-z_]+, *)?(mtld3d_types::)?(D3D|Guid|LUID)"
 APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it with ValueIn, write it with OutPtr'
+
+# The system `d3d9` runs on is reached through `platform.rs`, and the Win32
+# implementation lives under `platform/`. Everywhere else in the crate is
+# shared by both builds, so it declares no foreign function and no cfg that
+# tells the builds apart.
+PLATFORM_DIR=windows/d3d9/src
+PLATFORM_HOME='^windows/d3d9/src/platform(\.rs$|/)'
 
 status=0
 
@@ -257,6 +265,72 @@ app_pointer_derefs() {
     ' "$@"
 }
 
+# A Win32 import or a platform cfg outside `platform.rs` and `platform/`: an
+# `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or
+# `cfg_attr` that names `windows`, `unix` or a `target_*` key. A cfg is read up
+# to its closing parenthesis, which may be lines later. One still open at the
+# end of its file is a finding. Each line is cut at its first `//` first.
+platform_split() {
+    awk '
+        function depth(s,   t, o, c) {
+            t = s; o = gsub(/\(/, "", t)
+            t = s; c = gsub(/\)/, "", t)
+            return o - c
+        }
+        # The cfg expression alone: `s` cut after the parenthesis that closes it.
+        function closed(s,   i, c, d, seen) {
+            d = 0; seen = 0
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "(") { d++; seen = 1 }
+                else if (c == ")") { d--; if (seen && d == 0) return substr(s, 1, i) }
+            }
+            return s
+        }
+        function names_platform(s) {
+            return closed(s) ~ /(^|[^A-Za-z0-9_])(windows|unix|target_[a-z0-9_]+)([^A-Za-z0-9_]|$)/
+        }
+        function finding(line, what) {
+            printf "%s:%d: %s in %s\n", FILENAME, line, what, text
+        }
+        # Every cfg in `s`. One left open continues on the next lines.
+        function scan(s) {
+            while (match(s, /(^|[^A-Za-z0-9_])cfg(_attr)?!?[ \t]*\(/)) {
+                cfg = substr(s, RSTART)
+                start = FNR
+                if (depth(closed(cfg)) != 0) { nest = 1; open_file = FILENAME; open_text = $0; return }
+                if (names_platform(cfg)) finding(start, "platform cfg")
+                s = substr(cfg, length(closed(cfg)) + 1)
+            }
+        }
+        # A cfg the scan never closed hides every line after it.
+        function unclosed() {
+            if (nest > 0) printf "%s:%d: cfg never closed in %s\n", open_file, start, open_text
+            nest = 0
+        }
+        FNR == 1 { unclosed() }
+        END { unclosed() }
+        /^[ \t]*\/\// { next }
+        { code = $0; sub(/\/\/.*/, "", code) }
+        nest > 0 {
+            cfg = cfg " " code
+            if (depth(closed(cfg)) == 0) {
+                nest = 0
+                if (names_platform(cfg)) finding(start, "platform cfg")
+                scan(substr(cfg, length(closed(cfg)) + 1))
+            }
+            next
+        }
+        {
+            text = $0
+            if (code ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
+            if (code ~ /#\[link\(/) finding(FNR, "#[link(")
+            if (code ~ /os::windows/) finding(FNR, "os::windows")
+            scan(code)
+        }
+    ' "$@"
+}
+
 # Every type deriving Clone and/or Copy, as `path Type Derives`. The committed
 # inventory is diffed against this, so a speculative derive cannot slip in
 # unnoticed: adding one means consciously recording it.
@@ -398,6 +472,15 @@ case "${1:-}" in
         ;;
     esac
     case $file in
+    "$PLATFORM_DIR"/*.rs)
+        if ! printf '%s\n' "$file" | grep -qE "$PLATFORM_HOME"; then
+            findings=$(platform_split "$file")
+            [ -z "$findings" ] || report 'Win32 stays behind platform.rs' \
+                'Win32 import or platform cfg outside platform.rs and platform/' "$findings"
+        fi
+        ;;
+    esac
+    case $file in
     windows/*.rs)
         if ! printf '%s\n' "$file" | grep -qE "$PE_JOIN_EXEMPT"; then
             banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
@@ -492,6 +575,17 @@ if [ -n "$app_sources" ]; then
     # shellcheck disable=SC2086
     banned "$APP_POINTER_INPTR" "An application's pointer promises no alignment" \
         "$APP_POINTER_INPTR_MESSAGE" $app_sources
+fi
+
+shared_sources=$(git ls-files "$PLATFORM_DIR/*.rs" | grep -vE "$PLATFORM_HOME" || true)
+if [ -n "$shared_sources" ]; then
+    # shellcheck disable=SC2086
+    findings=$(platform_split $shared_sources)
+    if [ -n "$findings" ]; then
+        report 'Win32 stays behind platform.rs' \
+            'Win32 import or platform cfg outside platform.rs and platform/' \
+            "$findings"
+    fi
 fi
 
 modules=$(git ls-files '*/mod.rs' || true)

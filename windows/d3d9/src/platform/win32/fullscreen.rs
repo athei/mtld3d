@@ -80,6 +80,8 @@ use mtld3d_core::{
 };
 use rustc_hash::FxHashMap;
 
+use crate::{device::LeaveKind, direct3d9::DisplayModeInfo};
+
 /// Sub-target shared with the display-enumeration probes in `direct3d9`.
 const LOG_TARGET: &str = "mtld3d::d3d9::display";
 
@@ -88,7 +90,7 @@ const LOG_TARGET: &str = "mtld3d::d3d9::display";
 /// Win32 `RECT`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Rect {
+pub(super) struct Rect {
     pub left: i32,
     pub top: i32,
     pub right: i32,
@@ -189,25 +191,13 @@ const DPI_AWARENESS_UNAWARE: i32 = 0;
 /// end is a bug this cap turns into a truncated list rather than a hang.
 const MAX_ENUMERATED_MODES: u32 = 4096;
 
-/// One display mode as `EnumDisplaySettingsW` reports it.
-///
-/// `refresh_hz` may be 0 when the driver doesn't report one.
-#[derive(Clone, Copy)]
-pub struct DisplayModeInfo {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_hz: u32,
-    pub bits_per_pel: u32,
-}
-
-impl DisplayModeInfo {
-    const fn from_devmode(dm: &DevModeW) -> Self {
-        Self {
-            width: dm.pels_width,
-            height: dm.pels_height,
-            refresh_hz: dm.display_frequency,
-            bits_per_pel: dm.bits_per_pel,
-        }
+/// The display mode a `DEVMODEW` describes.
+const fn display_mode_from_devmode(dm: &DevModeW) -> DisplayModeInfo {
+    DisplayModeInfo {
+        width: dm.pels_width,
+        height: dm.pels_height,
+        refresh_hz: dm.display_frequency,
+        bits_per_pel: dm.bits_per_pel,
     }
 }
 
@@ -252,7 +242,7 @@ fn query_display_mode(mode_num: u32) -> Option<DisplayModeInfo> {
         );
         return None;
     }
-    Some(DisplayModeInfo::from_devmode(&dm))
+    Some(display_mode_from_devmode(&dm))
 }
 
 /// The primary display's current mode in the Win32 coordinate space.
@@ -280,7 +270,7 @@ pub fn enumerate_display_modes() -> Vec<DisplayModeInfo> {
         if !enum_display_settings(mode_num, &mut dm) {
             return modes;
         }
-        modes.push(DisplayModeInfo::from_devmode(&dm));
+        modes.push(display_mode_from_devmode(&dm));
     }
     warn!(
         target: LOG_TARGET,
@@ -299,7 +289,7 @@ pub fn enumerate_display_modes() -> Vec<DisplayModeInfo> {
 pub fn system_dpi() -> u32 {
     // SAFETY: `GetCurrentProcess` takes no arguments and returns the
     // current-process pseudo-handle.
-    let process = unsafe { crate::GetCurrentProcess() };
+    let process = unsafe { super::GetCurrentProcess() };
     // SAFETY: `process` is the current-process pseudo-handle, the one
     // process the call answers for.
     let dpi = unsafe { GetSystemDpiForProcess(process) };
@@ -346,8 +336,8 @@ pub fn warn_if_dpi_scaled(hwnd: *mut c_void) {
     // answers `DPI_AWARENESS_INVALID`.
     let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
     // An invalid awareness comes from a null or dead window and passes
-    // silently here. `client_rect_dims` in `direct3d9` warns about the dead
-    // one; a null window is the caller's own case and is silent there too.
+    // silently here. `window::client_size` warns about the dead one; a null
+    // window is the caller's own case and is silent there too.
     if awareness != DPI_AWARENESS_UNAWARE {
         return;
     }
@@ -433,7 +423,7 @@ fn set_requested_mode(requested: Option<ModeRequest>) -> ModeSetOutcome {
 /// comparison because the registry view may report 0 where the current view
 /// reports the real rate. The caller names the outcome in its own line,
 /// which says why the mode went back.
-pub fn restore_registry_mode() -> RegistryRestore {
+fn restore_registry_mode() -> RegistryRestore {
     let Some(cur) = query_display_mode(ENUM_CURRENT_SETTINGS) else {
         return RegistryRestore::Unreadable;
     };
@@ -497,7 +487,7 @@ unsafe extern "system" {
 }
 
 /// Set one of a window's `GWL_*` / `GWLP_*` longs, returning the previous value.
-pub fn set_window_long_ptr(hwnd: *mut c_void, index: i32, new: isize) -> isize {
+pub(super) fn set_window_long_ptr(hwnd: *mut c_void, index: i32, new: isize) -> isize {
     // SAFETY: SetWindowLongPtrW (or SetWindowLongW on 32-bit) accepts any
     // HWND and isize; documented to return the previous value.
     unsafe { SetWindowLongPtrW(hwnd, index, new) }
@@ -541,7 +531,7 @@ pub fn primary_monitor() -> *mut c_void {
 /// This is the rect a fullscreen device's window is stretched over. While a
 /// display mode is set it is that mode's rect, which win32u maps onto the
 /// physical monitor; between mode-sets it is the desktop's.
-pub fn primary_monitor_rect() -> Option<Rect> {
+fn primary_monitor_rect() -> Option<Rect> {
     let monitor = primary_monitor();
     let mut info = MonitorInfo {
         cb_size: MONITOR_INFO_SIZE,
@@ -675,7 +665,7 @@ static DRIVING_WINDOWS: LazyLock<Mutex<FxHashMap<usize, u32>>> =
 ///
 /// Read by the cursor subclass to skip the auto-resize for a `WM_SIZE` we
 /// caused ourselves on that window.
-pub fn driving_window(hwnd: *mut c_void) -> bool {
+pub(super) fn driving_window(hwnd: *mut c_void) -> bool {
     DRIVING_WINDOWS
         .lock()
         .expect("driving-windows mutex poisoned")
@@ -774,7 +764,7 @@ impl Drop for LeaveWatchGuard {
 }
 
 /// Counts one call into the application's procedure for a watched window while it lives.
-pub struct AppProcedureCall {
+pub(super) struct AppProcedureCall {
     hwnd: usize,
 }
 
@@ -783,7 +773,7 @@ pub struct AppProcedureCall {
 /// The cursor subclass holds the returned value across its call to the
 /// procedure it replaced, so a move the procedure makes is told apart from
 /// one the driver applies while the thread waits.
-pub fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
+pub(super) fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
     let hwnd = hwnd as usize;
     LEAVE_WATCHES
         .lock()
@@ -812,7 +802,7 @@ impl Drop for AppProcedureCall {
 /// it. Any other is the driver's or another thread's. A driver move the
 /// thread applies while that procedure is itself waiting counts as the
 /// application's, so the leave keeps it, as it kept every move before.
-pub fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
+pub(super) fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
     if flags & (SWP_NOMOVE | SWP_NOSIZE) == SWP_NOMOVE | SWP_NOSIZE {
         return;
     }
@@ -1012,7 +1002,7 @@ pub fn reactivate(saved: &mut SavedWindow) {
 /// It takes the window rather than the session: the restore broadcasts
 /// `WM_DISPLAYCHANGE` synchronously, which can re-enter the subclass and
 /// borrow the device mutably, so no borrow of the device may span it.
-pub fn deactivate(hwnd: *mut c_void) {
+pub(super) fn deactivate(hwnd: *mut c_void) {
     let restore = restore_registry_mode();
     log!(
         target: LOG_TARGET,
@@ -1146,18 +1136,6 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) -> WindowPlac
         rect.width(), rect.height(), rect.left, rect.top,
     );
     WindowPlacement::Placed(rect.label())
-}
-
-/// How leaving fullscreen puts the window back, which the kind of device decides.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LeaveKind {
-    /// A plain device: the pre-fullscreen rect, with the visibility the window has now.
-    Plain,
-    /// An extended device: the window stays where fullscreen put it and gets its saved visibility.
-    ///
-    /// `D3D9Ex` restores the window's style when it leaves fullscreen,
-    /// visibility included, and leaves its position and size alone.
-    Extended,
 }
 
 /// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.

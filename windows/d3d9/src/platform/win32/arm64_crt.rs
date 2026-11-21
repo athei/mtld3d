@@ -7,7 +7,7 @@
 
 use core::ffi::c_void;
 
-use crate::DLL_THREAD_DETACH;
+use super::DLL_THREAD_DETACH;
 
 /// The `type_info` vtable, under its MSVC decorated name.
 ///

@@ -6,7 +6,7 @@
 //! threads are posted) and returned to a process-wide pool, from which the next
 //! thread that allocates takes it. That happens only if the DLL hears about the
 //! exit: the x86 DLLs hear through MSVC's CRT, the ARM64X ones through the TLS
-//! callback in `windows/d3d9/src/arm64_crt.rs`. A DLL that does not hear
+//! callback in `windows/d3d9/src/platform/win32/arm64_crt.rs`. A DLL that does not hear
 //! leaks the allocator of every thread that ever called into it, with every
 //! slab the allocator holds.
 //!

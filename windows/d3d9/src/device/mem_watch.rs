@@ -5,7 +5,7 @@
 //! staging copies lives inside it. When it runs out, allocations fail and
 //! the game usually follows a garbage pointer a few frames later, far from
 //! the cause. This watch walks the address space every few presents, sums its
-//! usable free regions (`crash::free_space`), and logs one warning per
+//! usable free regions (`platform::free_space`), and logs one warning per
 //! threshold crossed on the way down, of the free total or of the largest free
 //! block, with the region map and the page boxes mtld3d holds, so the log says
 //! how close the process was and who owned the space.
@@ -63,7 +63,7 @@ use mtld3d_core::{
 use mtld3d_shared::tsc::{rdtsc, tsc_hz};
 
 use super::DeviceInner;
-use crate::crash::{address_space_map, free_space};
+use crate::platform::{ADDRESS_SPACE_WALKS, address_space_map, free_space};
 
 const LOG_TARGET: &str = "mtld3d::d3d9::mem_watch";
 
@@ -79,8 +79,8 @@ const SAMPLE_EVERY: u32 = 600;
 /// Samples between two unconditional log lines: a time series of the space at ~10 s.
 const REPORT_EVERY_SAMPLES: u32 = 2;
 
-/// Whether this build's process can run out of address space: a 32-bit one can.
-const WALKS: bool = cfg!(target_pointer_width = "32");
+/// Whether this build's process can run out of address space, as the platform answers.
+const WALKS: bool = ADDRESS_SPACE_WALKS;
 
 /// How long the watch thread waits for a present to answer its request for the device figures.
 ///
@@ -403,7 +403,7 @@ impl Drop for MemWatchWorker {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        if crate::log_sink::caller_holds_loader_lock() {
+        if crate::platform::caller_holds_loader_lock() {
             debug!(
                 target: LOG_TARGET,
                 "address space: the device's release holds the loader lock; letting the watch \

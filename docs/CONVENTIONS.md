@@ -28,6 +28,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
 | In an `extern "system" fn` under `windows/d3d9/src`, a pointer parameter turned into a reference, read or written through `*p`, `p.read()` or `p.write()`, or made a typed slice = 0, and `InPtr` / `InPtrMut` over a `D3D*`, `Guid` or `LUID` type = 0 | §An application's pointer promises no alignment |
+| Under `windows/d3d9/src`, outside `platform.rs` and `platform/`: an `unsafe extern` block, `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key = 0 | §Win32 stays behind `platform.rs` |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -67,7 +68,7 @@ The Makefile enforces the C/C++ half after the build. Every production install l
 
 ## Every device entry point holds the API lock
 
-A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `device/extended.rs` (the `IDirect3DDevice9Ex` entry points), `cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
+A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `device/extended.rs` (the `IDirect3DDevice9Ex` entry points), `device/cursor.rs`, `platform/win32/cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
 
 ## The PE side waits for its threads, it never joins them
 
@@ -100,6 +101,10 @@ How to apply:
 
 Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;` · a function references nothing outside its own args + well-known types · a comment says "wrapper around …" · the same mapping table appears in two `d3d9` modules.
 
+## Win32 stays behind `platform.rs`
+
+`d3d9` reaches the system it runs on through `windows/d3d9/src/platform.rs`. The Win32 implementation lives under `platform/`. Win32 imports stay in `platform.rs` and `platform/`. So do the cfgs that tell the Win32 build from a native one. Every other file of the crate is shared by both builds. `make audit` fails on an `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key anywhere else in `windows/d3d9/src`.
+
 ## End every edit cycle with `make fmt` + `make install`
 
 After any `.rs` change, run both before declaring the task done. `make` only rebuilds: it does **not** copy DLLs/.so into `$WINE_SDK` or `$WINE_INSTALL_DIR`, so launching the game without `make install` tests stale bits. `make test` implicitly runs both.
@@ -116,7 +121,7 @@ Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `_
 
 On MSVC i386, `raw-dylib` imports add stdcall decoration (`_Name@N`), but DLL exports use undecorated names (matching real Windows DLLs).
 
-- **Export side**: every export is listed in `d3d9.def` (linked via `/DEF:` in `build.rs`). The d3d9 API exports are declared through `hookable_export!` (`windows/d3d9/src/hookable.rs`), never as a plain `#[unsafe(no_mangle)]` or `export_name` function: on i386 and x86_64 the macro emits a naked entry that starts with a fixed prologue inline-hook engines (overlays, capture tools) decode and relocate, then jumps to the Rust body, whose signature it checks against the entry's. What a compiler emits for a short function is not something a hook engine's length decoder is guaranteed to know. The end-to-end test `export_prologues.rs` reads the export list from `d3d9.def` and fails on any export that does not start with the prologue.
+- **Export side**: every export is listed in `d3d9.def` (linked via `/DEF:` in `build.rs`). The d3d9 API exports are declared through `hookable_export!` (`windows/d3d9/src/platform/win32/hookable.rs`), never as a plain `#[unsafe(no_mangle)]` or `export_name` function: on i386 and x86_64 the macro emits a naked entry that starts with a fixed prologue inline-hook engines (overlays, capture tools) decode and relocate, then jumps to the Rust body, whose signature it checks against the entry's. What a compiler emits for a short function is not something a hook engine's length decoder is guaranteed to know. The end-to-end test `export_prologues.rs` reads the export list from `d3d9.def` and fails on any export that does not start with the prologue.
 - **Ordinals**: every `d3d9.def` entry carries the ordinal Windows' d3d9.dll gives the export, and the i386 bytes of its stdcall arguments in the comment after it (`Name @37 ; 4`). On i386 rustc exports each entry point under its decorated symbol (`_Name@4`), and lld drops a `.def` entry that names another symbol, ordinal and all, so `build.rs` writes the i686 link a copy whose entries name the decorated symbols. The x86_64 and ARM64X links read the file as it is. `EXPORT_ORDINAL_GATE` in the Makefile checks every built `d3d9.dll`, both halves of the ARM64X one, against the file.
 - **Import side**: `import_name_type = "undecorated"` on i386:
 
@@ -232,7 +237,7 @@ When extracting, derive `Copy`/`Clone` on the substruct only if the substruct is
 Composition is for reducing duplication or enforcing an invariant, not for cosmetic grouping. The four extant submodule structs on `DeviceInner` each earn their keep:
 
 - **`FfState`** — shared by the device, state-block save/restore, and tests; the state-block API can't be written without a typed snapshot.
-- **`CursorState`** — encapsulates WM_* subclass invariants the rest of `d3d9` shouldn't reach into.
+- **`CursorState`** — holds the D3D9 cursor rules and the overlay sync. Its one platform field, `SystemCursor`, encapsulates the WM_* subclass invariants the rest of `d3d9` shouldn't reach into.
 - **`StageBindings`** — owns the `[CachedComPtr; STAGE_COUNT]` array's refcount accounting plus per-(sampler, type_) latches; the slot-count-bounded loops live there.
 - **`ShaderBindings`** — pairs each stage's shader pointer with its constants array and `populated_rows` watermark.
 
@@ -314,7 +319,7 @@ Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (
 
 - **`CachedComPtr<T: ComUnknown, K: Ownership>`**: owning cached pointer with RAII refcount. `unsafe fn adopt(p)` takes a device-internal reference and `Drop` gives it back, so the application's public refcount never counts it. Use for every reference the device keeps on an external D3D9 COM object: `K = Bound` for bindings (bound RT/DS/VB/IB, textures, shaders, declaration), `K = Captured` for the objects a state block captures or records, which also keeps a `D3DPOOL_DEFAULT` object outstanding for `Reset`. Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
 
-Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
+Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `platform/win32/cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
 
 ### An application's pointer promises no alignment
 
