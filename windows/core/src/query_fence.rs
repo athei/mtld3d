@@ -40,5 +40,23 @@ pub const fn end_in_recording_frame(end_seq: u64, current_seq: u64) -> bool {
     end_seq != 0 && end_seq >= current_seq
 }
 
+/// The seq an EVENT query's `Issue(D3DISSUE_END)` fences.
+///
+/// The END covers every command issued before it. When nothing has been
+/// recorded since the last frame swap, all of those rode a frame already
+/// handed over (`current_seq - 1`), so the END fences that frame rather than
+/// the empty one being recorded, which would complete only once a whole
+/// further frame retired. An engine that issues its frame-sync END right
+/// after `Present` then keeps the one frame in flight D3D9 gives it. Never
+/// earlier than correct: anything recorded since the swap keeps `current_seq`.
+#[must_use]
+pub const fn event_end_seq(current_seq: u64, recorded_since_swap: bool) -> u64 {
+    if recorded_since_swap {
+        current_seq
+    } else {
+        current_seq.saturating_sub(1)
+    }
+}
+
 #[cfg(test)]
 mod tests;
