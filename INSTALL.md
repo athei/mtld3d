@@ -2,7 +2,8 @@
 
 Installation guide for the release bundle (`mtld3d.tar.xz`), on stock Wine and
 CrossOver Preview bottles. Building from source and `make install` are in the
-source repository's `docs/BUILDING.md`.
+source repository's `docs/BUILDING.md`. An older bundle installs by the
+`INSTALL.md` shipped in it.
 
 ## Requirements
 
@@ -205,9 +206,11 @@ DLLS="$CX/lib/wine/aarch64-windows:$CX/lib/wine/i386-windows:$CX/lib/wine:$BOTTL
 "$CX/bin/wine" --bottle MyBottle --env "WINEDLLPATH='$DLLS'" "$GAME_DIR/MyGame.exe"
 ```
 
-Every process the game starts inherits the value. A game started from the
-CrossOver Preview window gets CrossOver's value instead, finds no
-`mtld3d.dll` and fails to load the native `d3d9.dll`.
+Every process the game starts inherits the value. A launch through the
+bottle's `wine` without this `--env` gets CrossOver's value instead, finds no
+`mtld3d.dll` and fails to load the native `d3d9.dll`. With
+`--debugmsg +loaddll` added to the launch, Wine names the cause:
+`Library mtld3d.dll (which is needed by L"C:\\windows\\system32\\d3d9.dll") not found`.
 
 - Any Graphics setting is fine, including *Auto*: the switch and the database
   *Auto* consults only redirect Wine's builtin search, which `d3d9=native`
@@ -274,8 +277,6 @@ Check, in order:
    `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` in that directory
    came from `native/`, not `wine/`.
 3. `mtld3d.so` is in `aarch64-unix`, whatever the arch of the game.
-4. Use 0.6.0 or newer. Earlier releases carry BMI instructions that the arm64
-   Wine's x86 translation cannot execute, so the load fails the same way.
 
 The game's `Logs/gx.log` stays empty in this crash. An empty `Loaded Modules`
 section only means the game directory has no usable `dbghelp.dll`.
