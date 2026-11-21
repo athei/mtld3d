@@ -95,7 +95,6 @@ pub fn create_buffer(
     }
     let options = match desc.storage_mode {
         StorageMode::Shared => MTLResourceOptions::StorageModeShared,
-        StorageMode::Managed => MTLResourceOptions::StorageModeManaged,
         StorageMode::Private | StorageMode::Memoryless => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "create_buffer: storage_mode={:?} incompatible with \

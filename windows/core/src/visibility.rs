@@ -57,9 +57,7 @@ pub const BUFFER_SLOTS_256K: u32 = 32_768;
 /// Slots one visibility buffer holds on every other GPU.
 ///
 /// 65,528 bytes is the smallest maximum visibility query offset the tables
-/// document (Apple2 to Apple6), and the tables give none for Intel and AMD
-/// Macs (Mac2), so those take the smaller buffer. The last slot's offset is
-/// 65,528 bytes.
+/// document (Apple2 to Apple6). The last slot's offset is 65,528 bytes.
 pub const BUFFER_SLOTS_64K: u32 = 8_192;
 
 /// The fewest slots a frame's first buffer holds: one 16 KiB page.

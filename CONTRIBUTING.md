@@ -13,7 +13,7 @@ at it.
 | File | What it owns |
 | --- | --- |
 | [`README.md`](README.md) | The goal, the features, the requirements, and where everything else lives. |
-| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the two Wines (arm64 and x86_64) and the paths the Makefile reads, benchmarks and the release bundle. |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the arm64 Wine and the paths the Makefile reads, benchmarks and the release bundle. |
 | [`docs/GAMES.md`](docs/GAMES.md) | The games tested so far and how far each one gets. |
 | [`docs/STATUS.md`](docs/STATUS.md) | What is implemented, what is not yet, what never will be, and the divergences kept on purpose. |
 | [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
@@ -42,24 +42,16 @@ Two commands, both green before you commit:
   `docs/CONVENTIONS.md` behind it; read that section rather than
   pattern-matching your way past the grep.
 - `make test` is the host-native unit tests plus the end-to-end suite under
-  the Wine `WINE_SDK` names, one leg per build a game loads there:
-  `test-e2e-i686`, the 32-bit suite against the i686 build, and the x64
-  suite against the 64-bit build, `test-e2e-arm64x` against the ARM64X build
-  under the arm64 Wine, the primary target, and `test-e2e-x86_64` against the
-  x86_64 build under an x86_64 Wine (the two modes of
-  [`docs/BUILDING.md`](docs/BUILDING.md#prerequisites)). Under the arm64 Wine
-  a third leg, `test-e2e-arm64`, runs the suite as native ARM64 processes
-  against the ARM64X build's ARM64 half, in a private clone of `WINE_SDK` and
-  a prefix made after its install. Conformance is not
-  part of it, on purpose: many of its checks fail by design, so it gates on a
-  regression against a baseline instead of on zero failures.
+  the arm64 Wine `WINE_SDK` names, one leg per build a game loads there:
+  `test-e2e-i686`, the 32-bit suite against the i686 build, and
+  `test-e2e-arm64x`, the x64 suite against the ARM64X build. A third leg,
+  `test-e2e-arm64`, runs the suite as native ARM64 processes against the
+  ARM64X build's ARM64 half, in a private clone of `WINE_SDK` and a prefix
+  made after its install. Conformance is not part of it, on purpose: many of
+  its checks fail by design, so it gates on a regression against a baseline
+  instead of on zero failures.
 
-Under the arm64 Wine, `make test-e2e-x86_64` runs the x64 suite against the
-x86_64 build, emulated, and is not part of `make test`. It installs into a
-private clone of `WINE_SDK` and creates a fresh prefix for it, since the
-x86_64 build would take the ARM64X build's place in `aarch64-windows` (and a
-prefix only knows the builtins that were installed when it was made). The
-environment variables the targets read are listed in
+The environment variables the targets read are listed in
 [`docs/BUILDING.md`](docs/BUILDING.md#which-target-reads-which-path).
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
@@ -179,23 +171,23 @@ In CI every end-to-end leg uploads all four kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
 directory holds the ten newest of each, so a leg that restarted more than ten
 processes hands back its last ten. They are the layer's side of a red leg,
-which the job log lacks: when one image reads back black on test after test
+which the job log lacks: when one leg reads back black on test after test
 while its sibling legs are green, re-run the failed jobs first (`gh run rerun
 <run-id> --failed`, which lands on a fresh machine) and read the command
 buffer errors in the artifact's log, since a hosted runner's GPU can fail that
 way with no hang line in the job log and nothing else tells it from a
-regression. The Intel image's GPU, the paravirtual `AppleParavirtGPUMetal`,
-refuses a texture or a view now and then while several threads create
-and release them, with its kernel logging `addObject: Object already exists`
-in the system log, so on a paravirtual device the layer asks again for up to
-a quarter of a second and logs each create it recovers that way. A
-`CreateBackbuffer` failure on the Intel image is therefore read from two
-lines. The unix line names the request and the device; a sane request (the
-window's size, `BGRA8Unorm`, a sample count the device answered for)
-together with the layer's `still refused after` line for it is that runner
-fault outlasting the retries, so re-run the failed jobs and add the leg to
-the issue that tracks the fault. A line naming a zero dimension or a null
-handle is the layer's own bug.
+regression. A hosted runner's paravirtual GPU has refused a texture or a
+view now and then while several threads create and release them, with its
+kernel logging `addObject: Object already exists` in the system log, so on a
+paravirtual device (one whose name contains `Paravirtual`, as macos-26's
+`Apple Paravirtual device` does) the layer asks again for up to a quarter of
+a second and logs each create it recovers that way. A `CreateBackbuffer`
+failure on CI is therefore read from two lines. The unix line names the
+request and the device; a sane request (the window's size, `BGRA8Unorm`, a
+sample count the device answered for) together with the layer's `still
+refused after` line for it is that runner fault outlasting the retries, so
+re-run the failed jobs and add the leg to the issue that tracks the fault. A
+line naming a zero dimension or a null handle is the layer's own bug.
 
 Two things are worth knowing when a test process looks wrong. Once a device
 has existed, `d3d9.dll` terminates the process from the
@@ -214,8 +206,8 @@ named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: twelve is a
-clean `make test`.
+`processes` count in the summary says how many the run took: each leg's
+summary reads six on a clean run, one process per test binary.
 
 Explicit test selections, including recovery rounds and filtered initial runs,
 are split into batches that fit the Windows command-line limit. The budget
@@ -313,26 +305,16 @@ moves it by 8 %.
 measure one build: `ARCH=i686`, the default, the i686 build under the i686
 benchmark binary, the path World of Warcraft 1.12 and 3.3.5a take, whose x86
 translator runs our 32-bit DLLs, and `ARCH=arm64x` the ARM64X build under the
-x86_64 benchmark binary on the arm64 Wine, or `ARCH=x86_64` the x86_64 build
-on an x86_64 Wine. Each leg of `bench-ab` gets a private clone of that Wine
-with a fresh prefix, as the arm64 Wine's `test-e2e-x86_64` does, and
-`ARCH=arm64x make bench-ab` needs a `BASE` whose Makefile has
-`windows-arm64x`: it stops with a message naming `BASE` otherwise. A `BASE`
-whose Makefile predates `WINE_SDK` as the one Wine is given the variables of
-its own layout as well, all naming `WINE_SDK`, so `make bench-ab BASE=<an
-older commit>` still compares like with like. `bench-ab` and `bench-variants`
-set up isolated trees of their own and refuse `ISOLATED=1`. `make
-bench-variants` compares layouts instead of commits, under the arm64 Wine
-only: this checkout's x86_64 build, emulated, against its ARM64X build, both
-under `WINE_SDK` (`x86_64-vs-arm64x`). The pair is a `bench-ab` run whose
-report names each leg's runtime and DLL variant; it has one commit in both
-legs, so a binary the two layouts share loads as one image, which the
-comparison notes instead of refusing. It runs one Wine in both legs and
-changes only our DLLs, so it measures what the ARM64X build buys an x64 game.
-There is no pair for the i686 build, since a 32-bit process never loads the
-ARM64X build.
+x86_64 benchmark binary. Each leg of `bench-ab` gets a private clone of that
+Wine with a fresh prefix, as `test-e2e-arm64` does, and `ARCH=arm64x make
+bench-ab` needs a `BASE` whose Makefile has `windows-arm64x`: it stops with a
+message naming `BASE` otherwise. A `BASE` whose Makefile predates `WINE_SDK`
+as the one Wine is given the variables of its own layout as well, all naming
+`WINE_SDK`, so `make bench-ab BASE=<an older commit>` still compares like
+with like. `bench-ab` sets up isolated trees of its own and refuses
+`ISOLATED=1`.
 
-On an arm64 Wine the benchmarks' clock is FEX's translation of `rdtsc`, a
+On the arm64 Wine the benchmarks' clock is FEX's translation of `rdtsc`, a
 counter read that is not ordered after earlier stores (an `mfence` does not
 order it either), so stores still draining when a timed call starts are
 charged to that call. A row that times one call alone between writes is
@@ -523,16 +505,15 @@ instead of quietly simplifying.
 ## Working on conformance
 
 ```sh
-make conformance                       # both legs (i686, and arm64x or x86_64), diffed against the baseline
+make conformance                       # both legs (i686 and arm64x), diffed against the baseline
 make conformance-i686                  # one leg, one runner process
 make conformance-isolate ONLY=visual ARCH=arm64x REPEAT=1
-make conformance-isolate ONLY=device ARCH=i686 REPEAT=20 VARIANT=intel LOG=debug
+make conformance-isolate ONLY=device ARCH=i686 REPEAT=20 VARIANT=scale LOG=debug
 make conformance-baseline-i686         # re-record this leg's entries
 ```
 
-Every leg runs one build of Wine's d3d9 tests, the arm64 Wine release's, so
-the `file:line` sites of the baseline hold under either Wine. Under an
-x86_64 Wine, point `WINE_TESTS` at that release's `lib/wine/tests`
+Both legs run one build of Wine's d3d9 tests, the one the pinned Mach9
+release ships, so the `file:line` sites of the baseline hold on both
 (`docs/BUILDING.md` has the details).
 
 The rules that are easy to get wrong:
@@ -625,75 +606,43 @@ The description is what survives, and for anything non-trivial it carries:
 4. At least one considered alternative, including the dead ends.
 5. Verification: the commands you ran and what a reviewer should look for.
 
-CI pins two Wines and runs one per image, which sets the Makefile's mode and
-so its legs: macos-26 runs the arm64 Wine (the arm64 legs, `i686` and
-`arm64x`, against the arm64 Wine's conformance keys, and the native ARM64 e2e
-leg, `aarch64`), and macos-15, under Rosetta, and the Intel image run the
-x86_64 Wine (the x86_64 legs, `i686` and `x86_64`, against the x86_64 Wine's
-keys). The arm64 Wine needs macOS 26.4, which macos-15 does not have. Every
-conformance leg runs the arm64 Wine release's `d3d9_test.exe`: the
-x86_64-Wine images fetch that release's `lib/wine/tests` alone, `VERSION`
-included, cached by its pin, and name it in `WINE_TESTS`. CI compiles on
-three machines and replays everywhere else, all on macos-26 in the arm64
-mode. One job builds the stage (`make stage`: the i686, x86_64 and ARM64X
-builds, both unix `.so` builds, the e2e test binaries of every leg, the e2e
-and conformance runners for both host arches), which serves the legs of both
-Wines. `check` runs formatting and audit first, then documentation, Clippy
-(the ARM64X halves included) and unit tests, as steps of one job, and
-`check-perf` runs the `PERF=1` Clippy and unit-test legs of `make check` in
-parallel with it, since those build into a target directory of their own. A
-cache is saved only when its key missed, so a pull request's run saves only
-what main's caches lack, and `cache-cleanup.yml` deletes a pull request's
-caches when it closes. Production bundles are built by the release job only,
-also on macos-26 in the arm64 mode, so they carry the ARM64X pair beside the
-x86 builds.
-Every run on `main` has its own concurrency group so pending runs survive
-later pushes and every commit keeps its CI result. PR updates cancel the
-superseded run. The test machines carry no toolchain: they install the stage
-(`STAGE=<dir>`) and run the end-to-end and conformance suites on up to three
-images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
-and the Intel image, whose device has no unified memory and none of the
-packed 16-bit formats, so it runs the Intel/AMD code paths for real. A pull
-request runs the two arm64 images, and every leg it runs gates it. The Intel
-image's paravirtual GPU hangs and reads multisampled results wrong by itself,
-with no Wine and no mtld3d involved, often enough that a pull request could
-not count on a green Intel leg, so its legs run every night on `main` and on
-a dispatch with `intel_only`, which run that image alone; a push to `main`
-and any other dispatch run all three images. An Intel failure in the nightly
-run that is not a GPU hang comes from the commits since the last green one:
-a regression, or a `@mac2` conformance pin left stale by a pull request that
-fixed a site and updated only the Apple entries, which is re-recorded rather
-than read as a regression (`unix/conformance/CONFORMANCE.md` has the
-procedure). So a pull request that moves conformance counts, edits
-`baseline.txt`, or touches an Intel code path (the `intel.*` keys, Managed
-memory, the packed 16-bit formats) dispatches the workflow with `intel_only`
-on its branch before it merges. A release waits for a green Intel run (see
-"Cutting a release"). One more end-to-end leg, and one more conformance leg,
-run their suite at `render.scale = 0.75`, the evidence that the coordinates
-the tests assert on stay in the space D3D9 reports when the frame is
-rasterized smaller; a test that needs single-pixel resolution asks
+CI pins one Wine, the arm64 Wine of a Mach9 release (`WINE_RELEASE_ARM64`),
+and runs on one image, macos-26: the e2e legs `i686`, `x86_64` (the matrix
+name of the leg that runs `test-e2e-arm64x`, the x64 suite against the
+ARM64X build) and the native ARM64 `aarch64`, the conformance legs `i686` and
+`arm64x`, and one scaled leg of each suite. Every conformance leg runs that
+release's `d3d9_test.exe`. CI compiles on three machines and replays everywhere
+else. One job builds the stage (`make stage`: the i686 and ARM64X builds, the
+arm64 unix `.so`, the e2e test binaries of every leg, the e2e and conformance
+runners), which serves every leg. `check` runs formatting and audit first, then
+documentation, Clippy (the ARM64X halves included) and unit tests, as steps of
+one job, and `check-perf` runs the `PERF=1` Clippy and unit-test legs of
+`make check` in parallel with it, since those build into a target directory of
+their own. A cache is saved only when its key missed, so a pull request's
+run saves only what main's caches lack, and `cache-cleanup.yml` deletes a
+pull request's caches when it closes. Production bundles are built by the
+release job only, also on macos-26, so they carry the ARM64X pair beside the
+i686 build. Every run on `main` has its own concurrency group so pending
+runs survive later pushes and every commit keeps its CI result. PR updates
+cancel the superseded run. The test machines carry no toolchain: they
+install the stage (`STAGE=<dir>`) and run the end-to-end and conformance
+suites, and every leg a pull request runs gates it. The scaled end-to-end
+and conformance legs run their suite at `render.scale = 0.75`, the evidence
+that the coordinates the tests assert on stay in the space D3D9 reports when
+the frame is rasterized smaller; a test that needs single-pixel resolution asks
 `render_scale_is_identity()` and pins its exact shape at the identity rather
 than failing that leg, and the conformance sites that cannot (a probe on a
 colour boundary) are classified under "The scaled leg" in
-`unix/conformance/CONFORMANCE.md`. The Intel image reads the conformance
-baseline's `@mac2` entries, which only it can record: dispatch the workflow
-with `record_intel_baseline` (and `intel_only`, to run nothing else) and
-commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
-(`unix/conformance/CONFORMANCE.md` has the procedure). A conformance subtest
-that dies on one image now and then is caught by dispatching with
-`conformance_repeat=<n>`, which runs it that many times on every image and
-uploads each run's raw output, ending in how the process ended, with the
-layer's debug log beside it. Every conformance job's raw artifact, repeat or
-not, also carries the system log of the job's span, which is where AppKit
-reports an exception it swallowed, if it logs it there unredacted. Run
+`unix/conformance/CONFORMANCE.md`. A conformance subtest that dies now and
+then is caught by dispatching with `conformance_repeat=<n>`, which runs it
+that many times on every conformance job and uploads each run's raw output,
+ending in how the process ended, with the layer's debug log beside it.
+Every conformance job's raw artifact, repeat or not, also carries the system
+log of the job's span, which is where AppKit reports an exception it
+swallowed, if it logs it there unredacted. Run
 `make conformance` locally when your change touches the render or
-shader-emission path. The
-manual
-`probe-metal` job is how an image is checked before it is added, and it runs
-under the forced Intel answers, because its device filters 32-bit floats
-where a real Intel/AMD Mac's driver does not. On an Apple-family machine the
-forced answers (`make test INTEL=1`, `make conformance-intel`) are the way to
-run the Intel paths without the hardware.
+shader-emission path. The manual `probe-metal` job, on macos-26 only, is how
+an image is checked before it is added.
 
 The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`, against
 a local default of four), because parallel device creation aborts on a runner.
@@ -776,17 +725,12 @@ LOG_DIR=$PWD/.codex/evidence/bench-release/<version>`, which archives the runs
 and the report there. A regression it reports is fixed before the tag or named
 in the notes.
 
-Land that commit and wait for its run on `main` to go green. The latest Intel
-run on `main` has to be green too: that is the commit's own push run, which
-carries the Intel legs, unless a nightly or an `intel_only` dispatch ran
-after it. Pull requests do not run the Intel image, so that run is the only
-Intel verdict the release has, and a run whose Intel legs show nothing but
-GPU hangs is re-run until it gives one. Then push the tag. The
-release job refuses a tag whose version disagrees with either workspace, and
-refuses one whose commit has no green run on `main`; a tag pushed while that run
-is still going is waited on rather than rejected. It builds the bundle itself,
-after the tag exists, because every binary stamps `git describe` and one built
-before the tag names the previous release.
+Land that commit and wait for its run on `main` to go green. Then push the
+tag. The release job refuses a tag whose version disagrees with either
+workspace, and refuses one whose commit has no green run on `main`; a tag
+pushed while that run is still going is waited on rather than rejected. It
+builds the bundle itself, after the tag exists, because every binary stamps
+`git describe` and one built before the tag names the previous release.
 
 What is left is the notes and the publish. Group the points into sections rather
 than one flat list, give the two or three headline items a section each, and end

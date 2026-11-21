@@ -14,7 +14,6 @@ import unittest
 MAKEFILE = Path(__file__).resolve().parent.parent / "Makefile"
 FIELDS = ("WINE_SDK", "WINE_INSTALL_DIR", "WINEPREFIX", "WINE_LOADER", "WINEBUILD",
           "WINE_SERVER", "INSTALL_DIRS", "TEST_PREFIX")
-MODE_FIELDS = ("WINE_SDK_MODE", "PE64_BUILD", "UNIX_ARCH", "ARM64X_LEG")
 # The variables of the two-Wine layout, which the Makefile refuses at its top
 # level; a shell that still exports one would stop every run here.
 OLD_VARIABLES = ("WINE_X86_64", "WINE_ARM64", "WINE_SDK_ARM64X", "EC", "ARM64")
@@ -88,10 +87,7 @@ class MakeTestCase(unittest.TestCase):
             "recurse-old:\n"
             "\t+$(MAKE) --no-print-directory -f $(firstword $(MAKEFILE_LIST)) "
             "WINE_X86_64=/old WINE_ARM64=/old WINE_SDK_ARM64X=/old EC=1 ARM64=1 inspect\n"
-            "mode:\n"
-            "\t@printf '%s\\n' "
-            + " ".join(f"'resolved:{name}=$({name})'" for name in MODE_FIELDS)
-            + "\nrequire:\n"
+            "require:\n"
             "\t@$(WINE_SDK_REQUIRE)\n"
         )
         self.environment = os.environ.copy()
@@ -169,12 +165,10 @@ class IsolationTests(MakeTestCase):
                 self.run_make("-n", "ISOLATED=1", *arguments, *goals)
                 self.assertFalse((self.work / ".wine-isolated").exists())
 
-    def test_the_bench_comparisons_refuse_isolation_before_cloning(self):
-        for goal in ("bench-ab", "bench-variants"):
-            with self.subTest(goal=goal):
-                output = self.run_make("ISOLATED=1", "BASE=HEAD", goal, succeeds=False)
-                self.assertIn("run it without ISOLATED=1", output)
-                self.assertFalse((self.work / ".wine-isolated").exists())
+    def test_bench_ab_refuses_isolation_before_cloning(self):
+        output = self.run_make("ISOLATED=1", "BASE=HEAD", "bench-ab", succeeds=False)
+        self.assertIn("run it without ISOLATED=1", output)
+        self.assertFalse((self.work / ".wine-isolated").exists())
 
 
 class VariableTests(MakeTestCase):
@@ -192,8 +186,8 @@ class VariableTests(MakeTestCase):
                         output = self.run_make(f"{name}=1", "inspect", succeeds=False)
                     self.assertIn(f"no longer read: {name}.", output)
                     self.assertIn("WINE_SDK names the one Wine", output)
-                    self.assertIn("an arm64 or an x86_64 Wine", output)
-                    self.assertIn("the ARM64X build is built whenever it is the arm64 one", output)
+                    self.assertIn("an arm64 Wine", output)
+                    self.assertIn("the ARM64X build is always built", output)
 
     def test_old_variables_given_to_a_sub_make_stop_it_too(self):
         # Only a BASE of an older layout is ever given them (`make bench-ab`).
@@ -237,25 +231,24 @@ class VariableTests(MakeTestCase):
 
     def test_a_benchmark_takes_the_i686_or_the_arm64x_build(self):
         output = self.run_make("ARCH=x86_64", "BASE=HEAD", "bench-ab", succeeds=False)
-        self.assertIn("ARCH=x86_64: a benchmark measures the i686 build", output)
-        output = self.run_make("ARCH=i686", "bench-variants", succeeds=False)
-        self.assertIn("takes no ARCH", output)
+        self.assertIn("ARCH=x86_64: a benchmark measures the i686 build (ARCH=i686) or the ARM64X "
+                      "build (ARCH=arm64x)", output)
 
 
 class FakeWineTestCase(MakeTestCase):
-    """A fake arm64 Wine as WINE_SDK, a fake x86_64 Wine beside it, and a stage of every build."""
+    """A fake arm64 Wine as WINE_SDK, and a stage of every build."""
 
-    X86_64_DIRS = ("bin", "lib/wine/x86_64-unix", "lib/wine/i386-windows", "lib/wine/x86_64-windows",
-                   "lib/wine/d3d9/mtld3d/i386-windows", "lib/wine/d3d9/mtld3d/x86_64-windows",
-                   "lib/wine/d3d9/mtld3d/x86_64-unix")
     ARM64_DIRS = ("bin", "lib/wine/aarch64-unix", "lib/wine/i386-windows", "lib/wine/aarch64-windows",
                   "lib/wine/x86_64-windows", "lib/wine/d3d9/mtld3d/i386-windows",
                   "lib/wine/d3d9/mtld3d/aarch64-windows", "lib/wine/d3d9/mtld3d/aarch64-unix")
     SDK_FILES = ("lib/wine/aarch64-unix/compatdb.so", "lib/wine/i386-windows/libwinecrt0.a",
-                 "lib/wine/x86_64-windows/libwinecrt0.a", "lib/wine/aarch64-windows/libwinecrt0.a",
-                 "lib/wine/aarch64-windows/libntdll.a")
+                 "lib/wine/aarch64-windows/libwinecrt0.a", "lib/wine/aarch64-windows/libntdll.a")
+    # An x86_64 Wine with its link archives, which every target refuses.
+    X86_64_DIRS = ("bin", "lib/wine/x86_64-unix", "lib/wine/i386-windows", "lib/wine/x86_64-windows",
+                   "lib/wine/d3d9/mtld3d/i386-windows", "lib/wine/d3d9/mtld3d/x86_64-windows",
+                   "lib/wine/d3d9/mtld3d/x86_64-unix")
     X86_64_SDK_FILES = ("lib/wine/i386-windows/libwinecrt0.a", "lib/wine/x86_64-windows/libwinecrt0.a")
-    MACHINES = {"i386-windows": 0x014c, "x86_64-windows": 0x8664, "aarch64-windows": 0xaa64}
+    MACHINES = {"i386-windows": 0x014c, "aarch64-windows": 0xaa64}
     PE_HEADER = PE_HEADER
     FAKE_WINEBUILD = FAKE_WINEBUILD
     fake_pe = staticmethod(fake_pe)
@@ -296,15 +289,14 @@ class FakeWineTestCase(MakeTestCase):
         # build says ARM64) followed by the name of its directory, which
         # `content` reads back.
         self.stage = self.root / "stage"
-        for arch in ("i386-windows", "x86_64-windows", "aarch64-windows"):
+        for arch in ("i386-windows", "aarch64-windows"):
             (self.stage / arch).mkdir(parents=True)
             for name in ("d3d9.dll", "mtld3d.dll"):
                 (self.stage / arch / name).write_bytes(self.fake_pe(self.MACHINES[arch], arch))
             for name in ("d3d9.pdb", "mtld3d.pdb"):
                 (self.stage / arch / name).write_text(arch)
-        for arch in ("x86_64-unix", "aarch64-unix"):
-            (self.stage / arch / "mtld3d.so.dSYM").mkdir(parents=True)
-            (self.stage / arch / "mtld3d.so").write_text(arch)
+        (self.stage / "aarch64-unix/mtld3d.so.dSYM").mkdir(parents=True)
+        (self.stage / "aarch64-unix/mtld3d.so").write_text("aarch64-unix")
         self.environment.pop("WINE_INSTALL_DIR")
         self.environment["WINE_SDK"] = str(self.arm64)
 
@@ -326,97 +318,64 @@ class FakeWineTestCase(MakeTestCase):
         return self.run_make(f"STAGE={self.stage}", *arguments, "install", succeeds=succeeds)
 
 
-class ModeTests(FakeWineTestCase):
-    """The two modes, read from WINE_SDK's own `lib/wine`, and what each one's aggregates run."""
+class LegTests(FakeWineTestCase):
+    """What the aggregates build, test, stage and bundle under the arm64 Wine."""
 
     def dry_run(self, wine, *goals):
         # `-n` prints every recipe line, a sub-make's included, and runs none.
         return self.run_make(f"WINE_SDK={wine}", "-n", *goals)
 
-    def test_the_mode_follows_the_wine(self):
-        expected = {self.arm64: ("arm64", "arm64x", "arm64", "arm64x"),
-                    self.x86_64: ("x86_64", "x86_64", "x64", "")}
-        for wine, values in expected.items():
-            with self.subTest(wine=wine.name):
-                resolved = self.resolved(self.run_make(f"WINE_SDK={wine}", "mode"))
-                self.assertEqual(tuple(resolved[name] for name in MODE_FIELDS), values)
-        # A tree that is no Wine yet is held to the arm64 mode's requirements.
-        resolved = self.resolved(self.run_make(f"WINE_SDK={self.root / 'none'}", "mode"))
-        self.assertEqual(resolved["WINE_SDK_MODE"], "arm64")
-
-    def test_the_x86_64_mode_says_so_once(self):
-        line = "==> WINE_SDK is an x86_64 Wine: x86_64 mode, in which the ARM64X build is not built"
-        output = self.run_make(f"WINE_SDK={self.x86_64}", "recurse")
-        self.assertEqual([entry for entry in output.splitlines() if entry.startswith("==> WINE_SDK")],
-                         [f"{line}; the legs are i686 and x86_64"])
-        self.assertNotIn("==> WINE_SDK", self.run_make("recurse"))
-
-    def test_the_arm64x_build_is_built_linted_and_bundled_in_the_arm64_mode_alone(self):
+    def test_the_arm64x_build_is_built_linted_and_bundled_and_no_x86_64_dll(self):
         for goals in (("windows",), ("check",), ("-o", "all", "bundle"), ("-o", "all", "stage")):
             with self.subTest(goals=goals):
-                arm64 = self.dry_run(self.arm64, *goals)
-                x86_64 = self.dry_run(self.x86_64, *goals)
-                self.assertTrue("arm64x" in arm64 or "aarch64-pc-windows-msvc" in arm64, arm64)
-                for word in ("arm64x", "aarch64-pc-windows-msvc", "arm64ec", "LLVM_MINGW",
-                             "lld-link", "aarch64-windows"):
-                    self.assertNotIn(word, x86_64)
-                self.assertNotIn("system32-arm64", x86_64)
+                output = self.dry_run(self.arm64, *goals)
+                self.assertTrue("arm64x" in output or "aarch64-pc-windows-msvc" in output, output)
+                # The refusal messages name `lib/wine/x86_64-unix`, no path under it.
+                for word in ("x86_64-apple-darwin", "x86_64-unix/", "x86_64-windows", "rosetta"):
+                    self.assertNotIn(word, output)
+        # The stage builds the x64 test binaries, which the arm64x legs run.
+        self.assertIn("--target x86_64-pc-windows-msvc --message-format",
+                      self.dry_run(self.arm64, "-o", "all", "stage"))
+        self.assertNotIn("x86_64-pc-windows-msvc", self.dry_run(self.arm64, "windows"))
         bundle = self.dry_run(self.arm64, "-o", "all", "bundle")
         self.assertIn("native/aarch64-windows", bundle)
-        # An arm64 Wine's 64-bit prefix marker is the ARM64X build's hybrid one.
-        self.assertRegex(bundle, r"cp -c \S*/arm64x/\w+/mtld3d\.fake\.dll \S*/prefix-markers/system32-arm64/mtld3d\.dll")
+        # The 64-bit prefix marker is the ARM64X build's hybrid one.
+        self.assertRegex(bundle, r"cp -c \S*/arm64x/\w+/mtld3d\.fake\.dll\s+\S*/prefix-markers/system32-arm64/mtld3d\.dll")
+        self.assertNotIn("prefix-markers/system32/", bundle)
         self.assertIn("--fake-module -o windows/target/arm64x/release/mtld3d.fake.dll -b aarch64-windows -marm64x",
                       self.dry_run(self.arm64, "windows"))
 
-    def test_make_test_and_conformance_run_the_modes_own_legs(self):
-        arm64 = self.dry_run(self.arm64, "test")
-        x86_64 = self.dry_run(self.x86_64, "test")
-        self.assertIn("arm64x/release/d3d9.dll", arm64)
-        self.assertNotIn("x86_64-pc-windows-msvc/release/d3d9.dll", arm64)
-        self.assertIn("x86_64-pc-windows-msvc/release/d3d9.dll", x86_64)
-        self.assertNotIn("arm64x", x86_64)
-        # The arm64 mode's `make test` adds the native ARM64 leg, in a tree and
-        # prefix of its own, running the aarch64 test binaries; the x86_64 mode
-        # has none.
-        self.assertIn(".wine-isolated/leg-arm64/sdk/bin/wine", arm64)
-        self.assertIn("--target aarch64-pc-windows-msvc --message-format", arm64)
-        self.assertNotIn(".wine-isolated/leg-x86_64", arm64)
-        self.assertNotIn(".wine-isolated/leg-", x86_64)
-        self.assertNotIn("aarch64-pc-windows-msvc", x86_64)
-        self.assertIn(".wine-isolated/leg-x86_64", self.dry_run(self.arm64, "test-e2e-x86_64"))
-        self.assertNotIn(".wine-isolated", self.dry_run(self.x86_64, "test-e2e-x86_64"))
-        # Each Wine records under keys of its own, so neither rewrites the other's.
-        legs = {self.arm64: ["i686-arm64", "arm64x"], self.x86_64: ["i686", "x86_64"]}
-        for wine, expected in legs.items():
-            # `conformance-baseline` records the native, intel and scale variants of both.
-            for goal, variant, rounds in (("conformance", "", 1),
-                                          ("conformance-baseline", "--update-baseline", 3),
-                                          ("conformance-intel", "--variant intel", 1),
-                                          ("conformance-scale", "--variant scale", 1)):
-                with self.subTest(wine=wine.name, goal=goal):
-                    output = self.dry_run(wine, goal)
-                    runs = [line for line in output.splitlines() if "--arch " in line]
-                    self.assertEqual([re.search(r"--arch (\S+)", line)[1] for line in runs],
-                                     expected * rounds)
-                    for line in runs:
-                        self.assertIn(variant, line)
+    def test_make_test_and_conformance_run_the_arm64_legs(self):
+        test = self.dry_run(self.arm64, "test")
+        self.assertIn("arm64x/release/d3d9.dll", test)
+        self.assertNotIn("x86_64-pc-windows-msvc/release/d3d9.dll", test)
+        # `make test` adds the native ARM64 leg, in a tree and prefix of its
+        # own, running the aarch64 test binaries.
+        self.assertIn(".wine-isolated/leg-arm64/sdk/bin/wine", test)
+        self.assertIn("--target aarch64-pc-windows-msvc --message-format", test)
+        self.assertNotIn(".wine-isolated/leg-x86_64", test)
+        # `conformance-baseline` records the native and scale variants of both legs.
+        for goal, variant, rounds in (("conformance", "", 1),
+                                      ("conformance-baseline", "--update-baseline", 2),
+                                      ("conformance-scale", "--variant scale", 1)):
+            with self.subTest(goal=goal):
+                runs = [line for line in self.dry_run(self.arm64, goal).splitlines() if "--arch " in line]
+                self.assertEqual([re.search(r"--arch (\S+)", line)[1] for line in runs],
+                                 ["i686-arm64", "arm64x"] * rounds)
+                for line in runs:
+                    self.assertIn(variant, line)
+                    self.assertNotIn("--variant intel", line)
 
     def test_every_leg_runs_the_tests_wine_tests_names(self):
-        # One test build for both Wines: the arm64 Wine's own by default, and
-        # under an x86_64 Wine only the directory WINE_TESTS names.
+        # The arm64 Wine's own tests by default, else the directory WINE_TESTS names.
         tests = self.root / "arm64-release-tests"
-        for wine, arguments, expected in ((self.arm64, (), self.arm64 / "lib/wine/tests"),
-                                          (self.arm64, (f"WINE_TESTS={tests}",), tests),
-                                          (self.x86_64, (f"WINE_TESTS={tests}",), tests)):
-            with self.subTest(wine=wine.name, arguments=arguments):
-                output = self.dry_run(wine, *arguments, "conformance")
+        for arguments, expected in (((), self.arm64 / "lib/wine/tests"),
+                                    ((f"WINE_TESTS={tests}",), tests)):
+            with self.subTest(arguments=arguments):
+                output = self.dry_run(self.arm64, *arguments, "conformance")
                 exes = re.findall(r"--exe (\S+)", output)
                 self.assertEqual(exes, [f"{expected}/i386-windows/d3d9_test.exe",
                                         f"{expected}/x86_64-windows/d3d9_test.exe"])
-        output = self.run_make(f"WINE_SDK={self.x86_64}", "-o", "install-windows-i686", "-o",
-                               "install-unix-x64", "MAKE=true", "conformance-i686", succeeds=False)
-        self.assertIn("WINE_TESTS is not set: in the x86_64 mode", output)
-        self.assertNotIn("--exe", output)
 
     def test_the_runner_is_told_the_wine_version_the_tests_came_from(self):
         # WINE_TESTS's VERSION first, then the `wine --version` of the tree the
@@ -427,16 +386,13 @@ class ModeTests(FakeWineTestCase):
         stamped = self.root / "tests-stamped"
         stamped.mkdir()
         (stamped / "VERSION").write_text("wine-11.20-stamped\nanything after the first line\n")
-        inside = self.arm64 / "lib/wine/tests"
-        for wine, tests, expected in ((self.arm64, None, "wine-11.19-tree"),
-                                      (self.arm64, stamped, "wine-11.20-stamped"),
-                                      (self.x86_64, stamped, "wine-11.20-stamped"),
-                                      (self.x86_64, inside, "wine-11.19-tree"),
-                                      (self.x86_64, alone, None)):
-            with self.subTest(wine=wine.name, tests=tests and tests.name):
+        for tests, expected in ((None, "wine-11.19-tree"),
+                                (stamped, "wine-11.20-stamped"),
+                                (alone, None)):
+            with self.subTest(tests=tests and tests.name):
                 arguments = (f"WINE_TESTS={tests}",) if tests else ()
                 for goal in ("conformance", "conformance-baseline"):
-                    runs = [line for line in self.dry_run(wine, *arguments, goal).splitlines()
+                    runs = [line for line in self.dry_run(self.arm64, *arguments, goal).splitlines()
                             if "--arch " in line]
                     self.assertTrue(runs)
                     for line in runs:
@@ -445,18 +401,15 @@ class ModeTests(FakeWineTestCase):
                         else:
                             self.assertNotIn("--tests-wine-version", line)
 
-    def test_conformance_isolate_takes_a_leg_of_the_mode(self):
-        for wine, good, bad in ((self.arm64, ("i686", "arm64x"), "x86_64"),
-                                (self.x86_64, ("i686", "x86_64"), "arm64x")):
-            with self.subTest(wine=wine.name):
-                output = self.run_make(f"WINE_SDK={wine}", f"ARCH={bad}", "-n", "conformance-isolate",
-                                       succeeds=False)
-                self.assertIn(f"ARCH={bad}: `make conformance-isolate` runs a leg of the", output)
-                labels = [re.search(r"--arch (\S+)", line)[1]
-                          for arch in good
-                          for line in self.dry_run(wine, f"ARCH={arch}", "conformance-isolate").splitlines()
-                          if "--arch " in line]
-                self.assertEqual(labels, ["i686-arm64" if wine == self.arm64 else "i686", good[1]])
+    def test_conformance_isolate_takes_one_of_the_two_legs(self):
+        output = self.run_make("ARCH=x86_64", "-n", "conformance-isolate", succeeds=False)
+        self.assertIn("ARCH=x86_64: `make conformance-isolate` runs a leg of its own, "
+                      "ARCH=i686 or ARCH=arm64x", output)
+        labels = [re.search(r"--arch (\S+)", line)[1]
+                  for arch in ("i686", "arm64x")
+                  for line in self.dry_run(self.arm64, f"ARCH={arch}", "conformance-isolate").splitlines()
+                  if "--arch " in line]
+        self.assertEqual(labels, ["i686-arm64", "arm64x"])
 
     def test_the_native_arm64_leg_needs_the_aarch64_splat(self):
         # Without the splat's aarch64 libraries the leg stops naming
@@ -468,52 +421,34 @@ class ModeTests(FakeWineTestCase):
                       "test executables link against; `make setup-xwin` adds them", output)
         self.assertFalse((self.work / ".wine-isolated/leg-arm64").exists())
 
-    def test_the_other_modes_legs_refuse(self):
-        for wine, goal in ((self.arm64, "conformance-x86_64"), (self.arm64, "conformance-baseline-intel-x86_64"),
-                           (self.x86_64, "conformance-arm64x"), (self.x86_64, "test-e2e-arm64x"),
-                           (self.x86_64, "test-e2e-arm64")):
-            with self.subTest(wine=wine.name, goal=goal):
-                output = self.run_make(f"WINE_SDK={wine}", goal, succeeds=False)
-                self.assertIn(f"{goal} runs the", output)
-        for goal in ("windows-arm64x", "clippy-pe-arm64x"):
-            with self.subTest(goal=goal):
-                output = self.run_make(f"WINE_SDK={self.x86_64}", goal, succeeds=False)
-                self.assertIn(f"{goal} needs an arm64 Wine as WINE_SDK", output)
-        output = self.run_make(f"WINE_SDK={self.x86_64}", "bench-variants", succeeds=False)
-        self.assertIn("needs an arm64 Wine as WINE_SDK", output)
-        output = self.run_make(f"WINE_SDK={self.x86_64}", "ARCH=arm64x", "BASE=HEAD", "bench-ab",
-                               succeeds=False)
-        self.assertIn("ARCH=x86_64 in the x86_64 mode", output)
-
     def test_a_bench_ab_base_gets_the_variables_of_its_own_layout(self):
         # BENCH_BASE_ONE_WINE= stands for a BASE whose Makefile predates WINE_SDK
         # as the one Wine; HEAD reads WINE_SDK alone and gets none of the old set.
-        for wine, expected, absent in ((self.arm64, ("WINE_ARM64=", "EC=1"), "WINE_X86_64="),
-                                       (self.x86_64, ("WINE_X86_64=",), "EC=1")):
-            with self.subTest(wine=wine.name):
-                output = self.dry_run(wine, "BASE=HEAD", "BENCH_BASE_ONE_WINE=", "bench-ab")
-                base = next(line for line in output.splitlines() if " -C " in line and "PROD=1" in line)
-                for word in expected:
-                    self.assertIn(word, base)
-                self.assertNotIn(absent, base)
-                output = self.dry_run(wine, "BASE=HEAD", "bench-ab")
-                base = next(line for line in output.splitlines() if " -C " in line and "PROD=1" in line)
-                for word in ("WINE_ARM64=", "WINE_X86_64=", "WINE_SDK_ARM64X=", "EC=1"):
-                    self.assertNotIn(word, base)
+        output = self.dry_run(self.arm64, "BASE=HEAD", "BENCH_BASE_ONE_WINE=", "bench-ab")
+        base = next(line for line in output.splitlines() if " -C " in line and "PROD=1" in line)
+        for word in ("WINE_ARM64=", "EC=1"):
+            self.assertIn(word, base)
+        self.assertNotIn("WINE_X86_64=", base)
+        output = self.dry_run(self.arm64, "BASE=HEAD", "bench-ab")
+        base = next(line for line in output.splitlines() if " -C " in line and "PROD=1" in line)
+        for word in ("WINE_ARM64=", "WINE_X86_64=", "WINE_SDK_ARM64X=", "EC=1"):
+            self.assertNotIn(word, base)
 
     def test_an_isolated_clone_of_another_wine_is_refused(self):
         clone = self.work / ".wine-isolated/sdk"
-        self.run_make("ISOLATED=1", "mode")
+        self.run_make("ISOLATED=1", "inspect")
         self.assertTrue(clone.is_dir())
-        resolved = self.resolved(self.run_make("ISOLATED=1", "mode"))
-        self.assertEqual(resolved["WINE_SDK_MODE"], "arm64")
+        record = (self.work / ".wine-isolated/sdk.source").read_text()
+        self.assertTrue(record.startswith(f"{self.arm64} aarch64 "), record)
+        self.run_make("ISOLATED=1", "inspect")
         # Another Wine, a redeploy of the same one, and a clone with no record.
+        other = self.make_wine("other-arm64", self.ARM64_DIRS)
         wineserver = self.arm64 / "bin/wineserver"
         for change in ("other wine", "redeploy", "no record"):
             with self.subTest(change=change):
                 arguments = []
                 if change == "other wine":
-                    arguments.append(f"WINE_SDK={self.x86_64}")
+                    arguments.append(f"WINE_SDK={other}")
                 elif change == "redeploy":
                     saved = wineserver.read_text()
                     wineserver.unlink()
@@ -521,12 +456,12 @@ class ModeTests(FakeWineTestCase):
                     wineserver.chmod(0o755)
                 else:
                     (self.work / ".wine-isolated/sdk.source").unlink()
-                output = self.run_make("ISOLATED=1", *arguments, "mode", succeeds=False)
+                output = self.run_make("ISOLATED=1", *arguments, "inspect", succeeds=False)
                 self.assertIn(f"ISOLATED=1: {clone} was cloned from", output)
                 self.assertIn("`make clean-isolated` removes the clones", output)
                 self.run_make("ISOLATED=1", "clean-isolated")
                 self.assertFalse(clone.exists())
-                self.run_make("ISOLATED=1", "mode")
+                self.run_make("ISOLATED=1", "inspect")
 
 
 class InstallLayoutTests(FakeWineTestCase):
@@ -545,19 +480,24 @@ class InstallLayoutTests(FakeWineTestCase):
         self.assertFalse((self.arm64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
         self.assertFalse(list(self.arm64.rglob("x86_64-unix")))
 
-    def test_an_x86_64_install_dir_gets_its_own_pieces_beside_the_arm64_wine(self):
-        before = {wine: self.directories(wine) for wine in (self.x86_64, self.arm64)}
-        self.install(f"WINE_INSTALL_DIR={self.x86_64}")
-        for wine in (self.x86_64, self.arm64):
-            self.assertEqual(self.directories(wine), before[wine])
-        tree = self.x86_64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual(self.content(tree / "x86_64-windows/d3d9.dll"), "x86_64-windows")
-        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
-        self.assertEqual((tree / "x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
-        self.assertTrue((self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll").exists())
-        self.assertFalse(list(self.x86_64.rglob("aarch64-*")))
-        tree = self.arm64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "aarch64-windows")
+    def test_an_x86_64_wine_is_refused_naming_it(self):
+        # As WINE_INSTALL_DIR beside the arm64 WINE_SDK, and as WINE_SDK.
+        before = self.snapshot(self.x86_64)
+        for arguments in ((f"WINE_INSTALL_DIR={self.x86_64}",), (f"WINE_SDK={self.x86_64}",)):
+            with self.subTest(arguments=arguments):
+                output = self.install(*arguments, succeeds=False)
+                lines = self.printed(output, f"{self.x86_64} is an x86_64 Wine (it holds lib/wine/x86_64-unix); "
+                                     "mtld3d installs only into an arm64 Wine, one holding lib/wine/aarch64-unix")
+                self.assertEqual(len(lines), 1, output)
+                self.assertEqual(self.snapshot(self.x86_64), before)
+
+    def test_a_tree_that_is_no_wine_is_refused(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        output = self.install(f"WINE_INSTALL_DIR={empty}", succeeds=False)
+        self.assertEqual(len(self.printed(output, f"{empty} has no lib/wine/aarch64-unix, so it is no arm64 "
+                                          "Wine tree to install into")), 1, output)
+        self.assertEqual(list(empty.iterdir()), [])
 
     def test_a_missing_arch_directory_fails_the_install_and_is_not_created(self):
         missing = self.arm64 / "lib/wine/d3d9/mtld3d/aarch64-windows"
@@ -566,16 +506,14 @@ class InstallLayoutTests(FakeWineTestCase):
         self.assertIn(f"{missing} does not exist", output)
         self.assertFalse(missing.exists())
 
-    def test_the_arm64x_pair_gets_hybrid_markers_and_the_x86_64_pair_amd64_ones(self):
-        output = self.install(f"WINE_INSTALL_DIR={self.x86_64}")
+    def test_the_arm64x_pair_gets_hybrid_markers_and_the_i686_pair_i386_ones(self):
+        output = self.install()
         self.assertEqual(self.winebuild_lines(output), [])
         for name in ("d3d9", "mtld3d"):
             marker = self.arm64 / f"lib/wine/aarch64-windows/{name}.dll"
             self.assertIn("-b aarch64-windows -marm64x", self.content(marker))
             self.assertEqual(self.machine(marker), 0xaa64)
-            self.assertIn("-b x86_64-windows", self.content(self.x86_64 / f"lib/wine/x86_64-windows/{name}.dll"))
-            for wine in (self.arm64, self.x86_64):
-                self.assertIn("-b i686-windows", self.content(wine / f"lib/wine/i386-windows/{name}.dll"))
+            self.assertIn("-b i686-windows", self.content(self.arm64 / f"lib/wine/i386-windows/{name}.dll"))
 
     def snapshot(self, root):
         # Every file under `root` with its bytes, and every directory.
@@ -665,33 +603,24 @@ class InstallLayoutTests(FakeWineTestCase):
                 lines = self.printed(output, f"{dll} is no PE image whose machine make install can read")
                 self.assertEqual(len(lines), 1, output)
 
-    def test_an_isolated_install_writes_the_clone_and_not_the_wines(self):
-        before = {wine: sorted(str(path) for path in wine.rglob("*")) for wine in (self.x86_64, self.arm64)}
-        self.install("ISOLATED=1", f"WINE_INSTALL_DIR={self.x86_64}")
-        for wine in (self.x86_64, self.arm64):
-            self.assertEqual(sorted(str(path) for path in wine.rglob("*")), before[wine])
+    def test_an_isolated_install_writes_the_clone_and_not_the_wine(self):
+        before = sorted(str(path) for path in self.arm64.rglob("*"))
+        self.install("ISOLATED=1")
+        self.assertEqual(sorted(str(path) for path in self.arm64.rglob("*")), before)
         clones = self.work / ".wine-isolated"
         self.assertEqual(sorted(path.name for path in clones.iterdir()), ["prefix", "sdk", "sdk.source"])
         self.assertEqual(self.content(clones / "sdk/lib/wine/d3d9/mtld3d/aarch64-windows/d3d9.dll"),
                          "aarch64-windows")
 
-    def test_a_flat_x86_64_wine_gets_the_build_in_its_default_dirs(self):
-        for directory in ("i386-windows", "x86_64-windows", "x86_64-unix"):
-            (self.x86_64 / "lib/wine/d3d9/mtld3d" / directory).rmdir()
-        (self.x86_64 / "lib/wine/d3d9/mtld3d").rmdir()
-        (self.x86_64 / "lib/wine/d3d9").rmdir()
-        before = self.directories(self.x86_64)
-        self.install(f"WINE_INSTALL_DIR={self.x86_64}")
-        self.assertEqual(self.directories(self.x86_64), before)
-        self.assertEqual(self.content(self.x86_64 / "lib/wine/x86_64-windows/d3d9.dll"), "x86_64-windows")
-        self.assertEqual(self.content(self.x86_64 / "lib/wine/i386-windows/mtld3d.dll"), "i386-windows")
-        self.assertEqual((self.x86_64 / "lib/wine/x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
-
-    def test_a_wine_with_both_unix_dirs_is_refused_naming_the_leftover(self):
-        (self.arm64 / "lib/wine/x86_64-unix").mkdir()
-        output = self.install(succeeds=False)
-        self.assertIn("has both lib/wine/x86_64-unix and lib/wine/aarch64-unix", output)
-        self.assertIn("can be removed", output)
+    def test_a_leftover_x86_64_unix_dir_is_left_alone(self):
+        # An older bundle's `wine/` tree, copied in whole, carried one; the
+        # Wine is read by its `aarch64-unix`, and nothing goes into the other.
+        leftover = self.arm64 / "lib/wine/x86_64-unix"
+        leftover.mkdir()
+        self.install()
+        self.assertEqual(list(leftover.iterdir()), [])
+        self.assertEqual((self.arm64 / "lib/wine/d3d9/mtld3d/aarch64-unix/mtld3d.so").read_text(),
+                         "aarch64-unix")
 
     def test_an_arm64_wine_without_the_mtld3d_tree_is_refused(self):
         for directory in ("i386-windows", "aarch64-windows", "aarch64-unix"):
@@ -702,7 +631,7 @@ class InstallLayoutTests(FakeWineTestCase):
         self.assertFalse((self.arm64 / "lib/wine/d3d9").joinpath("mtld3d").exists())
 
     def test_a_build_against_a_wine_missing_a_piece_refuses_naming_it(self):
-        for target in ("windows-i686", "windows-arm64x", "clippy-pe-x86_64", "clippy-pe-arm64x",
+        for target in ("windows-i686", "windows-arm64x", "clippy-pe-i686", "clippy-pe-arm64x",
                        "doc-windows"):
             for missing in ("bin/winebuild", "lib/wine/aarch64-windows/libntdll.a",
                             "lib/wine/i386-windows/libwinecrt0.a"):
@@ -716,72 +645,20 @@ class InstallLayoutTests(FakeWineTestCase):
                     self.assertIn(f"WINE_SDK={self.arm64} ", output)
                     self.assertIn(f"no {missing}", output)
 
-    def test_each_mode_requires_its_own_pieces(self):
-        # A complete Wine of either arch passes; the x86_64 mode asks for no
-        # ARM64X archive, compatdb.so or mtld3d tree, and the arm64 mode for all.
-        for wine in (self.arm64, self.x86_64):
-            with self.subTest(wine=wine.name):
-                self.run_make(f"WINE_SDK={wine}", "require")
-        for wine, missing in ((self.x86_64, "lib/wine/x86_64-windows/libwinecrt0.a"),
-                              (self.arm64, "lib/wine/aarch64-unix/compatdb.so")):
-            with self.subTest(wine=wine.name, missing=missing):
-                (wine / missing).unlink()
-                output = self.run_make(f"WINE_SDK={wine}", "require", succeeds=False)
-                (wine / missing).touch()
-                self.assertIn(f"holds no {missing}", output)
+    def test_the_wine_sdk_requirements(self):
+        # A complete arm64 Wine passes, one missing compatdb.so or the mtld3d
+        # tree fails, and an x86_64 Wine fails on the compatdb.so it lacks.
+        self.run_make("require")
+        (self.arm64 / "lib/wine/aarch64-unix/compatdb.so").unlink()
+        output = self.run_make("require", succeeds=False)
+        (self.arm64 / "lib/wine/aarch64-unix/compatdb.so").touch()
+        self.assertIn("holds no lib/wine/aarch64-unix/compatdb.so", output)
+        output = self.run_make(f"WINE_SDK={self.x86_64}", "require", succeeds=False)
+        self.assertIn(f"WINE_SDK={self.x86_64} holds no lib/wine/aarch64-unix/compatdb.so", output)
+        self.assertIn("an x86_64 Wine holds lib/wine/x86_64-unix and cannot run the ARM64X build", output)
         shutil.rmtree(self.arm64 / "lib/wine/d3d9/mtld3d")
         output = self.run_make("require", succeeds=False)
         self.assertIn("has no lib/wine/d3d9/mtld3d tree", output)
-
-    def test_the_x86_64_mode_installs_the_x86_64_build(self):
-        before = self.directories(self.x86_64)
-        self.install(f"WINE_SDK={self.x86_64}")
-        self.assertEqual(self.directories(self.x86_64), before)
-        tree = self.x86_64 / "lib/wine/d3d9/mtld3d"
-        self.assertEqual(self.content(tree / "x86_64-windows/d3d9.dll"), "x86_64-windows")
-        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
-        self.assertEqual((tree / "x86_64-unix/mtld3d.so").read_text(), "x86_64-unix")
-        self.assertFalse(list(self.x86_64.rglob("aarch64-*")))
-
-    def test_an_arm64_install_dir_beside_an_x86_64_wine_sdk_gets_the_x86_64_build(self):
-        # The x86_64 mode builds no ARM64X pair, so the arm64 tree takes the
-        # x86_64 one, and its PE and unix halves come from one build.
-        tree = self.arm64 / "lib/wine/d3d9/mtld3d"
-        (tree / "aarch64-windows/d3d9.dll").write_text("an older ARM64X build")
-        before = self.directories(self.arm64)
-        self.install(f"WINE_SDK={self.x86_64}", f"WINE_INSTALL_DIR={self.arm64}")
-        self.assertEqual(self.directories(self.arm64), before)
-        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "x86_64-windows")
-        self.assertEqual(self.content(tree / "aarch64-windows/mtld3d.dll"), "x86_64-windows")
-        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
-        self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
-        for name in ("d3d9", "mtld3d"):
-            marker = self.content(self.arm64 / f"lib/wine/aarch64-windows/{name}.dll")
-            self.assertIn("-b x86_64-windows", marker)
-            self.assertNotIn("marm64x", marker)
-        self.assertEqual(self.content(self.x86_64 / "lib/wine/d3d9/mtld3d/x86_64-windows/d3d9.dll"),
-                         "x86_64-windows")
-
-    def test_the_x86_64_leg_installs_the_x86_64_build_into_a_clone_of_its_own(self):
-        before = sorted(str(path) for path in self.arm64.rglob("*"))
-        (self.stage / "tests/x86_64").mkdir(parents=True)
-        (self.stage / "tests/x86_64/e2e-fixture.exe").touch()
-        runner = self.stage / "e2e" / os.uname().machine / "mtld3d-e2e"
-        runner.parent.mkdir(parents=True)
-        runner.write_text("#!/bin/sh\nprintf 'runner:%s\\n' \"$*\"\n")
-        runner.chmod(0o755)
-        output = self.run_make(f"STAGE={self.stage}", "LEG_SUBMAKE=true", "test-e2e-x86_64")
-        self.assertEqual(sorted(str(path) for path in self.arm64.rglob("*")), before)
-        clone = self.work / ".wine-isolated/leg-x86_64/sdk"
-        tree = clone / "lib/wine/d3d9/mtld3d"
-        self.assertEqual(self.content(tree / "aarch64-windows/d3d9.dll"), "x86_64-windows")
-        self.assertEqual(self.content(tree / "i386-windows/d3d9.dll"), "i386-windows")
-        self.assertEqual((tree / "aarch64-unix/mtld3d.so").read_text(), "aarch64-unix")
-        for name in ("d3d9", "mtld3d"):
-            marker = self.content(clone / f"lib/wine/aarch64-windows/{name}.dll")
-            self.assertIn("-b x86_64-windows", marker)
-            self.assertNotIn("marm64x", marker)
-        self.assertIn(f"--wine {clone}/bin/wine", output)
 
     def test_the_native_arm64_leg_runs_the_aarch64_binaries_in_a_tree_of_its_own(self):
         # The ARM64X build in a clone with a prefix booted after the install,
@@ -790,7 +667,7 @@ class InstallLayoutTests(FakeWineTestCase):
         before = sorted(str(path) for path in self.arm64.rglob("*"))
         (self.stage / "tests/aarch64").mkdir(parents=True)
         (self.stage / "tests/aarch64/e2e-fixture.exe").touch()
-        runner = self.stage / "e2e" / os.uname().machine / "mtld3d-e2e"
+        runner = self.stage / "e2e/arm64/mtld3d-e2e"
         runner.parent.mkdir(parents=True)
         runner.write_text("#!/bin/sh\nprintf 'runner:%s\\n' \"$*\"\n")
         runner.chmod(0o755)

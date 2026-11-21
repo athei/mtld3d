@@ -276,22 +276,6 @@ impl SamplerSnapshot {
     }
 }
 
-/// Turn a stage's filtering into point sampling, for a texture the device cannot filter.
-///
-/// The single-precision float formats filter only on a device with 32-bit
-/// float filtering; elsewhere `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
-/// answers no for them and Metal does not filter them. The min and mag
-/// filters read POINT, and a mip filter other than NONE reads POINT too, which
-/// keeps the level selection and blends no texels. The PE side applies it to
-/// the stored state on its way to the draw, as it folds a texture's LOD.
-pub const fn sample_unfiltered(ss: &mut [u32; SAMPLER_STATE_COUNT]) {
-    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
-    ss[D3DSAMP_MAGFILTER as usize] = D3DTEXF_POINT;
-    if ss[D3DSAMP_MIPFILTER as usize] != D3DTEXF_NONE {
-        ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
-    }
-}
-
 /// Cached fragment LOD uniform derived from effective per-slot inputs.
 ///
 /// Input identity uses raw `f32` bits so signed zero and NaN payload changes

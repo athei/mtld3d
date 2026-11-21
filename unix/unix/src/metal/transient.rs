@@ -5,8 +5,8 @@
 //! PE-side retirement counter from its completion handler. A region is written
 //! again only after the counter of every command buffer that read it has
 //! reached the stamped sequence: an earlier write would change bytes the GPU
-//! has still to read, which Apple Silicon usually hides and the Intel and
-//! paravirtual devices do not.
+//! has still to read, which Apple Silicon usually hides and the paravirtual
+//! device does not.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;

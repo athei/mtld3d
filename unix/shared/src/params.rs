@@ -14,9 +14,9 @@ use super::{
 
 // ── Wire-layout guards ──
 //
-// Checked at compile time on EVERY target this crate is built for — the two
-// PE arches (i686 + x86_64 `*-pc-windows-msvc`) AND both unix `.so` arches
-// (x86_64 and aarch64 Apple, which share these `repr(C)` layouts). The
+// Checked at compile time on EVERY target this crate is built for: the PE
+// arches (i686, and the arm64ec and aarch64 halves of the ARM64X build) AND
+// the aarch64 Apple unix `.so`, which share these `repr(C)` layouts. The
 // whole PE↔unix thunk protocol assumes a `repr(C)` `u64` is 8-byte aligned on
 // all of them; if a 32-bit target ever aligned `u64` to 4, every struct with a
 // `u64` after an odd run of 4-byte fields would shift and the unix handler
@@ -179,28 +179,19 @@ pub struct CreateCommandQueueParams {
     /// device with it on every later thunk. `DestroyCommandQueue` returns it
     /// and frees the record.
     pub record_handle: DeviceRecordHandle, // out
-    /// 0 / non-zero boolean: `MTLDevice.hasUnifiedMemory`.
-    ///
-    /// False on Intel/AMD non-UMA Macs; the storage-mode policy in
-    /// `mtld3d-core::storage_policy` switches CPU-visible buffers to
-    /// `Managed` and the encoder enqueues `didModifyRange:` calls when
-    /// this is 0. (Textures are always `Private`.) The PE side may
-    /// force the non-UMA answer through `intel.managedMemory`.
-    pub unified_memory: u32, // out
     /// `device.minimumLinearTextureAlignmentForPixelFormat(BGRA8Unorm)`.
     ///
-    /// 16 on Apple Silicon, 256 on AMD/Intel (Mac2). Threaded into
-    /// `pad_source_stride` so blit-staging `bytes_per_row` rounds to this
-    /// floor. The PE side may raise it to the Mac2 value through
-    /// `intel.linearAlign256`.
+    /// Threaded into `pad_source_stride` so blit-staging `bytes_per_row`
+    /// rounds to this floor.
     pub min_linear_texture_align: u32, // out
+    pub pad0: u32,
     /// `debug.presentGateFile` as a unix path, `0` = no gate.
     ///
     /// While the named file exists, the queue's presenter parks before
     /// acquiring a drawable. The bytes are valid for the call; the unix
     /// side copies them into the presenter state it creates for this queue.
     pub gate_file_ptr: u64, // in: *const u8
-    pub gate_file_len: u32,                        // in: byte count
+    pub gate_file_len: u32, // in: byte count
     /// The queue's presenter switches, `debug.presentOccluded` among them.
     pub present_debug: PresentDebugFlags, // in
 }
@@ -558,13 +549,12 @@ pub struct PassDescriptor {
     pub stencil_clear_value: u32,                   // in: 0..=255
     pub command_count: u32,                         // in
     pub leading_blits_count: u32,                   // in
-    /// Leading-blit and color-subresource flags.
+    /// Color and depth subresource flags.
     ///
-    /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..11
-    /// carry the color attachment slice, wide enough for every depth plane of
-    /// a volume, bits 12..15 its mip level and bits 16..19 the depth
-    /// attachment's mip level. Ordinary 2D level-zero passes therefore retain
-    /// their previous 0/1 value and the descriptor keeps its size.
+    /// Bit 0 is unassigned. Bits 1..11 carry the color attachment slice, wide
+    /// enough for every depth plane of a volume, bits 12..15 its mip level and
+    /// bits 16..19 the depth attachment's mip level. Ordinary 2D level-zero
+    /// passes therefore carry 0.
     pub pass_flags: u32, // in
     /// Keeps the `u32` run even, so `extra_color` needs no implicit padding.
     pub reserved: u32,
@@ -578,7 +568,6 @@ pub struct PassDescriptor {
 }
 
 impl PassDescriptor {
-    const LEADING_BLITS_NEED_ENCODER: u32 = 1;
     const COLOR_SLICE_SHIFT: u32 = 1;
     const COLOR_LEVEL_SHIFT: u32 = 12;
     const DEPTH_LEVEL_SHIFT: u32 = 16;
@@ -588,16 +577,10 @@ impl PassDescriptor {
     /// and `D3DCAPS9::MaxVolumeExtent` advertises 2048.
     pub const MAX_COLOR_SLICE: u32 = 0x7ff;
 
-    /// Pack leading-blit, color-subresource and depth-level state.
+    /// Pack color-subresource and depth-level state.
     #[must_use]
-    pub const fn pack_flags(
-        needs_encoder: bool,
-        color_slice: u32,
-        color_level: u32,
-        depth_level: u32,
-    ) -> u32 {
-        (if needs_encoder { 1 } else { 0 })
-            | ((color_slice & Self::MAX_COLOR_SLICE) << Self::COLOR_SLICE_SHIFT)
+    pub const fn pack_flags(color_slice: u32, color_level: u32, depth_level: u32) -> u32 {
+        ((color_slice & Self::MAX_COLOR_SLICE) << Self::COLOR_SLICE_SHIFT)
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
             | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
     }
@@ -606,12 +589,6 @@ impl PassDescriptor {
     #[must_use]
     pub const fn depth_level(&self) -> u32 {
         (self.pass_flags >> Self::DEPTH_LEVEL_SHIFT) & 0xf
-    }
-
-    /// Whether the leading-blit list contains an encoder-bound command.
-    #[must_use]
-    pub const fn leading_blits_need_encoder(&self) -> bool {
-        self.pass_flags & Self::LEADING_BLITS_NEED_ENCODER != 0
     }
 
     /// Color attachment array slice.

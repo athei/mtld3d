@@ -444,13 +444,12 @@ const fn is_conversion_source(fmt: u32) -> bool {
 ///
 /// A format always converts to itself (the identity rows hold for any code,
 /// mapped or not). Otherwise the source must be something the blit can read
-/// ([`is_conversion_source`] — a pure predicate, since sources are sampled on
-/// every device) and the destination a colour format this device renders into
-/// (`is_render_target_format_on_device` — the render-quad writes into it).
-/// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
-/// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
+/// ([`is_conversion_source`]) and the destination a colour format the device
+/// renders into (`is_render_target_format`, since the render-quad writes into
+/// it). Windowed `CheckDeviceType` shares this predicate on purpose: the
+/// runtime asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
 /// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
-fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> bool {
+const fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
     if src == dst {
         return true;
     }
@@ -459,7 +458,7 @@ fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> 
     if src == D3DFMT_L8 || dst == D3DFMT_L8 {
         return false;
     }
-    is_conversion_source(src) && is_render_target_format_on_device(dst, expand_packed16)
+    is_conversion_source(src) && mtld3d_core::format::is_render_target_format(dst)
 }
 
 // Formats the texture pool can sample or receive uploads in.
@@ -513,33 +512,6 @@ const fn is_cube_texture_format(fmt: u32) -> bool {
         && !is_depth_stencil_format(fmt)
 }
 
-/// `mtld3d_core::format::is_render_target_format_device`, keyed on the config.
-///
-/// The form every advertisement arm and create gate that concerns actually
-/// rendering into a surface uses. `expand_packed16` is the interface's
-/// `intel.expandPacked16`; the pure format family is the core predicate, and
-/// callers that need the device-independent answer (the conversion SOURCE
-/// side) reach for that one directly.
-pub fn is_render_target_format_on_device(fmt: u32, expand_packed16: bool) -> bool {
-    mtld3d_core::format::is_render_target_format_device(
-        fmt,
-        native_packed16_supported(expand_packed16),
-    )
-}
-
-/// `map_d3d_format_device` with this device's packed 16-bit answer applied.
-///
-/// The form every create path that freezes a Metal format into a texture
-/// must use; layout-only callers (Lock pitch, staging sizing) may keep the
-/// plain `map_d3d_format`, whose source-layout fields are identical.
-/// `expand_packed16` is the interface's `intel.expandPacked16`.
-pub fn map_for_device(
-    format: u32,
-    expand_packed16: bool,
-) -> Option<mtld3d_core::format::FormatMapping> {
-    mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
-}
-
 /// Depth-stencil formats: the ones the capability answers offer.
 ///
 /// Read from `format::is_advertised_depth_format`, so a depth format the
@@ -582,9 +554,9 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // a sampled-only format with a twin, such as DXT1, answers no there.
 //
 // `R8G8B8` belongs here even though it is widened on upload: its backing is
-// `Bgra8Unorm` on every device, so the eager twin view exists and the decode
-// is real. The packed 16-bit formats stay out because their backing is
-// device-dependent and this predicate is pure.
+// `Bgra8Unorm`, so the eager twin view exists and the decode is real. The
+// packed 16-bit formats stay out because Metal has no sRGB twin of any packed
+// 16-bit pixel format.
 //
 // The list follows the Metal format, not the D3D9 name: DXT2 and DXT4 are the
 // BC2 and BC3 block encodings of DXT3 and DXT5 under another content
@@ -832,56 +804,6 @@ pub fn sampler_border_supported() -> bool {
 /// every create path answer from the same cached `GetDeviceInfo` reply.
 pub fn device_caps_flags() -> DeviceCapsFlags {
     device_info().caps
-}
-
-/// Whether the packed 16-bit Metal formats exist natively on this device.
-///
-/// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
-/// formats A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 are backed by
-/// `Bgra8Unorm` instead and widened by the GPU upload pass. `intel.expandPacked16`
-/// (`expand_packed16`, the interface's setting) forces the expansion path on
-/// any device so it can be exercised on Apple Silicon; it folds in here so
-/// every consumer (format mapping, `CheckDeviceFormat`, create gates) flips
-/// together.
-pub fn native_packed16_supported(expand_packed16: bool) -> bool {
-    let native = device_info()
-        .caps
-        .contains(DeviceCapsFlags::NATIVE_PACKED16)
-        && !expand_packed16;
-    if !native {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "packed 16-bit formats unavailable natively (forced={expand_packed16}): \
-             A4R4G4B4/R5G6B5/A1R5G5B5/X1R5G5B5 \
-             widen to BGRA8 in the GPU upload pass, 16-bit render targets are not advertised"
-        );
-    }
-    native
-}
-
-/// Whether the Metal device filters single-precision float textures.
-///
-/// `MTLDevice.supports32BitFloatFiltering` covers exactly R32F / G32R32F /
-/// A32B32G32R32F; `CheckDeviceFormat` answers `D3DUSAGE_QUERY_FILTER` for
-/// those three with it, so an engine that probes before picking a scene
-/// format takes its own fallback instead of sampling a format the device
-/// point-samples. The half-float members are filterable on every family and
-/// are unaffected. `intel.denyFloat32Filtering = true` (`deny`, the
-/// interface's setting) forces the negative answer on any device so the path
-/// can be exercised on Apple Silicon.
-pub fn float32_filtering_supported(deny: bool) -> bool {
-    let supported = device_info()
-        .caps
-        .contains(DeviceCapsFlags::FLOAT32_FILTERING)
-        && !deny;
-    if !supported {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "32-bit float filtering unavailable (forced={deny}): R32F/G32R32F/A32B32G32R32F \
-             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER and are sampled point-filtered"
-        );
-    }
-    supported
 }
 
 /// One spoofed adapter identity: everything a game sniffs, kept consistent.
@@ -1173,9 +1095,9 @@ extern "system" fn d3d9_check_device_type(
     windowed: i32,
 ) -> i32 {
     // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
-    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+    if unsafe { InPtr::<Direct3D9>::opt(this) }.is_none() {
         return D3DERR_INVALIDCALL;
-    };
+    }
     if adapter != 0 || dev_type != D3DDEVTYPE_HAL || !is_display_format(adapter_format) {
         warn!(
             target: LOG_TARGET,
@@ -1196,19 +1118,15 @@ extern "system" fn d3d9_check_device_type(
     // match the display format's colour family directly. The runtime asserts
     // `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
     // CheckDeviceFormatConversion(bb, display)`, so the renderable half is
-    // the device-restricted answer: where the packed 16-bit formats are
-    // expansion-backed, a 16-bit back buffer is refused here as well, and an
-    // engine picks X8R8G8B8 the way hardware without 16-bit render targets
-    // made it. Only a D3D9 back-buffer format is offered at all, so a title
-    // probing for its back buffer lands on one even where the device would
-    // render into a wider format. `CreateDevice` and `Reset` stay lenient and
-    // substitute the BGRA8 layer format for any format they are handed
-    // (`warn_unsupported_backbuffer_format`).
-    let expand_packed16 = d3d.config().expand_packed16;
+    // the render-target answer. Only a D3D9 back-buffer format is offered at
+    // all, so a title probing for its back buffer lands on one even where the
+    // device would render into a wider format. `CreateDevice` and `Reset`
+    // stay lenient and substitute the BGRA8 layer format for any format they
+    // are handed (`warn_unsupported_backbuffer_format`).
     let presentable = mtld3d_core::format::is_back_buffer_format(effective_bb, windowed != 0)
-        && is_render_target_format_on_device(effective_bb, expand_packed16)
+        && mtld3d_core::format::is_render_target_format(effective_bb)
         && if windowed != 0 {
-            is_format_conversion_supported(effective_bb, adapter_format, expand_packed16)
+            is_format_conversion_supported(effective_bb, adapter_format)
         } else {
             is_present_compatible(effective_bb, adapter_format)
         };
@@ -1356,24 +1274,16 @@ extern "system" fn d3d9_check_device_format(
     // answer is the render-target question itself, whether or not the caller
     // also passed D3DUSAGE_RENDERTARGET.
     if usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING != 0
-        && !is_render_target_format_on_device(check_format, cfg.expand_packed16)
+        && !mtld3d_core::format::is_render_target_format(check_format)
     {
         return D3DERR_NOTAVAILABLE;
     }
-    // The per-format device answers: D3DUSAGE_QUERY_FILTER (whether the
-    // format samples with linear filtering, a per-format device answer
-    // rather than the device-wide `D3DPTFILTERCAPS` bits `GetDeviceCaps`
-    // reports, and only the single-precision float family depends on the
-    // device), D3DUSAGE_QUERY_SRGBWRITE (a render-target format with an sRGB
-    // twin, the formats the write encodes) and D3DUSAGE_QUERY_LEGACYBUMPMAP
-    // (the signed formats a bump-environment stage reads its displacement
-    // from).
-    if !mtld3d_core::format::supports_usage_query(
-        check_format,
-        usage,
-        float32_filtering_supported(cfg.deny_float32_filtering),
-        native_packed16_supported(cfg.expand_packed16),
-    ) {
+    // The per-format answers: D3DUSAGE_QUERY_SRGBWRITE (a render-target
+    // format with an sRGB twin, the formats the write encodes) and
+    // D3DUSAGE_QUERY_LEGACYBUMPMAP (the signed formats a bump-environment
+    // stage reads its displacement from). D3DUSAGE_QUERY_FILTER answers yes
+    // for every format the device samples.
+    if !mtld3d_core::format::supports_usage_query(check_format, usage) {
         return D3DERR_NOTAVAILABLE;
     }
     let supported = if is_depth_stencil_format(check_format) {
@@ -1383,7 +1293,7 @@ extern "system" fn d3d9_check_device_format(
         if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
             false
         } else if usage & D3DUSAGE_RENDERTARGET != 0 {
-            is_render_target_format_on_device(check_format, cfg.expand_packed16)
+            mtld3d_core::format::is_render_target_format(check_format)
         } else if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
         } else {
@@ -1392,7 +1302,7 @@ extern "system" fn d3d9_check_device_format(
     } else if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
         is_depth_stencil_format(check_format)
     } else if usage & D3DUSAGE_RENDERTARGET != 0 {
-        is_render_target_format_on_device(check_format, cfg.expand_packed16)
+        mtld3d_core::format::is_render_target_format(check_format)
     } else if matches!(rtype, D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE) {
         // A volume's sRGB read is the twin view BC1, BC2 and BC3 all have,
         // the answer `has_srgb_read_decode` gives for the five DXT formats.
@@ -1425,17 +1335,12 @@ extern "system" fn d3d9_check_device_format(
     }
     // D3DUSAGE_AUTOGENMIPMAP needs render-target capability even when the
     // query does not include D3DUSAGE_RENDERTARGET, so the answer is the
-    // device's render-target answer for the format: a caller derives the one
-    // from the other and the two must agree. On a device that expands the
-    // packed 16-bit formats `generateMipmaps` would still work on the BGRA8
-    // backing, but advertising mip generation for a format the same interface
-    // refuses as a render target is the contradiction, so R5G6B5/A1R5G5B5
-    // answer NOAUTOGEN there and keep their existing creation policy.
-    // The formats of `uses_noautogen_fallback` answer NOAUTOGEN too, and
-    // their create retains usage with exactly one backing level and no internal
-    // generation flag.
+    // render-target answer for the format: a caller derives the one from the
+    // other and the two must agree. The formats of `uses_noautogen_fallback`
+    // answer NOAUTOGEN too, and their create retains usage with exactly one
+    // backing level and no internal generation flag.
     if usage & D3DUSAGE_AUTOGENMIPMAP != 0
-        && !is_render_target_format_on_device(check_format, cfg.expand_packed16)
+        && !mtld3d_core::format::is_render_target_format(check_format)
     {
         return D3DOK_NOAUTOGEN;
     }
@@ -1481,9 +1386,8 @@ extern "system" fn d3d9_check_device_multi_sample_type(
     let caps = device_caps_flags();
     // A format the device cannot render into at all cannot be multisampled
     // either, whatever count is asked for.
-    let renderable =
-        is_render_target_format_on_device(surface_format, d3d.config().expand_packed16)
-            || is_depth_stencil_format(surface_format);
+    let renderable = mtld3d_core::format::is_render_target_format(surface_format)
+        || is_depth_stencil_format(surface_format);
     // `D3DMULTISAMPLE_NONMASKABLE` reports how many rungs its quality ladder
     // has; every maskable level has exactly one quality level. Games poll the
     // whole enum at start-up, so neither the yes nor the no is logged.
@@ -1519,7 +1423,7 @@ extern "system" fn d3d9_check_depth_stencil_match(
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
         || !is_display_format(adapter_format)
-        || !(is_render_target_format_on_device(rt_format, cfg.expand_packed16)
+        || !(mtld3d_core::format::is_render_target_format(rt_format)
             || mtld3d_core::format::is_null_render_target(rt_format))
         || !is_depth_stencil_format(ds_format)
     {
@@ -1544,16 +1448,12 @@ extern "system" fn d3d9_check_device_format_conversion(
     target_format: u32,
 ) -> i32 {
     // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
-    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+    if unsafe { InPtr::<Direct3D9>::opt(this) }.is_none() {
         return D3DERR_INVALIDCALL;
-    };
+    }
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
-        || !is_format_conversion_supported(
-            source_format,
-            target_format,
-            d3d.config().expand_packed16,
-        )
+        || !is_format_conversion_supported(source_format, target_format)
     {
         trace!(
             target: LOG_TARGET,
@@ -1867,6 +1767,15 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     }
 
+    let info = device_info();
+    if let Some(reason) = mtld3d_core::gpu_caps::unsupported_gpu(
+        info.caps,
+        &String::from_utf8_lossy(&info.name[..info.name_len]),
+    ) {
+        error!(target: LOG_TARGET, "CreateDevice: {reason} → NOTAVAILABLE");
+        return D3DERR_NOTAVAILABLE;
+    }
+
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
     let mut present_debug = PresentDebugFlags::empty();
@@ -1874,8 +1783,8 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
-        unified_memory: 0,
         min_linear_texture_align: 0,
+        pad0: 0,
         gate_file_ptr: gate.as_ref().map_or(0, |path| path.as_ptr() as u64),
         gate_file_len: gate.as_ref().map_or(0, |path| {
             u32::try_from(path.len()).expect("a gate path fits u32")
@@ -2254,13 +2163,10 @@ fn spawn_native_encoder(
     cq: &CreateCommandQueueParams,
     cfg: &Arc<Mtld3dConfig>,
 ) -> Result<EncoderThread, i32> {
-    // Resolve overrides once so both runtime sides use identical GPU capabilities.
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
-        unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
         device_caps: device_caps_flags(),
-    }
-    .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
+    };
     EncoderThread::spawn(cq.device_handle, cq.record_handle, gpu_caps, cfg)
 }
 

@@ -279,8 +279,8 @@ const GUARD_BAND: f32 = 32768.0;
 /// magnification bit is as true as the minification one.
 ///
 /// Device-wide, not per format: whether one format samples with linear
-/// filtering is `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`, which answers the
-/// single-precision float family from the device (`format::supports_usage_query`).
+/// filtering is `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
+/// (`format::supports_usage_query`).
 const FILTER_DEFAULT: FilterCaps = FilterCaps::MINFPOINT
     .union(FilterCaps::MINFLINEAR)
     .union(FilterCaps::MINFANISOTROPIC)

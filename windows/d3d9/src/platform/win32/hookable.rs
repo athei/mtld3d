@@ -7,16 +7,11 @@
 //! instructions skips the hook, and some decoders only know the instruction
 //! forms MSVC emits at a function entry. What the compiler emits for a short
 //! Rust function is neither fixed nor chosen with that in mind, so every
-//! export the d3d9 API defines is a naked entry that starts with a prologue
-//! of its own and jumps to the Rust function that does the work:
-//!
-//! - i386: `8B FF 55 8B EC 5D` (`mov edi, edi; push ebp; mov ebp, esp; pop
-//!   ebp`), whose first five bytes are the Windows hot-patch prologue. A hook
-//!   engine copies the first three instructions, exactly five bytes.
-//! - `x86_64`: `0F 1F 44 00 00`, the five-byte NOP. One whole instruction
-//!   covers the five bytes, the entry leaves `rsp` untouched, so it needs no
-//!   unwind data, and the first instruction is at least two bytes long, which
-//!   is the x64 hot-patch requirement.
+//! export the d3d9 API defines on i386 is a naked entry that starts with a
+//! prologue of its own and jumps to the Rust function that does the work:
+//! `8B FF 55 8B EC 5D` (`mov edi, edi; push ebp; mov ebp, esp; pop ebp`),
+//! whose first five bytes are the Windows hot-patch prologue. A hook engine
+//! copies the first three instructions, exactly five bytes.
 //!
 //! The `jmp` to the body follows the prologue, so no relative branch sits in
 //! the bytes a hook engine displaces. The entry does not touch the arguments
@@ -75,22 +70,7 @@ macro_rules! hookable_export {
         }
 
         $(#[$attr])*
-        #[cfg(target_arch = "x86_64")]
-        #[unsafe(export_name = $export)]
-        // SAFETY: the entry runs one NOP, then jumps to a body with the same
-        // signature and calling convention, so the body sees the caller's
-        // arguments and stack and returns to the caller.
-        #[unsafe(naked)]
-        pub extern "system" fn $entry($($arg: $ty),*) $(-> $ret)? {
-            core::arch::naked_asm!(
-                ".byte 0x0f, 0x1f, 0x44, 0x00, 0x00",
-                "jmp {body}",
-                body = sym $body,
-            )
-        }
-
-        $(#[$attr])*
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86"))]
         #[unsafe(export_name = $export)]
         pub $($qualifier)* extern "system" fn $entry($($arg: $ty),*) $(-> $ret)? {
             $body($($arg),*)

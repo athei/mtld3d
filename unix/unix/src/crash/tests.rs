@@ -1,7 +1,7 @@
 //! Self-test for the crash handler's fault report.
 //!
 //! The handler reads the faulting frame out of `__darwin_mcontext64` at byte
-//! offsets hand-derived per architecture, which nothing else checks: a wrong one
+//! offsets hand-derived for arm64, which nothing else checks: a wrong one
 //! prints zeros in the single report a crash leaves behind. A signal handler can
 //! only be exercised by taking the signal, so the test re-executes the binary,
 //! faults on a known address, and asserts the child died through the handler's
@@ -14,14 +14,6 @@
 //! fatal like a fault. The fourth takes the same foreign fault on a thread
 //! that answers with no TEB, where handing it back would fault inside Wine,
 //! and pins that the process ends here with the first fault named.
-//!
-//! The trap-object tests take a `SIGILL` whose PC is a real `CoreFoundation`
-//! symbol on a thread that answers with no TEB, the shape of the framework's
-//! own trap, and point `rbx` at memory of a known kind: a readable object
-//! whose first word resolves to a symbol, an unmapped page, an object that
-//! ends one word before a protected page, and the null it may hold. The dump
-//! has to name what it can read and stop at the first word it cannot, and
-//! must stay absent from a trap in our own code and from a memory fault.
 //!
 //! The early-log tests fault before any location is named. A terminal fault,
 //! the shape of a game that dies before `Direct3DCreate9`, puts the report
@@ -57,10 +49,6 @@ const NO_TEB_SELFTEST_ENV: &str = "MTLD3D_CRASH_NO_TEB_SELFTEST";
 
 /// Set in a child that scans across a protected stack boundary.
 const STACK_SELFTEST_ENV: &str = "MTLD3D_CRASH_STACK_SELFTEST";
-
-/// Set in the re-executed child that takes a `CoreFoundation` trap; its value picks the object.
-#[cfg(target_arch = "x86_64")]
-const TRAP_OBJECT_SELFTEST_ENV: &str = "MTLD3D_CRASH_TRAP_OBJECT_SELFTEST";
 
 /// Set in the re-executed child that faults before the log location is named.
 const EARLY_LOG_SELFTEST_ENV: &str = "MTLD3D_CRASH_EARLY_LOG_SELFTEST";
@@ -124,9 +112,9 @@ extern "C" fn deref_this(this: *const u64) -> u8 {
     std::hint::black_box(unsafe { this.read() })
 }
 
-/// The saved-register decode names the faulting frame on the running arch.
+/// The saved-register decode names the faulting frame.
 ///
-/// Guards the `mcontext` offsets, which are hand-derived per arch and have
+/// Guards the `mcontext` offsets, which are hand-derived and have
 /// no compiler check: a wrong one silently reports zeros in the crash
 /// report, exactly when nobody can re-run the crash.
 #[test]
@@ -175,99 +163,19 @@ fn fault_report_decodes_registers() {
     assert_ne!(value_after("fault_pc="), zero, "{report}");
     assert_ne!(value_after(" sp="), zero, "{report}");
 
-    // The two per-arch offsets. On arm64 both decode exactly: AAPCS64 passes
-    // the argument in `x0` and `BLR` leaves the return address in `lr`, so
-    // the sentinel pins `ARG0_OFFSET` to the byte and a non-zero `lr` pins
-    // `LR_OFFSET`. The x86_64 pair can only be checked for presence, because
-    // neither is reproducible from a native call: `rcx` is the *Win64* first
-    // argument (what Wine's COM calls use, not System V's `rdi`), and
-    // `[rsp]` holds a return address only for a fault at a callee's first
-    // instruction, which is the jump-through-garbage shape it exists for.
+    // Both offsets decode exactly: AAPCS64 passes the argument in `x0` and
+    // `BLR` leaves the return address in `lr`, so the sentinel pins
+    // `ARG0_OFFSET` to the byte and a non-zero `lr` pins `LR_OFFSET`.
     let arg0_label = std::str::from_utf8(super::ARG0_LABEL).expect("ascii label");
     let caller_label = std::str::from_utf8(super::CALLER_LABEL).expect("ascii label");
     assert!(report.contains(arg0_label), "{report}");
     assert!(report.contains(caller_label), "{report}");
-    #[cfg(target_arch = "x86_64")]
-    for label in [
-        " rbx=", " rbp=", " r12=", " r13=", " r14=", " r15=", " rflags=",
-    ] {
-        assert!(value_after(label).starts_with("0x"), "{report}");
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        assert!(!report.contains(" rflags="), "{report}");
-        assert_eq!(
-            value_after(arg0_label),
-            format!("0x{BAD_ADDR:016x}"),
-            "{report}"
-        );
-        assert_ne!(value_after(caller_label), zero, "{report}");
-    }
-}
-
-/// Typed Darwin fields must survive the terminal report at their full width.
-///
-/// Distinct sentinels catch swapped offsets; all-one values pin the longest
-/// line including its newline. The synthetic context is read only by the
-/// handler, never restored as executable machine state.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn nonvolatile_registers_preserve_context() {
-    if let Ok(mode) = std::env::var(SELFTEST_ENV) {
-        // SAFETY: Darwin's machine context contains only integer state.
-        let mut registers: libc::__darwin_mcontext64 = unsafe { core::mem::zeroed() };
-        let sentinel = |value| if mode == "max" { u64::MAX } else { value };
-        registers.__ss.__rbx = sentinel(0x8123_4567_89ab_cdef);
-        registers.__ss.__rbp = sentinel(0x9234_5678_9abc_def0);
-        registers.__ss.__r12 = sentinel(0xa345_6789_abcd_ef01);
-        registers.__ss.__r13 = sentinel(0xb456_789a_bcde_f012);
-        registers.__ss.__r14 = sentinel(0xc567_89ab_cdef_0123);
-        registers.__ss.__r15 = sentinel(0xd678_9abc_def0_1234);
-        registers.__ss.__rflags = sentinel(0xe789_abcd_ef01_2345);
-        // SAFETY: ucontext contains integers and nullable raw pointers.
-        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
-        context.uc_mcontext = &raw mut registers;
-        context.uc_mcsize = core::mem::size_of_val(&registers);
-        super::handler(libc::SIGABRT, ptr::null_mut(), (&raw mut context).cast());
-        unreachable!("the terminal handler must end the child");
-    }
-
-    for (mode, expected) in [
-        (
-            "sentinels",
-            concat!(
-                "[mtld3d::unix] rbx=0x8123456789abcdef rbp=0x923456789abcdef0",
-                " r12=0xa3456789abcdef01 r13=0xb456789abcdef012",
-                " r14=0xc56789abcdef0123 r15=0xd6789abcdef01234",
-                " rflags=0xe789abcdef012345\n",
-            ),
-        ),
-        (
-            "max",
-            concat!(
-                "[mtld3d::unix] rbx=0xffffffffffffffff rbp=0xffffffffffffffff",
-                " r12=0xffffffffffffffff r13=0xffffffffffffffff",
-                " r14=0xffffffffffffffff r15=0xffffffffffffffff",
-                " rflags=0xffffffffffffffff\n",
-            ),
-        ),
-    ] {
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-            .args([
-                "--exact",
-                "crash::tests::nonvolatile_registers_preserve_context",
-                "--nocapture",
-            ])
-            .env(SELFTEST_ENV, mode)
-            .output()
-            .expect("re-exec the test binary");
-        let report = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{report}");
-        assert!(report.contains("FATAL: SIGABRT"), "{report}");
-        assert!(report.contains(expected), "{mode}: {report}");
-        assert_eq!(expected.len(), 179);
-        assert_eq!(report.matches(" rflags=").count(), 1, "{report}");
-    }
+    assert_eq!(
+        value_after(arg0_label),
+        format!("0x{BAD_ADDR:016x}"),
+        "{report}"
+    );
+    assert_ne!(value_after(caller_label), zero, "{report}");
 }
 
 /// A fault outside our image is named, then handed back.
@@ -300,7 +208,6 @@ fn foreign_fault_is_named_then_forwarded() {
 
     assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
     assert!(!report.contains("FATAL"), "{report}");
-    assert!(!report.contains(" rflags="), "{report}");
     let line = report
         .lines()
         .find(|l| l.contains("fault outside mtld3d.so"))
@@ -392,8 +299,6 @@ fn foreign_fault_without_a_teb_is_reported_not_forwarded() {
     assert!(foreign < fatal, "{report}");
     assert!(report.contains("has no Wine TEB"), "{report}");
     assert!(report.contains("native backtrace:"), "{report}");
-    #[cfg(target_arch = "x86_64")]
-    assert!(report.contains(" rflags=0x"), "{report}");
 }
 
 /// A trap instruction in our own code is fatal and named like a fault.
@@ -405,14 +310,9 @@ fn foreign_fault_without_a_teb_is_reported_not_forwarded() {
 fn illegal_instruction_in_our_code_is_fatal() {
     if std::env::var_os(ILL_SELFTEST_ENV).is_some() {
         super::install();
-        // SAFETY: deliberately traps; this is the signal under test, taken
-        // in a child process that never returns from the handler.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::asm!("ud2");
-        }
-        // SAFETY: as above, the permanently undefined encoding.
-        #[cfg(target_arch = "aarch64")]
+        // SAFETY: deliberately traps on the permanently undefined encoding;
+        // this is the signal under test, taken in a child process that never
+        // returns from the handler.
         unsafe {
             std::arch::asm!("udf #0");
         }
@@ -432,214 +332,6 @@ fn illegal_instruction_in_our_code_is_fatal() {
     let report = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{report}");
     assert!(report.contains("FATAL: SIGILL"), "{report}");
-    assert!(!report.contains("trap object"), "{report}");
-}
-
-/// Address of a `CoreFoundation` function, the PC a framework trap reports.
-///
-/// Looked up by name so the address is inside the framework's own image and
-/// not a wrapper of ours; the crate links the framework, so it is loaded.
-#[cfg(target_arch = "x86_64")]
-fn core_foundation_pc() -> u64 {
-    // SAFETY: `dlsym` with the default handle reads the loaded images only.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"CFRunLoopGetCurrent".as_ptr()) };
-    assert!(!symbol.is_null(), "CoreFoundation is loaded");
-    symbol as usize as u64
-}
-
-/// Take a `CoreFoundation` trap in the child with `rbx` naming `object`.
-///
-/// The context is read only by the handler, never restored as machine state;
-/// the stack pointer stays zero so the stack scans stay out of the report.
-#[cfg(target_arch = "x86_64")]
-fn trap_with_object(signo: libc::c_int, object: u64) {
-    // The install resolves Wine's `NtCurrentTeb` and finds none here, so the
-    // stand-in goes in after it.
-    super::install();
-    pin_wine_teb(no_teb_stub);
-    // SAFETY: Darwin's machine context contains only integer state.
-    let mut registers: libc::__darwin_mcontext64 = unsafe { core::mem::zeroed() };
-    registers.__ss.__rip = core_foundation_pc();
-    registers.__ss.__rbx = object;
-    // SAFETY: ucontext contains integers and nullable raw pointers.
-    let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
-    context.uc_mcontext = &raw mut registers;
-    context.uc_mcsize = core::mem::size_of_val(&registers);
-    super::handler(signo, ptr::null_mut(), (&raw mut context).cast());
-    unreachable!("the terminal handler must end the child");
-}
-
-/// Re-execute this test binary into one trap-object child and return its report.
-#[cfg(target_arch = "x86_64")]
-fn trap_object_report(test: &str, mode: &str) -> String {
-    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", test, "--nocapture"])
-        .env(TRAP_OBJECT_SELFTEST_ENV, mode)
-        .output()
-        .expect("re-exec the test binary");
-    let report = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(out.status.code(), Some(1), "{mode}: {report}");
-    report
-}
-
-/// The dump names a word that resolves to a symbol and prints the rest as hex.
-///
-/// The object's first word is the address of a function in this binary, so
-/// its line has to carry this binary's name and an offset; the second word is
-/// a bit pattern no image covers, so its line ends at the hex.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn trap_object_words_are_dumped_and_resolved() {
-    const TEST: &str = "crash::tests::trap_object_words_are_dumped_and_resolved";
-
-    if std::env::var_os(TRAP_OBJECT_SELFTEST_ENV).is_some() {
-        let mut object = [0u64; super::TRAP_OBJECT_WORDS];
-        object[0] = super::install as usize as u64;
-        object[1] = 0x8000_0000_0000_0001;
-        object[super::TRAP_OBJECT_WORDS - 1] = 0x0123_4567_89ab_cdef;
-        trap_with_object(libc::SIGILL, object.as_ptr() as usize as u64);
-    }
-
-    let report = trap_object_report(TEST, "resolved");
-    assert!(report.contains("FATAL: SIGILL"), "{report}");
-    assert!(report.contains("no Wine TEB"), "{report}");
-    assert!(
-        report.contains("CoreFoundation trap object words at rbx:\n"),
-        "{report}"
-    );
-    let exe = std::env::current_exe().expect("test binary path");
-    let basename = exe
-        .file_name()
-        .and_then(|n| n.to_str())
-        .expect("utf-8 test binary name");
-    let first = report
-        .lines()
-        .find(|line| line.starts_with("  +0x0000000000000000 "))
-        .unwrap_or_else(|| panic!("first word missing:\n{report}"));
-    // The child's load address differs from this process's, so the line is
-    // checked by the names it resolves to rather than by the address.
-    assert!(
-        first.contains(&basename[..basename.len().min(32)]),
-        "{first}\n{report}"
-    );
-    assert!(
-        first.contains("install+0x0000000000000000"),
-        "{first}\n{report}"
-    );
-    assert!(
-        report.contains("  +0x0000000000000008 0x8000000000000001\n"),
-        "{report}"
-    );
-    assert!(
-        report.contains("  +0x00000000000000b8 0x0123456789abcdef\n"),
-        "{report}"
-    );
-    assert!(!report.contains("trap object read unavailable"), "{report}");
-    assert_eq!(
-        report
-            .lines()
-            .filter(|line| line.starts_with("  +0x"))
-            .count(),
-        super::TRAP_OBJECT_WORDS,
-        "{report}"
-    );
-}
-
-/// An unreadable object costs one line and nothing else in the report.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn trap_object_at_an_unmapped_page_stops_the_dump() {
-    const TEST: &str = "crash::tests::trap_object_at_an_unmapped_page_stops_the_dump";
-
-    if std::env::var_os(TRAP_OBJECT_SELFTEST_ENV).is_some() {
-        trap_with_object(libc::SIGILL, 0xdead_b000);
-    }
-
-    let report = trap_object_report(TEST, "unmapped");
-    assert!(report.contains("FATAL: SIGILL"), "{report}");
-    assert!(
-        report.contains("CoreFoundation trap object words at rbx:\n"),
-        "{report}"
-    );
-    assert!(
-        report.contains("trap object read unavailable, stopping dump\n"),
-        "{report}"
-    );
-    assert!(!report.contains("  +0x"), "{report}");
-    assert!(report.contains("native backtrace:"), "{report}");
-}
-
-/// An object that ends at a protected page yields its readable words, then stops.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn trap_object_dump_stops_at_a_protected_page() {
-    const TEST: &str = "crash::tests::trap_object_dump_stops_at_a_protected_page";
-
-    if std::env::var_os(TRAP_OBJECT_SELFTEST_ENV).is_some() {
-        // SAFETY: sysconf reads the process's constant page size.
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-            .expect("positive page size");
-        // SAFETY: anonymous mapping with no fixed address or backing file.
-        let mapping = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                page * 2,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let boundary = mapping as usize + page;
-        // SAFETY: the second page is inside the live mapping and page-aligned.
-        let protected = unsafe { libc::mprotect(boundary as *mut c_void, page, libc::PROT_NONE) };
-        assert_eq!(protected, 0);
-        // SAFETY: the two words below the boundary are inside the readable page.
-        unsafe {
-            (boundary as *mut u64).sub(2).write(0x1111_1111_1111_1111);
-            (boundary as *mut u64).sub(1).write(0x2222_2222_2222_2222);
-        }
-        trap_with_object(libc::SIGILL, (boundary - 16) as u64);
-    }
-
-    let report = trap_object_report(TEST, "boundary");
-    assert!(
-        report.contains("  +0x0000000000000000 0x1111111111111111\n"),
-        "{report}"
-    );
-    assert!(
-        report.contains("  +0x0000000000000008 0x2222222222222222\n"),
-        "{report}"
-    );
-    assert!(!report.contains("  +0x0000000000000010"), "{report}");
-    assert!(
-        report.contains("trap object read unavailable, stopping dump\n"),
-        "{report}"
-    );
-}
-
-/// A null `rbx` and a memory fault in the framework both leave the dump out.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn trap_object_dump_needs_a_framework_trap_with_an_object() {
-    const TEST: &str = "crash::tests::trap_object_dump_needs_a_framework_trap_with_an_object";
-
-    if let Ok(mode) = std::env::var(TRAP_OBJECT_SELFTEST_ENV) {
-        let object = [super::install as usize as u64; super::TRAP_OBJECT_WORDS];
-        match mode.as_str() {
-            "null" => trap_with_object(libc::SIGILL, 0),
-            "segv" => trap_with_object(libc::SIGSEGV, object.as_ptr() as usize as u64),
-            other => panic!("unknown mode {other}"),
-        }
-    }
-
-    let report = trap_object_report(TEST, "null");
-    assert!(report.contains("FATAL: SIGILL"), "{report}");
-    assert!(!report.contains("trap object"), "{report}");
-    let report = trap_object_report(TEST, "segv");
-    assert!(report.contains("FATAL: SIGSEGV"), "{report}");
-    assert!(!report.contains("trap object"), "{report}");
 }
 
 #[test]
@@ -700,9 +392,6 @@ fn forward_with_stack(sp: u64) {
     // Model the kernel-owned context with live, aligned local storage. Only
     // the register slots read by the handler need nonzero values.
     let mut registers = [0u64; 40];
-    #[cfg(target_arch = "x86_64")]
-    let pc_slot = 144 / 8;
-    #[cfg(target_arch = "aarch64")]
     let pc_slot = 272 / 8;
     registers[pc_slot] = libc::strlen as *const () as usize as u64;
     registers[super::SP_OFFSET / 8] = sp;
@@ -717,15 +406,6 @@ fn guest_stack_scan_stops_at_unreadable_memory() {
     check_stack_boundaries(
         "crash::tests::guest_stack_scan_stops_at_unreadable_memory",
         super::scan_stack_for_our_frames,
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn caller_stack_read_tolerates_unreadable_memory() {
-    check_stack_boundaries(
-        "crash::tests::caller_stack_read_tolerates_unreadable_memory",
-        |sp| assert_eq!(super::caller_pc(ptr::null_mut(), sp), 0),
     );
 }
 
@@ -791,10 +471,10 @@ fn only_the_image_file_name_decides_whether_a_fault_is_ours() {
         super::path_names_our_image(c.as_ptr())
     }
 
-    assert!(names_ours("/opt/mtld3d/lib/wine/x86_64-unix/mtld3d.so"));
+    assert!(names_ours("/opt/mtld3d/lib/wine/aarch64-unix/mtld3d.so"));
     assert!(names_ours("mtld3d.so"));
     assert!(
-        !names_ours("/opt/mtld3d-toolchain/components/wine/lib/wine/x86_64-unix/ntdll.so"),
+        !names_ours("/opt/mtld3d-toolchain/components/wine/lib/wine/aarch64-unix/ntdll.so"),
         "Wine's own image under a directory named for this project is not ours",
     );
     assert!(
@@ -806,7 +486,9 @@ fn only_the_image_file_name_decides_whether_a_fault_is_ours() {
         "a trailing separator names no file"
     );
     assert!(!names_ours("/usr/lib/system/libsystem_platform.dylib"));
-    assert!(!names_ours("/opt/mtld3d/lib/wine/x86_64-unix/winemetal.so"));
+    assert!(!names_ours(
+        "/opt/mtld3d/lib/wine/aarch64-unix/winemetal.so"
+    ));
     assert!(
         !names_ours("/x/libmtld3d_unix.dylib"),
         "the file name has to begin with the needle, not merely contain it",
@@ -900,9 +582,6 @@ fn recovered_foreign_fault(early_dir: &std::ffi::OsStr) {
     );
     super::install();
     let mut registers = [0u64; 40];
-    #[cfg(target_arch = "x86_64")]
-    let pc_slot = 144 / 8;
-    #[cfg(target_arch = "aarch64")]
     let pc_slot = 272 / 8;
     registers[pc_slot] = libc::strlen as *const () as usize as u64;
     let mut context = [0u64; 7];
@@ -1065,9 +744,6 @@ fn a_pc_in_reserved_space_is_reported_as_guest_memory() {
         // The kernel's context, modelled with live local storage; a zero
         // stack pointer keeps the stack scan out of the report.
         let mut registers = [0u64; 40];
-        #[cfg(target_arch = "x86_64")]
-        let pc_slot = 144 / 8;
-        #[cfg(target_arch = "aarch64")]
         let pc_slot = 272 / 8;
         registers[pc_slot] = pc;
         let mut context = [0u64; 7];

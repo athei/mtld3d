@@ -2,9 +2,7 @@
 //!
 //! The pin is what makes the process-wide Metal caches sound: they hold
 //! pipeline states, textures and buffers built on one `MTLDevice`, and Metal
-//! rejects an encode that mixes objects of two. Every Mac these tests run on
-//! has one GPU, so the assertions pin the invariant rather than reproduce the
-//! dual-GPU divergence, which needs graphics switching to observe.
+//! rejects an encode that mixes objects of two.
 
 use mtld3d_shared::mtl::PresentDebugFlags;
 use objc2_metal::MTLDevice;
@@ -84,13 +82,7 @@ fn create_command_queue_hands_out_the_pinned_device() {
 #[test]
 fn only_the_paravirtual_device_name_takes_the_paravirtual_answers() {
     assert!(is_paravirtual_name("Apple Paravirtual device"));
-    for real in [
-        "Apple M1",
-        "Apple M4 Max",
-        "AMD Radeon Pro 5500M",
-        "Intel(R) UHD Graphics 630",
-        "Intel(R) Iris(TM) Plus Graphics",
-    ] {
+    for real in ["Apple M1", "Apple M4 Max", "Apple M3 Pro"] {
         assert!(!is_paravirtual_name(real), "{real} is a real GPU");
     }
 }

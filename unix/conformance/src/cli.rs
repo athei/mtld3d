@@ -29,11 +29,11 @@ pub struct Config {
     pub tests_wine_version: Option<String>,
     /// `--arch`: which build `exe` runs against, i.e. the label results record under.
     pub arch: Arch,
-    /// `--variant`: which device answers the run is measured under.
+    /// `--variant`: which configuration the run is measured under.
     ///
     /// `native` (the default) runs against the device's own capabilities;
-    /// `intel` forces every `intel.*` config key on and records under a
-    /// separate baseline leg.
+    /// `scale` runs at a reduced `render.scale` and records under a separate
+    /// baseline leg.
     pub variant: Variant,
     /// `--assets`: the directory holding `baseline.txt` / `CONFORMANCE.md`.
     ///
@@ -58,7 +58,7 @@ pub struct Config {
 ///
 /// Recognised flags: `--update-baseline`, `--wine <path>`, `--wineserver
 /// <path>`, `--exe <path>`, `--tests-wine-version <version>`, `--arch <arch>`,
-/// `--variant <native|intel|scale>`, `--assets <dir>`, `--only <subtest>`,
+/// `--variant <native|scale>`, `--assets <dir>`, `--only <subtest>`,
 /// `--repeat <N>`, `--log <filter>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
@@ -119,7 +119,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
             "--variant" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "--variant needs native|intel|scale".to_owned())?;
+                    .ok_or_else(|| "--variant needs native|scale".to_owned())?;
                 variant = value.parse::<Variant>()?;
             }
             "--assets" => {
@@ -160,7 +160,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     }
     let wine = wine.ok_or_else(|| "missing --wine <path to the wine loader>".to_owned())?;
     let exe = exe.ok_or_else(|| "missing --exe <path to d3d9_test.exe>".to_owned())?;
-    let arch = arch.ok_or_else(|| "missing --arch <i686|x86_64|i686-arm64|arm64x>".to_owned())?;
+    let arch = arch.ok_or_else(|| "missing --arch <i686-arm64|arm64x>".to_owned())?;
     Ok(Config {
         update,
         wine,

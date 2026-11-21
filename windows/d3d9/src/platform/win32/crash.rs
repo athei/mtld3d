@@ -108,8 +108,8 @@ const FOREIGN_REPORT_LIMIT: u32 = 4;
 /// Byte offset of `Esp` in the i386 `CONTEXT`.
 #[cfg(target_arch = "x86")]
 const CONTEXT_STACK_POINTER: usize = 0xc4;
-/// Byte offset of `Rsp` in the x64 `CONTEXT`, the layout ARM64EC code is handed too.
-#[cfg(any(target_arch = "x86_64", target_arch = "arm64ec"))]
+/// Byte offset of `Rsp` in the x64 `CONTEXT`, the layout ARM64EC code is handed.
+#[cfg(target_arch = "arm64ec")]
 const CONTEXT_STACK_POINTER: usize = 0x98;
 /// Byte offset of `Lr` in the ARM64 `CONTEXT`.
 #[cfg(target_arch = "aarch64")]

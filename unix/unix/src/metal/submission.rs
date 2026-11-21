@@ -67,7 +67,6 @@ impl RetirementCounter {
 
 /// Owned scalar state queued beside the existing owned frame payload.
 pub struct SubmitDescription {
-    pub blit_commands_need_encoder: bool,
     pub upload_pass_count: usize,
     pub present_layer: MetalHandle<CAMetalLayerKind>,
     pub present_texture: MetalHandle<MTLTextureKind>,

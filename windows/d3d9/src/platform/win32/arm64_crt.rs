@@ -1,6 +1,6 @@
 //! What MSVC's static CRT supplies that the ARM64X link has no library for.
 //!
-//! The i386 and `x86_64` DLLs link MSVC's `msvcrt.lib`, whose static part defines
+//! The i386 DLLs link MSVC's `msvcrt.lib`, whose static part defines
 //! everything below. The two ARM64X halves link llvm-mingw's CRT instead (see
 //! `windows-arm64x` in the Makefile), which defines none of it, and MSVC's
 //! ARM64 and ARM64EC libraries are not available to this build.

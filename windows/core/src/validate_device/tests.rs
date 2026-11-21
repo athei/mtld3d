@@ -15,32 +15,27 @@ fn filters(mag: u32, min: u32, mip: u32) -> [u32; SAMPLER_STATE_COUNT] {
 }
 
 #[test]
-fn the_defaults_validate_with_and_without_a_texture() {
-    let ss = sampler_state_defaults();
-    for bound in [None, Some(true), Some(false)] {
-        assert_eq!(
-            stage_filter_verdict(&ss, bound),
-            StageFilterVerdict::Valid,
-            "point mag/min and no mip filter run on any texture ({bound:?})"
-        );
-    }
+fn the_defaults_validate() {
+    assert_eq!(
+        stage_filter_verdict(&sampler_state_defaults()),
+        StageFilterVerdict::Valid,
+        "point mag/min and no mip filter run"
+    );
 }
 
 #[test]
-fn a_disabled_mag_or_min_filter_fails_with_or_without_a_texture() {
+fn a_disabled_mag_or_min_filter_fails() {
     for (mag, min) in [
         (D3DTEXF_NONE, D3DTEXF_NONE),
         (D3DTEXF_POINT, D3DTEXF_NONE),
         (D3DTEXF_NONE, D3DTEXF_POINT),
         (D3DTEXF_LINEAR, D3DTEXF_NONE),
     ] {
-        for bound in [None, Some(true), Some(false)] {
-            assert_eq!(
-                stage_filter_verdict(&filters(mag, min, D3DTEXF_NONE), bound),
-                StageFilterVerdict::FilterDisabled,
-                "mag {mag} min {min} with texture {bound:?}"
-            );
-        }
+        assert_eq!(
+            stage_filter_verdict(&filters(mag, min, D3DTEXF_NONE)),
+            StageFilterVerdict::FilterDisabled,
+            "mag {mag} min {min}"
+        );
     }
 }
 
@@ -49,13 +44,13 @@ fn a_disabled_mip_filter_is_not_a_disabled_stage() {
     // D3DTEXF_NONE is the default mip filter and selects a single level; only
     // mag and min carry the disabled-filter rule.
     assert_eq!(
-        stage_filter_verdict(&filters(D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE), None),
+        stage_filter_verdict(&filters(D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE)),
         StageFilterVerdict::Valid
     );
 }
 
 #[test]
-fn a_filtered_fetch_from_an_unfilterable_texture_fails() {
+fn every_enabled_filter_validates() {
     for (mag, min, mip) in [
         (D3DTEXF_LINEAR, D3DTEXF_POINT, D3DTEXF_NONE),
         (D3DTEXF_POINT, D3DTEXF_LINEAR, D3DTEXF_NONE),
@@ -63,30 +58,9 @@ fn a_filtered_fetch_from_an_unfilterable_texture_fails() {
         (D3DTEXF_ANISOTROPIC, D3DTEXF_POINT, D3DTEXF_NONE),
     ] {
         assert_eq!(
-            stage_filter_verdict(&filters(mag, min, mip), Some(false)),
-            StageFilterVerdict::TextureNotFilterable,
-            "mag {mag} min {min} mip {mip} on an unfilterable format"
-        );
-        assert_eq!(
-            stage_filter_verdict(&filters(mag, min, mip), Some(true)),
+            stage_filter_verdict(&filters(mag, min, mip)),
             StageFilterVerdict::Valid,
-            "mag {mag} min {min} mip {mip} on a filterable format"
-        );
-        assert_eq!(
-            stage_filter_verdict(&filters(mag, min, mip), None),
-            StageFilterVerdict::Valid,
-            "mag {mag} min {min} mip {mip} with no texture bound"
-        );
-    }
-}
-
-#[test]
-fn point_sampling_an_unfilterable_texture_validates() {
-    for mip in [D3DTEXF_NONE, D3DTEXF_POINT] {
-        assert_eq!(
-            stage_filter_verdict(&filters(D3DTEXF_POINT, D3DTEXF_POINT, mip), Some(false)),
-            StageFilterVerdict::Valid,
-            "point mag/min with mip {mip} samples any format"
+            "mag {mag} min {min} mip {mip}"
         );
     }
 }

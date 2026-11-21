@@ -21,10 +21,6 @@ impl WireValue for Mtld3dConfig {
         self.caps_all.write_wire(writer)?;
         self.main_thread_checker.write_wire(writer)?;
         self.fail_next_submit.write_wire(writer)?;
-        self.expand_packed16.write_wire(writer)?;
-        self.deny_float32_filtering.write_wire(writer)?;
-        self.managed_memory.write_wire(writer)?;
-        self.linear_align256.write_wire(writer)?;
         self.hdr_enable.write_wire(writer)?;
         self.color_space.write_wire(writer)?;
         self.cursor_scale.write_wire(writer)?;
@@ -59,10 +55,6 @@ impl WireValue for Mtld3dConfig {
             caps_all: <bool>::read_wire(reader)?,
             main_thread_checker: <bool>::read_wire(reader)?,
             fail_next_submit: <bool>::read_wire(reader)?,
-            expand_packed16: <bool>::read_wire(reader)?,
-            deny_float32_filtering: <bool>::read_wire(reader)?,
-            managed_memory: <bool>::read_wire(reader)?,
-            linear_align256: <bool>::read_wire(reader)?,
             hdr_enable: <bool>::read_wire(reader)?,
             color_space: <ColorSpacePolicy>::read_wire(reader)?,
             cursor_scale: <CursorScale>::read_wire(reader)?,
@@ -166,13 +158,11 @@ impl WireValue for CursorScale {
 
 impl WireValue for GpuCaps {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        self.unified_memory.write_wire(writer)?;
         self.min_linear_texture_align.write_wire(writer)?;
         self.device_caps.bits().write_wire(writer)
     }
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         Ok(Self {
-            unified_memory: bool::read_wire(reader)?,
             min_linear_texture_align: u32::read_wire(reader)?,
             device_caps: DeviceCapsFlags::from_bits(u32::read_wire(reader)?)
                 .ok_or(WireError::InvalidValue)?,

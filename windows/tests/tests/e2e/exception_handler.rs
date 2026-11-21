@@ -11,7 +11,7 @@
 //! handler.
 //!
 //! The thread raises an illegal instruction (`ud2`, or `udf #0` in a native
-//! ARM64 process), as a protector's instructions that Rosetta rejects do, and
+//! ARM64 process), as a protector's instructions that the x86 translator rejects do, and
 //! a vectored handler the test appends after the layer's resumes it past the
 //! instruction. It runs in a
 //! process of its own before any `Direct3DCreate9`, the state a protector

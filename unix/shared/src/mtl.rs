@@ -51,11 +51,13 @@ pub enum ReadbackPlanes {
 use strum::FromRepr;
 
 /// `MTLStorageMode` wire encoding. Matches the native Metal enum values.
+///
+/// `Managed` (1) is left out: it exists only on a GPU without unified
+/// memory, which mtld3d does not run on.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
 pub enum StorageMode {
     Shared = 0,
-    Managed = 1,
     Private = 2,
     Memoryless = 3,
 }
@@ -752,25 +754,20 @@ bitflags! {
     /// One flags word carries every per-device yes/no the PE side needs for
     /// caps advertisement, so a single `GetDeviceInfo` call (cached process-
     /// wide on the PE side) serves all consumers. New device-dependent caps
-    /// bits belong here, not in new thunks or new param fields.
+    /// bits belong here, not in new thunks or new param fields. Bit 2 is
+    /// unassigned.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct DeviceCapsFlags: u32 {
         /// Border-colour samplers are creatable (Mac2 family, not paravirtual).
         const SAMPLER_BORDER = 1 << 0;
-        /// The packed 16-bit pixel formats exist natively on this device.
+        /// The device belongs to Metal's Apple GPU family (`supportsFamily(Apple2)`).
         ///
-        /// `B5G6R5Unorm` / `Bgr5A1Unorm` / `Abgr4Unorm` are an
-        /// Apple-GPU-family feature; the Intel/AMD Bronze driver (Mac2)
-        /// aborts texture creation on them.
-        const NATIVE_PACKED16 = 1 << 1;
-        /// Single-precision float textures sample with linear filtering.
-        ///
-        /// `MTLDevice.supports32BitFloatFiltering`, which covers exactly
-        /// `R32Float` / `RG32Float` / `RGBA32Float`. Apple-family GPUs
-        /// report it; Mac2 devices answer for themselves, and the
-        /// Intel/AMD Bronze driver typically says no. The half-float
-        /// formats filter on every family and are not covered by this bit.
-        const FLOAT32_FILTERING = 1 << 2;
+        /// Every Apple Silicon GPU, the virtual one of a macOS VM on Apple
+        /// Silicon included, claims it, and no Intel or AMD GPU does.
+        /// `CreateDevice` fails on a device without it: the layer relies on
+        /// unified memory, the packed 16-bit pixel formats and 32-bit float
+        /// filtering, which only this family guarantees.
+        const APPLE_GPU = 1 << 1;
         /// `supportsTextureSampleCount:2` answered yes.
         const SAMPLE_COUNT_2 = 1 << 3;
         /// `supportsTextureSampleCount:4` answered yes.
@@ -791,9 +788,9 @@ bitflags! {
         /// The device takes a visibility query offset up to 256 KB.
         ///
         /// Apple's Metal feature set tables give that maximum for the Apple7
-        /// family and later; they give 65,528 bytes for Apple2 to Apple6 and
-        /// none for Mac2, which therefore keep the smaller buffer. Sizes one
-        /// occlusion-query visibility buffer.
+        /// family and later and 65,528 bytes for Apple2 to Apple6, which
+        /// therefore keep the smaller buffer. Sizes one occlusion-query
+        /// visibility buffer.
         const VISIBILITY_OFFSET_256K = 1 << 7;
     }
 }

@@ -327,10 +327,7 @@ pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
 /// This is the set the colour create paths accept, so it is also the set
 /// `CheckDeviceFormat` advertises for `D3DRTYPE_TEXTURE`, less the formats
 /// with no sampling path (ATI1's pitch, packed YUV's decode). Silent: a
-/// capability probe for an unmapped format is not a fault. Device-independent:
-/// the packed 16-bit members stay in the set on every device because
-/// `map_d3d_format_device` backs them with `Bgra8Unorm` where the native
-/// formats are missing.
+/// capability probe for an unmapped format is not a fault.
 #[must_use]
 pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
     lookup_d3d_format(d3d_format).is_some()
@@ -441,56 +438,6 @@ pub const fn is_volume_texture_format(d3d_format: u32) -> bool {
         && !matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
 }
 
-/// `map_d3d_format`, honouring whether the device has the packed 16-bit formats.
-///
-/// On a device with native packed 16-bit support the answer is identical to
-/// `map_d3d_format`. Without it (Intel/AMD Mac2, or `intel.expandPacked16`),
-/// the packed 16-bit D3D formats are backed by `Bgra8Unorm` instead;
-/// `bytes_per_pixel`/`block_bytes` stay 2 because they describe the SOURCE
-/// layout (Lock pitch, staging sizing — D3D9 Lock semantics are unchanged),
-/// and the upload widens texels to 32-bit in the GPU upload pass
-/// (`upload_pass`). Create paths that freeze a Metal format into a texture
-/// must use this form; layout-only callers may keep `map_d3d_format`.
-#[must_use]
-pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<FormatMapping> {
-    if !native_packed16 {
-        let expanded = match d3d_format {
-            // The upload pass writes D3D channel order directly into BGRA8
-            // and forces alpha opaque for the alpha-less R5G6B5 and
-            // X1R5G5B5, so none of the four needs a sampler swizzle, in
-            // particular A4R4G4B4 drops the native path's ABGR4
-            // channel-order workaround and X1R5G5B5 the native path's forced
-            // alpha. A swizzle would also be fatal here rather than
-            // cosmetic: Metal refuses `RenderTarget` usage on a swizzled
-            // texture view, and the expansion writes these textures through
-            // a render pass.
-            D3DFMT_R5G6B5 | D3DFMT_X1R5G5B5 => Some(FormatMapping {
-                metal_pixel_format: PixelFormat::Bgra8Unorm,
-                bytes_per_pixel: 2,
-                block_width: 1,
-                block_height: 1,
-                block_bytes: 2,
-                swizzle: None,
-                has_alpha: false,
-            }),
-            D3DFMT_A1R5G5B5 | D3DFMT_A4R4G4B4 => Some(FormatMapping {
-                metal_pixel_format: PixelFormat::Bgra8Unorm,
-                bytes_per_pixel: 2,
-                block_width: 1,
-                block_height: 1,
-                block_bytes: 2,
-                swizzle: None,
-                has_alpha: true,
-            }),
-            _ => None,
-        };
-        if expanded.is_some() {
-            return expanded;
-        }
-    }
-    map_d3d_format(d3d_format)
-}
-
 /// The formats D3D9 specifies a device swap chain's back buffer in.
 ///
 /// A8R8G8B8, X8R8G8B8, A1R5G5B5, X1R5G5B5 and R5G6B5, plus A2R10G10B10 in
@@ -510,34 +457,33 @@ pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
     }
 }
 
-/// Colour formats the Metal backend renders into, as a pure format family.
+/// Colour formats the Metal backend renders into.
 ///
-/// `A4R4G4B4` and `X1R5G5B5` are excluded on every device: their mapping
+/// `A4R4G4B4` and `X1R5G5B5` are excluded: their mapping
 /// carries a sampler swizzle (a channel-order correction and an alpha force
 /// respectively), and a swizzle only affects reads, so render writes would
 /// land in the wrong bits. `R8G8B8` is excluded for the same reason its
 /// texels are widened on upload: it has no Metal counterpart at all.
-/// `A8B8G8R8` and `X8B8G8R8` back `Rgba8Unorm`, colour-renderable on both GPU
-/// families, and a render-target handle is always handed out unswizzled, so
-/// the alpha force `X8B8G8R8` carries on the sampling side does not exclude
-/// it. `L8` carries a swizzle too (RRR1), but a render write lands in
-/// `R8Unorm`'s red, which is the channel the swizzle replicates on reads.
+/// `A8B8G8R8` and `X8B8G8R8` back `Rgba8Unorm`, and a render-target handle is
+/// always handed out unswizzled, so the alpha force `X8B8G8R8` carries on the
+/// sampling side does not exclude it. `L8` carries a swizzle too (RRR1), but a
+/// render write lands in `R8Unorm`'s red, which is the channel the swizzle
+/// replicates on reads. `R5G6B5` and `A1R5G5B5` map bit-for-bit to the native
+/// `B5G6R5Unorm` / `BGR5A1Unorm` Metal formats. The float family is
+/// colour-renderable on the Apple GPU family, as Metal's pixel-format
+/// capability table lists.
 ///
-/// The float family is renderable on every device: Metal's pixel-format
-/// capability table lists `R16Float` / `RG16Float` / `RGBA16Float` and
-/// `R32Float` / `RG32Float` / `RGBA32Float` as colour-renderable for both the
-/// Apple and the Mac2 families, so the answer needs no device query. Linear
-/// FILTERING is the half that differs, and it is [`supports_usage_query`],
-/// not this.
-///
-/// `R5G6B5` and `A1R5G5B5` are in the family because they map bit-for-bit to
-/// the native `B5G6R5Unorm` / `BGR5A1Unorm` Metal formats, which a device
-/// without those formats does not have; every advertisement and create gate
-/// that concerns rendering into a surface asks
-/// [`is_render_target_format_device`] instead. This pure form serves the one
-/// question that stays device-independent, which formats a conversion may
-/// read, since a source is sampled rather than rendered into. The conversion
-/// query takes `L8` back out of that set: it answers identity only.
+/// Three `IDirect3D9` answers derive from this one, and D3D9 requires them to
+/// agree. `CheckDeviceFormat(D3DUSAGE_RENDERTARGET)` is the answer itself.
+/// `CheckDeviceType` is refused for a back buffer the device cannot render
+/// into, whatever the present-time conversion says, so the runtime identity
+/// `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
+/// CheckDeviceFormatConversion(bb, display)` holds. And a
+/// `D3DUSAGE_AUTOGENMIPMAP` query answers the success code `D3DOK_NOAUTOGEN`
+/// rather than `D3D_OK` for a format that is no render target, mip generation
+/// being a render operation: the create still succeeds and simply generates
+/// nothing. The conversion query reads its sources from this set too, and
+/// takes `L8` back out of it: it answers identity only.
 #[must_use]
 pub const fn is_render_target_format(d3d_format: u32) -> bool {
     matches!(
@@ -560,58 +506,29 @@ pub const fn is_render_target_format(d3d_format: u32) -> bool {
     )
 }
 
-/// [`is_render_target_format`], restricted to what this device renders into.
-///
-/// On a device without the native packed 16-bit formats, `R5G6B5` and
-/// `A1R5G5B5` drop out: `map_d3d_format_device` backs them with `Bgra8Unorm`
-/// and they sample fine, but a BGRA8-backed "16-bit render target" would
-/// change `GetRenderTargetData` / `LockRect` readback fidelity and need
-/// pack-down machinery, so the honest answer is to not advertise them.
-///
-/// Three `IDirect3D9` answers derive from this one, and D3D9 requires them to
-/// agree. `CheckDeviceFormat(D3DUSAGE_RENDERTARGET)` is the answer itself.
-/// `CheckDeviceType` is refused for a back buffer the device cannot render
-/// into, whatever the present-time conversion says, so the runtime identity
-/// `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
-/// CheckDeviceFormatConversion(bb, display)` holds. And a
-/// `D3DUSAGE_AUTOGENMIPMAP` query answers the success code `D3DOK_NOAUTOGEN`
-/// rather than `D3D_OK` for a format that is no render target, mip generation
-/// being a render operation: the create still succeeds and simply generates
-/// nothing. An engine that probes then picks `X8R8G8B8`, which is what
-/// hardware of that era without 16-bit render targets forced anyway.
-#[must_use]
-pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bool) -> bool {
-    is_render_target_format(d3d_format)
-        && (native_packed16 || !matches!(d3d_format, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
-}
-
-/// Whether `D3DRS_SRGBWRITEENABLE` encodes a render target of this format on this device.
+/// Whether `D3DRS_SRGBWRITEENABLE` encodes a render target of this format.
 ///
 /// D3D9 applies the sRGB write to the render-target formats with an sRGB
 /// counterpart and writes every other one linear. Here that is a format the
 /// device renders into whose Metal format has an sRGB twin, the view the pass
 /// attaches under the state.
 #[must_use]
-pub fn takes_srgb_write(d3d_format: u32, native_packed16: bool) -> bool {
-    is_render_target_format_device(d3d_format, native_packed16)
-        && map_d3d_format_device(d3d_format, native_packed16)
+pub fn takes_srgb_write(d3d_format: u32) -> bool {
+    is_render_target_format(d3d_format)
+        && map_d3d_format(d3d_format)
             .is_some_and(|mapping| mapping.metal_pixel_format().srgb_twin().is_some())
 }
 
-/// The device-dependent half of a `CheckDeviceFormat` usage query.
+/// The format-dependent half of a `CheckDeviceFormat` usage query.
 ///
 /// `D3DUSAGE_QUERY_FILTER` asks whether a format samples with linear
 /// filtering. Metal's pixel-format capability table makes every colour format
-/// in the mapping table filterable on both the Apple and the Mac2 families
-/// with one exception: the single-precision floats R32F / G32R32F /
-/// A32B32G32R32F filter only where `MTLDevice.supports32BitFloatFiltering`
-/// holds, which `float32_filtering` carries from the device. The half-float
-/// members (R16F / G16R16F / A16B16G16R16F) filter on every family and stay
-/// advertised either way.
+/// in the mapping table filterable on the Apple GPU family, the
+/// single-precision floats included, so the filter query answers yes.
 ///
 /// `D3DUSAGE_QUERY_SRGBWRITE` asks whether `D3DRS_SRGBWRITEENABLE` encodes
-/// what is written into the format. It does for a render-target format of the
-/// device whose Metal format has an sRGB twin, the 8-bit four-channel
+/// what is written into the format. It does for a render-target format
+/// whose Metal format has an sRGB twin, the 8-bit four-channel
 /// formats, whether or not the query also carries `D3DUSAGE_RENDERTARGET`:
 /// the pass attaches the twin view, and the encode follows the blender. Every
 /// other render-target format (R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the
@@ -627,37 +544,20 @@ pub fn takes_srgb_write(d3d_format: u32, native_packed16: bool) -> bool {
 /// (`usage_allowed_for_rtype`) confines the question to 2D textures.
 ///
 /// A format that answers no to the bump query, and one that answers no to the
-/// sRGB-write query, is refused before the filter arm, so neither refusal can
-/// turn into the `D3DOK_NOAUTOGEN` success of a combined
-/// `D3DUSAGE_AUTOGENMIPMAP` query. A bump format passes the bump query
-/// through: the rest of the usage decides the answer, so beside
-/// `D3DUSAGE_AUTOGENMIPMAP` it gets the answer that usage alone gets, which
-/// is `D3DOK_NOAUTOGEN` for all three bump formats, since none is a render
-/// target. Other usage policy stays with the caller; the float family is
-/// colour-renderable on both GPU families.
+/// sRGB-write query, is refused here, so neither refusal can turn into the
+/// `D3DOK_NOAUTOGEN` success of a combined `D3DUSAGE_AUTOGENMIPMAP` query. A
+/// bump format passes the bump query through: the rest of the usage decides
+/// the answer, so beside `D3DUSAGE_AUTOGENMIPMAP` it gets the answer that
+/// usage alone gets, which is `D3DOK_NOAUTOGEN` for all three bump formats,
+/// since none is a render target. Other usage policy stays with the caller.
 #[must_use]
-pub fn supports_usage_query(
-    d3d_format: u32,
-    usage: u32,
-    float32_filtering: bool,
-    native_packed16: bool,
-) -> bool {
+pub fn supports_usage_query(d3d_format: u32, usage: u32) -> bool {
     if usage & D3DUSAGE_QUERY_LEGACYBUMPMAP != 0
         && !matches!(d3d_format, D3DFMT_V8U8 | D3DFMT_V16U16 | D3DFMT_Q8W8V8U8)
     {
         return false;
     }
-    if usage & D3DUSAGE_QUERY_SRGBWRITE != 0 && !takes_srgb_write(d3d_format, native_packed16) {
-        return false;
-    }
-    if usage & D3DUSAGE_QUERY_FILTER == 0 {
-        return true;
-    }
-    float32_filtering
-        || !matches!(
-            d3d_format,
-            D3DFMT_R32F | D3DFMT_G32R32F | D3DFMT_A32B32G32R32F
-        )
+    usage & D3DUSAGE_QUERY_SRGBWRITE == 0 || takes_srgb_write(d3d_format)
 }
 
 /// Whether a `CheckDeviceFormat` query on `rtype` may carry `usage`.
@@ -777,12 +677,9 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             // 24-bit B, G, R in ascending addresses, with no Metal
             // counterpart at all: no GPU family has a three-byte colour
             // format. The texels are widened to BGRA8 by the GPU upload pass
-            // (`upload_pass`), which also forces alpha opaque, the way the
-            // packed 16-bit formats are widened on a device without them.
+            // (`upload_pass`), which also forces alpha opaque.
             // `bytes_per_pixel` stays 3 because it describes the SOURCE
-            // layout that D3D9 Lock semantics expose. Unconditional, unlike
-            // the packed 16-bit expansion: there is no device where a native
-            // format could serve this one.
+            // layout that D3D9 Lock semantics expose.
             metal_pixel_format: PixelFormat::Bgra8Unorm,
             bytes_per_pixel: 3,
             block_width: 1,

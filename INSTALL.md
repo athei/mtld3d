@@ -1,26 +1,19 @@
 # Installing mtld3d
 
 Installation guide for the release bundle (`mtld3d.tar.xz`), on stock Wine and
-CrossOver bottles. Building from source and `make install` are in the source
-repository's `docs/BUILDING.md`.
+CrossOver Preview bottles. Building from source and `make install` are in the
+source repository's `docs/BUILDING.md`. An older bundle installs by the
+`INSTALL.md` shipped in it.
 
 ## Requirements
 
-- macOS 15 or macOS 26, on Apple Silicon or Intel. CI covers all but macOS 26
-  on Intel, which has no runners and is expected to work.
-- A Wine from [wine-build](https://github.com/athei/wine-build). Its arm64
-  Wine is the primary target, and its x86_64 Wine, based on CrossOver 26, which
-  an Intel Mac runs and CI pins, takes the x86_64 build. Older Wine or
-  CrossOver releases are not expected to work.
-- macOS 26.4 or later for the arm64 Wine, whose binaries are built for it. An
-  Apple Silicon Mac below that takes the x86_64 Wine under Rosetta 2.
+- A Mac with Apple Silicon. On any other Metal device `CreateDevice` fails
+  with `D3DERR_NOTAVAILABLE`.
+- macOS 26.4 or later, the oldest macOS the arm64 Wine runs on.
+- An arm64 Wine, which brings its own x86 translation: the Wine engine of
+  [Mach9](https://github.com/athei/mach9) v0.4.0, the release CI pins, or an
+  arm64 bottle of CrossOver Preview. An x86_64 Wine cannot load mtld3d.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
-- Rosetta 2 (`softwareupdate --install-rosetta`) for an x86_64 Wine. An arm64
-  Wine brings its own x86 translation (FEX).
-- [x87sidecar](https://github.com/athei/x87sidecar) under an x86_64 Wine, a JIT
-  that replaces Rosetta's slow handling of the x87 math in D3D9-era games. Its
-  cooperative attach mode needs the startup handshake that wine-build's Wines
-  carry, and then no entitlements.
 
 ## Choosing a route
 
@@ -29,10 +22,10 @@ or as a native `d3d9.dll` in the prefix, selected by a DLL override.
 
 | | Builtin | Native override |
 | --- | --- | --- |
-| Use for | A Wine installation you own: your own build, an app-bundled Wine, a package install | Stock Wine, when the stock d3d9 should keep serving other prefixes |
+| Use for | A Wine installation you own: your own build, an app-bundled Wine, or a packaged Wine if it is an arm64 build | Stock Wine, when the stock d3d9 should keep serving other prefixes |
 | Covers | Every d3d9 application in that Wine tree | Every application of its arch in the prefix |
 | Cost | A Wine update or reinstall wipes it. Other d3d9 applications lose the stock implementation | A registry override plus a `d3d9.dll` copy per prefix |
-| CrossOver | Not possible: `CrossOver.app` is replaced on every update | Required |
+| CrossOver Preview | Not possible: `CrossOver Preview.app` is replaced on every update | Required |
 
 ## Stock Wine, shared steps
 
@@ -46,43 +39,18 @@ In the bundle's directory, extract it:
 tar -xf mtld3d.tar.xz
 ```
 
-`ls "$WINE/lib/wine"` shows `aarch64-unix` on an arm64 Wine and `x86_64-unix`
-on an x86_64 one. `ls wine prefix-markers` shows what the bundle has. Run one
-of these four blocks.
+`ls "$WINE/lib/wine"` shows `aarch64-unix` on an arm64 Wine. A Wine whose
+`lib/wine` holds `x86_64-unix` and no `aarch64-unix` is an x86_64 Wine, which
+cannot load mtld3d.
 
-An arm64 Wine with a bundle that has `prefix-markers/system32-arm64`:
-
-```sh
-PE64=aarch64-windows DIR64=aarch64-windows UNIX=aarch64-unix MARKER64=system32-arm64
-```
-
-An arm64 Wine with a bundle that has `wine/aarch64-windows` but no
-`prefix-markers/system32-arm64`, such as 0.14.0:
-
-```sh
-PE64=aarch64-windows DIR64=aarch64-windows UNIX=aarch64-unix MARKER64=system32
-```
-
-An arm64 Wine with a bundle without `wine/aarch64-windows`:
-
-```sh
-PE64=x86_64-windows DIR64=aarch64-windows UNIX=aarch64-unix MARKER64=system32
-```
-
-An x86_64 Wine:
-
-```sh
-PE64=x86_64-windows DIR64=x86_64-windows UNIX=x86_64-unix MARKER64=system32
-```
-
-Then copy the builtin pair into `T`, the tree this Wine loads mtld3d from:
+Copy the builtin pair into `T`, the tree this Wine loads mtld3d from:
 
 ```sh
 T="$WINE/lib/wine/d3d9/mtld3d"; [ -d "$T" ] || T="$WINE/lib/wine"
 WIN="$WINEPREFIX/drive_c/windows"
 cp wine/i386-windows/mtld3d.dll "$T/i386-windows/"
-cp "wine/$PE64/mtld3d.dll" "$T/$DIR64/"
-cp "wine/$UNIX/mtld3d.so" "$T/$UNIX/"
+cp wine/aarch64-windows/mtld3d.dll "$T/aarch64-windows/"
+cp wine/aarch64-unix/mtld3d.so "$T/aarch64-unix/"
 ```
 
 If the prefix existed before this install, add its
@@ -90,7 +58,7 @@ If the prefix existed before this install, add its
 
 ```sh
 cp prefix-markers/syswow64/mtld3d.dll "$WIN/syswow64/"
-cp "prefix-markers/$MARKER64/mtld3d.dll" "$WIN/system32/"
+cp prefix-markers/system32-arm64/mtld3d.dll "$WIN/system32/"
 ```
 
 To configure the game, copy the sample next to its executable. On a later
@@ -107,12 +75,12 @@ reinstall, run the shared steps and this block again.
 
 ```sh
 cp wine/i386-windows/d3d9.dll "$T/i386-windows/"
-cp "wine/$PE64/d3d9.dll" "$T/$DIR64/"
+cp wine/aarch64-windows/d3d9.dll "$T/aarch64-windows/"
 ```
 
 ## Stock Wine, native-override route
 
-After the shared steps, run this block. A wine-build tree `T` also holds a
+After the shared steps, run this block. A Mach9 tree `T` also holds a
 builtin `d3d9.dll`, which every process without the override loads, so it is
 replaced to keep each process on one build; any other Wine's own `d3d9.dll`
 stays. `-n` keeps the first backup when this runs again, and `rm -f` removes
@@ -121,7 +89,7 @@ a game-folder copy, which would win over the prefix copy.
 ```sh
 if [ "$T" != "$WINE/lib/wine" ]; then
   cp wine/i386-windows/d3d9.dll "$T/i386-windows/"
-  cp "wine/$PE64/d3d9.dll" "$T/$DIR64/"
+  cp wine/aarch64-windows/d3d9.dll "$T/aarch64-windows/"
 fi
 cp -n "$WIN/system32/d3d9.dll" "$WIN/system32/d3d9.dll.orig" || true
 cp -n "$WIN/syswow64/d3d9.dll" "$WIN/syswow64/d3d9.dll.orig" || true
@@ -138,7 +106,7 @@ cp native/i386-windows/d3d9.dll "$WIN/syswow64/"
 For a 64-bit game:
 
 ```sh
-cp "native/$PE64/d3d9.dll" "$WIN/system32/"
+cp native/aarch64-windows/d3d9.dll "$WIN/system32/"
 ```
 
 Then set the DLL override, so Wine loads the native `d3d9.dll` instead of its
@@ -161,28 +129,57 @@ After an mtld3d upgrade or a Wine update or reinstall, run the shared steps and
 this route's first block again and re-copy `d3d9.dll` into the prefix, all from
 one build.
 
-On a wine-build Wine, a process that a per-game compatdb rule gives another
+On a Mach9 Wine, a process that a per-game compatdb rule gives another
 d3d9 does not search `T`, finds no `mtld3d.dll` and fails to load the native
 `d3d9.dll`.
 
-## CrossOver
+## CrossOver Preview
 
-`d3d9.dll` loads as a native DLL from the bottle's system directory, and the
-builtin pair comes through the bottle's DLL search path. Nothing is written
-into `CrossOver.app`.
+mtld3d runs in an arm64 bottle of CrossOver Preview, where an x64 game loads
+the ARM64X pair. `d3d9.dll` loads as a native DLL from the bottle's system
+directory, and the builtin pair comes from a directory in the bottle that the
+game's launch adds to the DLL search path. Nothing is written into
+`CrossOver Preview.app`.
 
-Set `MyBottle` to your bottle and `GAME_DIR` to the directory holding the game
-`.exe`. The builtin-marked `d3d9.dll` that `cp -R` brings along is inert: it
-can never shadow CrossOver's own builtin.
+The CrossOver Preview window shows a bottle's architecture as *Bottle Type*
+under *Advanced Settings*, and mtld3d needs `arm64`, which runs CrossOver's
+arm64 Wine. It is the `WineArch` key under `[Bottle]` in the bottle's
+`cxbottle.conf`. An existing arm64 bottle also needs the *CrossOver Preview*
+switch on under *Advanced Settings*, the `Preview` key under `[Bottle]`:
+CrossOver Preview's `wine` refuses to start a bottle without it. Without an
+arm64 bottle, choose *File > New Bottle…* and a *New Bottle Type* that ends in
+*(arm64)*, such as *Windows 10 (arm64)*. The *(Intel)* types run CrossOver's
+x86_64 Wine, which cannot load mtld3d.
+
+All blocks below run in one terminal, in the bundle's directory, because they
+share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
+for the bottle's name, as the window lists it under *Bottles*. Keep the
+quotes: a name can hold spaces, as the default *New Bottle* does.
+
+```sh
+CX="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
+NAME="MyBottle"
+```
+
+Instead of *File > New Bottle…*, the command line creates the same bottle,
+from `win10_64` or another 64-bit template:
+
+```sh
+"$CX/bin/cxbottle" --create --bottle "$NAME" --template win10_64 --winearch arm64
+```
+
+Set `GAME_DIR` to the directory holding the game `.exe`. The builtin-marked
+`d3d9.dll` that `cp -R` brings along is inert: it can never shadow
+CrossOver's own builtin.
 
 ```sh
 tar -xf mtld3d.tar.xz
-BOTTLE="$HOME/Library/Application Support/CrossOver/Bottles/MyBottle"
+BOTTLE="$HOME/Library/Application Support/CrossOver/Bottles/$NAME"
 GAME_DIR="$BOTTLE/drive_c/Program Files/MyGame"
 WIN="$BOTTLE/drive_c/windows"
 cp -R wine/. "$BOTTLE/mtld3d"
 cp prefix-markers/syswow64/mtld3d.dll "$WIN/syswow64/"
-cp prefix-markers/system32/mtld3d.dll "$WIN/system32/"
+cp prefix-markers/system32-arm64/mtld3d.dll "$WIN/system32/"
 cp -n "$WIN/system32/d3d9.dll" "$WIN/system32/d3d9.dll.orig" || true
 cp -n "$WIN/syswow64/d3d9.dll" "$WIN/syswow64/d3d9.dll.orig" || true
 rm -f "$GAME_DIR/d3d9.dll"
@@ -205,37 +202,128 @@ cp native/i386-windows/d3d9.dll "$WIN/syswow64/"
 For a 64-bit game:
 
 ```sh
-cp native/x86_64-windows/d3d9.dll "$WIN/system32/"
+cp native/aarch64-windows/d3d9.dll "$WIN/system32/"
 ```
 
 Then set the DLL override:
 
 ```sh
-CX_WINE="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
-"$CX_WINE" --bottle MyBottle reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
+"$CX/bin/wine" --bottle "$NAME" reg add 'HKCU\Software\Wine\DllOverrides' /v d3d9 /d native /f
 ```
 
-Finally, add the `mtld3d` directory to the bottle's DLL search path in
-`$BOTTLE/cxbottle.conf` (create the `[Wine]` section if it doesn't exist):
+### Launching the game
 
-```ini
-[Wine]
-"DllPath" = "${CX_ROOT}/lib/wine/x86_64-windows:${CX_ROOT}/lib/wine/i386-windows:${CX_ROOT}/lib/wine:${WINEPREFIX}/mtld3d"
+mtld3d's files live in the bottle, not in the app, so Wine finds `mtld3d.dll`
+and `mtld3d.so` only through `WINEDLLPATH`, and every launch has to add the
+bottle's `mtld3d` directory to it. CrossOver's `wine` script sets
+`WINEDLLPATH` to CrossOver's own directories on every launch, after it applies
+`[EnvironmentVariables]` from `cxbottle.conf`. Only a launch's *Environment
+variables* field (the `--env` option), or the `CX_ENV` variable when that field
+is empty, is applied after it. `cxbottle.conf` has no key that adds a
+directory, and a `WINEDLLPATH` under `HKCU\Environment` in the bottle never
+reaches the loader. CrossOver's directories stay first in the value: they hold
+its builtins, and its `wine` script keeps `$CX/lib/wine` there so the loader
+finds `ntdll.so`.
+
+Print the line that sets the value:
+
+```sh
+DLLS="$CX/lib/wine/aarch64-windows:$CX/lib/wine/i386-windows:$CX/lib/wine:$BOTTLE/mtld3d"
+echo "WINEDLLPATH='$DLLS'"
 ```
 
-`DllPath` replaces the launcher's `WINEDLLPATH`. ntdll still searches its own
-directory first, but the launcher finds `winewrapper.exe`, which it prepends to
-every launch, through this value, so CrossOver's own directories must stay
-listed. A `WINEDLLPATH` under `[EnvironmentVariables]` would be overwritten, so
-it must be the `[Wine]` key.
+Every process the game starts inherits the value. A launch without it gets
+CrossOver's value instead, finds no `mtld3d.dll` and fails to load the native
+`d3d9.dll`.
+
+#### Double-click on a launcher
+
+To give every launch from CrossOver Preview the value, put it into `CX_ENV`
+for the login session. Then quit CrossOver Preview and open it again: it reads
+the variable only when it starts.
+
+```sh
+launchctl setenv CX_ENV "WINEDLLPATH='$DLLS'"
+```
+
+A double-click on a launcher in the CrossOver Preview window then loads
+mtld3d, and so does opening the launcher's app in `~/Applications/CrossOver`
+or *Bottle > Run Command…* with an empty *Environment variables* field.
+
+- `CX_ENV` applies to every bottle. Launches in an arm64 bottle without
+  mtld3d, and in an *(Intel)* bottle, behave as they do without it.
+- It holds one bottle's `mtld3d` directory. Launch a game in another bottle
+  with the *Environment variables* field, as below.
+- Any text in a launch's *Environment variables* field replaces `CX_ENV`. To
+  add a variable to such a launch, enter the printed line first, then a space
+  and the variable.
+
+`launchctl setenv` lasts until logout. A LaunchAgent sets `CX_ENV` at every
+login. Loading it sets it now as well, and CrossOver Preview needs the same
+restart. To run the block again, for another bottle for example, run the
+removal block below first: `launchctl bootstrap` fails while the agent is
+loaded.
+
+```sh
+mkdir -p "$HOME/Library/LaunchAgents"
+AGENT="$HOME/Library/LaunchAgents/local.mtld3d.cx-env.plist"
+plutil -create xml1 "$AGENT"
+plutil -insert Label -string local.mtld3d.cx-env "$AGENT"
+plutil -insert RunAtLoad -bool YES "$AGENT"
+plutil -insert ProgramArguments -array "$AGENT"
+for arg in /bin/launchctl setenv CX_ENV "WINEDLLPATH='$DLLS'"; do
+  plutil -insert ProgramArguments -string "$arg" -append "$AGENT"
+done
+launchctl bootstrap "gui/$(id -u)" "$AGENT"
+```
+
+To remove the LaunchAgent and `CX_ENV`, run this, then quit CrossOver Preview
+and open it again:
+
+```sh
+launchctl bootout "gui/$(id -u)/local.mtld3d.cx-env"
+rm -f "$HOME/Library/LaunchAgents/local.mtld3d.cx-env.plist"
+launchctl unsetenv CX_ENV
+```
+
+#### Launching with the value each time
+
+Without `CX_ENV`, a double-click on a launcher does not load mtld3d. Paste the
+printed line, quotes included, into the *Environment variables* field of the
+launch instead:
+
+- For an installed program, select its launcher and click *Run With Options*,
+  or right-click it and choose *Run with Options…*, then click *Run*.
+- For any `.exe`, choose *Bottle > Run Command…* and enter its Windows path
+  in *Command*, in double quotes and followed by its arguments, such as
+  `"C:\Program Files\MyGame\MyGame.exe"`, then click *Run*.
+
+Neither window keeps the field: *Run With Options* opens empty the next time,
+and a launcher made with *Save Command as a Launcher* starts without it.
+
+From the terminal, launch the game, or the launcher that starts it, with the
+same value:
+
+```sh
+"$CX/bin/wine" --bottle "$NAME" --env "WINEDLLPATH='$DLLS'" "$GAME_DIR/MyGame.exe"
+```
+
+To see why a launch did not load mtld3d, tick *Create log file* in either
+window and enter `+loaddll` under *Additional Wine logging channels*, or add
+`--debugmsg +loaddll` to a terminal launch. The log, which the window writes
+to `~/Library/Logs/CrossOver Preview`, names the cause:
+`Library mtld3d.dll (which is needed by L"C:\\windows\\system32\\d3d9.dll") not found`.
+A 32-bit game prints the same `system32` path, which WoW64 maps to
+`syswow64`.
 
 - Any Graphics setting is fine, including *Auto*: the switch and the database
   *Auto* consults only redirect Wine's builtin search, which `d3d9=native`
   bypasses. Other Direct3D versions follow the bottle's backend selection.
 - CrossOver's compatibility database can ship per-game DLL overrides that
   outrank the bottle's, though no game is known to carry one for d3d9. The sign
-  is wined3d `GLSL` fixme lines in the log and no `mtld3d` lines.
-  `WINEDEBUG=+cxcompatdb` names any applied rule.
+  is wined3d `GLSL` fixme lines in the log and no `mtld3d` lines. Adding
+  `--cx-log "$HOME/cx.log" --debugmsg +cxcompatdb` to the launch names any
+  applied rule in that file.
 - CrossOver updates keep bottles. If one migrates the bottle and refreshes
   `drive_c/windows`, re-copy the two prefix markers and `d3d9.dll`.
 - To upgrade mtld3d, re-copy `d3d9.dll` and `$BOTTLE/mtld3d`, all from one
@@ -250,7 +338,8 @@ also be set through the `MTLD3D_CONFIG` environment variable
 
 `RUST_LOG=mtld3d=warn` is the single logging switch for the whole project. On
 stock Wine, export both in the environment that launches the game. On
-CrossOver, set them under `[EnvironmentVariables]` in `cxbottle.conf`.
+CrossOver Preview, set them under `[EnvironmentVariables]` in `cxbottle.conf`,
+or after the `WINEDLLPATH` line in a launch's *Environment variables* field.
 
 ## Troubleshooting
 
@@ -267,12 +356,11 @@ before the game draws anything, with no `RUST_LOG` setting needed:
 | `<arch>` | Build the process runs |
 | --- | --- |
 | `i686` | 32-bit game |
-| `x86_64` | The x86_64 build |
-| `arm64ec` | The ARM64X build in an x64 game on an arm64 Wine |
+| `arm64ec` | The ARM64X build in an x64 game |
 | `aarch64` | A native ARM64 program |
 
-The unix side's own line, `mtld3d.so <version> <id> initialized as <arch>`,
-reads `as x86_64, under Rosetta 2` when it runs through Rosetta 2.
+The unix side writes its own line, `mtld3d.so <version> <id> initialized as
+aarch64`.
 
 If they are absent, `d3d9.dll` never mapped, and every other symptom follows
 from that. Check the prefix markers first, then the override.
@@ -293,10 +381,10 @@ Check, in order:
 2. On the native-override route, `d3d9` is `native` under
    `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` in that directory
    came from `native/`, not `wine/`.
-3. The unix side is installed for the arch of the Wine build, not of the game.
-4. On an ARM64 Wine, or on macOS older than 15.4, use 0.6.0 or newer. Earlier
-   releases carry BMI instructions that neither `xtajit` nor pre-15.4 Rosetta
-   can execute, so the load fails the same way.
+3. `mtld3d.so` is in `aarch64-unix`, whatever the arch of the game.
+4. On CrossOver Preview, the launch added the bottle's `mtld3d` directory to
+   `WINEDLLPATH`, as in [Launching the game](#launching-the-game). A
+   double-click on a launcher does so only while `CX_ENV` is set.
 
 The game's `Logs/gx.log` stays empty in this crash. An empty `Loaded Modules`
 section only means the game directory has no usable `dbghelp.dll`.
@@ -313,7 +401,7 @@ folder.
 
 By default Wine's mac driver switches the whole desktop to the game's mode. To
 keep the desktop's resolution and window positions, make the mode-set virtual
-(on CrossOver, through the bottle's `wine`):
+(on CrossOver Preview, through the bottle's `wine`):
 
 ```sh
 wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /d Y /f
@@ -364,27 +452,18 @@ multiplies on top of it, rendering fewer pixels and upscaling.
 wine/                  lib/wine-shaped tree, every PE builtin-marked
   i386-windows/        d3d9.dll, Direct3D 9
                        mtld3d.dll, PE half of the unix-call bridge
-  x86_64-windows/      the same two, for an x86_64 Wine
-  aarch64-windows/     the same two as ARM64X images, for an arm64 Wine
-  x86_64-unix/         mtld3d.so, Metal-side unix library
-  aarch64-unix/        mtld3d.so for an arm64 Wine
+  aarch64-windows/     the same two as ARM64X images, for x64 games
+  aarch64-unix/        mtld3d.so, Metal-side unix library
 native/                unmarked d3d9.dll for the DLL-override route
   i386-windows/
-  x86_64-windows/
   aarch64-windows/     ARM64X
 prefix-markers/        mtld3d.dll stubs for a prefix wineboot never stamped
   syswow64/
-  system32/
   system32-arm64/
 mtld3d.conf            sample configuration
 INSTALL.md             this file
 LICENSE
 ```
-
-Releases after 0.13.0 are built against an arm64 Wine and have the
-`aarch64-windows` entries. Those after 0.14.0 also have
-`prefix-markers/system32-arm64/`. 0.13.0 and older releases, and any bundle
-built against an x86_64 Wine, have neither.
 
 `d3d9.dll` is one binary in two forms:
 
@@ -399,25 +478,22 @@ builtin pair, only when loaded as a builtin.
 
 ### Where the files go
 
-| Wine | Game | Build in `wine/` and `native/` | Into `T/` | Native `d3d9.dll` into |
-| --- | --- | --- | --- | --- |
-| Either | 32-bit | `i386-windows` | `i386-windows` | `syswow64` |
-| arm64 | 64-bit | `aarch64-windows` | `aarch64-windows` | `system32` |
-| arm64, bundle without `aarch64-windows` | 64-bit | `x86_64-windows` | `aarch64-windows` | `system32` |
-| x86_64 | 64-bit | `x86_64-windows` | `x86_64-windows` | `system32` |
+| Game | Build in `wine/` and `native/` | Into `T/` | Native `d3d9.dll` into |
+| --- | --- | --- | --- |
+| 32-bit | `i386-windows` | `i386-windows` | `syswow64` |
+| 64-bit | `aarch64-windows` | `aarch64-windows` | `system32` |
 
-`mtld3d.so` goes from `wine/<arch>-unix` to the same directory of `T`, for the
-arch of the Wine, not of the game. `T` is `$WINE/lib/wine/d3d9/mtld3d` in a
-wine-build Wine of either arch, whose subdirectories mirror `lib/wine`, and
-`$WINE/lib/wine` in any other Wine.
+`mtld3d.so` goes from `wine/aarch64-unix` to the same directory of `T`,
+whatever the arch of the game. `T` is `$WINE/lib/wine/d3d9/mtld3d` in a Mach9
+Wine, whose subdirectories mirror `lib/wine`, and `$WINE/lib/wine` in any
+other Wine.
 
-- A wine-build Wine's default `lib/wine` directories hold only placeholders.
+- A Mach9 Wine's default `lib/wine` directories hold only placeholders.
   Never copy over them: an x64 process loads the ARM64X pair behind either
   kind the Wine may ship, AMD64 or hybrid (ARM64X).
 - An arm64 Wine loads x64 builtins from `aarch64-windows`, never from
-  `x86_64-windows`, so only one 64-bit pair can be installed. The ARM64X pair
-  is faster: it runs as native code, where the x86_64 pair is translated.
-- The source tree's `make install` does all of this for a wine-build Wine and
+  `x86_64-windows`, and runs the ARM64X pair's ARM64EC half as native code.
+- The source tree's `make install` does all of this for a Mach9 Wine and
   re-stamps the placeholders (see `docs/BUILDING.md`).
 
 ### Prefix markers
@@ -426,13 +502,13 @@ A builtin loads only if the prefix's `system32` or `syswow64` holds a marker
 for its name. `wineboot` writes one for every builtin in `lib/wine` when it
 creates a prefix, so a prefix created after the install needs nothing. An
 existing prefix takes the stubs below, or a `wineboot -u`, which is a full
-prefix update and on a wine-build Wine stamps markers of the right machine.
+prefix update and on a Mach9 Wine stamps markers of the right machine.
 
 | Stub in `prefix-markers/` | Into | Machine | Works for |
 | --- | --- | --- | --- |
-| `syswow64/mtld3d.dll` | `syswow64` | 32-bit | 32-bit programs on either Wine |
-| `system32-arm64/mtld3d.dll` | `system32` | hybrid (ARM64X) | x64 and native ARM64 programs on an arm64 Wine. An x86_64 Wine refuses it |
-| `system32/mtld3d.dll` | `system32` | AMD64 | An x86_64 Wine. On an arm64 Wine, x64 programs only, for a bundle without `system32-arm64` |
+| `syswow64/mtld3d.dll` | `syswow64` | 32-bit | 32-bit programs |
+| `system32-arm64/mtld3d.dll` | `system32` | hybrid (ARM64X) | x64 and native ARM64 programs |
 
-Nothing in `prefix-markers/` belongs in `lib/wine`. CrossOver always needs the
-stubs: `mtld3d` never enters its `lib/wine`, so no `wineboot` stamps a marker.
+Nothing in `prefix-markers/` belongs in `lib/wine`. CrossOver Preview always
+needs the stubs: `mtld3d` never enters its `lib/wine`, so no `wineboot` stamps
+a marker.

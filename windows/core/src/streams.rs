@@ -338,7 +338,7 @@ pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32,
 /// from a shifted stream sits its stream's shift further into its slot, at a
 /// descriptor offset that is not a multiple of 4 and possibly ending up to 3
 /// bytes past the stride. This relies on Metal fetching such an attribute as
-/// addressed, which Apple-silicon GPUs do; Intel and AMD GPUs are unverified.
+/// addressed, which Apple-silicon GPUs do.
 /// It remembers what it was built from, so the next draw over the
 /// same declaration record, layouts and shifts reuses it (see
 /// [`Self::reuse_or_rebuild`]).
@@ -437,8 +437,7 @@ impl CrossingFetch {
     /// Which attributes cross is decided on the application's offsets; the
     /// shift then moves every attribute its slot's stream feeds, to an offset
     /// that is not a multiple of 4 and may end up to 3 bytes past the stride.
-    /// Metal fetches both as addressed on Apple-silicon GPUs; Intel and AMD
-    /// GPUs are unverified.
+    /// Metal fetches both as addressed on Apple-silicon GPUs.
     ///
     /// # Panics
     ///

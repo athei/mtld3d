@@ -2,25 +2,20 @@
 target = "i686-pc-windows-msvc"
 
 # The PE baselines are `pentium4` (SSE2) for i686 and `x86-64-v2` (SSE4.2) for
-# x86_64; `docs/BUILDING.md` ("Instruction-set baselines") gives what was
-# measured for each.
+# x86_64, which builds only the x64 end-to-end test executables;
+# `docs/BUILDING.md` ("Instruction-set baselines") gives what was measured.
 #
-# NO BMI here, in either PE target. These DLLs are guest code, so they run under whichever x86
-# translator the host Wine uses, and CrossOver's arm64 Wine translates 32-bit
+# NO BMI here, in either x86 PE target. This is guest code, so it runs under
+# the arm64 Wine's x86 translator, and CrossOver's arm64 Wine translates 32-bit
 # guests with `xtajit`, which implements neither BMI2 nor BMI1. Each one aborted
 # module init with STATUS_ILLEGAL_INSTRUCTION (c000001d) and took the game down
 # at startup: first a `mulx` in the shim's DllMain, then an `andn` in d3d9's.
-# Rosetta implements both, which is why this only ever showed up on an arm64
-# Wine, and why the flags looked free for so long.
 #
 # LZCNT went with them: an ABM-less CPU decodes it as BSF/BSR rather than
 # faulting, so an unsupported one would have gone unnoticed while quietly
 # returning a different answer. `tzcnt` still appears in the disassembly, which
 # is fine and not a regression of this rule: LLVM only emits it where BSF
 # semantics agree, and the encoding is a REP-prefixed BSF that any x86 decodes.
-#
-# The unix `.so` keeps BMI for its x86_64 build (see `unix/.cargo/config.toml`):
-# that one is host code and only ever runs under Rosetta, never under xtajit.
 # Verified by running the whole i686 e2e suite against CrossOver's arm64 Wine.
 
 # Frame pointers are not pinned here: a normal build takes the toolchain
@@ -81,9 +76,9 @@ rustflags = ["-C", "target-feature=-crt-static"]
 # zstd-sys, which the end-to-end tests link, only needs the C one.
 #
 # `-march` mirrors the rustflags `target-cpu` baseline so build-script C/C++
-# code (snmalloc-sys is the big one — ~300 KB of object in release on x86_64)
-# gets the same ISA: `x86-64-v2` on 64-bit, `pentium4` on 32-bit (which has no
-# x86-64-vN level). These DLLs run under x86-on-ARM translation, whose vector
+# code (snmalloc-sys is the big one) gets the same ISA: `x86-64-v2` on 64-bit,
+# `pentium4` on 32-bit (which has no x86-64-vN level). This code runs under
+# x86-on-ARM translation, whose vector
 # unit is 128-bit: 256-bit AVX/AVX2 ops are split across two halves and
 # underperform plain SSE, so neither baseline goes past SSE4.2, with no BMI for
 # the reason given above the rustflags. Where each one sits below that ceiling

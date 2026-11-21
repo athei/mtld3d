@@ -28,9 +28,10 @@ pub const BUILD: &str = env!("MTLD3D_BUILD");
 
 /// The architecture this image was compiled for, as the startup lines name it.
 ///
-/// One per half of a PE build: `i686`, `x86_64`, and for the ARM64X images
-/// `arm64ec` in the half an x64 process runs and `aarch64` in the one a
-/// native ARM64 process runs; the unix library is `x86_64` or `aarch64`. The
+/// One per half of a PE build: `i686`, and for the ARM64X images `arm64ec`
+/// in the half an x64 process runs and `aarch64` in the one a native ARM64
+/// process runs; the unix library is `aarch64`. `x86_64` names the x64
+/// end-to-end test executables, which compile this crate too. The
 /// line then says which build a process loaded, which its image ID alone
 /// cannot, since both halves of an ARM64X image share one.
 pub const ARCH: &str = if cfg!(target_arch = "x86") {
@@ -63,7 +64,7 @@ mod platform {
     const OPTIONAL_HEADER: usize = 0x18;
     /// `IMAGE_NT_OPTIONAL_HDR32_MAGIC`: a PE32 image, as shipped for i686.
     const MAGIC_PE32: u16 = 0x010b;
-    /// `IMAGE_NT_OPTIONAL_HDR64_MAGIC`: a PE32+ image, as shipped for `x86_64`.
+    /// `IMAGE_NT_OPTIONAL_HDR64_MAGIC`: a PE32+ image, as shipped for ARM64X.
     const MAGIC_PE32_PLUS: u16 = 0x020b;
     /// Offset of `NumberOfRvaAndSizes` within a PE32 optional header.
     const NUM_RVA_PE32: usize = 0x5c;

@@ -701,8 +701,7 @@ fn check_format_conversion() {
         "YUY2 -> X8R8G8B8 is decoded by the StretchRect render quad",
     );
     // A conversion destination has to be renderable, since the quad draws into
-    // it: R5G6B5 is one on a device with the packed 16-bit formats and is not
-    // on one without them, and the conversion answer follows that answer.
+    // it, so the conversion answer follows the device's render-target answer.
     let r5g6b5_renders = h.check_device_format(
         D3DFMT_X8R8G8B8,
         D3DUSAGE_RENDERTARGET,
@@ -748,10 +747,9 @@ fn windowed_device_type_follows_format_conversion() {
     // The runtime requires windowed CheckDeviceType to equal
     // CheckDeviceFormat(RT, bb) && CheckDeviceFormatConversion(bb, display),
     // so the answer for a 16-bit backbuffer on a 32-bit display is whatever
-    // this device says about rendering into R5G6B5: yes where the packed
-    // 16-bit Metal formats are native, no where they are expansion-backed
-    // (`expand16` pins that side). Deriving it here rather than pinning one
-    // of the two keeps the identity the assertion, which is the contract.
+    // this device says about rendering into R5G6B5. Deriving it here rather
+    // than pinning the answer keeps the identity the assertion, which is the
+    // contract.
     // Fullscreen has no present conversion and rejects the pair either way.
     let h = Harness::factory_only();
     assert_eq!(
@@ -3785,10 +3783,10 @@ fn create_fullscreen_honors_the_requested_resolution() {
 /// window manager: a cross-thread `SendMessage` waits until the window's thread
 /// next pumps, which is that restore. A release that answered the message would
 /// destroy the back buffer, its sRGB twin and the depth texture a second time
-/// and leak their replacements, which is what ended the process on the Intel CI
-/// image. The unix side refuses a destroy of a handle that is no longer live,
-/// and a build with debug assertions ends the process at that refusal, which is
-/// what makes this test fail without the guard.
+/// and leak their replacements, which can end the process. The unix side
+/// refuses a destroy of a handle that is no longer live, and a build with
+/// debug assertions ends the process at that refusal, which is what makes this
+/// test fail without the guard.
 #[test]
 fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
     const WM_SIZE: u32 = 0x0005;

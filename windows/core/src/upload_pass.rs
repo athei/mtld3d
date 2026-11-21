@@ -2,14 +2,13 @@
 //!
 //! Two upload shapes cannot ride `copyFromBuffer:toTexture:` as they are:
 //! a staging slab whose texels are narrower than the `Bgra8Unorm` texture
-//! they feed (the packed 16-bit formats on a device without the native
-//! packed formats, and 24-bit R8G8B8 on every device), and any mip whose
-//! row pitch is below Metal's
+//! they feed (24-bit R8G8B8, which has no Metal counterpart), and any mip
+//! whose row pitch is below Metal's
 //! `minimumLinearTextureAlignmentForPixelFormat:` (16 bytes on Apple
-//! Silicon, 256 on Mac2, which puts every small mip of a mipped texture
-//! under it). Both are served by a render pass whose fragment function reads
-//! the staging slab as a buffer argument, which is bound by neither the row
-//! alignment nor the source layout.
+//! Silicon, which puts the smallest mips of a mipped texture under it). Both
+//! are served by a render pass whose fragment function reads the staging
+//! slab as a buffer argument, which is bound by neither the row alignment nor
+//! the source layout.
 //!
 //! The destination has to carry `RenderTarget` usage for that, so the
 //! selection is frozen at texture-create time: [`needs_render_target`] is the
@@ -18,28 +17,18 @@
 //! at a texture that can be an attachment.
 
 use mtld3d_shared::mtl::PixelFormat;
-use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
-    D3DFMT_X1R5G5B5,
-};
+use mtld3d_types::{D3DFMT_A8R8G8B8, D3DFMT_R8G8B8};
 
 /// Source layout the upload quad's fragment function decodes.
 ///
 /// The discriminants are the wire values the shader switches on; keep them in
-/// step with the `decode` cases in the unix-side upload-quad MSL.
+/// step with the `decode` cases in the unix-side upload-quad MSL. Values 0, 1,
+/// 2 and 4 are unassigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum UploadDecode {
-    /// 2 bpp `R5G6B5` widened to `Bgra8Unorm`, alpha forced opaque.
-    R5G6B5 = 0,
-    /// 2 bpp `A1R5G5B5` widened to `Bgra8Unorm`.
-    A1R5G5B5 = 1,
-    /// 2 bpp `A4R4G4B4` widened to `Bgra8Unorm`.
-    A4R4G4B4 = 2,
     /// Verbatim copy of a 4-byte BGRA texel into the matching `Bgra8Unorm`.
     CopyBgra8 = 3,
-    /// 2 bpp `X1R5G5B5` widened to `Bgra8Unorm`, alpha forced opaque.
-    X1R5G5B5 = 4,
     /// 3 bpp `R8G8B8` widened to `Bgra8Unorm`, alpha forced opaque.
     R8G8B8 = 5,
 }
@@ -55,7 +44,6 @@ impl UploadDecode {
     #[must_use]
     pub const fn bytes_per_texel(self) -> u32 {
         match self {
-            Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 | Self::X1R5G5B5 => 2,
             Self::R8G8B8 => 3,
             Self::CopyBgra8 => 4,
         }
@@ -64,9 +52,8 @@ impl UploadDecode {
 
 /// Decode for an upload of `src_d3d_format` into a `gpu_format` texture.
 ///
-/// `Some` for the packed 16-bit formats a device without native support
-/// backs with `Bgra8Unorm`, for 24-bit `R8G8B8`, which no device has a Metal
-/// counterpart for, and for the one uncompressed colour format whose Metal
+/// `Some` for 24-bit `R8G8B8`, which has no Metal counterpart and is backed
+/// by `Bgra8Unorm`, and for the one uncompressed colour format whose Metal
 /// counterpart is renderable, carries no sampler swizzle, and stores its
 /// channels one unorm byte each. Everything else is `None`
 /// and keeps the blit upload (with its CPU repack when the pitch is under
@@ -79,10 +66,6 @@ pub const fn upload_decode(src_d3d_format: u32, gpu_format: PixelFormat) -> Opti
         return None;
     }
     match src_d3d_format {
-        D3DFMT_R5G6B5 => Some(UploadDecode::R5G6B5),
-        D3DFMT_A1R5G5B5 => Some(UploadDecode::A1R5G5B5),
-        D3DFMT_X1R5G5B5 => Some(UploadDecode::X1R5G5B5),
-        D3DFMT_A4R4G4B4 => Some(UploadDecode::A4R4G4B4),
         D3DFMT_R8G8B8 => Some(UploadDecode::R8G8B8),
         D3DFMT_A8R8G8B8 => Some(UploadDecode::CopyBgra8),
         _ => None,
@@ -96,14 +79,7 @@ pub const fn upload_decode(src_d3d_format: u32, gpu_format: PixelFormat) -> Opti
 /// the linear-texture alignment.
 #[must_use]
 pub const fn is_expansion(decode: UploadDecode) -> bool {
-    matches!(
-        decode,
-        UploadDecode::R5G6B5
-            | UploadDecode::A1R5G5B5
-            | UploadDecode::A4R4G4B4
-            | UploadDecode::X1R5G5B5
-            | UploadDecode::R8G8B8
-    )
+    matches!(decode, UploadDecode::R8G8B8)
 }
 
 /// True when this (source, GPU) format pair uploads through an expansion.
@@ -111,8 +87,7 @@ pub const fn is_expansion(decode: UploadDecode) -> bool {
 /// The create paths use it to reject a render target in a format whose
 /// texels are widened on the way in: the texture is BGRA8 underneath, so a
 /// lockable render target in that format would pair a narrower CPU staging
-/// with a 32-bit surface across the readback blits. That covers the packed
-/// 16-bit formats on a device with no native ones, and `R8G8B8` everywhere.
+/// with a 32-bit surface across the readback blits. That covers `R8G8B8`.
 #[must_use]
 pub const fn is_expanded_upload(src_d3d_format: u32, gpu_format: PixelFormat) -> bool {
     match upload_decode(src_d3d_format, gpu_format) {

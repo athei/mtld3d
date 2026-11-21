@@ -9,9 +9,8 @@
 //! the parent reads the log it left.
 //!
 //! Each of the three startup lines also names the arch its half runs as:
-//! `i686` for a 32-bit process, `x86_64` or, for the ARM64X build, `arm64ec`
-//! for an x64 one, `aarch64` for a native ARM64 one, and the unix library its
-//! own arch, followed by `, under Rosetta 2` when Rosetta translates it.
+//! `i686` for a 32-bit process, the ARM64X build's `arm64ec` for an x64 one,
+//! `aarch64` for a native ARM64 one, and `aarch64` for the unix library.
 
 use mtld3d_tests::Harness;
 
@@ -29,8 +28,8 @@ const CHILD_NAME: &str = "exit-after-create.exe";
 const PE_ARCHES: &[&str] = if cfg!(target_arch = "x86") {
     &["i686"]
 } else if cfg!(target_arch = "x86_64") {
-    // The x86_64 build, or the ARM64X build's ARM64EC half on an arm64 Wine.
-    &["x86_64", "arm64ec"]
+    // The ARM64X build's ARM64EC half.
+    &["arm64ec"]
 } else {
     &["aarch64"]
 };
@@ -71,10 +70,7 @@ fn a_process_ending_right_after_direct3dcreate9_keeps_its_startup_lines() {
     let (_, execution) = unix
         .split_once(" initialized as ")
         .expect("found by that text");
-    assert!(
-        ["aarch64", "x86_64", "x86_64, under Rosetta 2"].contains(&execution),
-        "mtld3d.so names its arch, and Rosetta 2 when it runs under it: {unix}"
-    );
+    assert_eq!(execution, "aarch64", "mtld3d.so names its arch: {unix}");
 }
 
 /// Create the interface and end the process at once, with nothing released.

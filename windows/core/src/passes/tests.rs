@@ -7191,7 +7191,15 @@ fn upload_prefix_preserves_order_through_pass_optimization() {
     for (target, blits) in [
         (
             old,
-            vec![BlitCommand::notify_buffer_did_modify_range(0x7000, 0, 16)],
+            vec![BlitCommand::copy_buffer_to_buffer(
+                &mtld3d_shared::CopyBufferToBufferInfo {
+                    src_buffer: 0x7000,
+                    dst_buffer: 0x7100,
+                    src_offset: 0,
+                    dst_offset: 0,
+                    byte_size: 16,
+                },
+            )],
         ),
         (fresh_texture, vec![copy_blit(old, fresh_texture)]),
     ] {
@@ -7239,7 +7247,7 @@ fn upload_prefix_preserves_order_through_pass_optimization() {
     }
     assert_eq!(
         s.passes()[0].leading_blits()[0].cmd,
-        BlitCommandType::NotifyBufferDidModifyRange as u32,
+        BlitCommandType::CopyBufferToBuffer as u32,
     );
     assert_eq!(s.passes()[1].leading_blits()[0].src_handle, old.raw());
     assert_eq!(

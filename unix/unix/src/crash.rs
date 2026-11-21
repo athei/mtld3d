@@ -67,14 +67,8 @@
 //! thread without one is reported in full here and ends the process, so the
 //! report leads with the fault that caused it.
 //!
-//! A trap `CoreFoundation` raises itself (`SIGILL` on a deliberate `ud2`, the
-//! way the framework halts on a run-loop timer it refuses to reschedule) names
-//! its condition in a string and nothing else, while the object it was checking
-//! is in `rbx`. The terminal report of such a trap therefore adds the first
-//! words of that object, each copied by the kernel rather than dereferenced and
-//! annotated with the image and symbol `dladdr` resolves it to, so the object's
-//! class, callout and context read as their owners without the handler assuming
-//! any layout.
+//! The register offsets the report reads are `__darwin_mcontext64`'s arm64
+//! layout, so they exist for `aarch64` alone and another arch fails to build.
 //!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
@@ -431,18 +425,18 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // invisible — and for a jump through a freed/garbage object the PC *is* the
     // bad address, which is the tell. `dladdr` (via `backtrace_symbols_fd`)
     // names the enclosing module/symbol.
-    let rip = fault_pc(ctx);
-    if rip != 0 {
+    let pc = fault_pc(ctx);
+    if pc != 0 {
         let mut b = [0u8; 192];
         let mut p = 0;
         push(&mut b, &mut p, b"[mtld3d::unix] fault_pc=");
-        push_hex(&mut b, &mut p, rip);
+        push_hex(&mut b, &mut p, pc);
         push(&mut b, &mut p, b"\n");
         // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
             let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
-        let mut frame = [rip as *mut c_void; 1];
+        let mut frame = [pc as *mut c_void; 1];
         // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd` is
         // async-signal-safe (resolves via `dladdr`, no malloc) and writes to the log descriptor.
         unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
@@ -459,15 +453,6 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         push(&mut b, &mut p, b"[mtld3d::unix] ");
         push(&mut b, &mut p, ARG0_LABEL);
         push_hex(&mut b, &mut p, mcontext_u64(ctx, ARG0_OFFSET));
-        #[cfg(target_arch = "x86_64")]
-        {
-            // The vtable pointer the faulting `CALL` loaded. No arm64
-            // counterpart: an indirect branch there goes through whichever
-            // register the compiler picked, and `fault_pc` above already
-            // carries the value it jumped to.
-            push(&mut b, &mut p, b" rax(vtbl)=");
-            push_hex(&mut b, &mut p, mcontext_u64(ctx, RAX_OFFSET));
-        }
         push(&mut b, &mut p, b" sp=");
         push_hex(&mut b, &mut p, sp);
         push(&mut b, &mut p, b"\n");
@@ -475,11 +460,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         unsafe {
             let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
-        #[cfg(target_arch = "x86_64")]
-        report_nonvolatile_registers(ctx);
-        #[cfg(target_arch = "x86_64")]
-        report_trap_object(signo, ctx);
-        let ret = caller_pc(ctx, sp);
+        let ret = caller_pc(ctx);
         if ret != 0 {
             let mut rb = [0u8; 192];
             let mut rp = 0;
@@ -921,19 +902,6 @@ fn stack_word<const N: usize>(sp: u64, slot: usize) -> Option<[u8; N]> {
     word
 }
 
-/// Copy the `index`th `N`-byte word of the object at `base`, without dereferencing it.
-///
-/// The object's words are consecutive, so the address is `base` plus `N`
-/// bytes per index. `None` for an address that overflows or that the kernel
-/// declines to copy; the caller decides what a failed read ends.
-#[cfg(target_arch = "x86_64")]
-fn object_word<const N: usize>(base: u64, index: usize) -> Option<[u8; N]> {
-    index
-        .checked_mul(N)
-        .and_then(|offset| base.checked_add(offset as u64))
-        .and_then(copy_word::<N>)
-}
-
 /// Copy `N` bytes at `address` into local storage through the kernel.
 ///
 /// The Mach call reports an unreadable source, including a mapping whose
@@ -1046,276 +1014,51 @@ const fn image_path_byte(path: *const core::ffi::c_char, index: usize) -> u8 {
     unsafe { at.read() }
 }
 
-/// True when the image path dyld owns ends in `suffix`.
-#[cfg(target_arch = "x86_64")]
-fn image_path_ends_with(path: *const core::ffi::c_char, suffix: &[u8]) -> bool {
-    let len = image_path_len(path);
-    if len < suffix.len() {
-        return false;
-    }
-    let start = len - suffix.len();
-    suffix
-        .iter()
-        .enumerate()
-        .all(|(i, &byte)| image_path_byte(path, start + i) == byte)
-}
-
-/// Append the last component of the image path dyld owns, at most 32 bytes of it.
-#[cfg(target_arch = "x86_64")]
-fn push_image_basename(buf: &mut [u8; 192], pos: &mut usize, path: *const core::ffi::c_char) {
-    /// The longest basename a line carries; keeps the whole line in its buffer.
-    const BASENAME_MAX: usize = 32;
-
-    let len = image_path_len(path);
-    let mut start = 0usize;
-    for index in 0..len {
-        if image_path_byte(path, index) == b'/' {
-            start = index + 1;
-        }
-    }
-    let mut name = [0u8; BASENAME_MAX];
-    let take = (len - start).min(BASENAME_MAX);
-    for (i, slot) in name.iter_mut().enumerate().take(take) {
-        *slot = image_path_byte(path, start + i);
-    }
-    push(buf, pos, &name[..take]);
-}
-
-/// Words copied out of the object a `CoreFoundation` trap holds in `rbx`.
-///
-/// Enough to cover a run-loop timer in every layout the framework has had:
-/// the runtime base, the lock, the run loop and mode pointers, the fire date,
-/// the interval, the tolerance, the fire ticks, the order, the callout and
-/// the context. Fixed, so the dump's length is too.
-#[cfg(target_arch = "x86_64")]
-const TRAP_OBJECT_WORDS: usize = 24;
-
-/// Dump the object a `CoreFoundation` trap holds in `rbx`, without touching it.
-///
-/// A framework trap (`SIGILL` on a deliberate `ud2`) names its condition in a
-/// string and nothing else, while the object it was checking is in `rbx`,
-/// which the trapping function keeps live across the cold call. Each word of
-/// that object is copied by the kernel into local storage, printed as hex at
-/// its offset, and followed by the image and symbol `dladdr` resolves it to,
-/// so a class pointer, a callout or a context reads as its owner while the
-/// handler assumes nothing about the layout. Only a `SIGILL` whose PC lies in
-/// `CoreFoundation` qualifies: a trap in our own code has its own report, and
-/// a memory fault's `rbx` is arbitrary. The first unreadable word ends the
-/// dump, and nothing here dereferences the object or calls into the framework.
-#[cfg(target_arch = "x86_64")]
-fn report_trap_object(signo: c_int, ctx: *mut c_void) {
-    /// The image whose traps carry their object in `rbx`.
-    const IMAGE_SUFFIX: &[u8] = b"/CoreFoundation";
-    const HDR: &[u8] = b"[mtld3d::unix] CoreFoundation trap object words at rbx:\n";
-    const UNREADABLE: &[u8] = b"[mtld3d::unix] trap object read unavailable, stopping dump\n";
-    /// The longest symbol name a word's line carries.
-    const SYMBOL_MAX: usize = 64;
-
-    if signo != libc::SIGILL {
-        return;
-    }
-    let Some(trap) = dladdr_info(fault_pc(ctx)) else {
-        return;
-    };
-    if !image_path_ends_with(trap.dli_fname, IMAGE_SUFFIX) {
-        return;
-    }
-    let base = mcontext_u64(ctx, mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbx));
-    if base == 0 {
-        return;
-    }
-    let fd = crate::log_file::raw_fd();
-    // SAFETY: write(2) is async-signal-safe; the bytes have static storage.
-    unsafe {
-        let _ = libc::write(fd, HDR.as_ptr().cast::<c_void>(), HDR.len());
-    }
-    for index in 0..TRAP_OBJECT_WORDS {
-        let Some(bytes) = object_word::<8>(base, index) else {
-            // SAFETY: as above.
-            unsafe {
-                let _ = libc::write(fd, UNREADABLE.as_ptr().cast::<c_void>(), UNREADABLE.len());
-            }
-            return;
-        };
-        let word = u64::from_ne_bytes(bytes);
-        let mut b = [0u8; 192];
-        let mut p = 0;
-        push(&mut b, &mut p, b"  +");
-        push_hex(&mut b, &mut p, (index * 8) as u64);
-        push(&mut b, &mut p, b" ");
-        push_hex(&mut b, &mut p, word);
-        if word >= 0x1000
-            && let Some(target) = dladdr_info(word)
-        {
-            push(&mut b, &mut p, b" ");
-            push_image_basename(&mut b, &mut p, target.dli_fname);
-            push(&mut b, &mut p, b"+");
-            push_hex(
-                &mut b,
-                &mut p,
-                word.wrapping_sub(target.dli_fbase as usize as u64),
-            );
-            if !target.dli_sname.is_null() {
-                // SAFETY: `dli_sname` is the NUL-terminated symbol name dyld
-                // owns; `strlen` is async-signal-safe.
-                let name_len = unsafe { libc::strlen(target.dli_sname) };
-                // SAFETY: `name_len` bytes at `dli_sname` are the name just measured.
-                let name =
-                    unsafe { core::slice::from_raw_parts(target.dli_sname.cast::<u8>(), name_len) };
-                push(&mut b, &mut p, b" ");
-                push(&mut b, &mut p, &name[..name_len.min(SYMBOL_MAX)]);
-                push(&mut b, &mut p, b"+");
-                push_hex(
-                    &mut b,
-                    &mut p,
-                    word.wrapping_sub(target.dli_saddr as usize as u64),
-                );
-            }
-        }
-        push(&mut b, &mut p, b"\n");
-        // SAFETY: write(2) is async-signal-safe; the buffer holds p initialized bytes.
-        unsafe {
-            let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
-        }
-    }
-}
-
 /// Capacity of the frame buffer handed to `backtrace`.
 const FRAME_CAP: c_int = 64;
 
 /// Byte offset of the saved stack pointer within `__darwin_mcontext64`.
 ///
-/// `x86_64` `__rsp`; `arm64` `__sp`, which follows `__x[29]`, `__fp`, `__lr`.
-#[cfg(target_arch = "x86_64")]
-const SP_OFFSET: usize = 72;
+/// `__sp`, which follows `__x[29]`, `__fp`, `__lr`.
 #[cfg(target_arch = "aarch64")]
 const SP_OFFSET: usize = 264;
 
 /// Byte offset of the register carrying a called method's first argument.
 ///
-/// `x86_64` `__rcx` is the Win64 first argument, i.e. a COM call's `this`;
-/// `arm64` `__x0` is the AAPCS64 first argument, the same role.
-#[cfg(target_arch = "x86_64")]
-const ARG0_OFFSET: usize = 32;
+/// `__x0` is the AAPCS64 first argument, i.e. a COM call's `this`.
 #[cfg(target_arch = "aarch64")]
 const ARG0_OFFSET: usize = 16;
 
 /// Byte offset of the register carrying a native call's first argument.
 ///
-/// `x86_64` `__rdi`, the System V first argument, which is what a framework
-/// or the Objective-C runtime was handed; `arm64` `__x0`, the same role.
-#[cfg(target_arch = "x86_64")]
-const NATIVE_ARG0_OFFSET: usize = 48;
+/// `__x0`, which is what a framework or the Objective-C runtime was handed.
 #[cfg(target_arch = "aarch64")]
 const NATIVE_ARG0_OFFSET: usize = 16;
-
-/// Byte offset of `__rax`, which holds the vtable pointer a `CALL` loaded.
-#[cfg(target_arch = "x86_64")]
-const RAX_OFFSET: usize = 16;
 
 /// Byte offset of `__lr`, where `BLR` leaves the return address.
 #[cfg(target_arch = "aarch64")]
 const LR_OFFSET: usize = 256;
 
 /// Label for the first-argument register in the fault report.
-#[cfg(target_arch = "x86_64")]
-const ARG0_LABEL: &[u8] = b"rcx(this)=";
-#[cfg(target_arch = "aarch64")]
 const ARG0_LABEL: &[u8] = b"x0(this)=";
 
 /// Label for the caller address in the fault report, naming where it came from.
-#[cfg(target_arch = "x86_64")]
-const CALLER_LABEL: &[u8] = b"caller(ret@rsp)=";
-#[cfg(target_arch = "aarch64")]
 const CALLER_LABEL: &[u8] = b"caller(lr)=";
 
-/// Retain architectural nonvolatile registers and flags from the faulting context.
+/// The return address of the frame that faulted.
 ///
-/// Darwin places the 64-bit thread state after its 16-byte exception state.
-/// The libc fields mirror that SDK layout, including the 64-bit RFLAGS slot.
-/// A separate line fits all seven full-width values and its newline in the
-/// existing 192-byte buffer without crowding out the argument or stack fields.
-#[cfg(target_arch = "x86_64")]
-fn report_nonvolatile_registers(ctx: *mut c_void) {
-    const REGISTERS: [(&[u8], usize); 7] = [
-        (
-            b"rbx=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbx),
-        ),
-        (
-            b" rbp=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbp),
-        ),
-        (
-            b" r12=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r12),
-        ),
-        (
-            b" r13=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r13),
-        ),
-        (
-            b" r14=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r14),
-        ),
-        (
-            b" r15=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r15),
-        ),
-        (
-            b" rflags=",
-            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rflags),
-        ),
-    ];
-
-    let mut buf = [0u8; 192];
-    let mut pos = 0;
-    push(&mut buf, &mut pos, b"[mtld3d::unix] ");
-    for (label, offset) in REGISTERS {
-        push(&mut buf, &mut pos, label);
-        push_hex(&mut buf, &mut pos, mcontext_u64(ctx, offset));
-    }
-    push(&mut buf, &mut pos, b"\n");
-    // SAFETY: write(2) is async-signal-safe; the buffer holds pos initialized bytes.
-    unsafe {
-        let _ = libc::write(
-            crate::log_file::raw_fd(),
-            buf.as_ptr().cast::<c_void>(),
-            pos,
-        );
-    }
-}
-
-/// The return address of the frame that faulted, or 0 if it can't be read.
-///
-/// `x86_64` `CALL` pushes it, so for a jump-through-garbage fault (which faults
-/// at the callee's first instruction, before any prologue) it is the word at
-/// `[rsp]`; an unreadable `rsp` reports no return address.
-#[cfg(target_arch = "x86_64")]
-fn caller_pc(_ctx: *mut c_void, sp: u64) -> u64 {
-    stack_word(sp, 0).map_or(0, u64::from_ne_bytes)
-}
-
-/// The return address of the frame that faulted, or 0 if it can't be read.
-///
-/// `arm64` `BLR` leaves it in `__lr` rather than on the stack, so this needs no
+/// `BLR` leaves it in `__lr` rather than on the stack, so this needs no
 /// memory read at all and stays valid even when the stack pointer is garbage.
-#[cfg(target_arch = "aarch64")]
-const fn caller_pc(ctx: *mut c_void, _sp: u64) -> u64 {
+const fn caller_pc(ctx: *mut c_void) -> u64 {
     mcontext_u64(ctx, LR_OFFSET)
 }
 
 /// The faulting program counter from a signal `ucontext`, or 0 if it can't be read.
 ///
-/// `uc_mcontext` is a pointer to `__darwin_mcontext64`, sitting at byte offset 0x30 in
-/// `ucontext_t` (same on both macOS arches). The PC offset *within* the
-/// `mcontext` is arch-specific: `x86_64` `__rip` follows the 16-byte exception
-/// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte
-/// exception state + 32 thread-state `u64`s (272). Both are shipped: the `.so`
-/// follows the arch of the Wine that loads it.
+/// `uc_mcontext` is a pointer to `__darwin_mcontext64`, sitting at byte offset
+/// 0x30 in `ucontext_t`. `__pc` follows the 16-byte exception state and 32
+/// thread-state `u64`s (272).
 const fn fault_pc(ctx: *mut c_void) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    const PC_OFFSET: usize = 144;
     #[cfg(target_arch = "aarch64")]
     const PC_OFFSET: usize = 272;
 
@@ -1340,8 +1083,7 @@ const fn fault_pc(ctx: *mut c_void) -> u64 {
 /// Read a `u64` at byte `offset` within the signal `ucontext`'s `mcontext`.
 ///
 /// Offsets follow `__darwin_mcontext64` for the arch this built for: a 16-byte
-/// exception state, then the thread-state registers. `x86_64` has `rax` at 16,
-/// `rcx` at 32, `rsp` at 72, `rip` at 144; `arm64` has `x0` at 16 (the rest of
+/// exception state, then the thread-state registers: `x0` at 16 (the rest of
 /// `__x[29]` following), then `fp` at 248, `lr` at 256, `sp` at 264, `pc` at
 /// 272. Returns 0 if the context can't be read.
 const fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {

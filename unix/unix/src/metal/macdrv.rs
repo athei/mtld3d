@@ -2530,7 +2530,7 @@ fn configure_metal_layer(
     // because Wine retains the underlying Obj-C objects for the
     // lifetime of the view. Cast the layer pointer through `u64` to
     // strip the `!Send` so the `move` closure compiles; reconstruct
-    // on the main thread. Sound on x86_64 — pointers fit in `u64`
+    // on the main thread. Sound on a 64-bit host: pointers fit in `u64`
     // losslessly.
     let layer_addr = layer as u64;
     run_on_main_thread_sync(move || {

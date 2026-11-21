@@ -923,7 +923,6 @@ fn test_submit_params(
     failed: &AtomicU64,
 ) -> SubmitDescription {
     SubmitDescription {
-        blit_commands_need_encoder: false,
         upload_pass_count: 0,
         present_layer: MetalHandle::NULL,
         present_texture: MetalHandle::NULL,
@@ -1154,7 +1153,7 @@ fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor 
         stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: 0,
-        pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(0, 0, 0),
         reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
@@ -1415,8 +1414,7 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
                 let coherent = AtomicU64::new(0);
                 let upload = AtomicU64::new(0);
                 let failed = AtomicU64::new(0);
-                let mut params = test_submit_params(&coherent, &upload, &failed);
-                params.blit_commands_need_encoder = true;
+                let params = test_submit_params(&coherent, &upload, &failed);
                 let frame = FrameSubmission {
                     description: &params,
                     blits: &rejected,
@@ -1452,7 +1450,6 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
         assert!(super::encode_leading_blits(
             &cb,
             &commands,
-            true,
             super::BlitSite::FrameLeading,
             &mut ctx,
         ));

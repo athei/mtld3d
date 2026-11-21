@@ -22,11 +22,10 @@ mod tests;
 /// independently compiled VS and PS libraries, so each stage is its own
 /// library.
 ///
-/// MSL pinned to 2.4 so the same compiled libraries work on Intel/AMD
-/// Macs. Metal 3.x is Apple-Silicon-only; without the pin, Metal picks
-/// a default that depends on the host (≥ 3.0 on macOS 14+) and Intel
-/// drivers reject the source. Our DXSO emitter doesn't use any 3.x
-/// features, so the pin is loss-free.
+/// MSL pinned to 2.4 so the language the emitted source is compiled against
+/// does not move with the host: without the pin, Metal picks a default that
+/// depends on the macOS release (≥ 3.0 on macOS 14+). Our DXSO emitter
+/// doesn't use any 3.x features, so the pin is loss-free.
 pub fn compile_shader_library(
     device_handle: MetalHandle<MTLDeviceKind>,
     msl: &str,

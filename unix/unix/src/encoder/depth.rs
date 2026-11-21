@@ -4,17 +4,15 @@ use mtld3d_core::{
     depth_texture::{PackedDepth, PlaneLayout},
     encoder_data::DepthTransfer,
     page_box::{PageBox, PageBoxRead},
-    storage_policy::buffer_storage_mode,
 };
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, BufferCreateDesc, CopyBufferToTextureInfo, MetalHandle,
-    mtl::{BufferKind, DepthTransferKind, DestroyKind, PixelFormat},
+    mtl::{BufferKind, DepthTransferKind, DestroyKind, PixelFormat, StorageMode},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
 use super::{
-    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, RetainedPages,
-    destroy_resources_bulk,
+    FrameEncoder, PendingResourceRetention, RetainedPages, destroy_resources_bulk,
     upload_view::{TextureView, UploadView},
 };
 
@@ -77,7 +75,7 @@ impl FrameEncoder {
                 backing_ptr: page.as_ptr() as u64,
                 length: page.len() as u64,
                 id: job.info().texture_id().raw(),
-                storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+                storage_mode: StorageMode::Shared,
                 kind: BufferKind::Repack,
             })
             .collect();
@@ -101,7 +99,6 @@ impl FrameEncoder {
             self.end_current_pass("dynamic_depth_upload");
         }
         for ((page, pitch, kind), handle) in pages.into_iter().zip(handles) {
-            self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, page.len() as u64);
             let mut command = BlitCommand::copy_buffer_to_texture(&CopyBufferToTextureInfo {
                 buffer_handle: handle.raw(),
                 buffer_offset: 0,
@@ -134,9 +131,6 @@ impl FrameEncoder {
                     seq: self.current_submit_seq,
                     from_texture: true,
                 });
-        }
-        if !ordered {
-            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
         self.blit_retention.hold(
             PageBoxRead::new(std::sync::Arc::clone(job.staging().backing())),

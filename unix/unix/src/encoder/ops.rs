@@ -17,7 +17,7 @@ use mtld3d_shared::{
     InPtr, MetalHandle,
     encoder_protocol::EncoderOpcode,
     encoder_wire::WireError,
-    mtl::{DeviceCapsFlags, PixelFormat},
+    mtl::PixelFormat,
     mtl_handle::{CAMetalLayerKind, MTLTextureKind},
 };
 
@@ -674,10 +674,8 @@ fn emit_stretch_rect_blit(
         // YUV source is decoded to RGB by the fragment function), so this path
         // also converts a cross-format pair. `device_stretch_rect` guarantees
         // the destination is a render target here.
-        // Device-aware: the pipeline's colour format must match the attachment
-        // texture as created on this device (BGRA8 for an expanded 16-bit dst).
         let Some(dst_format) =
-            map_for_encoder(dst_info.format, enc).map(|m| m.metal_pixel_format())
+            mtld3d_core::format::map_d3d_format(dst_info.format).map(|m| m.metal_pixel_format())
         else {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
@@ -828,10 +826,12 @@ fn emit_same_texture_stretch(
         }
         return;
     }
-    // Device-aware mapping: the scratch has to carry the Metal format the one
-    // texture was actually created with, and the render quad keys its pipeline
-    // and colour attachment off the same value.
-    let Some(format) = map_for_encoder(dst_info.format, enc).map(|m| m.metal_pixel_format()) else {
+    // The scratch has to carry the Metal format the one texture was created
+    // with, and the render quad keys its pipeline and colour attachment off
+    // the same value.
+    let Some(format) =
+        mtld3d_core::format::map_d3d_format(dst_info.format).map(|m| m.metal_pixel_format())
+    else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "StretchRect: format 0x{:x} unmapped → a copy inside that surface is dropped",
@@ -931,19 +931,6 @@ fn emit_same_texture_stretch(
         enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
     }
 }
-fn map_for_encoder(format: u32, enc: &FrameEncoder) -> Option<mtld3d_core::format::FormatMapping> {
-    let native = enc
-        .gpu_caps
-        .device_caps
-        .contains(DeviceCapsFlags::NATIVE_PACKED16)
-        && !enc.config().expand_packed16;
-    if !native {
-        mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
-            "packed 16-bit formats unavailable natively (forced={}): A4R4G4B4/R5G6B5/A1R5G5B5/X1R5G5B5 widen to BGRA8 in the GPU upload pass, 16-bit render targets are not advertised", enc.config().expand_packed16);
-    }
-    mtld3d_core::format::map_d3d_format_device(format, native)
-}
-
 fn surface_slice(info: &records::SurfaceRecord) -> Option<u32> {
     (info.present & 1 != 0).then_some(info.slice)
 }

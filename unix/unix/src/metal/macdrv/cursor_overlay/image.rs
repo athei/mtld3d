@@ -27,8 +27,7 @@ pub fn transparent() -> Option<CFRetained<CGImage>> {
 
 /// Copy a completed, CPU-visible texture into an independently owned image.
 ///
-/// The caller observes its command buffer's completion first. Managed textures
-/// must have a synchronizeResource blit in that command buffer.
+/// The caller observes its command buffer's completion first.
 pub fn readback(
     texture: &ProtocolObject<dyn MTLTexture>,
     space: Option<&CGColorSpace>,

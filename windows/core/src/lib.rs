@@ -52,8 +52,6 @@ pub mod fullscreen_resize;
 pub mod gamma;
 pub mod gpu_caps;
 pub mod guest_completions;
-#[cfg(any(test, all(target_arch = "x86_64", target_os = "windows")))]
-pub mod guest_mem;
 pub mod guest_pages;
 pub mod guest_queries;
 pub mod held_pages;
@@ -91,7 +89,6 @@ pub mod snapshot;
 pub mod staging_coverage;
 pub mod startup_work;
 pub mod state_trace;
-pub mod storage_policy;
 pub mod streams;
 pub mod stretch_rect;
 pub mod surface_lock;

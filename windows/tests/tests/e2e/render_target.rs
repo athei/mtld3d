@@ -990,10 +990,7 @@ fn stretch_rect_from_an_x_offscreen_plain_into_one_with_alpha_writes_opaque_alph
         }
     }
 
-    // Each source is red with its padding clear. X8R8G8B8 shares its storage
-    // with A1R5G5B5 and A4R4G4B4 on a device that widens the packed 16-bit
-    // formats (`make test INTEL=1`), where a byte copy would hand the padding
-    // over; on a device with them the pair is two storages either way.
+    // Each source is red with its padding clear; each pair is two storages.
     let fill = |format: u32| -> Vec<u8> {
         if format == D3DFMT_X1R5G5B5 {
             core::iter::repeat_n(X1_RED.to_le_bytes(), SIDE * SIDE)
@@ -3647,23 +3644,6 @@ fn get_dc_on_an_odd_width_16_bit_lockable_render_target_reaches_the_last_row() {
     const GREEN_COLORREF: u32 = 0x0000_FF00;
     const RED_COLORREF: u32 = 0x0000_00FF;
     let h = Harness::new();
-    // A device without Metal's packed 16-bit pixel formats does not advertise
-    // them as render targets and rejects the create to match, which leaves
-    // nothing to hold a DC over. That contract is pinned in `expand16`.
-    if h.check_device_format(
-        D3DFMT_X8R8G8B8,
-        D3DUSAGE_RENDERTARGET,
-        mtld3d_types::D3DRTYPE_SURFACE,
-        D3DFMT_R5G6B5,
-    ) != D3D_OK
-    {
-        assert_ne!(
-            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
-            D3D_OK,
-            "a 16-bit render target is rejected where the caps deny it"
-        );
-        return;
-    }
     let rt = h.create_lockable_render_target(W, H, D3DFMT_R5G6B5);
     assert_eq!(h.color_fill_hr(&rt, GREEN), D3D_OK, "ColorFill green");
 
@@ -4582,23 +4562,6 @@ fn get_render_target_data_writes_rows_at_the_reported_pitch() {
     const SENTINEL: u16 = 0xAAAA;
 
     let h = Harness::new();
-    // A device without Metal's packed 16-bit pixel formats does not advertise
-    // them as render targets and rejects the create to match, which leaves
-    // nothing to read back. That contract is pinned in `expand16`.
-    if h.check_device_format(
-        D3DFMT_X8R8G8B8,
-        D3DUSAGE_RENDERTARGET,
-        mtld3d_types::D3DRTYPE_SURFACE,
-        D3DFMT_R5G6B5,
-    ) != D3D_OK
-    {
-        assert_ne!(
-            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
-            D3D_OK,
-            "a 16-bit render target is rejected where the caps deny it"
-        );
-        return;
-    }
     let backbuffer = h.render_target(0);
     let rt = h.create_render_target(W, H, D3DFMT_R5G6B5);
     assert_eq!(h.set_render_target(0, &rt), 0, "bind the R5G6B5 target");

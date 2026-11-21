@@ -77,8 +77,8 @@ const DRAIN_GRACE: Duration = Duration::from_secs(1);
 ///
 /// The wait for the prefix's configure lock counts against it. The end of the
 /// old server is immediate, and the boot of the new one is what costs: the
-/// Makefile's boot of a configured prefix on the Intel CI image (`wineserver
-/// -p`, then `wineboot`) took 15 s. A step still running past this is killed
+/// Makefile's boot of a configured prefix (`wineserver -p`, then `wineboot`)
+/// took 15 s on a hosted CI image. A step still running past this is killed
 /// and the run says the restart failed. The caller passes it to
 /// [`restart_session`].
 const SESSION_RESTART_BUDGET: Duration = Duration::from_secs(120);
@@ -802,9 +802,9 @@ fn is_gpu_hang_line(line: &str) -> bool {
 /// win32u lists. Under `EmulateModeset` win32u lists every size at 60 Hz and
 /// the display's own rate only above 60, and winemac reports that rate
 /// truncated to whole hertz, so on a display below 60 Hz (a 59.94 Hz monitor
-/// reads 59, the Intel CI image's display 30) the current mode is no listed
-/// one and the test's restore of it is refused. A display at 60 Hz matches
-/// the 60 Hz entries, and one above lists its own rate.
+/// reads 59) the current mode is no listed one and the test's restore of it
+/// is refused. A display at 60 Hz matches the 60 Hz entries, and one above
+/// lists its own rate.
 ///
 /// The steps are the ones the Makefile ends its prefix configuration with:
 /// end the server, wait for it to go, start a persistent one, boot the prefix
@@ -1037,10 +1037,9 @@ fn exit_trailer(status: ExitStatus) -> String {
 /// tone-mapping shader while another machine blits. The baseline has to mean
 /// the same thing on every machine that runs it, so pin the SDR path here.
 ///
-/// The leg's variant appends its own entries: the `intel` variant turns every
-/// `intel.*` key on so the whole suite runs under the answers an Intel/AMD Mac
-/// gives. A kept run adds `log.dir`, so the process's log file lands beside
-/// its raw output.
+/// The leg's variant appends its own entries: the `scale` variant sets the
+/// reduced `render.scale` its leg is measured at. A kept run adds `log.dir`,
+/// so the process's log file lands beside its raw output.
 fn config_entries(leg: Leg, raw: Option<&RawTarget>) -> String {
     let mut entries = format!(
         "shaderCache.enable=false;shader.asyncCompile=false;color.hdr.enable=false{}",

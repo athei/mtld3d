@@ -89,10 +89,9 @@ pub const VERSION_POOL_CEILING_BYTES: u64 = 1 << 30;
 /// Divisor of the device's recommended working set that gives the spares' cap below the ceiling.
 ///
 /// An eighth keeps the pool's share of a small machine's GPU memory small:
-/// about 683 MiB of an 8 GB Apple silicon Mac's 5.3 GiB, 192 MiB of an
-/// integrated Intel GPU's 1.5 GiB and 512 MiB of a 4 GB discrete GPU, while
-/// every machine with a working set of 8 GiB or more (a 16 GB Mac and up)
-/// reaches [`VERSION_POOL_CEILING_BYTES`].
+/// about 683 MiB of an 8 GB Apple silicon Mac's 5.3 GiB, while every machine
+/// with a working set of 8 GiB or more (a 16 GB Mac and up) reaches
+/// [`VERSION_POOL_CEILING_BYTES`].
 pub const VERSION_POOL_WORKING_SET_DIVISOR: u64 = 8;
 
 /// Quarters of the device's recommended working set the process may allocate before spares go.
@@ -103,8 +102,8 @@ pub const VERSION_POOL_WORKING_SET_DIVISOR: u64 = 8;
 /// allocation and a whole copy, what it cost before the pool. Parking
 /// resumes only below the line less the cap, so a process hovering at the
 /// line does not park and destroy in turn. `currentAllocatedSize` may also
-/// count the no-copy buffers that wrap upload staging, so on a discrete GPU
-/// the line can trip early; that costs speed only, never texels.
+/// count the no-copy buffers that wrap upload staging, so the line can trip
+/// early; that costs speed only, never texels.
 pub const VERSION_POOL_PRESSURE_QUARTERS: u64 = 3;
 
 /// How much GPU memory the pool may use, from the device's recommended working set.

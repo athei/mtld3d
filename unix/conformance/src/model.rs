@@ -17,61 +17,37 @@ use std::{
 
 /// The PE builds the suite runs against, in baseline-output order.
 ///
-/// Each names a test binary, the build it runs against and the Wine it runs
-/// under, so the counts of one Wine never land in another's entries. `I686`
-/// and `X64` are the i386 and `x86_64` test binaries against the build of
-/// their own architecture under an `x86_64` Wine. `I686Arm64` is the i386
-/// binary against the i686 build under the arm64 Wine, whose x86 translator
-/// moves counts of its own. `Arm64x` is the `x86_64` binary against the ARM64X
-/// build, which the arm64 Wine loads into an x64 process in place of the
-/// `x86_64` one.
+/// Each names a test binary and the build it runs against under the arm64
+/// Wine. `I686Arm64` is the i386 binary against the i686 build, run through
+/// the Wine's x86 translator, which moves counts of its own. `Arm64x` is the
+/// `x86_64` binary against the ARM64X build, which the arm64 Wine loads into
+/// an x64 process.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Arch {
-    I686,
-    X64,
     I686Arm64,
     Arm64x,
 }
 
-/// Which device answers the run was measured under, in baseline-output order.
+/// Which configuration the run was measured under, in baseline-output order.
 ///
-/// `Native` runs against the device's own capabilities; `Intel` forces every
-/// `intel.*` config key on, so the suite sees the answers an Intel/AMD Mac
-/// gives whatever the machine underneath; `Scale` rasterizes every frame at
-/// 75% of the resolution D3D9 reports and lets `MetalFX` resolve it back up,
-/// so the suite reads the resample a reduced `render.scale` rides.
+/// `Native` runs against the device's own capabilities; `Scale` rasterizes
+/// every frame at 75% of the resolution D3D9 reports and lets `MetalFX`
+/// resolve it back up, so the suite reads the resample a reduced
+/// `render.scale` rides.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Variant {
     Native,
-    Intel,
     Scale,
 }
 
-/// The GPU family of the machine a run was measured on, in baseline-output order.
+/// One runner process's identity: architecture and configuration.
 ///
-/// The `intel` variant forces the D3D9-visible answers of an Intel/AMD Mac,
-/// but the GPU underneath still decides what the suite sees past those
-/// answers: a tile-based Apple GPU elides depth stores and merges hidden
-/// overdraw before the visibility counter, an Apple GPU encodes special
-/// floats its own way, and the validation layer applies different texture
-/// rules per family. So the same leg reads different counts on the two
-/// families, and the baseline keeps an entry per family.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub enum Gpu {
-    Apple,
-    Mac2,
-}
-
-/// One runner process's identity: architecture, device answers, and the GPU family underneath.
-///
-/// The baseline is keyed by leg and subtest, so a measurement under the Intel
-/// answers never overwrites the native one for the same architecture, and a
-/// measurement on one GPU family never overwrites the other's.
+/// The baseline is keyed by leg and subtest, so a measurement at the reduced
+/// render scale never overwrites the native one for the same architecture.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Leg {
     pub arch: Arch,
     pub variant: Variant,
-    pub gpu: Gpu,
 }
 
 /// The four `d3d9_test.exe` subtests, in baseline-output order.
@@ -172,63 +148,38 @@ impl SubtestResult {
 impl Variant {
     /// The `MTLD3D_CONFIG` entries the variant adds to the runner's pinned set.
     ///
-    /// Empty for `Native`. `Intel` turns on every `intel.*` key, which is
-    /// how a real Intel/AMD Mac answers, so the run measures the whole
-    /// family at once rather than one key at a time. `Scale` sets the one
-    /// `render.scale` the end-to-end suite's scaled leg runs at, so the two
-    /// legs read the same frame shape.
+    /// Empty for `Native`. `Scale` sets the one `render.scale` the
+    /// end-to-end suite's scaled leg runs at, so the two legs read the same
+    /// frame shape.
     #[must_use]
     pub const fn config_entries(self) -> &'static str {
         match self {
             Self::Native => "",
-            Self::Intel => {
-                ";intel.expandPacked16=true;intel.denyFloat32Filtering=true;\
-                 intel.managedMemory=true;intel.linearAlign256=true"
-            }
             Self::Scale => ";render.scale=0.75",
         }
     }
 }
 
-impl Gpu {
-    /// The GPU family of this machine.
-    ///
-    /// Read from the runner's own architecture: an Apple Silicon Mac carries
-    /// an Apple-family GPU and nothing else, an Intel Mac carries an Intel or
-    /// AMD GPU and never an Apple one, and the runner binary is always the
-    /// host's architecture.
-    #[must_use]
-    pub const fn host() -> Self {
-        if cfg!(target_arch = "aarch64") {
-            Self::Apple
-        } else {
-            Self::Mac2
-        }
-    }
-}
-
 impl Leg {
-    /// Every leg, in baseline-output order: every variant of each architecture on each GPU family.
-    pub const ALL: [Self; 24] = {
-        let mut all = [Self {
-            arch: Arch::I686,
+    /// Every leg, in baseline-output order: every variant of each architecture.
+    pub const ALL: [Self; 4] = [
+        Self {
+            arch: Arch::I686Arm64,
             variant: Variant::Native,
-            gpu: Gpu::Apple,
-        }; 24];
-        let archs = [Arch::I686, Arch::X64, Arch::I686Arm64, Arch::Arm64x];
-        let variants = [Variant::Native, Variant::Intel, Variant::Scale];
-        let gpus = [Gpu::Apple, Gpu::Mac2];
-        let mut i = 0;
-        while i < all.len() {
-            all[i] = Self {
-                arch: archs[i / 6],
-                variant: variants[(i / 2) % 3],
-                gpu: gpus[i % 2],
-            };
-            i += 1;
-        }
-        all
-    };
+        },
+        Self {
+            arch: Arch::I686Arm64,
+            variant: Variant::Scale,
+        },
+        Self {
+            arch: Arch::Arm64x,
+            variant: Variant::Native,
+        },
+        Self {
+            arch: Arch::Arm64x,
+            variant: Variant::Scale,
+        },
+    ];
 }
 
 impl Subtest {
@@ -250,8 +201,6 @@ impl Subtest {
 impl fmt::Display for Arch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::I686 => "i686",
-            Self::X64 => "x86_64",
             Self::I686Arm64 => "i686-arm64",
             Self::Arm64x => "arm64x",
         })
@@ -262,33 +211,19 @@ impl fmt::Display for Variant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Native => "native",
-            Self::Intel => "intel",
             Self::Scale => "scale",
         })
     }
 }
 
-impl fmt::Display for Gpu {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Apple => "apple",
-            Self::Mac2 => "mac2",
-        })
-    }
-}
-
-/// `i686` for the native leg, `i686+intel` or `i686+scale` for a variant, `@mac2` off Apple.
+/// `arm64x` for the native leg, `arm64x+scale` for the scaled one.
 ///
-/// The native form is the bare architecture and the Apple family is implicit,
-/// so a baseline recorded before variants or families existed reads unchanged.
+/// The native form is the bare architecture, so the common leg needs no suffix.
 impl fmt::Display for Leg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.arch)?;
         if self.variant != Variant::Native {
             write!(f, "+{}", self.variant)?;
-        }
-        if self.gpu == Gpu::Mac2 {
-            write!(f, "@{}", self.gpu)?;
         }
         Ok(())
     }
@@ -311,8 +246,6 @@ impl FromStr for Arch {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "i686" => Ok(Self::I686),
-            "x86_64" => Ok(Self::X64),
             "i686-arm64" => Ok(Self::I686Arm64),
             "arm64x" => Ok(Self::Arm64x),
             other => Err(format!("unknown arch {other:?}")),
@@ -326,21 +259,8 @@ impl FromStr for Variant {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "native" => Ok(Self::Native),
-            "intel" => Ok(Self::Intel),
             "scale" => Ok(Self::Scale),
             other => Err(format!("unknown variant {other:?}")),
-        }
-    }
-}
-
-impl FromStr for Gpu {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "apple" => Ok(Self::Apple),
-            "mac2" => Ok(Self::Mac2),
-            other => Err(format!("unknown gpu family {other:?}")),
         }
     }
 }
@@ -349,15 +269,11 @@ impl FromStr for Leg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (s, gpu) = match s.split_once('@') {
-            Some((s, gpu)) => (s, gpu.parse::<Gpu>()?),
-            None => (s, Gpu::Apple),
-        };
         let (arch, variant) = match s.split_once('+') {
             Some((arch, variant)) => (arch.parse::<Arch>()?, variant.parse::<Variant>()?),
             None => (s.parse::<Arch>()?, Variant::Native),
         };
-        Ok(Self { arch, variant, gpu })
+        Ok(Self { arch, variant })
     }
 }
 
@@ -395,9 +311,7 @@ impl Baseline {
         out.push_str("# keeps the two files covering the same sites.\n");
         out.push_str("# Format: \"[leg/subtest] crash=<0|1>\" header, then indented\n");
         out.push_str("#         \"  <file>.c:<line> count=<n>\". A leg of the form\n");
-        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys,\n");
-        out.push_str("#         \"<arch>+scale\" the run at render.scale = 0.75, and\n");
-        out.push_str("#         \"<leg>@mac2\" the run on an Intel/AMD GPU (no suffix: Apple).\n");
+        out.push_str("#         \"<arch>+scale\" is the run at render.scale = 0.75.\n");
         out.push('\n');
         for (&(leg, subtest), sub) in &self.entries {
             let _ = writeln!(out, "[{leg}/{subtest}] crash={}", u8::from(sub.crash));

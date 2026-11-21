@@ -1,33 +1,16 @@
 # No `[build] target` here: a bare `cargo build`/`test` in this workspace
-# defaults to the native host arch (fast, no Rosetta), which is what unit
-# tests and clippy want. Shipped artifacts are built by passing `--target`
-# explicitly (see the Makefile `unix:` recipe), once per Wine host ISA:
-# x86_64-apple-darwin for today's Wine on macOS, aarch64-apple-darwin for the
-# arm64 Wine being prepared. The aarch64 build needs no entry of its own: it is
-# the native arch, and its ABI mandates a frame pointer anyway.
+# builds for the host, which is what unit tests and clippy want. The shipped
+# `.so` is built with `--target aarch64-apple-darwin` (see the Makefile `unix:`
+# recipe), the native arch, which needs no entry of its own: its ABI mandates
+# a frame pointer anyway.
 #
 # Frame pointers are not pinned below: a normal build takes the toolchain
 # default. The guest-pc sampling profiler needs them (it walks the frame-pointer
-# chain, and this `.so` is guest code under x86-on-ARM translation like the PE
-# side), so a profiling build asks for them with `FP=1 make`, which appends
-# `-C force-frame-pointers=yes` to these flags.
-[target.x86_64-apple-darwin]
-rustflags = [
-    "-C", "target-cpu=x86-64-v2",
-    "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
-]
+# chain), so a profiling build asks for them with `FP=1 make`, which appends
+# `-C force-frame-pointers=yes` to the rustflags.
 
 [env]
-MACOSX_DEPLOYMENT_TARGET = "15.0"
-# `-march=x86-64-v2` mirrors the rustflags `target-cpu=x86-64-v2` baseline so
-# build-script C/C++ code (snmalloc-sys, zstd-sys) gets the same ISA. This `.so`
-# runs under x86-on-ARM translation, whose vector unit is 128-bit: 256-bit
-# AVX/AVX2 ops are split across two halves and underperform plain SSE, so the
-# baseline caps at SSE4.2 (128-bit, 1:1 with the host vector unit) plus the
-# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT). The
-# C-family objects built here are `mtld3d-unix`'s Objective-C delegate forward,
-# snmalloc-sys's C++ and zstd-sys's C, which the `cc` crate compiles with these
-# flags. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to these, which is how a
-# production build adds `NDEBUG` (see the Makefile).
-CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"
-CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"
+# 26.0 because the arm64 Wine that loads the `.so` cannot run on anything
+# older: its loader and ntdll.so import a macOS 26.0 symbol. Users need 26.4,
+# the floor that Wine declares.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

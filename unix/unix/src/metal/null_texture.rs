@@ -20,10 +20,7 @@ use objc2_metal::{
     MTLTextureType, MTLTextureUsage,
 };
 
-use crate::{
-    LOG_TARGET,
-    metal::{device::cpu_written_texture_storage, handle::BorrowRetained},
-};
+use crate::{LOG_TARGET, metal::handle::BorrowRetained};
 
 /// Handles to the four fallback textures and their default sampler.
 ///
@@ -132,10 +129,9 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
 
 /// A 1×1 (per slice) `RGBA8Unorm` texture filled with opaque black.
 ///
-/// `slices` is 6 for a cube (one per face), 1 otherwise. CPU-writable storage
-/// for the device (see [`cpu_written_texture_storage`]) so the pixel can be
-/// written with `replaceRegion:`; the four bytes are `(R, G, B, A) =
-/// (0, 0, 0, 255)`, which samples as `(0, 0, 0, 1)`.
+/// `slices` is 6 for a cube (one per face), 1 otherwise. `Shared` storage so
+/// the pixel can be written with `replaceRegion:`; the four bytes are
+/// `(R, G, B, A) = (0, 0, 0, 255)`, which samples as `(0, 0, 0, 1)`.
 fn make_black_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     texture_type: MTLTextureType,
@@ -151,7 +147,7 @@ fn make_black_texture(
     // SAFETY: plain property setter on a fresh descriptor.
     unsafe { desc.setDepth(1) };
     desc.setUsage(MTLTextureUsage::ShaderRead);
-    desc.setStorageMode(cpu_written_texture_storage(device));
+    desc.setStorageMode(MTLStorageMode::Shared);
 
     let Some(texture) = super::texture::new_texture(device, &desc, "mtld3d-null-black") else {
         mtld3d_shared::log_once_warn!(
