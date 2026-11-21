@@ -176,17 +176,18 @@ while its sibling legs are green, re-run the failed jobs first (`gh run rerun
 <run-id> --failed`, which lands on a fresh machine) and read the command
 buffer errors in the artifact's log, since a hosted runner's GPU can fail that
 way with no hang line in the job log and nothing else tells it from a
-regression. The macos-26 image's GPU, the paravirtual `Apple Paravirtual
-device`, refuses a texture or a view now and then while several threads
-create and release them, with its kernel logging `addObject: Object already
-exists` in the system log, so on a paravirtual device the layer asks again
-for up to a quarter of a second and logs each create it recovers that way. A
-`CreateBackbuffer` failure on CI is therefore read from two lines. The unix
-line names the request and the device; a sane request (the window's size, `BGRA8Unorm`, a sample count the device answered for)
-together with the layer's `still refused after` line for it is that runner
-fault outlasting the retries, so re-run the failed jobs and add the leg to
-the issue that tracks the fault. A line naming a zero dimension or a null
-handle is the layer's own bug.
+regression. A hosted runner's paravirtual GPU has refused a texture or a
+view now and then while several threads create and release them, with its
+kernel logging `addObject: Object already exists` in the system log, so on a
+paravirtual device (one whose name contains `Paravirtual`, as macos-26's
+`Apple Paravirtual device` does) the layer asks again for up to a quarter of
+a second and logs each create it recovers that way. A `CreateBackbuffer`
+failure on CI is therefore read from two lines. The unix line names the
+request and the device; a sane request (the window's size, `BGRA8Unorm`, a
+sample count the device answered for) together with the layer's `still
+refused after` line for it is that runner fault outlasting the retries, so
+re-run the failed jobs and add the leg to the issue that tracks the fault. A
+line naming a zero dimension or a null handle is the layer's own bug.
 
 Two things are worth knowing when a test process looks wrong. Once a device
 has existed, `d3d9.dll` terminates the process from the
@@ -205,9 +206,8 @@ named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: six is a clean
-leg, one per test binary, and eighteen a clean `make test`, whose three legs
-each run the six.
+`processes` count in the summary says how many the run took: each leg's
+summary reads six on a clean run, one process per test binary.
 
 Explicit test selections, including recovery rounds and filtered initial runs,
 are split into batches that fit the Windows command-line limit. The budget
@@ -615,31 +615,30 @@ the stage (`make stage`: the i686 and ARM64X builds, the arm64 unix `.so`,
 the e2e test binaries of every leg, the e2e and conformance runners), which
 serves every leg. `check` runs formatting and audit first, then
 documentation, Clippy (the ARM64X halves included) and unit tests, as steps
-of one job, and
-`check-perf` runs the `PERF=1` Clippy and unit-test legs of `make check` in
-parallel with it, since those build into a target directory of their own. A
-cache is saved only when its key missed, so a pull request's run saves only
-what main's caches lack, and `cache-cleanup.yml` deletes a pull request's
-caches when it closes. Production bundles are built by the release job only,
-also on macos-26, so they carry the ARM64X pair beside the i686 build.
-Every run on `main` has its own concurrency group so pending runs survive
-later pushes and every commit keeps its CI result. PR updates cancel the
-superseded run. The test machines carry no toolchain: they install the stage
-(`STAGE=<dir>`) and run the end-to-end and conformance suites, and every leg
-a pull request runs gates it. The scaled end-to-end and conformance legs
-run their suite at `render.scale = 0.75`, the evidence that the coordinates
-the tests assert on stay in the space D3D9 reports when the frame is
-rasterized smaller; a test that needs single-pixel resolution asks
+of one job, and `check-perf` runs the `PERF=1` Clippy and unit-test legs of
+`make check` in parallel with it, since those build into a target directory
+of their own. A cache is saved only when its key missed, so a pull request's
+run saves only what main's caches lack, and `cache-cleanup.yml` deletes a
+pull request's caches when it closes. Production bundles are built by the
+release job only, also on macos-26, so they carry the ARM64X pair beside the
+i686 build. Every run on `main` has its own concurrency group so pending
+runs survive later pushes and every commit keeps its CI result. PR updates
+cancel the superseded run. The test machines carry no toolchain: they
+install the stage (`STAGE=<dir>`) and run the end-to-end and conformance
+suites, and every leg a pull request runs gates it. The scaled end-to-end
+and conformance legs run their suite at `render.scale = 0.75`, the evidence
+that the coordinates the tests assert on stay in the space D3D9 reports when
+the frame is rasterized smaller; a test that needs single-pixel resolution asks
 `render_scale_is_identity()` and pins its exact shape at the identity rather
 than failing that leg, and the conformance sites that cannot (a probe on a
 colour boundary) are classified under "The scaled leg" in
 `unix/conformance/CONFORMANCE.md`. A conformance subtest that dies now and
 then is caught by dispatching with `conformance_repeat=<n>`, which runs it
-that many times on every conformance job and
-uploads each run's raw output, ending in how the process ended, with the
-layer's debug log beside it. Every conformance job's raw artifact, repeat or
-not, also carries the system log of the job's span, which is where AppKit
-reports an exception it swallowed, if it logs it there unredacted. Run
+that many times on every conformance job and uploads each run's raw output,
+ending in how the process ended, with the layer's debug log beside it.
+Every conformance job's raw artifact, repeat or not, also carries the system
+log of the job's span, which is where AppKit reports an exception it
+swallowed, if it logs it there unredacted. Run
 `make conformance` locally when your change touches the render or
 shader-emission path. The manual `probe-metal` job, on macos-26 only, is how
 an image is checked before it is added.
@@ -726,12 +725,11 @@ and the report there. A regression it reports is fixed before the tag or named
 in the notes.
 
 Land that commit and wait for its run on `main` to go green. Then push the
-tag. The
-release job refuses a tag whose version disagrees with either workspace, and
-refuses one whose commit has no green run on `main`; a tag pushed while that run
-is still going is waited on rather than rejected. It builds the bundle itself,
-after the tag exists, because every binary stamps `git describe` and one built
-before the tag names the previous release.
+tag. The release job refuses a tag whose version disagrees with either
+workspace, and refuses one whose commit has no green run on `main`; a tag
+pushed while that run is still going is waited on rather than rejected. It
+builds the bundle itself, after the tag exists, because every binary stamps
+`git describe` and one built before the tag names the previous release.
 
 What is left is the notes and the publish. Group the points into sections rather
 than one flat list, give the two or three headline items a section each, and end

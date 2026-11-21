@@ -101,17 +101,16 @@ runs. The ARM64X build is native code and has no such baseline.
 targets' CPU baseline, for the Rust and for the C and C++ that build scripts
 compile. Neither goes past SSE4.2 or uses BMI; the comments there say why.
 
-The i686 build targets `pentium4`, plain SSE2. It was chosen over `nehalem`
-by a measurement of World of Warcraft 1.12 and 3.3.5a under Rosetta, where
-`pentium4` took 9 to 15 % less time per call for the state setters, the
-shader-constant uploads and a vertex-buffer lock, and 2.4 % off the buffer
-benchmark's frame, while the World of Warcraft 1.12 frame moved by +0.8 %,
-inside that run's noise, and the fixed-function draws by +0.5 %. Two
-per-draw gauges of the perf summary rose: the draw snapshot
-(`draw_snapshot_ms`) by 9.5 % and its key building (`draw_snapshot_keys_ms`)
-by 7.3 %. Under the arm64 Wine's translator the same change cost about 7 %
-on a clean draw and 2 to 3 % on a frame, so the baseline is worth measuring
-again under that translator.
+The i686 build targets `pentium4`, plain SSE2. Against `nehalem`, measured
+with World of Warcraft 1.12 and 3.3.5a under Rosetta, `pentium4` takes 9 to
+15 % less time per call for the state setters, the shader-constant uploads
+and a vertex-buffer lock, and 2.4 % off the buffer benchmark's frame, while
+the World of Warcraft 1.12 frame moves by +0.8 %, inside that run's noise,
+and the fixed-function draws by +0.5 %. Two per-draw gauges of the perf
+summary rise: the draw snapshot (`draw_snapshot_ms`) by 9.5 % and its key
+building (`draw_snapshot_keys_ms`) by 7.3 %. Under the arm64 Wine's
+translator (FEX) `pentium4` costs about 7 % on a clean draw and 2 to 3 % on
+a frame against `nehalem`. The baseline is to be measured again under FEX.
 
 The x86_64 target, which builds only the x64 end-to-end test executables,
 targets `x86-64-v2`.
@@ -119,8 +118,9 @@ targets `x86-64-v2`.
 ## Install
 
 `make install` puts the build into the Wine `WINE_SDK` names and into
-`WINE_INSTALL_DIR` when that is set, a game's Wine tree, an arm64 Wine as
-well; a `WINE_INSTALL_DIR` naming `WINE_SDK` itself is written once.
+`WINE_INSTALL_DIR` when that is set, a game's Wine tree, which has to be an
+arm64 Wine too; a `WINE_INSTALL_DIR` naming `WINE_SDK` itself is written
+once.
 `d3d9.dll` gets Wine's builtin signature there, so it replaces Wine's own
 d3d9 for that tree. The build goes into the Wine's mtld3d subtree
 (`lib/wine/d3d9/mtld3d`), with markers in the default directories.
@@ -225,15 +225,15 @@ stamps its own by: hybrid ones (`winebuild -marm64x`, an ARM64 placeholder
 with ARM64EC metadata) when every d3d9 tree that has the DLL holds an ARM64X
 build of it, as after an install of the ARM64X build, and AMD64 ones
 otherwise, as when another d3d9 tree holds an x86_64 build of it. A hybrid
-one also takes a winebuild that writes the ARM64EC
-metadata into it, which the release's does from arm64-11.19-2 on; an older
-one writes a plain ARM64 placeholder an x64 process refuses, and the install
-fails naming it before it changes anything in the Wine. An x64 process
-accepts both kinds; a native ARM64 one loads a name only behind a hybrid
-placeholder. A prefix copies the placeholders when it is created and takes a
-changed one on its next `wineboot -u`. A runtime-only arm64 Wine without
-that tree, such as CrossOver Preview's, is refused; `INSTALL.md` installs
-the release bundle into one.
+one also takes a winebuild that writes the ARM64EC metadata into it, which
+the release's does from arm64-11.19-2 on; an older one writes a plain ARM64
+placeholder an x64 process refuses, and the install fails naming it before
+it changes anything in the Wine. An x64 process accepts both kinds; a
+native ARM64 one loads a name only behind a hybrid placeholder. A prefix
+copies the placeholders when it is created and takes a changed one on its
+next `wineboot -u`. A runtime-only arm64 Wine without that tree, such as
+CrossOver Preview's, is refused; `INSTALL.md` installs the release bundle
+into one.
 
 Under that Wine the PE side of a 32-bit game runs translated, while the
 ARM64X build's ARM64EC half runs as native code, and everything in
