@@ -51,7 +51,8 @@ The versions CI pins (the Rust toolchains, the cargo tools, nextest, the
 Mach9 release whose arm64 Wine macos-26 runs, and llvm-mingw) are in the
 `env` block of [`ci.yml`](../.github/workflows/ci.yml). The MSVC CRT and
 Windows SDK versions are pinned in the Makefile, and the macOS deployment
-target is in [`unix/.cargo/config.toml`](../unix/.cargo/config.toml).
+target, 26.0, is in [`unix/.cargo/config.toml`](../unix/.cargo/config.toml).
+Users need macOS 26.4 or later, the arm64 Wine's own floor.
 
 ## Setup
 

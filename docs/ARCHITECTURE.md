@@ -670,8 +670,9 @@ per sprite hash, so hide/show and a return to an earlier sprite reuse them
 without another GPU submission, and while a changed sprite renders the sprite on
 screen keeps following the pointer with its own geometry.
 
-The cursor's CAMetalLayer hosts images for its macOS 15-compatible HDR controls;
-it never acquires or presents a drawable. This leaves the game as the only drawable
+The cursor's CAMetalLayer hosts images and keeps the layer's HDR controls
+(`wantsExtendedDynamicRangeContent`, the colorspace); it never acquires or
+presents a drawable. This leaves the game as the only drawable
 stream eligible for Metal HUD selection. Disabling the HUD on a cursor drawable
 layer is insufficient: it can still affect the game's HUD scale during device
 recreation. The image-hosting window stays across attachment changes.
