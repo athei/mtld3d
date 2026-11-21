@@ -607,9 +607,10 @@ The description is what survives, and for anything non-trivial it carries:
 5. Verification: the commands you ran and what a reviewer should look for.
 
 CI pins one Wine, the arm64 Wine of a Mach9 release (`WINE_RELEASE_ARM64`),
-and runs on one image, macos-26: the e2e legs `i686`, `arm64x` and the native
-ARM64 `aarch64`, the conformance legs `i686` and `arm64x`, and one scaled leg
-of each suite. Every conformance leg runs that release's `d3d9_test.exe`.
+and runs on one image, macos-26: the e2e legs `i686`, `x86_64` (the matrix
+name of the leg that runs `test-e2e-arm64x`, the x64 suite against the
+ARM64X build) and the native ARM64 `aarch64`, the conformance legs `i686` and
+`arm64x`, and one scaled leg of each suite. Every conformance leg runs that release's `d3d9_test.exe`.
 CI compiles on three machines and replays everywhere else. One job builds
 the stage (`make stage`: the i686 and ARM64X builds, the arm64 unix `.so`,
 the e2e test binaries of every leg, the e2e and conformance runners), which

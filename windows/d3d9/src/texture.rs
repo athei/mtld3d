@@ -581,8 +581,8 @@ impl TextureInner {
     ///
     /// The format the application declared, which is what a byte-layout
     /// comparison against another D3D9 resource is made on: the Metal format
-    /// alone would call a packed 16-bit level expanded to BGRA8 on a device
-    /// without the native format the same layout as a real BGRA8 one.
+    /// alone would call an R8G8B8 level, which is widened to BGRA8 on the GPU,
+    /// the same layout as a real BGRA8 one.
     pub const fn d3d_format(&self) -> u32 {
         self.d3d_format
     }
@@ -4588,10 +4588,9 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     }
     // SAFETY: as above; the staging calls that reach the device are done.
     let dev = unsafe { &*(device_inner_ptr as *const DeviceInner) };
-    // A widened level (R8G8B8 on every device, the packed 16-bit formats on
-    // one without them) is BGRA8 on the GPU and narrower in its staging, so
-    // its texels come back four bytes wide into pages of their own and are
-    // narrowed into the staging rows the lock reports.
+    // A widened level (R8G8B8) is BGRA8 on the GPU and narrower in its
+    // staging, so its texels come back four bytes wide into pages of their
+    // own and are narrowed into the staging rows the lock reports.
     let mut wide =
         mtld3d_core::upload_pass::is_expanded_upload(ti.d3d_format, ti.metal_pixel_format)
             .then(|| PageBox::new_zeroed((width as usize) * 4 * (height as usize)));
@@ -4676,10 +4675,9 @@ struct NarrowTarget {
 
 /// Narrow a level read back as four-byte texels into its staging rows.
 ///
-/// A widened level (R8G8B8 on every device, the packed 16-bit formats on one
-/// without them) is BGRA8 on the GPU and narrower in its staging, so a read
-/// back of it lands four bytes a texel at `width * 4` in `wide` and is
-/// converted into the layout the lock reports. False when the codec does not
+/// A widened level (R8G8B8) is BGRA8 on the GPU and narrower in its staging,
+/// so a read back of it lands four bytes a texel at `width * 4` in `wide` and
+/// is converted into the layout the lock reports. False when the codec does not
 /// cover the format or a row would run past either side.
 fn narrow_widened_read(wide: &PageBox, target: &NarrowTarget) -> bool {
     let needed = (target.bytes_per_row as usize).saturating_mul(target.height as usize);

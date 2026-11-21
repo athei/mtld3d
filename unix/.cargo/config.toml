@@ -10,5 +10,7 @@
 # `-C force-frame-pointers=yes` to the rustflags.
 
 [env]
-# The arm64 Wine that loads the `.so` runs on macOS 26 and later only.
+# 26.0 because the arm64 Wine that loads the `.so` cannot run on anything
+# older: its loader and ntdll.so import a macOS 26.0 symbol. Users need 26.4,
+# the floor that Wine declares.
 MACOSX_DEPLOYMENT_TARGET = "26.0"

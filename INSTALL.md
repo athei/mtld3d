@@ -10,9 +10,9 @@ source repository's `docs/BUILDING.md`. An older bundle installs by the
 - A Mac with Apple Silicon. On any other Metal device `CreateDevice` fails
   with `D3DERR_NOTAVAILABLE`.
 - macOS 26.4 or later, the oldest macOS the arm64 Wine runs on.
-- An arm64 Wine, which brings its own x86 translation: the Wine engine of a
-  [Mach9](https://github.com/athei/mach9) release, which CI pins, or an arm64
-  bottle of CrossOver Preview. An x86_64 Wine cannot load mtld3d.
+- An arm64 Wine, which brings its own x86 translation: the Wine engine of
+  [Mach9](https://github.com/athei/mach9) v0.4.0, the release CI pins, or an
+  arm64 bottle of CrossOver Preview. An x86_64 Wine cannot load mtld3d.
 - A 64-bit prefix or bottle. 32-bit games run in it through WoW64.
 
 ## Choosing a route
@@ -22,7 +22,7 @@ or as a native `d3d9.dll` in the prefix, selected by a DLL override.
 
 | | Builtin | Native override |
 | --- | --- | --- |
-| Use for | A Wine installation you own: your own build, an app-bundled Wine, a package install | Stock Wine, when the stock d3d9 should keep serving other prefixes |
+| Use for | A Wine installation you own: your own build, an app-bundled Wine, or a packaged Wine if it is an arm64 build | Stock Wine, when the stock d3d9 should keep serving other prefixes |
 | Covers | Every d3d9 application in that Wine tree | Every application of its arch in the prefix |
 | Cost | A Wine update or reinstall wipes it. Other d3d9 applications lose the stock implementation | A registry override plus a `d3d9.dll` copy per prefix |
 | CrossOver Preview | Not possible: `CrossOver Preview.app` is replaced on every update | Required |

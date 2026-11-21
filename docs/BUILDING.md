@@ -102,16 +102,12 @@ runs. The ARM64X build is native code and has no such baseline.
 targets' CPU baseline, for the Rust and for the C and C++ that build scripts
 compile. Neither goes past SSE4.2 or uses BMI; the comments there say why.
 
-The i686 build targets `pentium4`, plain SSE2. Against `nehalem`, measured
-with World of Warcraft 1.12 and 3.3.5a under Rosetta, `pentium4` takes 9 to
-15 % less time per call for the state setters, the shader-constant uploads
-and a vertex-buffer lock, and 2.4 % off the buffer benchmark's frame, while
-the World of Warcraft 1.12 frame moves by +0.8 %, inside that run's noise,
-and the fixed-function draws by +0.5 %. Two per-draw gauges of the perf
-summary rise: the draw snapshot (`draw_snapshot_ms`) by 9.5 % and its key
-building (`draw_snapshot_keys_ms`) by 7.3 %. Under the arm64 Wine's
-translator (FEX) `pentium4` costs about 7 % on a clean draw and 2 to 3 % on
-a frame against `nehalem`. The baseline is to be measured again under FEX.
+The i686 build targets `pentium4`, plain SSE2. The baseline was measured
+under Rosetta, where against `nehalem` it took 9 to 15 % less time per call
+for the state setters, the shader-constant uploads and a vertex-buffer lock
+with World of Warcraft 1.12 and 3.3.5a. Under FEX it costs about 7 % on a
+clean draw and 2 to 3 % on a frame against `nehalem`; it is to be measured
+again under FEX.
 
 The x86_64 target, which builds only the x64 end-to-end test executables,
 targets `x86-64-v2`.
@@ -121,9 +117,8 @@ targets `x86-64-v2`.
 `make install` puts the build into the Wine `WINE_SDK` names and into
 `WINE_INSTALL_DIR` when that is set, a game's Wine tree, which has to be an
 arm64 Wine too; a `WINE_INSTALL_DIR` naming `WINE_SDK` itself is written
-once.
-`d3d9.dll` gets Wine's builtin signature there, so it replaces Wine's own
-d3d9 for that tree. The build goes into the Wine's mtld3d subtree
+once. `d3d9.dll` gets Wine's builtin signature there, so it replaces Wine's
+own d3d9 for that tree. The build goes into the Wine's mtld3d subtree
 (`lib/wine/d3d9/mtld3d`), with markers in the default directories.
 
 Each Wine gets the i686 build in `i386-windows`, the ARM64X build in
@@ -154,15 +149,15 @@ suite against the ARM64X build, whose ARM64EC half its processes run. Both
 install into the one tree and share one prefix, since the two builds go into
 different directories. The third leg, `test-e2e-arm64`, runs the suite built
 for `aarch64-pc-windows-msvc`, native ARM64 processes, against the ARM64X
-build's ARM64 half, which the arm64 Wine's compatdb gives them from
-arm64-11.19-2 on. A native ARM64 process loads a builtin only behind a
-hybrid placeholder in the prefix's `system32`, and a prefix made before an
-install stamped hybrid ones keeps the AMD64 copies it took then, so this leg
-installs into a private clone of `WINE_SDK` with a prefix created after the
-install, and never writes into `WINE_SDK` itself. Its test binaries link
-like the x86 legs', through `lld-link` and the xwin splat, which holds
-aarch64 libraries for them (`make setup-xwin` adds them to a splat that
-lacks them).
+build's ARM64 half, which the arm64 Wine's compatdb gives them in the
+athei/wine-build tag arm64-11.19-2 or any later Mach9 release. A native ARM64
+process loads a builtin only behind a hybrid placeholder in the prefix's
+`system32`, and a prefix made before an install stamped hybrid ones keeps the
+AMD64 copies it took then, so this leg installs into a private clone of
+`WINE_SDK` with a prefix created after the install, and never writes into
+`WINE_SDK` itself. Its test binaries link like the x86 legs', through
+`lld-link` and the xwin splat, which holds aarch64 libraries for them
+(`make setup-xwin` adds them to a splat that lacks them).
 
 `make check` also lints and unit-tests a `PERF=1` build, the only build of a
 gate that compiles the perf telemetry and its tests. It goes into `target/perf`
@@ -200,10 +195,10 @@ the two binaries.
 
 The baseline's header names the Wine version those tests were built from,
 and the conformance targets tell the runner that version: the first line of
-`$WINE_TESTS/VERSION`, which the release writes beside the tests from
-arm64-11.19-2 on (the `wine --version` string of their build), else the
-`wine --version` of the Wine tree `WINE_TESTS` lies in when that tree has a
-runnable `bin/wine`, as `WINE_SDK` does. Tests with neither have no known
+`$WINE_TESTS/VERSION`, which the release writes beside the tests in
+arm64-11.19-2 or any later Mach9 release (the `wine --version` string of
+their build), else the `wine --version` of the Wine tree `WINE_TESTS` lies
+in when that tree has a runnable `bin/wine`, as `WINE_SDK` does. Tests with neither have no known
 version: the run skips the comparison with the header and a re-record keeps
 it.
 
@@ -216,25 +211,25 @@ conformance suite and its baseline.
 
 Mach9's arm64 Wine runs x86 programs through FEX. It keeps mtld3d in
 `lib/wine/d3d9/mtld3d`, and its compatdb.so prepends that tree to the builtin
-search of every x86 process and, from arm64-11.19-2 on, of every native ARM64
-one, mtld3d being its d3d9 default for them. An x64
-program runs there as an ARM64EC process, which loads its builtins from
-`aarch64-windows`, so the 64-bit modules sit in the tree's `aarch64-windows`
-whatever their machine. The placeholders `make install` stamps for them in
-the default `lib/wine/aarch64-windows` follow the rule the Mach9 bundle
-stamps its own by: hybrid ones (`winebuild -marm64x`, an ARM64 placeholder
-with ARM64EC metadata) when every d3d9 tree that has the DLL holds an ARM64X
-build of it, as after an install of the ARM64X build, and AMD64 ones
-otherwise, as when another d3d9 tree holds an x86_64 build of it. A hybrid
-one also takes a winebuild that writes the ARM64EC metadata into it, which
-the release's does from arm64-11.19-2 on; an older one writes a plain ARM64
-placeholder an x64 process refuses, and the install fails naming it before
-it changes anything in the Wine. An x64 process accepts both kinds; a
-native ARM64 one loads a name only behind a hybrid placeholder. A prefix
-copies the placeholders when it is created and takes a changed one on its
-next `wineboot -u`. A runtime-only arm64 Wine without that tree, such as
-CrossOver Preview's, is refused; `INSTALL.md` installs the release bundle
-into one.
+search of every x86 process and, in arm64-11.19-2 or any later Mach9
+release, of every native ARM64 one, mtld3d being its d3d9 default for them.
+An x64 program runs there as an ARM64EC process, which loads its builtins
+from `aarch64-windows`, so the 64-bit modules sit in the tree's
+`aarch64-windows` whatever their machine. The placeholders `make install`
+stamps for them in the default `lib/wine/aarch64-windows` follow the rule the
+Mach9 bundle stamps its own by: hybrid ones (`winebuild -marm64x`, an ARM64
+placeholder with ARM64EC metadata) when every d3d9 tree that has the DLL
+holds an ARM64X build of it, as after an install of the ARM64X build, and
+AMD64 ones otherwise, as when another d3d9 tree holds an x86_64 build of it.
+A hybrid one also takes a winebuild that writes the ARM64EC metadata into
+it, which the release's does in arm64-11.19-2 or any later Mach9 release; an
+older one writes a plain ARM64 placeholder an x64 process refuses, and the
+install fails naming it before it changes anything in the Wine. An x64
+process accepts both kinds; a native ARM64 one loads a name only behind a
+hybrid placeholder. A prefix copies the placeholders when it is created and
+takes a changed one on its next `wineboot -u`. A runtime-only arm64 Wine
+without that tree, such as CrossOver Preview's, is refused; `INSTALL.md`
+installs the release bundle into one.
 
 Under that Wine the PE side of a 32-bit game runs translated, while the
 ARM64X build's ARM64EC half runs as native code, and everything in

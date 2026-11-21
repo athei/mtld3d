@@ -102,8 +102,8 @@ pub const VERSION_POOL_WORKING_SET_DIVISOR: u64 = 8;
 /// allocation and a whole copy, what it cost before the pool. Parking
 /// resumes only below the line less the cap, so a process hovering at the
 /// line does not park and destroy in turn. `currentAllocatedSize` may also
-/// count the no-copy buffers that wrap upload staging, so on a discrete GPU
-/// the line can trip early; that costs speed only, never texels.
+/// count the no-copy buffers that wrap upload staging, so the line can trip
+/// early; that costs speed only, never texels.
 pub const VERSION_POOL_PRESSURE_QUARTERS: u64 = 3;
 
 /// How much GPU memory the pool may use, from the device's recommended working set.

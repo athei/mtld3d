@@ -185,9 +185,10 @@ const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 /// One frame in this many, on average, runs its per-call and per-draw timers.
 ///
 /// A timer costs about as much as a cheap call (two counter reads and the
-/// booking, 12 to 17 ns as measured), so a `PERF=1` build that times
-/// every call of every frame runs its API thread about half again slower
-/// than the production build. Timing whole frames keeps every timed frame
+/// booking, 12 to 17 ns as measured under Rosetta and not re-measured on
+/// the arm64 Wine), so a `PERF=1` build that times every call of every
+/// frame runs its API thread about half again slower than the production
+/// build. Timing whole frames keeps every timed frame
 /// exact (nesting, exclusive time, the rows that are a parent less its
 /// children) and leaves the others at production cost but for the few
 /// once-a-frame timers. The summary takes its timer rows from the timed

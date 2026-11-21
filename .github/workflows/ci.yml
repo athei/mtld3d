@@ -206,8 +206,8 @@ jobs:
   # One more, `aarch64`, runs the native ARM64 test binaries against the
   # ARM64X build's ARM64 half (`test-e2e-arm64`); it is an `include` entry
   # rather than an axis value, as the scaled leg below is. The `runner` axis
-  # has the one image, macos-26, and stays an axis so the job and artifact
-  # names keep naming it.
+  # has the one image, macos-26; it is an axis so the job and artifact names
+  # carry the runner.
   #
   # One more leg runs the whole suite at `render.scale = 0.75`: the back
   # buffer rasterized smaller than the resolution D3D9 reports and resolved

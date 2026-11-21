@@ -608,9 +608,9 @@ fn surface_bytes_charges_colour_and_depth_surfaces() {
     // A standalone 2048x2048 A8R8G8B8 render target is 16 MiB.
     assert_eq!(surface_bytes(2048, 2048, D3DFMT_A8R8G8B8), 16 * 1024 * 1024);
     assert_eq!(surface_bytes(2048, 2048, D3DFMT_X8R8G8B8), 16 * 1024 * 1024);
-    // Source bytes per pixel, not the Metal backing: R5G6B5 is 2 bytes even
-    // where it is expanded to BGRA8, and D24S8 is 4 even though the Metal
-    // texture behind it is `Depth32Float_Stencil8`.
+    // Source bytes per pixel, not the Metal backing: R5G6B5 is 2 bytes, and
+    // D24S8 is 4 even though the Metal texture behind it is
+    // `Depth32Float_Stencil8`.
     assert_eq!(surface_bytes(256, 128, D3DFMT_R5G6B5), 256 * 128 * 2);
     assert_eq!(surface_bytes(1024, 1024, D3DFMT_D24S8), 4 * 1024 * 1024);
     assert_eq!(surface_bytes(1024, 1024, D3DFMT_D16), 2 * 1024 * 1024);

@@ -617,13 +617,14 @@ ARM64X_SYSLIBS     := mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi3
 # What the leg needs beyond the x86 legs' toolchain and WINE_SDK_REQUIRE,
 # checked before it builds so that a missing piece is named instead of
 # surfacing as a build-script or link error. ARM64X_REQUIRE_TARGETS is what
-# cargo needs for the two halves beyond the Wine archives, which is all a
-# clippy leg needs: both Rust targets. ARM64X_REQUIRE_LINK is what the link
+# cargo needs for the two halves beyond the Wine archives: both Rust targets,
+# and the targets $(1) adds, the x64 one where a recipe builds or lints the
+# x64 test binaries the arm64x legs run. ARM64X_REQUIRE_LINK is what the link
 # adds. Each is one shell line that exits 2 with a message on the first thing
 # missing.
 define ARM64X_REQUIRE_TARGETS
 installed=$$(rustup target list --installed --toolchain $(RUST_STABLE) 2>/dev/null); \
-for target in $(PE_arm64) $(PE_arm64ec); do \
+for target in $(PE_arm64) $(PE_arm64ec) $(1); do \
 	echo "$$installed" | grep -qx $$target || { echo "ARM64X: the Rust target $$target is not installed for $(RUST_STABLE); \`make setup-rust\` adds it" >&2; exit 2; }; \
 done
 endef
@@ -674,7 +675,7 @@ endef
 
 windows-arm64x:
 	$(WINE_SDK_REQUIRE)
-	$(ARM64X_REQUIRE_TARGETS)
+	$(call ARM64X_REQUIRE_TARGETS)
 	$(ARM64X_REQUIRE_LINK)
 	cd windows && for target in $(PE_arm64) $(PE_arm64ec); do \
 		for crate in mtld3d d3d9; do \
@@ -1104,6 +1105,7 @@ stage: all
 	cp -c $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_i386))); cp -c $$exes $(STAGE_DIR)/tests/i686/
+	$(call ARM64X_REQUIRE_TARGETS,$(PE_x64))
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_x64))); cp -c $$exes $(STAGE_DIR)/tests/x86_64/
 	$(XWIN_AARCH64_REQUIRE)
 	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_arm64))); cp -c $$exes $(STAGE_DIR)/tests/aarch64/
@@ -1420,7 +1422,10 @@ test-e2e-i686: install-windows-i686 install-unix-arm64
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_i686)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) $(E2E_FLAGS) -- $$exes
 
+# A stage carries the x64 test binaries, so only a build here checks for the
+# target they are built for.
 test-e2e-arm64x: install-windows-arm64x install-unix-arm64
+	$(if $(STAGE),,$(call ARM64X_REQUIRE_TARGETS,$(PE_x64)))
 	$(MAKE) configure-test-prefix
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) $(E2E_FLAGS) -- $$exes
@@ -2018,7 +2023,7 @@ clippy-pe-i686:
 # the native ARM64 leg and the x86_64 ones of the arm64x legs.
 clippy-pe-arm64x:
 	$(WINE_SDK_REQUIRE)
-	$(ARM64X_REQUIRE_TARGETS)
+	$(call ARM64X_REQUIRE_TARGETS,$(PE_x64))
 	for target in $(PE_arm64) $(PE_arm64ec); do \
 		( cd windows && cargo +$(RUST_STABLE) clippy --target $$target $(DENY_WARNINGS) ) || exit ; \
 		( cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $$target $(DENY_WARNINGS) ) || exit ; \

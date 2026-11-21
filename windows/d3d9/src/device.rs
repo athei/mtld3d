@@ -9659,9 +9659,8 @@ extern "system" fn device_stretch_rect(
     // render target or an offscreen-plain surface (cross-format
     // RT/texture/offscreen → RT, plus the offscreen→offscreen case handled on
     // the CPU just below).
-    // Device-aware mapping: it must agree with the Metal formats the textures
-    // were actually created with (e.g. a packed 16-bit pair that is
-    // BGRA8-backed on this device is NOT cross-format).
+    // The mapping must agree with the Metal formats the textures were
+    // actually created with.
     // A planar source always converts: its R8 storage holds YUV planes, not
     // the pixels of any colour format, so it never takes the 1:1 blit. It is
     // answered ahead of the lookup, which has no entry for it.

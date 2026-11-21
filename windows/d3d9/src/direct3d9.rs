@@ -554,9 +554,9 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // a sampled-only format with a twin, such as DXT1, answers no there.
 //
 // `R8G8B8` belongs here even though it is widened on upload: its backing is
-// `Bgra8Unorm` on every device, so the eager twin view exists and the decode
-// is real. The packed 16-bit formats stay out because their backing is
-// device-dependent and this predicate is pure.
+// `Bgra8Unorm`, so the eager twin view exists and the decode is real. The
+// packed 16-bit formats stay out because Metal has no sRGB twin of any packed
+// 16-bit pixel format.
 //
 // The list follows the Metal format, not the D3D9 name: DXT2 and DXT4 are the
 // BC2 and BC3 block encodings of DXT3 and DXT5 under another content

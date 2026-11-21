@@ -116,9 +116,9 @@ fn parses_only_and_repeat() {
 fn bad_subtest_and_arch_error() {
     let err = parse_args(base(&["--only", "nope"])).unwrap_err();
     assert!(err.contains("unknown subtest"), "{err}");
-    for retired in ["arm", "i686", "x86_64"] {
+    for unknown in ["arm", "i686", "x86_64"] {
         let err =
-            parse_args(args(&["--wine", "/w", "--exe", "/e", "--arch", retired])).unwrap_err();
+            parse_args(args(&["--wine", "/w", "--exe", "/e", "--arch", unknown])).unwrap_err();
         assert!(err.contains("unknown arch"), "{err}");
     }
 }

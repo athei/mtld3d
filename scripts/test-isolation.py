@@ -319,7 +319,7 @@ class FakeWineTestCase(MakeTestCase):
 
 
 class LegTests(FakeWineTestCase):
-    """What the aggregates build, test and bundle, and the targets an x86_64 Wine had."""
+    """What the aggregates build, test, stage and bundle under the arm64 Wine."""
 
     def dry_run(self, wine, *goals):
         # `-n` prints every recipe line, a sub-make's included, and runs none.
@@ -333,7 +333,7 @@ class LegTests(FakeWineTestCase):
                 # The refusal messages name `lib/wine/x86_64-unix`, no path under it.
                 for word in ("x86_64-apple-darwin", "x86_64-unix/", "x86_64-windows", "rosetta"):
                     self.assertNotIn(word, output)
-        # The x64 test binaries are still built and staged, for the arm64x legs.
+        # The stage builds the x64 test binaries, which the arm64x legs run.
         self.assertIn("--target x86_64-pc-windows-msvc --message-format",
                       self.dry_run(self.arm64, "-o", "all", "stage"))
         self.assertNotIn("x86_64-pc-windows-msvc", self.dry_run(self.arm64, "windows"))
@@ -365,16 +365,6 @@ class LegTests(FakeWineTestCase):
                 for line in runs:
                     self.assertIn(variant, line)
                     self.assertNotIn("--variant intel", line)
-
-    def test_the_targets_of_the_x86_64_wine_and_the_intel_legs_are_gone(self):
-        for goal in ("windows-x86_64", "unix-x64", "install-windows-x86_64", "install-unix-x64",
-                     "test-e2e-x86_64", "clippy-pe-x86_64", "mem-routine-gate", "bench-variants",
-                     "setup-rosetta", "conformance-x86_64", "conformance-intel",
-                     "conformance-intel-i686", "conformance-baseline-intel-arm64x"):
-            with self.subTest(goal=goal):
-                output = self.run_make("-n", goal, succeeds=False)
-                self.assertIn("No rule to make target", output)
-                self.assertIn(goal, output)
 
     def test_every_leg_runs_the_tests_wine_tests_names(self):
         # The arm64 Wine's own tests by default, else the directory WINE_TESTS names.

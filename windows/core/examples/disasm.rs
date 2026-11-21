@@ -1,6 +1,6 @@
-//! Offline disassembler for DXSO bytecode dumped via `MTLD3D_BYTECODE_DUMP`.
+//! Offline disassembler for DXSO bytecode dumped via `debug.bytecodeDumpDir`.
 //!
-//! Usage: `cargo run --example disasm --target x86_64-apple-darwin -- <file.dxso>`
+//! Usage: `cargo run --example disasm --target aarch64-apple-darwin -- <file.dxso>`
 //!
 //! Prints the parsed IR as Debug and the MSL the emitter produces, so a
 //! captured bytecode blob can be inspected without launching Wine.
