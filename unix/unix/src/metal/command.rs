@@ -2674,8 +2674,7 @@ fn encode_pass(
         |v: u64| u32::try_from(v).expect("PE wire u64 low-half fits u32 by packing contract");
     mtld3d_shared::crumb!("pass:enter", pass_idx as u64, pass.command_count);
     // Leading blits order uploads before their dependent upload pass,
-    // or a surface copy between the application's render passes. A
-    // notification-only list needs no MTLBlitCommandEncoder.
+    // or a surface copy between the application's render passes.
     if pass.leading_blits_ptr != 0 && pass.leading_blits_count > 0 {
         // SAFETY: PE supplied `leading_blits_ptr` as a `[BlitCommand; n]`
         // valid for the call duration per the PassDescriptor wire contract.
