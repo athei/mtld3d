@@ -391,10 +391,7 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside
   its back-buffer set and keeps a 16-bit one. `CheckDeviceType` offers that
   set only. No knob.
-- The adapter mode list leaves out every display size win32u cannot scale
-  the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
-  for one follows the window instead of setting the mode. The list describes
-  the primary display only. No knob.
+- The adapter mode list describes the primary display only. No knob.
 - With `display.maxResolutions` set, the adapter mode list and the main
   module's `EnumDisplaySettings` offer at most that many sizes, the largest
   ones and always the desktop's, where a driver lists every mode it has. The

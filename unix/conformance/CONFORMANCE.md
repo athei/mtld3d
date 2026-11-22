@@ -475,26 +475,6 @@ record. A knob, where one makes sense, is named with its default.
   never read, so no site observes it. No knob: the behaviour a knob would
   restore needs a shader path the layer does not have, so there is nothing
   to trade.
-- **The adapter mode list leaves out the display sizes win32u cannot scale
-  the monitor to.** After a mode-set, win32u recomputes the monitor's scale
-  as `dpi * physical / size` on each axis, reduces it by the greatest common
-  divisor of its terms, and packs each term into 16 bits. CrossOver 27's
-  win32u asserts that the reduced numerator fits (`make_ratio`,
-  `sysparams.c:324`) and aborts the process when it does not; at 96 dpi on a
-  3456x2234 display that is 2992x1934, 2992x1870, 2336x1510, 2056x1329,
-  2056x1285, 1496x967, 1496x935, 1168x755 and 1168x730, all sizes Wine lists
-  itself. A CrossOver 27 build cannot be told apart from here, so the sizes
-  are left out on every Wine: `EnumAdapterModes` and the main module's
-  `EnumDisplaySettingsW` never offer one, and a fullscreen request for one
-  follows the window, as a request for no display mode does, rather than
-  setting the mode. The physical size is the largest extent on each axis of
-  Win32's mode list, which under `EmulateModeset` is the physical mode, and
-  the DPI is `GetSystemDpiForProcess`. The desktop mode always stays, and the
-  sizes left out are logged once. No site observes it directly:
-  `test_reset_fullscreen` sets the first served size other than the
-  desktop's, which was 2992x1934 and aborted the `device` subtest on
-  CrossOver 27. No knob: the sizes a knob would restore end the process on
-  the Wine that lists them.
 - **`display.maxResolutions` bounds the sizes a game enumerates.** Unset, as
   in the suite, the adapter lists every settable size at every refresh rate
   Wine lists, as a driver does. Set, `EnumAdapterModes` and the main module's
@@ -1142,8 +1122,7 @@ the window topmost: raising the window to the topmost level deadlocks winemac
 The mode list `EnumAdapterModes` serves is `EnumDisplaySettingsW`'s at the
 desktop's colour depth: every size no larger than the desktop, each at every
 refresh rate user32 lists for it, ordered by width, height and refresh rate,
-so an enumerated mode is one win32u accepts by construction. It leaves out
-only the sizes win32u cannot scale the monitor to (see Kept divergences).
+so an enumerated mode is one win32u accepts by construction.
 `display.maxResolutions` can bound it to the largest sizes; the suite sets no
 bound, and a fullscreen request for any mode in the full list is set whether
 or not a bounded list carries it. The test binary, being the process's main

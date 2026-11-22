@@ -13,7 +13,7 @@ pub use imp::{
     apply_device_control_word, caller_holds_loader_lock, capture_hotkey_pressed, client_size,
     create_surface_dc, current_display_mode, destroy_surface_dc, dispatch_unix_call,
     enumerate_display_modes, free_space, is_maximized, main_image_version_blob, note_create_device,
-    primary_monitor, release_logger, system_dpi, unix_path, warn_if_dpi_scaled,
+    primary_monitor, release_logger, unix_path, warn_if_dpi_scaled,
 };
 
 /// What the system realizes of the device's cursor.

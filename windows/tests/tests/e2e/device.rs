@@ -13,16 +13,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_core::display_mode::{
-    drop_unscalable_sizes, listed_modes, physical_extent, select_mode_sizes, served_modes,
-    served_sizes,
-};
+use mtld3d_core::display_mode::{listed_modes, select_mode_sizes, served_modes, served_sizes};
 use mtld3d_tests::{
     Activation, Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex,
     WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation,
     assert_pixel_eq, config_var, create_window, current_display_bits_per_pel, cursor_is_live,
     cursor_mask_bits, destroy_window, enumerate_display_sizes, enumerate_user32_display_modes,
-    foreground_window, pump_until_quiet, run_child, spawn_scoped, system_dpi, window_rect,
+    foreground_window, pump_until_quiet, run_child, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -198,15 +195,12 @@ fn enum_adapter_modes_serves_every_settable_size_at_every_listed_rate() {
     );
     let listed = enumerate_user32_display_modes(current_display_bits_per_pel());
     let listed_sizes: Vec<(u32, u32)> = listed.iter().map(|&(size, _)| size).collect();
-    let physical = physical_extent(desktop, listed_sizes.iter().copied());
-    let dpi = system_dpi();
-    let mut settable = select_mode_sizes(desktop, listed_sizes.iter().copied());
-    drop_unscalable_sizes(&mut settable, physical, dpi);
+    let settable = select_mode_sizes(desktop, listed_sizes.iter().copied());
     let modes = listed_modes(listed.iter().copied(), (desktop, current.refresh_rate));
     let expected = served_modes(modes, &served_sizes(&settable, 0));
     assert_eq!(
         served, expected,
-        "EnumAdapterModes on a {physical:?} display at {dpi} dpi, user32 listing {listed:?}"
+        "EnumAdapterModes on a {desktop:?} desktop, user32 listing {listed:?}"
     );
     assert!(
         served.iter().any(|&(size, _)| size == (640, 480)) || !settable.contains(&(640, 480)),

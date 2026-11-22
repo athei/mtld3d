@@ -44,6 +44,5 @@ pub use win32::{
     cursor_mask_bits, destroy_window, enumerate_display_sizes, enumerate_user32_display_modes,
     foreground_window, harness_window_proc, make_topmost, move_window_on_next_display_change,
     post_quit_message, pump_until_quiet, send_message, set_opengl_pixel_format, set_parent,
-    set_window_long, set_window_pos, show_window, system_dpi, window_long, window_proc,
-    window_rect,
+    set_window_long, set_window_pos, show_window, window_long, window_proc, window_rect,
 };

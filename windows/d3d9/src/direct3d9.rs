@@ -12,8 +12,7 @@ use mtld3d_core::{
     caps,
     config::{CursorScale, Mtld3dConfig},
     display_mode::{
-        ModeRequest, drop_unscalable_sizes, effective_refresh, listed_modes, physical_extent,
-        select_mode_sizes, served_modes, served_sizes,
+        ModeRequest, effective_refresh, listed_modes, select_mode_sizes, served_modes, served_sizes,
     },
     format_probe::FormatProbeKey,
     multisample,
@@ -145,9 +144,8 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
 struct AdapterModes {
     /// Every size a fullscreen request may set, desktop first.
     ///
-    /// Win32's list under [`select_mode_sizes`]' filters, less the sizes
-    /// [`drop_unscalable_sizes`] leaves out: a subset of what user32 accepts
-    /// a mode-set for.
+    /// Win32's list under [`select_mode_sizes`]' filters: a subset of what
+    /// user32 accepts a mode-set for.
     settable: Vec<(u32, u32)>,
     /// Every mode Win32 lists at a settable size, as `((width, height), refresh_hz)`.
     ///
@@ -192,25 +190,7 @@ fn build_adapter_modes() -> AdapterModes {
         .iter()
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
         .map(|mode| (mode.width, mode.height));
-    let physical = physical_extent((host_w, host_h), candidates.clone());
-    let mut settable = select_mode_sizes((host_w, host_h), candidates);
-    // After a mode-set win32u rescales the monitor by a ratio whose terms it
-    // packs into 16 bits each, and some Wine builds abort the process when a
-    // term does not fit. Those builds cannot be told apart from here, so the
-    // sizes are left out on every Wine: a fullscreen request for one follows
-    // the window rather than setting the mode.
-    let dpi = crate::platform::system_dpi();
-    let unscalable = drop_unscalable_sizes(&mut settable, physical, dpi);
-    if !unscalable.is_empty() {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "adapter modes: {} sizes left out, win32u cannot represent the scale from them onto \
-             the {}x{} display at {dpi} dpi in 16 bits: {unscalable:?}",
-            unscalable.len(),
-            physical.0,
-            physical.1
-        );
-    }
+    let settable = select_mode_sizes((host_w, host_h), candidates);
     if enumerated.is_empty() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -230,10 +210,8 @@ fn build_adapter_modes() -> AdapterModes {
 
     info!(
         target: LOG_TARGET,
-        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz on a {}x{} display; {} sizes \
-         settable of {} enumerated modes",
-        physical.0,
-        physical.1,
+        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz; {} sizes settable of {} enumerated \
+         modes",
         settable.len(),
         enumerated.len(),
     );
@@ -1503,10 +1481,7 @@ extern "system" fn d3d9_get_adapter_monitor(_this: *mut c_void, _adapter: u32) -
 /// The membership test behind the fullscreen honor-or-follow split in
 /// [`resolve_backbuffer_dims`]. Answered against every settable size, not
 /// only the bounded list games enumerate: a game's own config may name a
-/// mode its menu no longer lists, and user32 accepts it all the same. The
-/// sizes [`drop_unscalable_sizes`] leaves out answer `false` although user32
-/// lists them: `CrossOver` 27's win32u would abort the process on a mode-set
-/// to one.
+/// mode its menu no longer lists, and user32 accepts it all the same.
 pub fn is_settable_mode(width: u32, height: u32) -> bool {
     ADAPTER_MODES.settable.contains(&(width, height))
 }
@@ -1530,10 +1505,7 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 ///   outright, so no game can depend on it being honored; such games carry
 ///   their window size into the request and size their rendering and input
 ///   from the window, so the client rect wins there, the lenient answer that
-///   keeps the window, back buffer and mouse in one space. The same holds
-///   for a size user32 lists but the mode table leaves out because
-///   `CrossOver` 27's win32u would abort on it: the device sets no mode and
-///   the back buffer follows the window.
+///   keeps the window, back buffer and mouse in one space.
 /// - **Maximized window**: the window manager sizes the window, not the game,
 ///   so the client area wins and the requested resolution is ignored;
 ///   `render.scale` is the resolution control in that mode.
@@ -1580,8 +1552,7 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
                 "fullscreen device: requested {}x{} is no settable display mode (user32 does not \
-                 list it, or CrossOver 27's win32u would abort on it), so the back buffer \
-                 follows the window ({}x{}) instead",
+                 list it), so the back buffer follows the window ({}x{}) instead",
                 pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
             );
         }

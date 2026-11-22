@@ -66,7 +66,6 @@ unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
-    fn GetSystemDpiForProcess(process: *mut c_void) -> u32;
     fn SetWindowPos(
         hwnd: usize,
         insert_after: usize,
@@ -1176,26 +1175,6 @@ pub fn enumerate_user32_display_modes(bits_per_pel: u32) -> Vec<((u32, u32), u32
         >(entry)
     };
     walk_display_modes(enumerate, Some(bits_per_pel))
-}
-
-/// The system DPI this process sees (`GetSystemDpiForProcess`).
-///
-/// The DPI win32u scales the monitor by after a mode-set, as d3d9 reads it
-/// to decide which sizes it may serve, with d3d9's fallback to 96 when the
-/// call answers 0.
-#[must_use]
-pub fn system_dpi() -> u32 {
-    const USER_DEFAULT_SCREEN_DPI: u32 = 96;
-    // SAFETY: kernel32 export that takes no arguments and returns the
-    // current-process pseudo-handle.
-    let process = unsafe { GetCurrentProcess() };
-    // SAFETY: user32 export; `process` is the current-process pseudo-handle.
-    let dpi = unsafe { GetSystemDpiForProcess(process) };
-    if dpi == 0 {
-        USER_DEFAULT_SCREEN_DPI
-    } else {
-        dpi
-    }
 }
 
 /// The size and rate of every mode `enumerate` lists for the primary display, from index 0 on.
