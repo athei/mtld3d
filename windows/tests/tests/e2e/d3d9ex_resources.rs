@@ -630,7 +630,7 @@ fn set_priority_takes_the_default_pool_on_an_extended_device() {
 
 /// An ATI2 offscreen plain exists in the scratch pool alone, on either kind of device.
 #[test]
-fn ati2_is_no_offscreen_plain_surface_on_either_kind_of_device() {
+fn an_ati2_offscreen_plain_exists_in_the_scratch_pool_alone() {
     for h in [extended(), Harness::new()] {
         for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
             let (hr, out) = h.create_offscreen_plain_surface_seeded(16, 16, D3DFMT_ATI2, pool);

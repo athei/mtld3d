@@ -6955,7 +6955,7 @@ pub extern "system" fn cube_lock_rect(
     if level >= ti.app_level_count()
         || (ti.d3d_pool == D3DPOOL_DEFAULT
             && ti.d3d_usage & D3DUSAGE_DYNAMIC == 0
-            && !mtld3d_core::format::locks_byte_per_texel(ti.d3d_format))
+            && !mtld3d_core::format::locks_in_default_pool_without_dynamic(ti.d3d_format))
     {
         return D3DERR_INVALIDCALL;
     }

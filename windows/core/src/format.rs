@@ -314,11 +314,20 @@ pub const fn is_dxt_format(d3d_format: u32) -> bool {
 /// 4-texel block ([`lock_row_pitch`]) and a sub-rect pointer `y * pitch + x`
 /// bytes past the level's start, while the level holds its BC5 blocks in
 /// place. Such a pointer does not address the rect's own blocks, so a write
-/// through a sub-rect lock is published as a write of the whole level. The
-/// format also locks as a level of a `D3DPOOL_DEFAULT` texture without
-/// `D3DUSAGE_DYNAMIC`, which D3D9 refuses for every other format.
+/// through a sub-rect lock is published as a write of the whole level.
 #[must_use]
 pub const fn locks_byte_per_texel(d3d_format: u32) -> bool {
+    d3d_format == D3DFMT_ATI2
+}
+
+/// Whether a default-pool level of the format locks without `D3DUSAGE_DYNAMIC`.
+///
+/// D3D9 refuses the lock of a non-dynamic default-pool level, 2D or cube
+/// face, for every format but `ATI2`, whose level locks whatever its usage.
+/// The level keeps a CPU copy to hand out, read back from the GPU when it
+/// was released after an upload.
+#[must_use]
+pub const fn locks_in_default_pool_without_dynamic(d3d_format: u32) -> bool {
     d3d_format == D3DFMT_ATI2
 }
 

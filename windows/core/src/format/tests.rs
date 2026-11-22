@@ -528,6 +528,30 @@ fn ati2_maps_to_bc5_with_red_and_green_exchanged() {
     }
 }
 
+/// Only an `ATI2` level locks in the default pool without dynamic usage.
+///
+/// The rule is its own predicate: the byte-per-texel lock layout says
+/// nothing about which pool a level locks in.
+#[test]
+fn only_ati2_locks_in_the_default_pool_without_dynamic_usage() {
+    use mtld3d_types::{D3DFMT_ATI1, D3DFMT_ATI2, D3DFMT_DXT5};
+
+    assert!(super::locks_in_default_pool_without_dynamic(D3DFMT_ATI2));
+    for other in [
+        D3DFMT_ATI1,
+        D3DFMT_DXT1,
+        D3DFMT_DXT5,
+        D3DFMT_A8R8G8B8,
+        D3DFMT_D24S8,
+        D3DFMT_INTZ,
+    ] {
+        assert!(
+            !super::locks_in_default_pool_without_dynamic(other),
+            "format {other:#x}"
+        );
+    }
+}
+
 #[test]
 fn format_name_renders_mapped_names_and_a_fixed_unknown() {
     assert_eq!(format_name(D3DFMT_A8R8G8B8), "A8R8G8B8");

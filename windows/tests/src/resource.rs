@@ -1254,6 +1254,14 @@ impl CubeTexture<'_> {
         unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, core::ptr::null()) }
     }
 
+    /// `AddDirtyRect(face, rect)` with a `D3DRECT`-style `[left, top, right, bottom]`.
+    #[must_use]
+    pub fn add_dirty_rect_partial(&self, face: u32, rect: &[i32; 4]) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture; `rect` is a live
+        // four-`i32` RECT for the duration of the call.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, rect.as_ptr().cast::<c_void>()) }
+    }
+
     /// Lock one cube face and mip level.
     ///
     /// # Panics

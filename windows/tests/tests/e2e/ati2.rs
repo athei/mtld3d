@@ -7,17 +7,19 @@
 //! bytes in. Each block samples green from its first eight bytes and red from
 //! its second, with blue and alpha one.
 
-use mtld3d_tests::{CubeTexture, Harness, Texture, TexturedVertex, assert_pixel_approx};
+use mtld3d_tests::{
+    CubeTexture, Harness, Texture, TexturedVertex, VolumeVertex, assert_pixel_approx,
+};
 use mtld3d_types::{
     D3D_OK, D3DBOX, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATI2,
-    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY,
-    D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
+    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE,
+    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
 };
 
 /// The display format every query here is asked against.
@@ -53,6 +55,49 @@ fn setup(h: &Harness) {
         assert_eq!(h.set_sampler_state(0, state, D3DTEXF_POINT), D3D_OK);
     }
 }
+
+/// Draw the bound cube over the whole target along the constant direction `dir`.
+fn sample_cube(h: &Harness, dir: [f32; 3]) -> u32 {
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        D3D_OK
+    );
+    let v = |x, y| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xffff_ffff,
+        u: dir[0],
+        v: dir[1],
+        w: dir[2],
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(0, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), D3D_OK);
+    });
+    h.read_pixel(320, 240)
+}
+
+/// On the +X face of an 8x8 cube, the direction that reads its block (0, 0).
+const CUBE_BLOCK_0: [f32; 3] = [1.0, 0.5, 0.5];
+
+/// On the +X face of an 8x8 cube, the direction that reads its block (1, 0).
+const CUBE_BLOCK_1: [f32; 3] = [1.0, 0.5, -0.5];
+
+/// The three rows a lock of the top-left 4x4 of an 8x8 level writes to zero block (1, 0).
+///
+/// The lock points at the level's start with a pitch of 8, so its rows land
+/// at bytes 0, 8 and 16: the first and second halves of block (0, 0), kept
+/// as they were, and the start of block (1, 0), whose endpoints the third
+/// row zeroes.
+const TOP_LEFT_ROWS: [u8; 12] = [0x7f, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// Draw the bound texture over the whole target at the constant coordinate `(u, 0.5)`.
 fn sample(h: &Harness, u: f32) -> u32 {
@@ -409,4 +454,106 @@ fn an_ati2_sub_rect_lock_publishes_the_whole_level() {
     assert_pixel_approx(sample(&h, 0.625), NEITHER, 1, "third block after");
     assert_pixel_approx(sample(&h, 0.125), GREEN_HALF, 1, "first block unchanged");
     assert_pixel_approx(sample(&h, 0.375), GREEN_HALF, 1, "second block unchanged");
+}
+
+/// `AddDirtyRect` over a sub-rect publishes the whole level of a managed texture.
+///
+/// A `D3DLOCK_NO_DIRTY_UPDATE` lock of the left 8x4 of an uploaded 16x4
+/// level publishes nothing at its unlock, and zeroes the first half of the
+/// third block through its third row. `AddDirtyRect` over the same rect then
+/// names the rect's texels, but the write reached a block outside them, so
+/// the whole level is published and the draw sees the third block change.
+#[test]
+fn an_ati2_add_dirty_rect_publishes_the_whole_level() {
+    let h = Harness::new();
+    setup(&h);
+    let texture = h.create_texture(16, 4, 1, 0, D3DFMT_ATI2, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write(&block(HALF, ZERO).repeat(4));
+    assert_eq!(h.set_texture(0, &texture), D3D_OK);
+    assert_pixel_approx(sample(&h, 0.625), GREEN_HALF, 1, "third block before");
+    {
+        let mut lock = texture.lock_rect_partial(0, &[0, 0, 8, 4], D3DLOCK_NO_DIRTY_UPDATE);
+        let mut rows = HALF.to_vec();
+        rows.extend_from_slice(&HALF);
+        rows.extend_from_slice(&ZERO);
+        lock.write_u8_rect(8, 3, &rows);
+    }
+    assert_eq!(texture.add_dirty_rect_partial(&[0, 0, 8, 4]), D3D_OK);
+    assert_pixel_approx(sample(&h, 0.625), NEITHER, 1, "third block after");
+    assert_pixel_approx(sample(&h, 0.125), GREEN_HALF, 1, "first block unchanged");
+}
+
+/// A sub-rect lock of a cube face publishes the whole face.
+///
+/// The lock of the top-left 4x4 of an uploaded 8x8 managed face writes the
+/// start of block (1, 0) through its third row, outside the rect's block,
+/// and the draw sees that block change while block (0, 0) keeps its texels.
+#[test]
+fn an_ati2_cube_face_sub_rect_lock_publishes_the_whole_face() {
+    let h = Harness::new();
+    setup(&h);
+    let cube = h.create_cube_texture_owned(8, 1, 0, D3DFMT_ATI2, D3DPOOL_MANAGED);
+    cube.lock_rect(0, 0, 0).write(&block(HALF, ZERO).repeat(4));
+    assert_eq!(h.set_cube_texture(0, &cube), D3D_OK);
+    assert_pixel_approx(
+        sample_cube(&h, CUBE_BLOCK_1),
+        GREEN_HALF,
+        1,
+        "block (1, 0) before",
+    );
+    {
+        let mut lock = cube.lock_rect_partial(0, 0, &[0, 0, 4, 4], 0);
+        assert_eq!(lock.pitch(), 8);
+        lock.write_u8_rect(4, 3, &TOP_LEFT_ROWS);
+    }
+    assert_pixel_approx(
+        sample_cube(&h, CUBE_BLOCK_1),
+        NEITHER,
+        1,
+        "block (1, 0) after",
+    );
+    assert_pixel_approx(
+        sample_cube(&h, CUBE_BLOCK_0),
+        GREEN_HALF,
+        1,
+        "block (0, 0) unchanged",
+    );
+}
+
+/// `AddDirtyRect` over a sub-rect of a cube face makes the whole face an `UpdateTexture` source.
+///
+/// A `D3DLOCK_NO_DIRTY_UPDATE` lock of the top-left 4x4 of a system-memory
+/// face, already copied once, adds no dirty region and writes the start of
+/// block (1, 0). `AddDirtyRect` over the same rect then names only block
+/// (0, 0), but the write reached block (1, 0), so `UpdateTexture` copies the
+/// whole face and the default-pool cube samples the change.
+#[test]
+fn an_ati2_cube_add_dirty_rect_marks_the_whole_face() {
+    let h = Harness::new();
+    setup(&h);
+    let source = h.create_cube_texture_owned(8, 1, 0, D3DFMT_ATI2, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0, 0, 0)
+        .write(&block(HALF, ZERO).repeat(4));
+    let target = h.create_cube_texture_owned(8, 1, 0, D3DFMT_ATI2, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_cube_texture_hr(&source, &target), D3D_OK);
+    assert_eq!(h.set_cube_texture(0, &target), D3D_OK);
+    assert_pixel_approx(
+        sample_cube(&h, CUBE_BLOCK_1),
+        GREEN_HALF,
+        1,
+        "block (1, 0) before",
+    );
+    {
+        let mut lock = source.lock_rect_partial(0, 0, &[0, 0, 4, 4], D3DLOCK_NO_DIRTY_UPDATE);
+        lock.write_u8_rect(4, 3, &TOP_LEFT_ROWS);
+    }
+    assert_eq!(source.add_dirty_rect_partial(0, &[0, 0, 4, 4]), D3D_OK);
+    assert_eq!(h.update_cube_texture_hr(&source, &target), D3D_OK);
+    assert_pixel_approx(
+        sample_cube(&h, CUBE_BLOCK_1),
+        NEITHER,
+        1,
+        "block (1, 0) after",
+    );
 }

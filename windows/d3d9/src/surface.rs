@@ -1120,10 +1120,12 @@ impl Direct3DSurface9 {
     /// GPU-backed or texture-backed surface. The pool is not filtered, so a
     /// `D3DPOOL_SCRATCH` surface answers as well as a `D3DPOOL_SYSTEMMEM` one;
     /// a caller that needs a valid `UpdateSurface` source checks
-    /// [`Self::standalone_pool`] too. The row pitch is the layout
-    /// `CreateOffscreenPlainSurface` allocated and `systemmem_lock_rect`
-    /// reports: a block-row stride for compressed formats and a dword-aligned
-    /// pixel-row stride for linear formats.
+    /// [`Self::standalone_pool`] too. The row pitch is the stored layout
+    /// `CreateOffscreenPlainSurface` allocated: a block-row stride for
+    /// compressed formats and a dword-aligned pixel-row stride for linear
+    /// formats. `systemmem_lock_rect` reports the same pitch, except for a
+    /// format that locks a byte per texel (`format::locks_byte_per_texel`),
+    /// whose lock pitch is a quarter of the stored block row.
     ///
     /// The read is the backing's exposure, so a backing nothing has written
     /// yet is zeroed first.
@@ -2499,7 +2501,7 @@ extern "system" fn surface_lock_rect(
         let (pool, usage) = (tex.d3d_pool(), tex.d3d_usage());
         if pool == D3DPOOL_DEFAULT
             && usage & D3DUSAGE_DYNAMIC == 0
-            && !mtld3d_core::format::locks_byte_per_texel(tex.d3d_format())
+            && !mtld3d_core::format::locks_in_default_pool_without_dynamic(tex.d3d_format())
             && !obj
                 .inner()
                 .flags
