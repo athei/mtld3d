@@ -39,6 +39,8 @@ fn enum_discriminants_round_trip() {
     assert_eq!(PixelFormat::from_repr(131), Some(PixelFormat::Bc1RgbaSrgb));
     assert_eq!(PixelFormat::from_repr(133), Some(PixelFormat::Bc2RgbaSrgb));
     assert_eq!(PixelFormat::from_repr(135), Some(PixelFormat::Bc3RgbaSrgb));
+    assert_eq!(PixelFormat::Bc5RgUnorm as u32, 142);
+    assert_eq!(PixelFormat::from_repr(142), Some(PixelFormat::Bc5RgUnorm));
     assert_eq!(PixelFormat::Depth32Float as u32, 252);
     assert_eq!(PixelFormat::Depth32FloatStencil8 as u32, 260);
     assert_eq!(PixelFormat::from_repr(252), Some(PixelFormat::Depth32Float));
@@ -78,6 +80,8 @@ fn srgb_twin_table() {
     assert_eq!(PixelFormat::Bgra8UnormSrgb.srgb_twin(), None);
     assert_eq!(PixelFormat::Rgba8UnormSrgb.srgb_twin(), None);
     assert_eq!(PixelFormat::Bc1RgbaSrgb.srgb_twin(), None);
+    // Metal has no sRGB BC5.
+    assert_eq!(PixelFormat::Bc5RgUnorm.srgb_twin(), None);
 
     // No sRGB encoding for single-channel, float, or depth formats.
     assert_eq!(PixelFormat::A8Unorm.srgb_twin(), None);
@@ -169,7 +173,7 @@ fn block_layout_table() {
         assert_eq!(block.bytes(), bytes, "{format:?} pixel size");
     }
 
-    // BC1 and BC4 pack a 4x4 block into 8 bytes, BC2 and BC3 into 16.
+    // BC1 and BC4 pack a 4x4 block into 8 bytes, BC2, BC3 and BC5 into 16.
     for (format, bytes) in [
         (PixelFormat::Bc1Rgba, 8),
         (PixelFormat::Bc1RgbaSrgb, 8),
@@ -178,6 +182,7 @@ fn block_layout_table() {
         (PixelFormat::Bc2RgbaSrgb, 16),
         (PixelFormat::Bc3Rgba, 16),
         (PixelFormat::Bc3RgbaSrgb, 16),
+        (PixelFormat::Bc5RgUnorm, 16),
     ] {
         let block = format.block_layout();
         assert_eq!(block.width(), 4, "{format:?} spans four pixels");

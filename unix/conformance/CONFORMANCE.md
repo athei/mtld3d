@@ -993,8 +993,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-11-20: 0 `real`, 159 `expected`, 1 `caps`,
-5 `ceiling`, 3 `flaky`, 0 `untriaged`, 168 unique sites in all.
+`Sites:` tokens below: 0 `real`, 159 `expected`, 0 `caps`, 5 `ceiling`,
+3 `flaky`, 0 `untriaged`, 167 unique sites in all.
 The 2026-07-20 audit recorded every subtest-leg of Wine 11.0's tests
 `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's and 11.21's tests keep them.
@@ -1242,8 +1242,8 @@ exactly as on any other leg; the legs carry none today.
 
 None: no failing site is `real` today.
 
-Every failing site is a recorded decision (`expected`), a capability we
-do not advertise (`caps`), a pin above the usual read, because the site
+Every failing site is a recorded decision (`expected`), a pin above the
+usual read, because the site
 reads lower on other hardware or flaps below it here (`ceiling`), or a known
 flap (`flaky`), each with its rationale in the
 per-cluster section below.
@@ -1578,6 +1578,14 @@ incompatible with that design, which we keep. Site 12819 is the same pointer
 layout assertion across six cube faces and their mip levels. Cube staging is
 also one PageBox per subresource so a face or mip can rename independently.
 Per-subresource pixel data is correct.
+
+The counts are per format: A8R8G8B8, A8 and L8, and ATI2 since the device
+offers it, each in the managed, system-memory and scratch pools. A 257-texel
+2D chain fails at its eight levels after the first (24 per format, 96 on
+every key) and a cube chain at its 53 subresources after the first (159 per
+format, 636). The expected pointers of the ATI2 rows step by the pitch the
+lock reports, 260 at level 0, which is the byte-per-texel pitch D3D9 gives
+the format. ATI1 is not offered and skips.
 
 ### device.c/test_cursor_clipping
 Sites: 14946=ceiling
@@ -2010,15 +2018,24 @@ size it had was the maximized window's rather than the 640x480 requested.
 The detach itself passes: the held surface's container is the device and a
 new back buffer object is handed out.
 
-### d3d9ex.c/test_resource_access
-Sites: 4585=caps
+### ATI2 in test_resource_access, test_surface_blocks and test_lockrect_offset
 
-The volume loop creates an ATI2 volume in the scratch pool without asking
-`CheckDeviceFormat` first, where the 2D and cube loops and `device.c`'s copy
-of this loop skip ATI2 when the device does not offer it. The device offers
-no ATI2 resource, and a FOURCC the driver does not know has no size the
-runtime could allocate, scratch pool included, so `D3DERR_INVALIDCALL` is
-the answer of a device without the format.
+ATI2 is offered as a 2D and cube texture, backed by BC5, so the ATI2 rows of
+`test_resource_access` in `device.c` and `d3d9ex.c`, the ATI2 row of
+`test_surface_blocks`, `test_lockrect_offset` and `test_miptree_layout`,
+and the 2D and cube ATI2 passes of `visual.c/test_updatetexture` run instead
+of skipping. The `d3d9ex.c` volume loop creates an ATI2 volume in the
+scratch pool without asking `CheckDeviceFormat` first, and the scratch
+create now succeeds, so 4585 passes. Every other run row passes, the lock of
+a non-dynamic default-pool level and cube face (device.c:13952,
+d3d9ex.c:4533) and the scratch plain's pitch of 128 and offset of 7740 at
+(60, 60) (device.c:8503, 8515) included; the only new failures are the
+`test_miptree_layout` pointer counts. Volumes and offscreen plains outside
+the scratch pool stay refused and unadvertised, so the volume rows of
+`device.c/test_resource_access` and `test_updatetexture` still skip, and
+the plain rows' `todo_wine` checks of the refusal print `Test succeeded
+inside todo block`, which the runner does not count. `test_3dc_formats`
+asks for ATI1 as well and still skips.
 
 ### d3d9ex.c/test_sysmem_draw
 Sites: 4779=expected 4804=expected 4842=expected
@@ -2235,8 +2252,8 @@ Volume queries accept DYNAMIC, FILTER, SRGBREAD, VERTEXTEXTURE and WRAPANDMIP
 for the five formats and reject SRGBWRITE, RENDERTARGET, DEPTHSTENCIL,
 POSTPIXELSHADER_BLENDING and AUTOGENMIPMAP. SRGBREAD covers DXT2 and DXT4 on
 volumes, as on 2D and cube textures, because BC2 and BC3 have sRGB views, and
-no upstream test asks it of either format. ATI1 and packed-YUV volumes stay
-unadvertised and SCRATCH-only. DXT2 and DXT4 keep their format identities and
+no upstream test asks it of either format. ATI1, ATI2 and packed-YUV volumes
+stay unadvertised and SCRATCH-only. DXT2 and DXT4 keep their format identities and
 share the DXT3 and DXT5 block encodings: the stored blocks are sampled as they
 are, with no multiply or divide by alpha, and the application chooses its
 blend factors.

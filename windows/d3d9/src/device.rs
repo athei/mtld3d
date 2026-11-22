@@ -76,8 +76,8 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
-    D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
-    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
+    D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_ATI2, D3DFMT_INDEX16, D3DFMT_INDEX32,
+    D3DFMT_UYVY, D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
     D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
@@ -10444,6 +10444,15 @@ extern "system" fn device_create_offscreen_plain_surface(
     // `device_create_texture` (which re-derives its own device borrow) without
     // holding a live borrow from `obj` across the call.
     let device_inner = obj.inner_ptr();
+    // An ATI2 plain exists in the scratch pool alone: D3D9 refuses one in the
+    // default and system-memory pools, and the query answers no for it.
+    if format == D3DFMT_ATI2 && pool != D3DPOOL_SCRATCH {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateOffscreenPlainSurface(format=ATI2, pool={pool}) → INVALIDCALL (an ATI2 \
+             plain surface is a D3DPOOL_SCRATCH resource only)");
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
+    }
     // D3DPOOL_DEFAULT: a lockable, GPU-resident offscreen surface. Back it with
     // an internal color texture (CPU staging for LockRect + a Metal texture for
     // StretchRect) and hand back its owned level-0 surface — lock/unlock/upload

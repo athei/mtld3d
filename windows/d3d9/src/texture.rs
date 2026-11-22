@@ -2612,13 +2612,11 @@ impl TextureInner {
         flags: u32,
     ) -> Option<(*mut u8, u32)> {
         let index = self.cube_subresource_index(face, level)?;
-        let pitch = self.mip_bytes_per_row[level];
-        let offset = mtld3d_core::texture_staging::texture_lock_offset(
+        let (pitch, offset) = mtld3d_core::texture_staging::level_lock_layout(
+            self.d3d_format,
             rect,
-            pitch,
-            self.block_w,
-            self.block_h,
-            self.block_bytes,
+            self.mip_bytes_per_row[level],
+            (self.block_w, self.block_h, self.block_bytes),
         );
         let staging_len = self.cube.as_deref()?.staging[index].logical_len();
         assert!(
@@ -2982,11 +2980,26 @@ impl TextureInner {
         let index = self
             .cube_subresource_index(face, level)
             .expect("validated cube subresource");
+        let published = self.published_lock_rect(rect);
         let cube = self.cube.as_deref_mut().expect("cube storage");
         cube.current_lock_readonly[index] = read_only;
         cube.current_lock_no_dirty[index] = no_dirty;
-        cube.current_lock_rect[index] = rect;
+        cube.current_lock_rect[index] = published;
         cube.locked[index] = true;
+    }
+
+    /// The region a lock of `rect` publishes when it ends, `None` for the whole level.
+    ///
+    /// A format that locks a byte per texel (`format::locks_byte_per_texel`)
+    /// hands out a pointer that does not address the rect's own blocks, so
+    /// its writes may land in any block of the level and the whole level is
+    /// published. Every other format publishes the rect it locked.
+    const fn published_lock_rect(&self, rect: Option<DirtyRect>) -> Option<DirtyRect> {
+        if mtld3d_core::format::locks_byte_per_texel(self.d3d_format) {
+            None
+        } else {
+            rect
+        }
     }
 
     /// Consume the state `cube_stash_lock` left for one face level.
@@ -3098,13 +3111,11 @@ impl TextureInner {
         if !self.ensure_staging_for_lock(level, flags) {
             return None;
         }
-        let pitch = self.mip_bytes_per_row[level];
-        let offset = mtld3d_core::texture_staging::texture_lock_offset(
+        let (pitch, offset) = mtld3d_core::texture_staging::level_lock_layout(
+            self.d3d_format,
             rect,
-            pitch,
-            self.block_w,
-            self.block_h,
-            self.block_bytes,
+            self.mip_bytes_per_row[level],
+            (self.block_w, self.block_h, self.block_bytes),
         );
         // Invariant: the Lock pointer must land strictly within the
         // staging Box. We hand the game a raw `*mut c_void` through
@@ -3286,7 +3297,7 @@ impl TextureInner {
     ) {
         self.current_lock_readonly[level] = read_only;
         self.current_lock_no_dirty[level] = no_dirty;
-        self.current_lock_rect[level] = rect;
+        self.current_lock_rect[level] = self.published_lock_rect(rect);
         self.locked[level] = true;
     }
 
@@ -5086,6 +5097,9 @@ extern "system" fn texture_add_dirty_rect(this: *mut c_void, rect: *const c_void
             .perf_mut()
             .bump_texture_add_dirty_rect(partial, area_bp);
     }
+    // A format whose lock writes reach any block of the level publishes the
+    // whole level here too.
+    let dirty = ti.published_lock_rect(dirty);
     // Source dirtiness and managed GPU publication are separate consumers.
     // Other pools keep their existing metadata-only AddDirtyRect behavior.
     ti.mark_update_dirty_every_level(None, dirty);
@@ -6266,9 +6280,18 @@ extern "system" fn volume_lock_box(
     if inner.d3d_pool == D3DPOOL_DEFAULT && inner.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
         return D3DERR_INVALIDCALL;
     }
-    let Some((_, row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
+    let Some((_, stored_row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
         return D3DERR_INVALIDCALL;
     };
+    // A byte-per-texel format reports a quarter of its block row; a slice
+    // still spans the level's block rows.
+    let byte_per_texel = mtld3d_core::format::locks_byte_per_texel(inner.d3d_format);
+    let row_pitch = mtld3d_core::format::lock_row_pitch(
+        inner.d3d_format,
+        stored_row_pitch.cast_unsigned(),
+        inner.block_h,
+    )
+    .cast_signed();
     // An optional box must be a non-empty, in-bounds half-open region; unlike
     // 2D surfaces, volumes validate it strictly.
     // The returned pointer is then offset to the box origin.
@@ -6311,12 +6334,20 @@ extern "system" fn volume_lock_box(
         }
         let row = usize::try_from(row_pitch).unwrap_or(0);
         let slice = usize::try_from(slice_pitch).unwrap_or(0);
-        // Block-space offset: `row_pitch` is bytes-per-block-row for compressed
-        // formats, so convert pixel coords to block coords before the multiply
-        // (block_bytes == bytes_per_pixel for uncompressed, so unchanged there).
-        (b.front as usize).saturating_mul(slice)
-            + ((b.top / bh) as usize).saturating_mul(row)
-            + ((b.left / bw) as usize).saturating_mul(inner.block_bytes as usize)
+        if byte_per_texel {
+            // A byte per texel: row `top`, byte `left` of the front slice.
+            (b.front as usize).saturating_mul(slice)
+                + (b.top as usize).saturating_mul(row)
+                + b.left as usize
+        } else {
+            // Block-space offset: `row_pitch` is bytes-per-block-row for
+            // compressed formats, so convert pixel coords to block coords
+            // before the multiply (block_bytes == bytes_per_pixel for
+            // uncompressed, so unchanged there).
+            (b.front as usize).saturating_mul(slice)
+                + ((b.top / bh) as usize).saturating_mul(row)
+                + ((b.left / bw) as usize).saturating_mul(inner.block_bytes as usize)
+        }
     } else {
         0
     };
@@ -6919,8 +6950,12 @@ pub extern "system" fn cube_lock_rect(
         return D3DERR_INVALIDCALL;
     };
     let ti = obj.inner_mut();
+    // A default-pool face locks only with dynamic usage, but for a format D3D9
+    // locks there whatever the usage (ATI2).
     if level >= ti.app_level_count()
-        || (ti.d3d_pool == D3DPOOL_DEFAULT && ti.d3d_usage & D3DUSAGE_DYNAMIC == 0)
+        || (ti.d3d_pool == D3DPOOL_DEFAULT
+            && ti.d3d_usage & D3DUSAGE_DYNAMIC == 0
+            && !mtld3d_core::format::locks_in_default_pool_without_dynamic(ti.d3d_format))
     {
         return D3DERR_INVALIDCALL;
     }
@@ -7052,6 +7087,7 @@ extern "system" fn cube_add_dirty_rect(this: *mut c_void, face: u32, rect: *cons
     } else {
         None
     };
+    let dirty = ti.published_lock_rect(dirty);
     ti.mark_update_dirty_every_level(Some(face), dirty);
     D3D_OK
 }

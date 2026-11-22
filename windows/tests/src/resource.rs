@@ -382,6 +382,33 @@ impl VolumeTexture<'_> {
         (hr, locked.bits.is_null())
     }
 
+    /// `LockBox` of `region` (the whole level for `None`), returning what the lock reports.
+    ///
+    /// Returns the hr, the row pitch, the slice pitch and the address the lock
+    /// points at, for a test that pins the lock's layout rather than writing
+    /// through it. A successful lock leaves the level mapped until
+    /// [`Self::unlock_box`].
+    #[must_use]
+    pub fn lock_box_layout(&self, level: u32, region: Option<&D3DBOX>) -> (i32, i32, i32, usize) {
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // the optional box is live through the call, null locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                0,
+            )
+        };
+        (hr, locked.row_pitch, locked.slice_pitch, locked.bits.addr())
+    }
+
     /// `UnlockBox` for mip `level`. Returns the hr.
     #[must_use]
     pub fn unlock_box(&self, level: u32) -> i32 {
@@ -1225,6 +1252,14 @@ impl CubeTexture<'_> {
         // SAFETY: the wrapper owns a live cube texture; a null rect names the
         // whole face.
         unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, core::ptr::null()) }
+    }
+
+    /// `AddDirtyRect(face, rect)` with a `D3DRECT`-style `[left, top, right, bottom]`.
+    #[must_use]
+    pub fn add_dirty_rect_partial(&self, face: u32, rect: &[i32; 4]) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture; `rect` is a live
+        // four-`i32` RECT for the duration of the call.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, rect.as_ptr().cast::<c_void>()) }
     }
 
     /// Lock one cube face and mip level.

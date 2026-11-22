@@ -53,8 +53,8 @@
   device.c:12195 count=1
   device.c:12685 count=1
   device.c:12690 count=1
-  device.c:12780 count=72
-  device.c:12819 count=477
+  device.c:12780 count=96
+  device.c:12819 count=636
   device.c:14946 count=1
   device.c:15146 count=1
   device.c:15218 count=1
@@ -140,7 +140,6 @@
   d3d9ex.c:3432 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
-  d3d9ex.c:4585 count=1
   d3d9ex.c:4779 count=1
   d3d9ex.c:4804 count=1
   d3d9ex.c:4842 count=1
@@ -192,8 +191,8 @@
   device.c:12195 count=1
   device.c:12685 count=1
   device.c:12690 count=1
-  device.c:12780 count=72
-  device.c:12819 count=477
+  device.c:12780 count=96
+  device.c:12819 count=636
   device.c:14946 count=1
   device.c:15146 count=1
   device.c:15218 count=1
@@ -312,7 +311,6 @@
   d3d9ex.c:3432 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
-  d3d9ex.c:4585 count=1
   d3d9ex.c:4779 count=1
   d3d9ex.c:4804 count=1
   d3d9ex.c:4842 count=1
@@ -364,8 +362,8 @@
   device.c:12195 count=1
   device.c:12685 count=1
   device.c:12690 count=1
-  device.c:12780 count=72
-  device.c:12819 count=477
+  device.c:12780 count=96
+  device.c:12819 count=636
   device.c:14946 count=1
   device.c:15146 count=1
   device.c:15218 count=1
@@ -450,7 +448,6 @@
   d3d9ex.c:3432 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
-  d3d9ex.c:4585 count=1
   d3d9ex.c:4779 count=1
   d3d9ex.c:4804 count=1
   d3d9ex.c:4842 count=1
@@ -502,8 +499,8 @@
   device.c:12195 count=1
   device.c:12685 count=1
   device.c:12690 count=1
-  device.c:12780 count=72
-  device.c:12819 count=477
+  device.c:12780 count=96
+  device.c:12819 count=636
   device.c:14946 count=1
   device.c:15146 count=1
   device.c:15218 count=1
@@ -621,7 +618,6 @@
   d3d9ex.c:3432 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
-  d3d9ex.c:4585 count=1
   d3d9ex.c:4779 count=1
   d3d9ex.c:4804 count=1
   d3d9ex.c:4842 count=1

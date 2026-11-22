@@ -3,7 +3,7 @@ use mtld3d_shared::mtl::{PixelFormat, Swizzle};
 use mtld3d_types::{
     D3DFMT_A1R5G5B5, D3DFMT_A2B10G10R10, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4, D3DFMT_A8,
     D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE,
+    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_ATI2, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE,
     D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE,
     D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5,
     D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NULL,
@@ -196,6 +196,7 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_G32R32F => "G32R32F",
         D3DFMT_A32B32G32R32F => "A32B32G32R32F",
         D3DFMT_ATI1 => "ATI1",
+        D3DFMT_ATI2 => "ATI2",
         D3DFMT_V8U8 => "V8U8",
         D3DFMT_A2B10G10R10 => "A2B10G10R10",
         D3DFMT_A2R10G10B10 => "A2R10G10B10",
@@ -305,6 +306,46 @@ pub const fn is_dxt_format(d3d_format: u32) -> bool {
         d3d_format,
         D3DFMT_DXT1 | D3DFMT_DXT2 | D3DFMT_DXT3 | D3DFMT_DXT4 | D3DFMT_DXT5
     )
+}
+
+/// Whether a lock of the format reports a byte per texel over its compressed blocks.
+///
+/// D3D9 hands an `ATI2` lock a pitch of the level's width rounded up to the
+/// 4-texel block ([`lock_row_pitch`]) and a sub-rect pointer `y * pitch + x`
+/// bytes past the level's start, while the level holds its BC5 blocks in
+/// place. Such a pointer does not address the rect's own blocks, so a write
+/// through a sub-rect lock is published as a write of the whole level.
+#[must_use]
+pub const fn locks_byte_per_texel(d3d_format: u32) -> bool {
+    d3d_format == D3DFMT_ATI2
+}
+
+/// Whether a default-pool level of the format locks without `D3DUSAGE_DYNAMIC`.
+///
+/// D3D9 refuses the lock of a non-dynamic default-pool level, 2D or cube
+/// face, for every format but `ATI2`, whose level locks whatever its usage.
+/// The level keeps a CPU copy to hand out, read back from the GPU when it
+/// was released after an upload.
+#[must_use]
+pub const fn locks_in_default_pool_without_dynamic(d3d_format: u32) -> bool {
+    d3d_format == D3DFMT_ATI2
+}
+
+/// The row pitch a lock of a level reports, from the pitch the level is stored at.
+///
+/// `stored_pitch` is the level's row stride in its staging: one block row
+/// for a compressed format. A format that locks a byte per texel
+/// ([`locks_byte_per_texel`]) reports a quarter of a 16-byte block row,
+/// `4 * ceil(width / 4)`; its byte extent `pitch * height` never exceeds the
+/// stored level, `pitch * 4 * ceil(height / 4)` bytes. Every other format
+/// reports the stored pitch.
+#[must_use]
+pub const fn lock_row_pitch(d3d_format: u32, stored_pitch: u32, block_height: u32) -> u32 {
+    if locks_byte_per_texel(d3d_format) && block_height > 1 {
+        stored_pitch / block_height
+    } else {
+        stored_pitch
+    }
 }
 
 /// Map a D3D9 colour format to its Metal counterpart, warning when there is none.
@@ -976,6 +1017,19 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             block_height: 4,
             block_bytes: 8, // ATI1N (BC4): single red channel — replicate to RGB, alpha = 1.0.
             swizzle: Some([Swizzle::Red, Swizzle::Red, Swizzle::Red, Swizzle::One]),
+            has_alpha: false,
+        }),
+        D3DFMT_ATI2 => Some(FormatMapping {
+            // ATI2N is BC5 block for block. D3D9 reads green from the first
+            // eight bytes of a block and red from the second, which BC5
+            // decodes as red and green, so the view exchanges the two; blue
+            // and alpha sample as 1.0.
+            metal_pixel_format: PixelFormat::Bc5RgUnorm,
+            bytes_per_pixel: 0,
+            block_width: 4,
+            block_height: 4,
+            block_bytes: 16,
+            swizzle: Some([Swizzle::Green, Swizzle::Red, Swizzle::One, Swizzle::One]),
             has_alpha: false,
         }),
         _ => None,
