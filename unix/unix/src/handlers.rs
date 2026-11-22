@@ -214,6 +214,19 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
         );
     }
 
+    // The panel is a display fact, not a Metal one, so a missing device
+    // still reports it.
+    if let Some((width, height)) = metal::main_display_panel_pixels() {
+        params.panel_width = width;
+        params.panel_height = height;
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetDeviceInfo: the main display reports no native mode; the adapter mode list \
+             keeps the sizes above the panel"
+        );
+    }
+
     STATUS_SUCCESS
 }
 

@@ -2980,6 +2980,15 @@ fn screen_display_id(screen: &objc2_app_kit::NSScreen) -> Option<u32> {
     (display != 0).then_some(display)
 }
 
+/// The native pixel size of the main display's panel, if it reports one.
+///
+/// The main display is winemac's primary adapter, `\\.\DISPLAY1`. Only
+/// CoreGraphics is read, which any thread may call, so this runs on the
+/// calling thread.
+pub fn main_display_panel_pixels() -> Option<(u32, u32)> {
+    native_panel_pixels(objc2_core_graphics::CGMainDisplayID())
+}
+
 /// The native pixel size of `display`, if it reports one.
 ///
 /// A display flags one native mode per refresh rate, and with the duplicate

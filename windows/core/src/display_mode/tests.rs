@@ -1,6 +1,7 @@
 use super::{
-    ModeRequest, ModeSetOutcome, RegistryRestore, effective_refresh, listed_modes,
-    mode_set_attempts, select_mode_sizes, served_mode_indices, served_modes, served_sizes,
+    ModeRequest, ModeSetOutcome, RegistryRestore, drop_sizes_above_panel, effective_refresh,
+    listed_modes, mode_set_attempts, select_mode_sizes, served_mode_indices, served_modes,
+    served_sizes,
 };
 
 const MBP: (u32, u32) = (3456, 2234);
@@ -178,6 +179,70 @@ fn a_scaled_desktop_serves_the_panel_size_and_the_default_size() {
         assert!(served.contains(&size), "{size:?} missing from {served:?}");
     }
     assert_eq!(served.last(), Some(&(4112, 2658)));
+}
+
+/// The desktop of a 3456x2234 panel at "More Space", the backing store.
+const MORE_SPACE: (u32, u32) = (4112, 2658);
+
+#[test]
+fn sizes_above_the_panel_are_left_out_and_the_desktop_stays_first() {
+    // 3840x2160 is wider than the panel and 3200x2400 taller; the desktop is
+    // larger on both axes and stays, as the adapter display mode.
+    let mut settable = select_mode_sizes(
+        MORE_SPACE,
+        [
+            (640, 480),
+            (3840, 2160),
+            MBP,
+            (3200, 2400),
+            (1728, 1117),
+            (2560, 1600),
+        ],
+    );
+    let dropped = drop_sizes_above_panel(&mut settable, MBP);
+    assert_eq!(
+        settable,
+        vec![MORE_SPACE, (640, 480), MBP, (1728, 1117), (2560, 1600)]
+    );
+    assert_eq!(dropped, vec![(3840, 2160), (3200, 2400)]);
+    assert!(settable[1..].iter().all(|&(w, h)| w <= MBP.0 && h <= MBP.1));
+}
+
+#[test]
+fn a_panel_equal_to_the_desktop_or_unknown_leaves_the_list_alone() {
+    let list = select_mode_sizes(MBP, MBP_WINE_SIZES);
+    for panel in [MBP, (0, 0), (MBP.0, 0), (0, MBP.1)] {
+        let mut settable = list.clone();
+        assert_eq!(
+            drop_sizes_above_panel(&mut settable, panel),
+            [] as [(u32, u32); 0],
+            "panel {panel:?}"
+        );
+        assert_eq!(settable, list, "panel {panel:?}");
+    }
+}
+
+#[test]
+fn sizes_in_points_with_retina_mode_off_all_fit_the_panel() {
+    // With RetinaMode off the desktop of "More Space" is 2056x1329 points,
+    // and every size Wine lists is below the panel's pixels.
+    let list = select_mode_sizes((2056, 1329), MBP_NORETINA_WINE_SIZES);
+    let mut settable = list.clone();
+    assert_eq!(
+        drop_sizes_above_panel(&mut settable, MBP),
+        [] as [(u32, u32); 0]
+    );
+    assert_eq!(settable, list);
+}
+
+#[test]
+fn an_empty_settable_list_drops_nothing_above_the_panel() {
+    let mut settable = Vec::new();
+    assert_eq!(
+        drop_sizes_above_panel(&mut settable, MBP),
+        [] as [(u32, u32); 0]
+    );
+    assert_eq!(settable, [] as [(u32, u32); 0]);
 }
 
 #[test]

@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_core::display_mode::{listed_modes, select_mode_sizes, served_modes, served_sizes};
+use mtld3d_core::display_mode::{
+    drop_sizes_above_panel, listed_modes, select_mode_sizes, served_modes, served_sizes,
+};
 use mtld3d_tests::{
     Activation, Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex,
     WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, activation,
@@ -171,7 +173,8 @@ fn enum_adapter_modes_serves_every_settable_size_at_every_listed_rate() {
     // With no display.maxResolutions bound EnumAdapterModes serves every
     // size of user32's own list (read past the main module's redirected
     // import) at the desktop's colour depth that a fullscreen device may set,
-    // at every refresh rate user32 lists for it, by size and then rate. The
+    // at every refresh rate user32 lists for it, by size and then rate,
+    // except the sizes larger than the panel on a scaled desktop. The
     // desktop is the largest size on both axes, so it comes last. A rate
     // user32 leaves at 0 or 1 reads as the desktop's, and the desktop's own
     // mode is listed whatever user32 lists for its size.
@@ -195,7 +198,18 @@ fn enum_adapter_modes_serves_every_settable_size_at_every_listed_rate() {
     );
     let listed = enumerate_user32_display_modes(current_display_bits_per_pel());
     let listed_sizes: Vec<(u32, u32)> = listed.iter().map(|&(size, _)| size).collect();
-    let settable = select_mode_sizes(desktop, listed_sizes.iter().copied());
+    let mut settable = select_mode_sizes(desktop, listed_sizes.iter().copied());
+    // A Win32 process cannot read the panel. The largest served extent other
+    // than the desktop's stands for it: every listed size within that extent
+    // has to be served, and none outside it.
+    let served_extent = served
+        .iter()
+        .map(|&(size, _)| size)
+        .filter(|&size| size != desktop)
+        .fold((0, 0), |(w, h), (size_w, size_h)| {
+            (w.max(size_w), h.max(size_h))
+        });
+    drop_sizes_above_panel(&mut settable, served_extent);
     let modes = listed_modes(listed.iter().copied(), (desktop, current.refresh_rate));
     let expected = served_modes(modes, &served_sizes(&settable, 0));
     assert_eq!(

@@ -39,6 +39,9 @@ const _: () = {
     assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 96);
     assert!(core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr) == 88);
+    assert!(core::mem::size_of::<GetDeviceInfoParams>() == 48);
+    assert!(core::mem::offset_of!(GetDeviceInfoParams, panel_width) == 36);
+    assert!(core::mem::offset_of!(GetDeviceInfoParams, panel_height) == 40);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<PresentClientSurfaceParams>() == 16);
     assert!(core::mem::offset_of!(PresentClientSurfaceParams, reasons) == 8);
@@ -163,6 +166,13 @@ pub struct GetDeviceInfoParams {
     /// answer once per process and derives every device-conditional cap from
     /// it.
     pub caps: DeviceCapsFlags,
+    /// Out: the primary display's native panel size in pixels, 0 by 0 when unknown.
+    ///
+    /// Read from the main display's mode list whether or not a Metal device
+    /// exists. The adapter leaves the sizes larger than it out of the mode
+    /// list, the desktop's aside.
+    pub panel_width: u32,
+    pub panel_height: u32, // out
     pub pad0: u32,
 }
 

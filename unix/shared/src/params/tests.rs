@@ -38,6 +38,17 @@ fn attach_metal_layer_layout() {
 }
 
 #[test]
+fn get_device_info_layout() {
+    use super::GetDeviceInfoParams;
+    // 4*u64 + 1*DeviceCapsFlags + 3*u32 = 32 + 4 + 12 = 48
+    assert_eq!(core::mem::align_of::<GetDeviceInfoParams>(), 8);
+    assert_eq!(core::mem::size_of::<GetDeviceInfoParams>(), 48);
+    assert_eq!(core::mem::offset_of!(GetDeviceInfoParams, caps), 32);
+    assert_eq!(core::mem::offset_of!(GetDeviceInfoParams, panel_width), 36);
+    assert_eq!(core::mem::offset_of!(GetDeviceInfoParams, panel_height), 40);
+}
+
+#[test]
 fn present_client_surface_layout() {
     use super::PresentClientSurfaceParams;
     // 1*MetalHandle + 1*ClientSurfaceRequest + 1*u32 pad = 8 + 4 + 4 = 16

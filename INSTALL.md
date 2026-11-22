@@ -462,7 +462,10 @@ multiplies on top of it, rendering fewer pixels and upscaling.
 - Wine lists forty-odd sizes on a Retina display, which can overflow a menu of
   fixed length. `display.maxResolutions` in `mtld3d.conf` then offers only the
   largest. The World of Warcraft profile sets it to 32.
-- Any mode Wine accepts stays settable, listed or not.
+- On a scaled desktop, such as *More Space*, Wine lists sizes up to the
+  desktop's backing store, larger than the panel. The adapter leaves out
+  every size larger than the panel but the desktop's own.
+- Any other mode Wine accepts stays settable, listed or not.
 - A request that matches no mode follows the window.
 - A fullscreen game keeps its device on a focus change: the desktop mode comes
   back on deactivation and the game's mode on activation.

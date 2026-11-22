@@ -391,7 +391,11 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside
   its back-buffer set and keeps a 16-bit one. `CheckDeviceType` offers that
   set only. No knob.
-- The adapter mode list describes the primary display only. No knob.
+- On a scaled desktop the adapter mode list leaves out every size larger
+  than the panel on either axis but keeps the desktop's own, which is larger
+  and stays the adapter display mode, where a driver lists no mode above
+  the panel. A fullscreen request for a size left out follows the window.
+  The list describes the primary display only. No knob.
 - With `display.maxResolutions` set, the adapter mode list and the main
   module's `EnumDisplaySettings` offer at most that many sizes, the largest
   ones and always the desktop's, where a driver lists every mode it has. The

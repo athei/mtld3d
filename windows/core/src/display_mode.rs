@@ -176,6 +176,36 @@ pub fn select_mode_sizes(
     sizes
 }
 
+/// Leave out of `settable` every size larger than the display's `panel` on either axis.
+///
+/// On a scaled desktop Win32 lists sizes up to the backing store, which is
+/// larger than the panel, and a mode above the panel renders pixels the
+/// display scales away. The desktop, the first entry, always stays: it is the
+/// adapter display mode, whatever its size. Every other entry keeps its
+/// place. A panel with a zero dimension is unknown and leaves the list as it
+/// is. Returns the sizes left out, in list order.
+pub fn drop_sizes_above_panel(
+    settable: &mut Vec<(u32, u32)>,
+    panel: (u32, u32),
+) -> Vec<(u32, u32)> {
+    let (panel_w, panel_h) = panel;
+    let Some(&desktop) = settable.first() else {
+        return Vec::new();
+    };
+    if panel_w == 0 || panel_h == 0 {
+        return Vec::new();
+    }
+    let mut dropped = Vec::new();
+    settable.retain(|&(w, h)| {
+        let keep = (w, h) == desktop || (w <= panel_w && h <= panel_h);
+        if !keep {
+            dropped.push((w, h));
+        }
+        keep
+    });
+    dropped
+}
+
 /// The sizes `EnumAdapterModes` serves, from the settable ones: smallest first, at most `max`.
 ///
 /// Every settable size is served, ordered by width and then height as a
