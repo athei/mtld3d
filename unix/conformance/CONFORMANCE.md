@@ -973,8 +973,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below: 0 `real`, 159 `expected`, 0 `caps`, 5 `ceiling`,
-3 `flaky`, 0 `untriaged`, 167 unique sites in all.
+`Sites:` tokens below: 0 `real`, 157 `expected`, 0 `caps`, 5 `ceiling`,
+3 `flaky`, 0 `untriaged`, 165 unique sites in all.
 The 2026-07-20 audit recorded every subtest-leg of Wine 11.0's tests
 `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
 2026-10-18 note below says, and Wine 11.20's and 11.21's tests keep them.
@@ -1840,21 +1840,6 @@ Pixel (1, 119) and (1, 360) lie on the first column and the first and last
 rows of a viewport bound, and read a one-eighth blend (`0x202020`) of the
 colour across it ("The scaled leg").
 
-### visual.c/depth_buffer_test
-Sites: 14575=expected
-
-The test creates targets of 320x240, 480x360 and 640x480 and binds each
-with the device's one depth buffer, expecting depth written through one to
-be read through another at the same pixel. The 640x480 target is the
-back-buffer size and rasterizes at the scale, the depth buffer with it; the
-480x360 target is its own size and does not. Depth written through the
-scaled target lands at three quarters of its reported coordinates, then is
-read through the unscaled target at the unconverted ones, so the two probes
-read the colour of the neighbouring quad. By design: the scale is a property
-of the targets at the back-buffer size (`mtld3d.conf`, `render.scale`), and
-a depth buffer shared between a scaled and an unscaled target of different
-sizes has no single mapping that serves both.
-
 ### visual.c/clip_planes
 Sites: 16177=expected 16179=expected
 
@@ -1862,20 +1847,6 @@ The plane cuts the quad at y = 240.5 in the reported space and the probes
 sit on rows 240 and 241, the two rows either side of it; under the scale
 that edge falls inside one render row and both probes read its blend
 (`0x9ca13c`) ("The scaled leg").
-
-### visual.c/test_null_format
-Sites: 24934=expected
-
-The 400x300 `small_rt` is not the back-buffer size and rasterizes unscaled,
-while the implicit depth surface is scaled with the back buffer, so the depth
-the draw through `small_rt` writes under the 640-wide viewport lands at four
-thirds of its coordinates when the scaled back buffer reads it: three probes
-past x = 400 read the drawn depth instead of the cleared one, `Expected color
-0x0000ff00 at (440, 90), got 0x00000000`, and the same at (520, 90) and
-(520, 150). Only the `+scale` keys carry it, and only because the test no
-longer skips; the draws through the `NULL` targets read as expected. The same
-pairing as `visual.c/depth_buffer_test`, whose rationale it shares. #1255
-holds a repro without a `NULL` target.
 
 ### visual.c/test_filling_convention
 Sites: 27457=expected
@@ -2254,7 +2225,9 @@ test_surface_format_null (device.c:9372) skipped at its first query
 the lockable 128x128 surface and its lock, the colour clear with no depth
 surface, and the full-chain texture create, every `ok()` passing.
 test_null_format (visual.c:24739) skipped at visual.c:24822 and now runs
-both readbacks. On the plain keys every assertion passes; on the two
-`+scale` keys visual.c:24934 fails three times, from the draw through the
-400x300 colour target, not through `NULL` (see `visual.c/test_null_format`).
+both readbacks, and every assertion passes on all four keys. On the
+`+scale` keys its draw through the unscaled 400x300 colour target over the
+scaled implicit depth surface draws into an unscaled copy of that surface,
+which is carried back before the back buffer reads it (`docs/STATUS.md`, a
+colour target and a depth surface on different grids).
 Neither test logs a Metal validation line on any of the four keys.

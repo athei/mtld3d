@@ -30,15 +30,15 @@ use mtld3d_tests::{
     assert_pixel_eq, spawn_scoped,
 };
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
-    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_LIGHTING,
+    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 use super::render_target::{draw_fill, read_back, sample_mip_level_4};
@@ -1905,4 +1905,257 @@ fn two_devices_at_different_scales_read_their_own_vpos() {
             );
         }
     });
+}
+
+/// A quad over the clip-space box `[x0, x1] x [y0, y1]` at depth `z` in `color`, as a strip.
+const fn clip_box(x0: f32, x1: f32, y0: f32, y1: f32, z: f32, color: u32) -> [PosColorVertex; 4] {
+    [
+        PosColorVertex {
+            x: x0,
+            y: y1,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: x1,
+            y: y1,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: x0,
+            y: y0,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: x1,
+            y: y0,
+            z,
+            color,
+        },
+    ]
+}
+
+/// A quad over the whole viewport at depth `z` in `color`.
+const fn viewport_quad(z: f32, color: u32) -> [PosColorVertex; 4] {
+    clip_box(-1.0, 1.0, -1.0, 1.0, z, color)
+}
+
+/// A device with the auto D24S8 depth-stencil, pinned at `render.scale=0.75`.
+///
+/// The tests of a render target of its own size over the back buffer's depth
+/// surface pin the scale, since at the identity the two share one grid and
+/// nothing they cover happens.
+fn depth_harness_at_three_quarters() -> Harness {
+    Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    })
+}
+
+/// Set up a diffuse draw with the depth test under `compare` and depth writes as `write` says.
+fn depth_draw_setup(h: &Harness, compare: u32, write: bool) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, u32::from(write)), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, compare), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+}
+
+#[test]
+fn a_small_target_over_the_back_buffer_depth_keeps_its_depth_writes_inside_its_extent() {
+    // A 400x300 target is not the back buffer's size and rasterizes unscaled,
+    // while the implicit depth surface scales with the back buffer. D3D9
+    // pairs render-target pixel (x, y) with depth sample (x, y), so the depth
+    // the draw writes stays inside x < 400 and y < 300 and the back buffer
+    // reads it there. Holds at any scale.
+    let h = Harness::with_depth();
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    let lower = D3DVIEWPORT9 {
+        x: 0,
+        y: 60,
+        width: 640,
+        height: 420,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&lower), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, RED)),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &back_buffer), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(1.0, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(200, 90),
+        BLACK,
+        "inside the small target the drawn depth rejects the quad",
+    );
+    for (x, y) in [(440, 90), (520, 90), (520, 150)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("({x}, {y}) is past the small target and keeps the cleared depth"),
+        );
+    }
+}
+
+#[test]
+fn depth_outside_a_small_targets_extent_survives_a_pass_through_it() {
+    // Depth written through the scaled back buffer, then a pass through an
+    // unscaled 400x300 target that writes depth inside its own extent only.
+    // The back buffer then reads the small target's depth inside x < 400 and
+    // y < 300, and its own everywhere else, unchanged by the pass between.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    depth_draw_setup(&h, D3DCMP_ALWAYS, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, RED)),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.75, BLUE)),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &back_buffer), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, false);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        GREEN,
+        "inside the small target its depth 0.75 passes the quad",
+    );
+    for (x, y) in [(520, 150), (200, 400), (600, 440)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            RED,
+            &format!("({x}, {y}) keeps the back buffer's depth 0.25"),
+        );
+    }
+}
+
+#[test]
+fn a_submission_ending_on_a_small_target_hands_its_depth_to_the_next_one() {
+    // The pass through the unscaled 400x300 target is the last one of its
+    // submission: the read-back of that target sends it. The draw after it,
+    // in the next submission, reads the depth that pass wrote, in place.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        BLUE,
+        "the small target's draw, sent by its read-back",
+    );
+    assert_eq!(h.set_render_target(0, &back_buffer), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, false);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        BLACK,
+        "the small target's depth 0.25 rejects the quad",
+    );
+    for (x, y) in [(520, 150), (200, 400)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("({x}, {y}) is past the small target and keeps the cleared depth"),
+        );
+    }
+}
+
+#[test]
+fn a_scaled_target_over_an_unscaled_depth_surface_keeps_its_depth_on_the_scaled_grid() {
+    // The reverse pairing, pinned at what it does: the back buffer, scaled to
+    // 480x360, over an 800x600 depth surface, which is not the back buffer's
+    // size and stays unscaled. Depth the back buffer writes over x < 320
+    // lands on the depth surface's texels x < 240, the scaled grid's, so a
+    // pass through an unscaled 800x600 target reads it there. D3D9 reads it
+    // at x < 320, y < 480, where (280, 100) and (280, 400) would be black.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let depth = h.create_depth_stencil_surface(800, 600, D3DFMT_D24S8);
+    let large = h.create_render_target(800, 600, D3DFMT_X8R8G8B8);
+    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    assert_eq!(h.set_render_target(0, &large), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "the whole depth surface, through the target of its own size"
+    );
+    assert_eq!(h.set_render_target(0, &back_buffer), 0);
+    depth_draw_setup(&h, D3DCMP_ALWAYS, true);
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLESTRIP,
+            2,
+            &clip_box(-1.0, 0.0, -1.0, 1.0, 0.25, RED)
+        ),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &large), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, false);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(100, 100),
+        BLACK,
+        "inside both grids' written area",
+    );
+    for (x, y) in [(280, 100), (280, 400), (500, 100)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("({x}, {y}) lies past the scaled grid's written texels"),
+        );
+    }
 }

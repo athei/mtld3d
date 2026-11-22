@@ -19,6 +19,7 @@ pub use mtld3d_core::encoder_data::{
 };
 
 pub mod cursor;
+mod depth_plane;
 mod extended;
 mod frame_dump;
 mod mem_watch;
@@ -752,6 +753,11 @@ pub struct DeviceInner {
     /// pipeline-vs-framebuffer depth/stencil mismatch and drops the draw).
     /// `(binding, is_sampleable, has_stencil, sample_count)`.
     last_depth_binding: Option<(DepthBinding, bool, bool, u8)>,
+    /// The depth plane of passes through an unscaled render target over a scaled depth surface.
+    ///
+    /// `device/depth_plane.rs` opens and closes its spans; the bindings
+    /// above keep naming the depth surface the application bound.
+    depth_plane: mtld3d_core::depth_plane::DepthPlane,
     /// Live `IDirect3DTexture9` objects.
     ///
     /// Populated in `texture_create` after `Box::into_raw`; entries removed in
@@ -1752,6 +1758,9 @@ impl DeviceInner {
     /// the `submit_seq` it carries. Shared between `Present` and
     /// `flush_current_frame_blocking`.
     fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> (FrameData, u64) {
+        // A depth plane's span ends with the frame that opened it, so whatever
+        // reads the depth surface after this submission reads what it drew.
+        self.close_depth_span();
         // Textures that moved to another device leave this encoder's cache
         // behind every op the outgoing frame recorded.
         for tex_id in self.departed_textures.take() {
@@ -1900,6 +1909,7 @@ impl DeviceInner {
     /// every frame of a failed device.
     #[cold]
     fn discard_unsendable_frame(&mut self) {
+        self.abandon_depth_span();
         let fresh = self.fresh_frame();
         drop(core::mem::replace(&mut self.current_frame, fresh));
         self.reassert_saved_bindings();
@@ -3719,6 +3729,7 @@ impl Direct3DDevice9 {
             last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
+            depth_plane: mtld3d_core::depth_plane::DepthPlane::new(),
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
             departed_textures: DepartedTextures::default(),
             retired_while_failed: Vec::new(),
@@ -4627,6 +4638,9 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // device-internal reference can be the last one on its object, whose
         // finalization still reaches this device.
         device_inner.recording_state_block = None;
+        // The plane retires through the same queue as the surfaces below,
+        // ahead of the flush that delivers them.
+        device_inner.release_depth_plane();
         device_inner.bound_rt_mut().teardown();
         device_inner.bound_buffers_mut().teardown();
         device_inner.stage_bindings_mut().teardown();
@@ -5539,6 +5553,10 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     // per the ABI; alignment is not assumed.
     unsafe { report_resolved_geometry(present_params, &pp) };
 
+    // The depth plane goes back into its surface and is retired while every
+    // surface it can name is still alive; the targets this `Reset` binds pair
+    // anew.
+    dev.release_depth_plane();
     // Captured before the configuration below changes what the held
     // surfaces resolve to.
     let held = dev.hold_implicit_surfaces();
@@ -9471,6 +9489,9 @@ extern "system" fn device_stretch_rect(
         // Past every depth-stencil gate, so the endpoints' pending uploads are
         // work this call will use.
         flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
+        // Either endpoint may be the surface a depth plane stands in for: the
+        // copy reads and writes the surface, so the plane goes back first.
+        dev.close_depth_span();
         if resolve {
             // The samples are reduced by a depth transfer queued after the
             // passes recorded so far, which also enters the source into the
@@ -10669,6 +10690,11 @@ extern "system" fn device_set_render_target(
         );
         return D3DERR_INVALIDCALL;
     }
+    // A depth plane standing in for the depth surface pairs with the render
+    // target 0 it opened for, so it goes back before another takes the slot.
+    if slot == 0 && surf != dev.bound_rt().render_target(0) {
+        dev.close_depth_span();
+    }
     if mtld3d_core::format::is_null_render_target(desc.format) {
         return set_null_render_target(dev, slot, surf, (desc.width, desc.height));
     }
@@ -10939,6 +10965,10 @@ extern "system" fn device_set_depth_stencil_surface(
         }
         (desc.width, desc.height)
     };
+    // The plane goes back into the outgoing surface while it is still bound,
+    // and so still alive. A rebind of the same surface closes it too: the
+    // bind below names the surface, not the plane.
+    dev.close_depth_span();
     dev.bound_rt_mut().replace_depth_stencil(surf);
     // A null surface explicitly removes the depth buffer; track it so the
     // pipeline snapshot reports no depth instead of falling back to the
@@ -11277,6 +11307,11 @@ extern "system" fn device_clear(
     // clear.
     if flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) != 0 && !dev.depth_stencil_bound() {
         return reject_depth_clear_without_surface(flags);
+    }
+    // A depth or stencil clear through an unscaled render target 0 over a
+    // scaled depth surface lands in the plane, in the target's own space.
+    if flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) != 0 {
+        dev.open_depth_span();
     }
 
     // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
@@ -13397,6 +13432,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         return;
     }
     let sampled = obj.inner().perf_mut().record_snapshot_rebuild(dirty.bits());
+    // The targets changed since the last draw, so the pass this draw opens may
+    // pair an unscaled render target 0 with a scaled depth surface.
+    if dirty.contains(SnapshotDirty::RT_DS) {
+        obj.inner().open_depth_span();
+    }
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
     let stages_timer = CycleAddTimer::start(stages_ptr);

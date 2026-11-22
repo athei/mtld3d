@@ -25,6 +25,7 @@ pub mod convert;
 pub mod crash_report;
 pub mod cursor;
 pub mod departed_textures;
+pub mod depth_plane;
 pub mod depth_stencil_state;
 pub mod depth_texture;
 pub mod dirty_range;
