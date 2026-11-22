@@ -430,7 +430,7 @@ open, and Mach9 before v0.4.0. mtld3d lists these sizes all the same.
   3456x2234 panel at *More Space*, a 4112x2658 desktop at 192 dpi, they
   include the panel's own 3456x2234 and the Default 1728x1117.
 - Without `EmulateModeset` the mac driver switches the display itself, the
-  ratio is the DPI alone, and the assert is never reached.
+  ratio reduces to the DPI alone, and the assert always holds.
 - To avoid it, pick another size in the game, or run a Mach9 release from
   v0.4.0 on.
 

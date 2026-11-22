@@ -3011,7 +3011,7 @@ fn native_panel_pixels(display: u32) -> Option<(u32, u32)> {
     let key = unsafe { kCGDisplayShowDuplicateLowResolutionModes };
     let options = CFDictionary::<CFString, CFBoolean>::from_slices(&[key], &[CFBoolean::new(true)]);
     // SAFETY: the options map that key to a `CFBoolean`, the type CoreGraphics
-    // documents for it; the display id came from `AppKit`.
+    // documents for it; the display id came from `AppKit` or CoreGraphics.
     let modes = unsafe { CGDisplayCopyAllDisplayModes(display, Some(options.as_ref())) }?;
     // SAFETY: CoreGraphics documents every element of the array as a `CGDisplayMode`.
     let modes = unsafe { modes.cast_unchecked::<CGDisplayMode>() };

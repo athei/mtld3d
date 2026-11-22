@@ -1125,7 +1125,8 @@ refresh rate user32 lists for it, ordered by width, height and refresh rate,
 so an enumerated mode is one win32u accepts by construction. On a scaled
 desktop, where the desktop is the backing store and larger than the panel,
 it also leaves out every size other than the desktop's larger than the
-primary display's panel; the suite's display is not scaled.
+primary display's panel. The CI runner's display is a 2x display; what its
+panel reads there is not established.
 `display.maxResolutions` can bound it to the largest sizes; the suite sets no
 bound, and a fullscreen request for any mode in the full list is set whether
 or not a bounded list carries it. The test binary, being the process's main
