@@ -151,6 +151,10 @@ arm64 bottle, choose *File > New Bottle…* and a *New Bottle Type* that ends in
 *(arm64)*, such as *Windows 10 (arm64)*. The *(Intel)* types run CrossOver's
 x86_64 Wine, which cannot load mtld3d.
 
+CrossOver Preview's `win32u` lacks the 16-bit ratio fix, so with
+`EmulateModeset` on some fullscreen sizes end the game; *Sizes that end the
+game under `EmulateModeset`* under *Fullscreen* names them.
+
 All blocks below run in one terminal, in the bundle's directory, because they
 share its variables. Set `CX` and `NAME` first. `MyBottle` is a placeholder
 for the bottle's name, as the window lists it under *Bottles*. Keep the
@@ -412,6 +416,24 @@ before launching the game and let the previous session exit first. The game
 window is then scaled onto the display, letterboxed if the aspect differs, with
 mouse input mapped into the mode.
 
+### Sizes that end the game under `EmulateModeset`
+
+With `EmulateModeset` on, a mode-set can abort the game in Wine's `win32u` on
+a Wine without its 16-bit ratio fix: CrossOver Preview, upstream Wine while
+[MR !12724](https://gitlab.winehq.org/wine/wine/-/merge_requests/12724) is
+open, and Mach9 before v0.4.0. mtld3d lists these sizes all the same.
+
+- After an emulated mode-set `win32u` rescales the monitor by the system DPI
+  times the display's size over the mode's size, on each axis, reduces each
+  ratio, and asserts that its terms fit in 16 bits.
+- The sizes that fail are those whose reduced ratio does not fit. On a
+  3456x2234 panel at *More Space*, a 4112x2658 desktop at 192 dpi, they
+  include the panel's own 3456x2234 and the Default 1728x1117.
+- Without `EmulateModeset` the mac driver switches the display itself, the
+  ratio reduces to the DPI alone, and the assert always holds.
+- To avoid it, pick another size in the game, or run a Mach9 release from
+  v0.4.0 on.
+
 ### System DPI other than 96
 
 Wine scales the window size and mouse coordinates of a game that does not
@@ -440,8 +462,10 @@ multiplies on top of it, rendering fewer pixels and upscaling.
 - Wine lists forty-odd sizes on a Retina display, which can overflow a menu of
   fixed length. `display.maxResolutions` in `mtld3d.conf` then offers only the
   largest. The World of Warcraft profile sets it to 32.
-- Any mode Wine accepts stays settable, listed or not, except the sizes some
-  Wine builds abort on (`docs/STATUS.md`, Kept divergences).
+- On a scaled desktop, such as *More Space*, Wine lists sizes up to the
+  desktop's backing store, larger than the panel. The adapter leaves out
+  every size larger than the panel but the desktop's own.
+- Any other mode Wine accepts stays settable, listed or not.
 - A request that matches no mode follows the window.
 - A fullscreen game keeps its device on a focus change: the desktop mode comes
   back on deactivation and the game's mode on activation.

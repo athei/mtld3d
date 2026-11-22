@@ -133,7 +133,7 @@ pub use capture::capture_hotkey_pressed;
 pub use crash::{address_space_map, free_space};
 pub use fpu::apply_device_control_word;
 pub use fullscreen::{
-    current_display_mode, enumerate_display_modes, is_maximized, primary_monitor, system_dpi,
+    current_display_mode, enumerate_display_modes, is_maximized, primary_monitor,
     warn_if_dpi_scaled,
 };
 pub use log_sink::{

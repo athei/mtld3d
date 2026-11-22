@@ -151,12 +151,6 @@ pub fn mode_set_attempts(request: ModeRequest) -> impl Iterator<Item = ModeReque
     core::iter::once(request).chain(without_rate)
 }
 
-/// The bound on the reduced numerator of win32u's monitor scale ratio.
-///
-/// win32u packs the numerator and the denominator of that ratio into 16 bits
-/// each, so a numerator of this value or more is one it cannot represent.
-const MONITOR_RATIO_LIMIT: u64 = 1 << 16;
-
 /// The sizes a fullscreen device may set, from Win32's mode list.
 ///
 /// `current` (the desktop mode) comes first so it doubles as the adapter
@@ -182,56 +176,30 @@ pub fn select_mode_sizes(
     sizes
 }
 
-/// The physical display size win32u scales a mode onto, from the desktop and Win32's mode list.
+/// Leave out of `settable` every size larger than the display's `panel` on either axis.
 ///
-/// Under `EmulateModeset` win32u lists the physical mode and virtual modes no
-/// larger than it on either axis, so the largest extent on each axis across
-/// the desktop and the list is the physical mode, even while a virtual mode
-/// is current. A list the driver reports itself need have no such entry, and
-/// the extent is then no mode at all; after a mode-set there the physical
-/// mode is the new mode, so [`monitor_ratio_fits`] holds for every size and
-/// the extent only leaves out sizes that did not need it.
-pub fn physical_extent(
-    desktop: (u32, u32),
-    sizes: impl IntoIterator<Item = (u32, u32)>,
-) -> (u32, u32) {
-    sizes.into_iter().fold(desktop, |(w, h), (size_w, size_h)| {
-        (w.max(size_w), h.max(size_h))
-    })
-}
-
-/// Whether win32u can represent the scale from a mode of `size` onto `physical` at `dpi`.
-///
-/// After a mode-set win32u recomputes each monitor's scale as the ratio
-/// `dpi * physical / size` on each axis, reduced by the greatest common
-/// divisor of its two terms, and packs the reduced terms into 16 bits each.
-/// Some Wine builds assert that the reduced numerator fits, and abort the
-/// process when it does not: at 96 dpi on a 2234-pixel-high display that is
-/// every height sharing a factor of 3 or less with 214464, such as 1934. The
-/// denominator is a mode size and always fits. A zero term never fails.
-#[must_use]
-pub fn monitor_ratio_fits(size: (u32, u32), physical: (u32, u32), dpi: u32) -> bool {
-    axis_ratio_fits(size.0, physical.0, dpi) && axis_ratio_fits(size.1, physical.1, dpi)
-}
-
-/// Leave out of `settable` the sizes whose monitor scale [`monitor_ratio_fits`] rejects.
-///
-/// The desktop, the first entry, always stays: it is the adapter display
-/// mode, so the list is never empty. Every other entry keeps its place.
-/// Returns the sizes left out, in list order.
-pub fn drop_unscalable_sizes(
+/// On a scaled desktop Win32 lists sizes up to the backing store, which is
+/// larger than the panel, and a mode above the panel renders pixels the
+/// display scales away. The desktop, the first entry, always stays: it is the
+/// adapter display mode, whatever its size. Every other entry keeps its
+/// place. A panel with a zero dimension is unknown and leaves the list as it
+/// is. Returns the sizes left out, in list order.
+pub fn drop_sizes_above_panel(
     settable: &mut Vec<(u32, u32)>,
-    physical: (u32, u32),
-    dpi: u32,
+    panel: (u32, u32),
 ) -> Vec<(u32, u32)> {
+    let (panel_w, panel_h) = panel;
     let Some(&desktop) = settable.first() else {
         return Vec::new();
     };
+    if panel_w == 0 || panel_h == 0 {
+        return Vec::new();
+    }
     let mut dropped = Vec::new();
-    settable.retain(|&size| {
-        let keep = size == desktop || monitor_ratio_fits(size, physical, dpi);
+    settable.retain(|&(w, h)| {
+        let keep = (w, h) == desktop || (w <= panel_w && h <= panel_h);
         if !keep {
-            dropped.push(size);
+            dropped.push((w, h));
         }
         keep
     });
@@ -342,19 +310,4 @@ pub fn served_mode_indices(
 
 fn pixels((w, h): (u32, u32)) -> u64 {
     u64::from(w) * u64::from(h)
-}
-
-/// One axis of [`monitor_ratio_fits`].
-fn axis_ratio_fits(size: u32, physical: u32, dpi: u32) -> bool {
-    let num = u64::from(dpi) * u64::from(physical);
-    let divisor = gcd(num, u64::from(size)).max(1);
-    num / divisor < MONITOR_RATIO_LIMIT
-}
-
-/// The greatest common divisor, `gcd(n, 0) = n`.
-const fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
 }

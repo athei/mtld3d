@@ -296,7 +296,7 @@ pub fn system_dpi() -> u32 {
     if dpi == 0 {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "GetSystemDpiForProcess answered 0; the mode filter assumes \
+            "GetSystemDpiForProcess answered 0; the DPI check assumes \
              {USER_DEFAULT_SCREEN_DPI} dpi"
         );
         return USER_DEFAULT_SCREEN_DPI;
