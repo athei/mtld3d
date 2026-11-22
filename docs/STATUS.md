@@ -185,7 +185,7 @@ unless its entry says otherwise.
   texture. A scaled colour target over an unscaled depth surface of another
   size writes and tests that surface on the colour target's scaled grid, and
   a depth or stencil `Clear` by rect or viewport past the colour target keeps
-  the colour target's extent there, warned once. A whole-surface depth or
+  the colour target's extent there, each warned once. A whole-surface depth or
   stencil `Clear` reaches the whole depth surface at any scale, and at the
   identity scale every shape reaches it as D3D9 does.
 - A `NULL` render target 0 beside real render targets 1..3, or with no depth

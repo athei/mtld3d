@@ -2725,6 +2725,9 @@ impl DeviceInner {
     #[cold]
     #[inline(never)]
     fn resolve_resz_depth(&mut self) {
+        // The resolve reads the bound depth attachment at the surface's own
+        // extent, so a depth plane standing in for it goes back first.
+        self.close_depth_span();
         let bindings = self.stage_bindings();
         let tex = bindings.texture(0);
         if tex.is_null() {
@@ -13432,10 +13435,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         return;
     }
     let sampled = obj.inner().perf_mut().record_snapshot_rebuild(dirty.bits());
-    // The targets changed since the last draw, so the pass this draw opens may
-    // pair an unscaled render target 0 with a scaled depth surface.
-    if dirty.contains(SnapshotDirty::RT_DS) {
-        obj.inner().open_depth_span();
+    // The targets or the depth and stencil tests may have changed since the
+    // last draw, so this draw may need the depth plane of a pass pairing an
+    // unscaled render target 0 with a scaled depth surface.
+    if dirty.intersects(SnapshotDirty::RT_DS | SnapshotDirty::RS) {
+        obj.inner().open_depth_span_for_draw();
     }
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));

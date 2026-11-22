@@ -21,28 +21,48 @@ use crate::{encoder_data::DepthTransfer, render_scale::RenderScale};
 /// How render target 0 and the depth surface share a raster grid.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pairing {
-    /// Both are rasterized at one scale, or there is nothing to pair.
+    /// Both are rasterized at one scale, or the pass binds no depth surface beside render target 0.
     Shared,
     /// Render target 0 unscaled over a scaled, single-sampled depth surface: the plane serves it.
     Mixed,
     /// The mixed shape over a multisampled depth surface, which the transfer cannot write.
     MixedMultisampled,
+    /// Render target 0 scaled over an unscaled depth surface, which keeps the scaled grid.
+    Reverse,
+}
+
+/// The attachments a pass would open with, as far as their grids go.
+pub struct PassTargets {
+    /// What render target 0 is rasterized at.
+    pub rt0_scale: RenderScale,
+    /// Whether render target 0 is a `NULL` surface, shaped after the depth surface.
+    pub rt0_is_null: bool,
+    /// Render target 0's sample count.
+    pub rt0_samples: u8,
+    /// What the depth surface is rasterized at.
+    pub depth_scale: RenderScale,
+    /// The depth surface's sample count.
+    pub depth_samples: u8,
 }
 
 /// Classify the pass a draw or clear opens from what its attachments are rasterized at.
 ///
 /// A `NULL` render target 0 is shaped after the depth surface, scale
-/// included, so it never pairs with one of another grid.
+/// included, so it never pairs with one of another grid. A pass whose
+/// render target 0 and depth surface disagree on samples leaves the depth
+/// surface out, so it pairs with nothing either.
 #[must_use]
-pub const fn pairing(
-    rt0_scale: RenderScale,
-    rt0_is_null: bool,
-    depth_scale: RenderScale,
-    depth_samples: u8,
-) -> Pairing {
-    if rt0_is_null || !rt0_scale.is_identity() || depth_scale.is_identity() {
+pub const fn pairing(targets: &PassTargets) -> Pairing {
+    let rt0_scaled = !targets.rt0_scale.is_identity();
+    let depth_scaled = !targets.depth_scale.is_identity();
+    if targets.rt0_is_null
+        || targets.rt0_samples != targets.depth_samples
+        || rt0_scaled == depth_scaled
+    {
         Pairing::Shared
-    } else if depth_samples > 1 {
+    } else if rt0_scaled {
+        Pairing::Reverse
+    } else if targets.depth_samples > 1 {
         Pairing::MixedMultisampled
     } else {
         Pairing::Mixed
@@ -63,13 +83,6 @@ pub struct DepthSurface {
     pub scale: RenderScale,
 }
 
-/// The device's plane: a Private depth texture of one size and format.
-struct Plane {
-    handle: MetalHandle<MTLTextureKind>,
-    logical_size: (u32, u32),
-    format: PixelFormat,
-}
-
 /// The plane a device owns and the span that has it standing in for a depth surface.
 ///
 /// The device allocates the plane, binds it while the span is open and
@@ -79,6 +92,8 @@ pub struct DepthPlane {
     plane: Option<Plane>,
     /// The surface whose depth the plane holds while a span is open.
     span: Option<DepthSurface>,
+    /// The reported size and format of a plane the device was refused, not asked for again.
+    refused: Option<PlaneKey>,
 }
 
 impl DepthPlane {
@@ -88,7 +103,19 @@ impl DepthPlane {
         Self {
             plane: None,
             span: None,
+            refused: None,
         }
+    }
+
+    /// Whether a plane for `surface` was refused, so allocating one again is not worth a try.
+    #[must_use]
+    pub fn refused_for(&self, surface: &DepthSurface) -> bool {
+        self.refused == Some(PlaneKey::of(surface))
+    }
+
+    /// Remember that a plane for `surface` was refused, until a plane is installed or taken.
+    pub const fn note_refused(&mut self, surface: &DepthSurface) {
+        self.refused = Some(PlaneKey::of(surface));
     }
 
     /// Whether a span is open, so the plane stands in for a depth surface.
@@ -100,30 +127,31 @@ impl DepthPlane {
     /// The plane, when one of `surface`'s reported size and format is allocated.
     #[must_use]
     pub fn plane_for(&self, surface: &DepthSurface) -> Option<MetalHandle<MTLTextureKind>> {
+        let key = PlaneKey::of(surface);
         self.plane
             .as_ref()
-            .filter(|plane| {
-                plane.logical_size == surface.logical_size && plane.format == surface.format
-            })
+            .filter(|plane| plane.key == key)
             .map(|plane| plane.handle)
     }
 
-    /// Install a newly allocated plane and hand back the one it replaces, for retirement.
+    /// Install a newly allocated plane for `surface` and hand back the one it replaces.
+    ///
+    /// The replaced plane is the caller's to retire. A refusal remembered
+    /// for an earlier key is forgotten.
     ///
     /// # Panics
     /// Panics while a span is open: the plane in use cannot be replaced.
     pub fn replace_plane(
         &mut self,
         handle: MetalHandle<MTLTextureKind>,
-        logical_size: (u32, u32),
-        format: PixelFormat,
+        surface: &DepthSurface,
     ) -> Option<MetalHandle<MTLTextureKind>> {
         assert!(self.span.is_none(), "the plane of an open span is replaced");
+        self.refused = None;
         self.plane
             .replace(Plane {
                 handle,
-                logical_size,
-                format,
+                key: PlaneKey::of(surface),
             })
             .map(|plane| plane.handle)
     }
@@ -181,12 +209,13 @@ impl DepthPlane {
         self.span = None;
     }
 
-    /// Take the plane for retirement.
+    /// Take the plane for retirement, and forget a remembered refusal.
     ///
     /// # Panics
     /// Panics while a span is open: close it first.
     pub fn take_plane(&mut self) -> Option<MetalHandle<MTLTextureKind>> {
         assert!(self.span.is_none(), "the plane of an open span is taken");
+        self.refused = None;
         self.plane.take().map(|plane| plane.handle)
     }
 }
@@ -194,6 +223,28 @@ impl DepthPlane {
 impl Default for DepthPlane {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The device's plane: a Private depth texture of one key.
+struct Plane {
+    handle: MetalHandle<MTLTextureKind>,
+    key: PlaneKey,
+}
+
+/// What a plane serves: a depth surface's reported size and format.
+#[derive(PartialEq, Eq)]
+struct PlaneKey {
+    logical_size: (u32, u32),
+    format: PixelFormat,
+}
+
+impl PlaneKey {
+    const fn of(surface: &DepthSurface) -> Self {
+        Self {
+            logical_size: surface.logical_size,
+            format: surface.format,
+        }
     }
 }
 

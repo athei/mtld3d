@@ -26,19 +26,19 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, Texture, TexturedVertex,
-    assert_pixel_eq, spawn_scoped,
+    Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, Surface, Texture,
+    TexturedVertex, assert_pixel_eq, spawn_scoped,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_LIGHTING,
-    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_X8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT,
+    D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 use super::render_target::{draw_fill, read_back, sample_mip_level_4};
@@ -2158,4 +2158,232 @@ fn a_scaled_target_over_an_unscaled_depth_surface_keeps_its_depth_on_the_scaled_
             &format!("({x}, {y}) lies past the scaled grid's written texels"),
         );
     }
+}
+
+/// The whole reported frame as a viewport, for a target smaller than it.
+const FULL_FRAME: D3DVIEWPORT9 = D3DVIEWPORT9 {
+    x: 0,
+    y: 0,
+    width: 640,
+    height: 480,
+    min_z: 0.0,
+    max_z: 1.0,
+};
+
+/// Draw a quad at 0.5 over the back buffer, depth-tested `LESSEQUAL` without depth writes.
+///
+/// It survives exactly where the depth surface holds 0.5 or more.
+fn probe_quad_over_the_back_buffer(h: &Harness, back_buffer: &Surface<'_>) {
+    assert_eq!(h.set_render_target(0, back_buffer), 0);
+    depth_draw_setup(h, D3DCMP_LESSEQUAL, false);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+}
+
+/// Assert that depth 0.25 lies inside the 400x300 extent and 1.0 outside it.
+fn assert_small_extent_holds_the_near_depth(h: &Harness) {
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        BLACK,
+        "inside the small target the near depth rejects the quad",
+    );
+    for (x, y) in [(520, 150), (200, 400)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("({x}, {y}) is past the small target and keeps the cleared depth"),
+        );
+    }
+}
+
+#[test]
+fn a_pass_through_a_small_target_continued_after_a_read_back_keeps_its_depth_in_place() {
+    // The read-back of the 400x300 target ends a submission in the middle of
+    // its pass; the draw after it continues through the same target. Both
+    // draws land in place, so the nearer second one wins inside the target.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.75, BLUE)),
+        0
+    );
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        BLUE,
+        "the first draw, sent by the read-back",
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, RED)),
+        0
+    );
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
+}
+
+#[test]
+fn a_rect_depth_clear_past_a_small_target_reaches_the_scaled_depth_surface() {
+    // A depth rect reaching past an unscaled 400x300 target, under a viewport
+    // over the whole frame, clears the implicit depth surface over the whole
+    // rect, as at the identity scale.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(h.set_viewport(&FULL_FRAME), 0);
+    assert_eq!(
+        h.clear_rects(
+            D3DCLEAR_ZBUFFER,
+            BLACK,
+            0.0,
+            0,
+            &[D3DRECT {
+                x1: 0,
+                y1: 0,
+                x2: 600,
+                y2: 450,
+            }],
+        ),
+        0,
+        "a depth rect past the small target"
+    );
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    for (x, y) in [(200, 150), (560, 420)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            BLACK,
+            &format!("({x}, {y}) lies inside the rect and holds 0.0"),
+        );
+    }
+    assert_pixel_eq(
+        h.read_pixel(620, 465),
+        GREEN,
+        "outside the rect the depth keeps 1.0",
+    );
+}
+
+#[test]
+fn a_depth_stretch_rect_after_a_small_target_copies_the_depth_it_drew() {
+    // A whole-surface depth copy of the implicit surface while a pass through
+    // an unscaled 400x300 target is still bound over it: the copy holds the
+    // depth that pass drew, in place.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("the auto depth surface");
+    let copy = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    assert_eq!(
+        h.stretch_rect(&implicit, &copy, D3DTEXF_NONE),
+        0,
+        "copy the implicit depth surface"
+    );
+    assert_eq!(h.set_depth_stencil_surface(&copy), 0);
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
+}
+
+#[test]
+fn a_depth_surface_bound_over_a_small_target_takes_its_draws_in_place() {
+    // A pass through an unscaled 400x300 target over the implicit surface,
+    // then another depth surface at the back buffer's size bound under the
+    // same target, cleared and drawn: the second surface holds that draw in
+    // place, and the back buffer reads it there.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let other = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.75, BLUE)),
+        0
+    );
+    assert_eq!(h.set_depth_stencil_surface(&other), 0);
+    assert_eq!(h.set_viewport(&FULL_FRAME), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, RED)),
+        0
+    );
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
+}
+
+#[test]
+fn a_resz_resolve_after_a_small_target_copies_the_depth_it_drew() {
+    // A RESZ resolve into an INTZ texture at the back buffer's size while a
+    // pass through an unscaled 400x300 target is still bound over the
+    // implicit surface: the INTZ holds the depth that pass drew, in place,
+    // read back by binding it as the back buffer's depth surface.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("the auto depth surface");
+    let intz = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0),
+        0,
+        "prime the INTZ to 0.0, which a RESZ that never ran leaves"
+    );
+    assert_eq!(h.set_depth_stencil_surface(&implicit), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
 }
