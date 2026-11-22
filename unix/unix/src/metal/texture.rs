@@ -1262,6 +1262,7 @@ pub const fn mtl_pixel_format(wire: PixelFormat) -> MTLPixelFormat {
         PixelFormat::R16Float => MTLPixelFormat::R16Float,
         PixelFormat::R32Float => MTLPixelFormat::R32Float,
         PixelFormat::Bc4RUnorm => MTLPixelFormat::BC4_RUnorm,
+        PixelFormat::Bc5RgUnorm => MTLPixelFormat::BC5_RGUnorm,
         PixelFormat::Rg8Unorm => MTLPixelFormat::RG8Unorm,
         PixelFormat::Rg8Snorm => MTLPixelFormat::RG8Snorm,
         PixelFormat::Rg16Unorm => MTLPixelFormat::RG16Unorm,
@@ -1306,6 +1307,7 @@ pub const fn wire_pixel_format(mtl: MTLPixelFormat) -> Option<PixelFormat> {
         MTLPixelFormat::R16Float => PixelFormat::R16Float,
         MTLPixelFormat::R32Float => PixelFormat::R32Float,
         MTLPixelFormat::BC4_RUnorm => PixelFormat::Bc4RUnorm,
+        MTLPixelFormat::BC5_RGUnorm => PixelFormat::Bc5RgUnorm,
         MTLPixelFormat::RG8Unorm => PixelFormat::Rg8Unorm,
         MTLPixelFormat::RG8Snorm => PixelFormat::Rg8Snorm,
         MTLPixelFormat::RG16Unorm => PixelFormat::Rg16Unorm,
@@ -1353,6 +1355,7 @@ pub const fn is_resolvable_color_format(fmt: PixelFormat) -> bool {
             | PixelFormat::Bc3Rgba
             | PixelFormat::Bc3RgbaSrgb
             | PixelFormat::Bc4RUnorm
+            | PixelFormat::Bc5RgUnorm
             | PixelFormat::Depth32Float
             | PixelFormat::Depth32FloatStencil8
     )

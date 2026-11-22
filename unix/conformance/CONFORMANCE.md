@@ -2235,8 +2235,8 @@ Volume queries accept DYNAMIC, FILTER, SRGBREAD, VERTEXTEXTURE and WRAPANDMIP
 for the five formats and reject SRGBWRITE, RENDERTARGET, DEPTHSTENCIL,
 POSTPIXELSHADER_BLENDING and AUTOGENMIPMAP. SRGBREAD covers DXT2 and DXT4 on
 volumes, as on 2D and cube textures, because BC2 and BC3 have sRGB views, and
-no upstream test asks it of either format. ATI1 and packed-YUV volumes stay
-unadvertised and SCRATCH-only. DXT2 and DXT4 keep their format identities and
+no upstream test asks it of either format. ATI1, ATI2 and packed-YUV volumes
+stay unadvertised and SCRATCH-only. DXT2 and DXT4 keep their format identities and
 share the DXT3 and DXT5 block encodings: the stored blocks are sampled as they
 are, with no multiply or divide by alpha, and the application chooses its
 blend factors.

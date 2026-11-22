@@ -1261,6 +1261,52 @@ fn block_aligned_lock_origin_is_unchanged_under_division() {
     assert_eq!(pixel, (8 / 4) * 2048 + (16 / 4) * 16);
 }
 
+// ── level_lock_layout ──
+
+/// An `ATI2` level locks a byte per texel over its 16-byte blocks.
+///
+/// A 128x128 level stores 32 block rows of 512 bytes. The lock reports a
+/// pitch of 128 and points `y * 128 + x` bytes in, so the rect at (60, 60)
+/// starts 7740 bytes in. The lower-right 4x4, traversed row by row at that
+/// pitch, ends on the level's last byte.
+#[test]
+fn ati2_locks_a_byte_per_texel_over_its_blocks() {
+    use mtld3d_types::D3DFMT_ATI2;
+
+    let block = (4, 4, 16);
+    assert_eq!(level_lock_layout(D3DFMT_ATI2, None, 512, block), (128, 0));
+    assert_eq!(
+        level_lock_layout(D3DFMT_ATI2, Some(off_rect(60, 60, 8, 8)), 512, block),
+        (128, 7740)
+    );
+    let (pitch, start) = level_lock_layout(D3DFMT_ATI2, Some(off_rect(124, 124, 4, 4)), 512, block);
+    assert_eq!(start + 3 * pitch as usize + 4, 128 * 128);
+    // A level narrower than a block: one 16-byte block row, a pitch of four.
+    assert_eq!(level_lock_layout(D3DFMT_ATI2, None, 16, block), (4, 0));
+    // Six texels wide round up to eight.
+    assert_eq!(level_lock_layout(D3DFMT_ATI2, None, 32, block).0, 8);
+}
+
+/// Every other format reports its stored pitch and the block-row offset.
+#[test]
+fn other_formats_lock_at_their_stored_pitch() {
+    use mtld3d_types::{D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT5};
+
+    let rect = Some(off_rect(32, 64, 64, 64));
+    assert_eq!(
+        level_lock_layout(D3DFMT_DXT5, rect, 1024, (4, 4, 16)),
+        (1024, 16512)
+    );
+    assert_eq!(
+        level_lock_layout(D3DFMT_ATI1, rect, 512, (4, 4, 8)),
+        (512, 16 * 512 + 8 * 8)
+    );
+    assert_eq!(
+        level_lock_layout(D3DFMT_A8R8G8B8, rect, 1024, (1, 1, 4)),
+        (1024, 64 * 1024 + 32 * 4)
+    );
+}
+
 #[test]
 fn a_plain_lock_of_an_uploaded_released_level_reads_it_back() {
     for flags in NON_DISCARD_LOCK_FLAGS {

@@ -40,7 +40,7 @@ use super::{
 /// The usage-query rules below are properties of the whole table rather than
 /// of the formats that once carried a rule of their own, so they are asserted
 /// over all of it.
-const COLOUR_FORMATS: [u32; 37] = [
+const COLOUR_FORMATS: [u32; 38] = [
     mtld3d_types::D3DFMT_A8R8G8B8,
     mtld3d_types::D3DFMT_X8R8G8B8,
     mtld3d_types::D3DFMT_A8B8G8R8,
@@ -63,6 +63,7 @@ const COLOUR_FORMATS: [u32; 37] = [
     mtld3d_types::D3DFMT_G32R32F,
     mtld3d_types::D3DFMT_A32B32G32R32F,
     mtld3d_types::D3DFMT_ATI1,
+    mtld3d_types::D3DFMT_ATI2,
     mtld3d_types::D3DFMT_V8U8,
     mtld3d_types::D3DFMT_A2B10G10R10,
     mtld3d_types::D3DFMT_A2R10G10B10,
@@ -478,6 +479,52 @@ fn premultiplied_dxt_aliases_share_the_srgb_twinned_format_of_dxt3_and_dxt5() {
                 "format {format:#x}"
             );
         }
+    }
+}
+
+/// `ATI2` is BC5 storage sampled with red and green exchanged.
+///
+/// D3D9 reads green from the first eight bytes of a block and red from the
+/// second, BC5 decodes them as red and green, and blue and alpha read one.
+/// The format is no render target, has no sRGB twin, is no GPU volume, and
+/// locks a byte per texel at the stored block row over four.
+#[test]
+fn ati2_maps_to_bc5_with_red_and_green_exchanged() {
+    use mtld3d_types::{D3DFMT_ATI1, D3DFMT_ATI2};
+
+    let ati2 = map_d3d_format(D3DFMT_ATI2).expect("ATI2 is mapped");
+    assert_eq!(ati2.metal_pixel_format(), PixelFormat::Bc5RgUnorm);
+    assert_eq!(
+        ati2.swizzle(),
+        Some([Swizzle::Green, Swizzle::Red, Swizzle::One, Swizzle::One])
+    );
+    assert_eq!(ati2.bytes_per_pixel(), 0, "the compressed-layout marker");
+    assert_eq!(
+        (ati2.block_width(), ati2.block_height(), ati2.block_bytes()),
+        (4, 4, 16)
+    );
+    assert!(ati2.is_compressed());
+    assert!(!ati2.has_alpha());
+    assert_eq!(ati2.metal_pixel_format().srgb_twin(), None);
+    assert!(is_mapped_color_format(D3DFMT_ATI2));
+    assert!(!super::is_render_target_format(D3DFMT_ATI2));
+    assert!(!is_volume_texture_format(D3DFMT_ATI2));
+    assert!(!super::is_dxt_format(D3DFMT_ATI2));
+    assert_eq!(format_name(D3DFMT_ATI2), "ATI2");
+    // A 257-texel row stores 65 blocks of 16 bytes and locks at 260.
+    assert_eq!(
+        compute_mip_size(257, 257, 0, &ati2),
+        (257, 257, 67_600, 1040)
+    );
+    assert_eq!(super::lock_row_pitch(D3DFMT_ATI2, 1040, 4), 260);
+    // A 1x1 tail level keeps one whole block and locks at four.
+    assert_eq!(compute_mip_size(257, 257, 8, &ati2), (1, 1, 16, 16));
+    assert_eq!(super::lock_row_pitch(D3DFMT_ATI2, 16, 4), 4);
+
+    assert!(super::locks_byte_per_texel(D3DFMT_ATI2));
+    for other in [D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_A8R8G8B8] {
+        assert!(!super::locks_byte_per_texel(other), "format {other:#x}");
+        assert_eq!(super::lock_row_pitch(other, 1040, 4), 1040);
     }
 }
 

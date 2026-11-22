@@ -49,12 +49,18 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   code, R, G, B, A into U, V, W, Q.
 - DXT1 to DXT5 volume textures use native BC1, BC2 and BC3 3D storage in
   every pool, with short mips, slice filtering and sRGB sampling. DXT2 and
-  DXT4 keep their identities and sample the stored blocks unchanged. ATI1
-  and packed-YUV volumes stay SCRATCH-only, and render-target usage and mip
-  autogeneration stay unavailable on volumes.
-- Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
-  textures, auto-generated mipmaps, `StretchRect` with format conversion and
-  packed and planar YUV decoding, `GetDC`.
+  DXT4 keep their identities and sample the stored blocks unchanged. ATI1,
+  ATI2 and packed-YUV volumes stay SCRATCH-only, and render-target usage and
+  mip autogeneration stay unavailable on volumes.
+- ATI2 (3Dc) textures use native BC5 storage as 2D and cube textures in every
+  pool, lock at a byte per texel (pitch `align(W, 4)`) and sample red and
+  green as D3D9 reads them. Render-target, sRGB and mip-autogeneration usages
+  are unavailable; ATI2 volumes and offscreen plain surfaces are
+  SCRATCH-only. A level of a default-pool ATI2 texture locks without
+  `D3DUSAGE_DYNAMIC`, as D3D9 lets it.
+- Compressed (DXT1 to DXT5, ATI1, ATI2), integer and float formats, cube and
+  volume textures, auto-generated mipmaps, `StretchRect` with format
+  conversion and packed and planar YUV decoding, `GetDC`.
 - Planar YV12 and NV12 as DEFAULT-pool offscreen plain surfaces: they lock at
   the 4-byte-aligned width with the chroma planes after the luma rows, and
   `StretchRect` decodes them (reduced-range BT.601) into any render target, at

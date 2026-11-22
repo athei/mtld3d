@@ -137,6 +137,8 @@ pub enum PixelFormat {
     Bc3RgbaSrgb = 135,
     /// Single-channel block-compressed unorm (BC4). D3D9 `D3DFMT_ATI1` (ATI1N).
     Bc4RUnorm = 140,
+    /// Two-channel block-compressed unorm (BC5). D3D9 `D3DFMT_ATI2` (ATI2N, 3Dc).
+    Bc5RgUnorm = 142,
     /// Depth-only 32-bit float depth attachment.
     ///
     /// Apple Silicon has no 24-bit depth format, so D3D9 D24X8 / D24 / D32 /
@@ -221,9 +223,11 @@ impl PixelFormat {
             | Self::Depth32FloatStencil8 => BlockLayout::pixel(8),
             Self::Rgba32Float => BlockLayout::pixel(16),
             Self::Bc1Rgba | Self::Bc1RgbaSrgb | Self::Bc4RUnorm => BlockLayout::compressed(8),
-            Self::Bc2Rgba | Self::Bc2RgbaSrgb | Self::Bc3Rgba | Self::Bc3RgbaSrgb => {
-                BlockLayout::compressed(16)
-            }
+            Self::Bc2Rgba
+            | Self::Bc2RgbaSrgb
+            | Self::Bc3Rgba
+            | Self::Bc3RgbaSrgb
+            | Self::Bc5RgUnorm => BlockLayout::compressed(16),
         }
     }
 }

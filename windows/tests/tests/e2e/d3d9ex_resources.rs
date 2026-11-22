@@ -15,7 +15,7 @@
 //! upload path, `UpdateSurface` from system memory into a default-pool DXT
 //! texture and a cube face, works on it, and so do the extended extras:
 //! `StretchRect` between whole default-pool textures, `SetPriority` on the
-//! default pool, and no ATI2 plain surface.
+//! default pool, and an ATI2 plain surface in the scratch pool alone.
 
 use core::ffi::c_void;
 
@@ -628,12 +628,23 @@ fn set_priority_takes_the_default_pool_on_an_extended_device() {
     assert_eq!(managed.priority(), 7, "a plain managed texture does");
 }
 
+/// An ATI2 offscreen plain exists in the scratch pool alone, on either kind of device.
 #[test]
 fn ati2_is_no_offscreen_plain_surface_on_either_kind_of_device() {
     for h in [extended(), Harness::new()] {
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
+            let (hr, out) = h.create_offscreen_plain_surface_seeded(16, 16, D3DFMT_ATI2, pool);
+            assert_eq!(
+                (hr, out.is_null()),
+                (D3DERR_INVALIDCALL, true),
+                "pool {pool}"
+            );
+        }
+        let plain = h.create_offscreen_plain_surface(16, 16, D3DFMT_ATI2, D3DPOOL_SCRATCH);
+        let (hr, desc) = plain.desc();
         assert_eq!(
-            h.create_offscreen_plain_surface_hr(16, 16, D3DFMT_ATI2, D3DPOOL_DEFAULT),
-            D3DERR_INVALIDCALL
+            (hr, desc.format, desc.pool),
+            (D3D_OK, D3DFMT_ATI2, D3DPOOL_SCRATCH)
         );
     }
 }

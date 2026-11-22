@@ -382,6 +382,33 @@ impl VolumeTexture<'_> {
         (hr, locked.bits.is_null())
     }
 
+    /// `LockBox` of `region` (the whole level for `None`), returning what the lock reports.
+    ///
+    /// Returns the hr, the row pitch, the slice pitch and the address the lock
+    /// points at, for a test that pins the lock's layout rather than writing
+    /// through it. A successful lock leaves the level mapped until
+    /// [`Self::unlock_box`].
+    #[must_use]
+    pub fn lock_box_layout(&self, level: u32, region: Option<&D3DBOX>) -> (i32, i32, i32, usize) {
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // the optional box is live through the call, null locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                0,
+            )
+        };
+        (hr, locked.row_pitch, locked.slice_pitch, locked.bits.addr())
+    }
+
     /// `UnlockBox` for mip `level`. Returns the hr.
     #[must_use]
     pub fn unlock_box(&self, level: u32) -> i32 {

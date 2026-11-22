@@ -65,7 +65,11 @@ use mtld3d_types::{
     D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
-use crate::{dirty_rect::DirtyRect, texture_flags::TextureFlags};
+use crate::{
+    dirty_rect::DirtyRect,
+    format::{lock_row_pitch, locks_byte_per_texel},
+    texture_flags::TextureFlags,
+};
 
 /// What the caller should do with the old backing's contents on a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +472,34 @@ pub const fn texture_lock_offset(
         }
         None => 0,
     }
+}
+
+/// The pitch a lock of one level reports and the byte offset of the rect it points at.
+///
+/// `stored_pitch` is the level's `mip_bytes_per_row` and `block` its block
+/// width, height and bytes. A format that locks a byte per texel
+/// ([`locks_byte_per_texel`]) reports [`lock_row_pitch`] and points
+/// `y * pitch + x` bytes in: for a rect inside the level, that start and the
+/// end of the rect's rows traversed at that pitch stay within
+/// `pitch * height` bytes, inside the stored level. Every other format
+/// reports the stored pitch and [`texture_lock_offset`].
+#[must_use]
+pub const fn level_lock_layout(
+    d3d_format: u32,
+    rect: Option<DirtyRect>,
+    stored_pitch: u32,
+    block: (u32, u32, u32),
+) -> (u32, usize) {
+    if !locks_byte_per_texel(d3d_format) {
+        let offset = texture_lock_offset(rect, stored_pitch, block.0, block.1, block.2);
+        return (stored_pitch, offset);
+    }
+    let pitch = lock_row_pitch(d3d_format, stored_pitch, block.1);
+    let offset = match rect {
+        Some(r) => r.y as usize * pitch as usize + r.x as usize,
+        None => 0,
+    };
+    (pitch, offset)
 }
 
 /// Where a partial upload's box sits in the staging, and the shape its snapshot takes.

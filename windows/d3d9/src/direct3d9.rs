@@ -31,16 +31,16 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DDISPLAYMODEEX,
     D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8,
-    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
-    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
-    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
-    D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9ExVtbl, IDirect3D9Vtbl,
-    LUID,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_ATI2, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
+    D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ,
+    D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE,
+    D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
+    D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSCANLINEORDERING_INTERLACED,
+    D3DSCANLINEORDERING_PROGRESSIVE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
+    IDirect3D9ExVtbl, IDirect3D9Vtbl, LUID,
 };
 
 use super::{
@@ -491,12 +491,15 @@ const fn is_texture_format(fmt: u32) -> bool {
 
 /// Formats `CreateOffscreenPlainSurface` accepts, the `D3DRTYPE_SURFACE` answer without usage.
 ///
-/// Every texture format, plus the YUV formats, which have no sampling path:
-/// the packed 4:2:2 pair as an offscreen plain in any pool, and the planar
-/// 4:2:0 pair as a default-pool one only. Both are lockable `StretchRect`
-/// sources, so every texture-typed query for them stays refused.
+/// Every texture format but ATI2, plus the YUV formats, which have no
+/// sampling path: the packed 4:2:2 pair as an offscreen plain in any pool,
+/// and the planar 4:2:0 pair as a default-pool one only. Both are lockable
+/// `StretchRect` sources, so every texture-typed query for them stays
+/// refused. D3D9 refuses an ATI2 plain in the default and system-memory
+/// pools and creates one in the scratch pool alone, which a query, having no
+/// pool, answers no for.
 const fn is_plain_surface_format(fmt: u32) -> bool {
-    is_texture_format(fmt)
+    (is_texture_format(fmt) && fmt != D3DFMT_ATI2)
         || mtld3d_core::stretch_rect::is_packed_yuv(fmt)
         || mtld3d_core::stretch_rect::is_planar_yuv(fmt)
 }
