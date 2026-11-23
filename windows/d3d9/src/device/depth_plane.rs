@@ -2,14 +2,15 @@
 //!
 //! `mtld3d_core::depth_plane` says what the plane is and builds its transfers.
 //! The device decides here when a span opens (a draw that reads or writes
-//! depth or stencil, as `draw_needs_plane` says, or a depth or stencil clear,
-//! about to open a pass through an unscaled render target 0 over a scaled
-//! depth surface) and when it closes (render target 0 or the depth binding
-//! changes, a `StretchRect` or a RESZ resolve reads or writes a depth surface,
-//! the frame is submitted, `Reset`, release), allocates and retires the plane,
-//! and records the transfers and the depth bindings into the frame. The saved
-//! bindings keep naming the surface the application bound, so a fresh frame
-//! starts on it and opens a span of its own when its first pass needs one.
+//! depth or stencil, as `draw_reads_or_writes` says, or a depth or stencil
+//! clear, about to open a pass through an unscaled render target 0 over a
+//! scaled depth surface) and when it closes (render target 0 or the depth
+//! binding changes, a `StretchRect` or a RESZ resolve reads or writes a depth
+//! surface, the frame is submitted, `Reset`, release), allocates and retires
+//! the plane, and records the transfers and the depth bindings into the frame.
+//! The saved bindings keep naming the surface the application bound, so a
+//! fresh frame starts on it and opens a span of its own when its first pass
+//! needs one.
 //!
 //! What the bound targets pair as is classified once and kept on the plane's
 //! state. Every writer of what the classification reads forgets it:
@@ -21,8 +22,8 @@
 //! format and sample count are fixed while it is bound.
 
 use mtld3d_core::{
-    depth_plane::{DepthSurface, Pairing, PassTargets, draw_needs_plane, pairing},
-    depth_stencil_state::snapshot_from_state,
+    depth_plane::{DepthSurface, Pairing, PassTargets, pairing},
+    depth_stencil_state::draw_reads_or_writes,
     format::{is_null_render_target, map_d3d_depth_format},
     render_scale::RenderScale,
 };
@@ -73,7 +74,7 @@ impl DeviceInner {
         let Some(has_stencil) = self.classified_mixed_targets() else {
             return;
         };
-        if draw_needs_plane(&snapshot_from_state(self.render_states()), has_stencil) {
+        if draw_reads_or_writes(self.render_states(), has_stencil) {
             self.open_span_over_mixed_targets();
         }
     }

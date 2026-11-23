@@ -218,24 +218,11 @@ impl DepthStencilSnapshot {
     /// the state `WoW` draws its interface and glow passes with.
     #[must_use]
     pub fn uses_depth(&self) -> bool {
-        self.depth_enable != 0
-            && (self.depth_write != 0
-                || d3d_to_metal_cmp(u32::from(self.depth_func)) != CompareFunc::Always)
-    }
-
-    /// Whether a draw under this state reads or writes the stencil plane.
-    ///
-    /// `D3DRS_STENCILENABLE` alone does not decide it: a test that always
-    /// passes and keeps the value on every outcome it can reach, the D3D9
-    /// defaults, reads no stencil value and changes none, and neither does
-    /// one that always passes with no writable bit. The depth-fail operation
-    /// counts as reachable whatever the depth test is, so the answer errs
-    /// towards use.
-    #[must_use]
-    pub fn uses_stencil(&self) -> bool {
-        let writable = self.write_mask & STENCIL_MASK_BITS != 0;
-        self.stencil_enable != 0
-            && (face_uses_stencil(self.front, writable) || face_uses_stencil(self.back, writable))
+        depth_in_use(
+            self.depth_enable != 0,
+            self.depth_write != 0,
+            self.depth_func,
+        )
     }
 }
 
@@ -273,6 +260,53 @@ pub fn snapshot_from_state(rs: &[u32; RENDER_STATE_COUNT]) -> DepthStencilSnapsh
         read_mask: rs[D3DRS_STENCILMASK as usize],
         write_mask: rs[D3DRS_STENCILWRITEMASK as usize],
     }
+}
+
+/// Whether a draw under `rs` reads or writes depth, or stencil where the attachment has it.
+///
+/// Depth by the rule of [`DepthStencilSnapshot::uses_depth`]. For stencil,
+/// `D3DRS_STENCILENABLE` alone does not decide it: a test that always passes
+/// and keeps the value on every outcome it can reach, the D3D9 defaults, reads
+/// no stencil value and changes none, and neither does one that always passes
+/// with no writable bit. The depth-fail operation counts as reachable whatever
+/// the depth test is, so the answer errs towards use.
+///
+/// Reads the states the answer depends on and builds no snapshot:
+/// [`snapshot_from_state`] keeps the draw path as its one caller, because a
+/// second call site in `d3d9.dll` measured about 6 ns more on every draw with
+/// a changed render state.
+#[must_use]
+pub fn draw_reads_or_writes(rs: &[u32; RENDER_STATE_COUNT], stencil_plane: bool) -> bool {
+    let enum_rs = |state: u32| crate::render_state::enum_value(rs, state);
+    if depth_in_use(
+        rs[D3DRS_ZENABLE as usize] != 0,
+        rs[D3DRS_ZWRITEENABLE as usize] != 0,
+        enum_rs(D3DRS_ZFUNC),
+    ) {
+        return true;
+    }
+    if !stencil_plane || rs[D3DRS_STENCILENABLE as usize] == 0 {
+        return false;
+    }
+    let writable = rs[D3DRS_STENCILWRITEMASK as usize] & STENCIL_MASK_BITS != 0;
+    let face = |func: u32, depth_fail: u32, pass: u32| {
+        face_uses_stencil(
+            StencilFaceState {
+                func: enum_rs(func),
+                fail_op: OP_KEEP,
+                depth_fail_op: enum_rs(depth_fail),
+                pass_op: enum_rs(pass),
+            },
+            writable,
+        )
+    };
+    face(D3DRS_STENCILFUNC, D3DRS_STENCILZFAIL, D3DRS_STENCILPASS)
+        || (rs[D3DRS_TWOSIDEDSTENCILMODE as usize] != 0
+            && face(
+                D3DRS_CCW_STENCILFUNC,
+                D3DRS_CCW_STENCILZFAIL,
+                D3DRS_CCW_STENCILPASS,
+            ))
 }
 
 /// Pack a snapshot into the depth/stencil cache key.
@@ -420,6 +454,11 @@ const fn face_word(face: StencilFaceState) -> u32 {
         pass_op,
     } = face;
     u32::from_le_bytes([func, fail_op, depth_fail_op, pass_op])
+}
+
+/// Whether a depth test with these states reads or writes the depth plane.
+fn depth_in_use(enable: bool, write: bool, func: u8) -> bool {
+    enable && (write || d3d_to_metal_cmp(u32::from(func)) != CompareFunc::Always)
 }
 
 /// Whether one face's test can reject a fragment or its operations can change a stencil value.

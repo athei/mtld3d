@@ -12,16 +12,15 @@
 //! stencil clear, and back when render target 0 or the depth binding changes,
 //! before anything else reads the surface, and before the frame is submitted;
 //! the passes in between share the one span. A draw that can neither fail a
-//! test nor change a value needs no plane and opens none. Nearest up then
-//! nearest down is the identity at any scale up to one, so depth the passes do
-//! not touch survives the round trip unchanged.
+//! test nor change a value (`depth_stencil_state::draw_reads_or_writes`), the
+//! depth test on with a compare that always passes and depth writes off, as a
+//! glow or interface pass draws, needs no plane and opens none. Nearest up
+//! then nearest down is the identity at any scale up to one, so depth the
+//! passes do not touch survives the round trip unchanged.
 
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
-use crate::{
-    depth_stencil_state::DepthStencilSnapshot, encoder_data::DepthTransfer,
-    render_scale::RenderScale,
-};
+use crate::{encoder_data::DepthTransfer, render_scale::RenderScale};
 
 /// How render target 0 and the depth surface share a raster grid.
 #[derive(Debug, PartialEq, Eq)]
@@ -72,17 +71,6 @@ pub const fn pairing(targets: &PassTargets) -> Pairing {
     } else {
         Pairing::Mixed
     }
-}
-
-/// Whether a draw under `state` has to see the depth surface's values on its own grid.
-///
-/// A draw that reads or writes depth does, and so does one that reads or
-/// writes stencil when the surface has a stencil plane. A draw with the depth
-/// test on, a compare that always passes and depth writes off, the state of
-/// a glow or interface pass, reads and changes nothing and needs no plane.
-#[must_use]
-pub fn draw_needs_plane(state: &DepthStencilSnapshot, surface_has_stencil: bool) -> bool {
-    state.uses_depth() || (surface_has_stencil && state.uses_stencil())
 }
 
 /// The scaled depth surface a span carries into the plane and back.
@@ -157,7 +145,7 @@ impl DepthPlane {
         self.targets = Targets::Unknown;
     }
 
-    /// Whether the bound targets were classified as mixed, and then whether the surface has stencil.
+    /// For targets classified as mixed, whether the depth surface has a stencil plane.
     #[must_use]
     pub const fn mixed_has_stencil(&self) -> Option<bool> {
         match self.targets {
