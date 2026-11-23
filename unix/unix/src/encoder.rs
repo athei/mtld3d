@@ -3201,28 +3201,58 @@ impl FrameEncoder {
         self.bump_depth_write_epoch();
     }
 
-    /// Resolve one multisampled depth surface into a single-sampled one.
+    /// Carry one whole depth surface into another through a depth transfer.
     ///
-    /// The multisample arm of the depth-to-depth `StretchRect`: D3D9 resolves
+    /// Two callers record it, told apart by the source's sample count. The
+    /// multisample arm of the depth-to-depth `StretchRect`: D3D9 resolves
     /// the samples on a copy that leaves a multisampled surface, and Metal's
     /// blit encoder refuses a sample-count change outright, so the copy is a
     /// depth transfer (see [`Self::resolve_depth_to_texture`] for why not a
-    /// render-pass resolve). Both handles address the whole surface, which the
-    /// caller has established. Sample zero is the reduction: D3D9 defines no
+    /// render-pass resolve). Sample zero is the reduction: D3D9 defines no
     /// filter for this and it is what the hardware the copy was written for
-    /// delivers.
+    /// delivers. And the depth plane of a pass whose render target 0 and
+    /// depth surface are rasterized on different grids, single-sampled at
+    /// both ends, into the plane before the pass and back after it. Both
+    /// handles address the whole surface, which the caller has established.
     pub fn resolve_depth_surface(&mut self, transfer: &DepthTransfer) {
         let (width, height) = transfer.source_size;
-        if self.queue_depth_transfer(transfer) {
+        let (to_width, to_height) = transfer.destination_size;
+        let queued = self.queue_depth_transfer(transfer);
+        if transfer.source_samples > 1 {
+            if queued {
+                mtld3d_shared::log_once_info!(
+                    target: LOG_TARGET,
+                    "StretchRect: resolving a multisampled {width}x{height} depth surface \
+                     into a single-sampled one"
+                );
+            } else {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "StretchRect: depth resolve skipped (src={:#x}, dst={:#x})",
+                    transfer.source.raw(),
+                    transfer.destination.raw()
+                );
+            }
+        } else if queued {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "StretchRect: resolving a multisampled {width}x{height} depth surface \
-                 into a single-sampled one"
+                "depth plane: a pass draws through a render target and a depth surface on \
+                 different raster grids; its depth is carried between a {width}x{height} and a \
+                 {to_width}x{to_height} texture around it"
             );
         } else {
-            mtld3d_shared::log_once_warn!(
+            // One line per direction and extent pair: the pass draws against a
+            // plane that was not filled, or its depth is not carried back.
+            let key = (u64::from(width) << 48)
+                | (u64::from(height) << 32)
+                | (u64::from(to_width) << 16)
+                | u64::from(to_height);
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                "StretchRect: depth resolve skipped (src={:#x}, dst={:#x})",
+                key: key,
+                "depth plane: the {width}x{height} to {to_width}x{to_height} depth transfer was \
+                 not queued (src={:#x}, dst={:#x}), so the depth of a pass on another raster \
+                 grid is lost",
                 transfer.source.raw(),
                 transfer.destination.raw()
             );

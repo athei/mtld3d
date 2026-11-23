@@ -26,7 +26,7 @@
 //! render target 1 of the same size, and in a 1x1 and 1x2 shape under a
 //! 640x640 viewport.
 
-use mtld3d_tests::{Harness, RhwVertex, Surface, assert_pixel_eq, render_scale_is_identity};
+use mtld3d_tests::{Harness, RhwVertex, Surface, assert_pixel_eq};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL,
     D3DCMP_LESS, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLOCK_READONLY,
@@ -672,16 +672,16 @@ fn a_depth_clear_through_a_1x1_target_reaches_the_whole_depth_surface() {
     assert_pixel_eq(small, BLUE, "the 1x1 target keeps its clear");
 }
 
-/// An unwritten 1x1 render target 0 over the back buffer's depth surface, at either scale.
+/// An unwritten 1x1 render target 0 over the back buffer's depth surface, at any scale.
 ///
 /// A masked quad over the left half at z = 0.5, then a green quad over the
-/// whole back buffer at z = 0.75. At the identity scale the masked draw
-/// reaches the left half of the depth surface. Under a reduced
-/// `render.scale` that depth surface is rasterized smaller, the pass keeps
-/// the 1x1 target's area, and only the first texel of the depth surface
-/// changes.
+/// whole back buffer at z = 0.75. The masked draw reaches the left half of
+/// the depth surface. Under a reduced `render.scale` that depth surface is
+/// rasterized smaller than the unscaled 1x1 target's grid, so the pass draws
+/// into an unscaled copy of it, which goes back before the back buffer reads
+/// it.
 #[test]
-fn an_unwritten_1x1_target_over_the_back_buffer_depth_follows_the_render_scale() {
+fn an_unwritten_1x1_target_over_the_back_buffer_depth_reaches_it_at_any_scale() {
     let h = Harness::with_depth();
     let (width, height) = back_buffer_extent(&h);
     let (width_px, height_px) = h.dims();
@@ -742,11 +742,7 @@ fn an_unwritten_1x1_target_over_the_back_buffer_depth_follows_the_render_scale()
     assert_eq!(h.end_scene(), D3D_OK, "EndScene");
     let left = h.read_pixel(width_px / 4, height_px / 2);
     let right = h.read_pixel(width_px * 5 / 8, height_px / 2);
-    if render_scale_is_identity() {
-        assert_pixel_eq(left, RED, "the masked draw reached the left half");
-    } else {
-        assert_pixel_eq(left, GREEN, "a scaled depth surface keeps the 1x1 area");
-    }
+    assert_pixel_eq(left, RED, "the masked draw reached the left half");
     assert_pixel_eq(right, GREEN, "the right half was never drawn");
 }
 

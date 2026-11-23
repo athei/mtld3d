@@ -174,14 +174,20 @@ unless its entry says otherwise.
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
   single-level `D3DOK_NOAUTOGEN` fallback.
-- A colour target smaller than its depth surface under `render.scale`: a
-  whole-surface depth or stencil `Clear` reaches the whole depth surface at
-  any scale, but two cases keep the colour target's extent, each warned
-  once. One is the draws through a 1x1 render target 0 left unwritten over a
-  depth surface that `render.scale` reduces; the other is a depth or stencil
-  `Clear` by rect or by viewport that reaches past the colour target while
-  either surface is scaled. At the identity scale both reach the depth
-  surface, as D3D9 does.
+- A colour target and a depth surface on different grids under
+  `render.scale`. A pass through an unscaled render target 0 over a depth
+  surface `render.scale` reduces draws and clears into an unscaled copy of
+  the surface, carried in and back by a nearest-texel transfer, so its depth
+  lands on the pixels D3D9 reports, a 1x1 render target 0 left unwritten and
+  a depth or stencil `Clear` by rect or viewport past the colour target
+  included. Two such depth surfaces keep the scaled grid, each warned once:
+  a multisampled one, which the transfer cannot write, and a level of a depth
+  texture. A scaled colour target over an unscaled depth surface of another
+  size writes and tests that surface on the colour target's scaled grid, and
+  a depth or stencil `Clear` by rect or viewport past the colour target keeps
+  the colour target's extent there, each warned once. A whole-surface depth or
+  stencil `Clear` reaches the whole depth surface at any scale, and at the
+  identity scale every shape reaches it as D3D9 does.
 - A `NULL` render target 0 beside real render targets 1..3, or with no depth
   surface: its passes attach the depth surface alone, so draws through it
   write no colour to render targets 1..3 and a `Clear(D3DCLEAR_TARGET)`

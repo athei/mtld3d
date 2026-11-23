@@ -291,6 +291,123 @@ fn only_a_test_that_can_fail_or_a_write_uses_depth() {
     );
 }
 
+/// What `draw_reads_or_writes` answers for the default states with `writes` applied.
+fn draw_uses(writes: &[(u32, u32)], stencil_plane: bool) -> bool {
+    let mut rs = render_state_defaults();
+    for &(state, value) in writes {
+        rs[state as usize] = value;
+    }
+    draw_reads_or_writes(&rs, stencil_plane)
+}
+
+#[test]
+fn a_draw_reads_or_writes_depth_by_the_snapshot_rule() {
+    let depth = |enable: u32, write: u32, func: u32| {
+        draw_uses(
+            &[
+                (D3DRS_ZENABLE, enable),
+                (D3DRS_ZWRITEENABLE, write),
+                (D3DRS_ZFUNC, func),
+            ],
+            true,
+        )
+    };
+    assert!(!depth(0, 1, D3DCMP_LESSEQUAL), "ZENABLE off gates the rest");
+    assert!(
+        !depth(1, 0, D3DCMP_ALWAYS),
+        "always passes, writes nothing: a glow or interface pass"
+    );
+    assert!(depth(1, 1, D3DCMP_ALWAYS), "writes depth");
+    assert!(depth(1, 0, D3DCMP_LESSEQUAL), "reads depth");
+    assert!(
+        depth(1, 0, D3DCMP_ALWAYS + 0x100),
+        "a compare outside the enum reads as the default, which can fail"
+    );
+    assert!(
+        draw_uses(
+            &[
+                (D3DRS_ZENABLE, 1),
+                (D3DRS_ZWRITEENABLE, 0),
+                (D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+            ],
+            false,
+        ),
+        "depth counts on an attachment without a stencil plane"
+    );
+}
+
+#[test]
+fn a_draw_reads_or_writes_stencil_only_through_a_test_that_can_fail_or_a_reachable_write() {
+    let stencil = |writes: &[(u32, u32)]| {
+        let mut all = vec![(D3DRS_ZENABLE, 0), (D3DRS_STENCILENABLE, 1)];
+        all.extend_from_slice(writes);
+        draw_uses(&all, true)
+    };
+    assert!(
+        !stencil(&[]),
+        "STENCILENABLE with the default always-pass, keep-everything state"
+    );
+    assert!(
+        !stencil(&[
+            (D3DRS_STENCILENABLE, 0),
+            (D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+        ]),
+        "STENCILENABLE off gates the rest"
+    );
+    assert!(
+        stencil(&[(D3DRS_STENCILFUNC, D3DCMP_EQUAL)]),
+        "a compare that can fail reads the plane"
+    );
+    assert!(
+        stencil(&[(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE)]),
+        "the pass write"
+    );
+    assert!(
+        stencil(&[(D3DRS_STENCILZFAIL, D3DSTENCILOP_REPLACE)]),
+        "the depth-fail write"
+    );
+    assert!(
+        !stencil(&[(D3DRS_STENCILFAIL, D3DSTENCILOP_REPLACE)]),
+        "the fail write is unreachable under an always-pass compare"
+    );
+    assert!(
+        !stencil(&[(D3DRS_CCW_STENCILPASS, D3DSTENCILOP_REPLACE)]),
+        "the CCW states are inert until two-sided mode"
+    );
+    assert!(
+        stencil(&[
+            (D3DRS_TWOSIDEDSTENCILMODE, 1),
+            (D3DRS_CCW_STENCILPASS, D3DSTENCILOP_REPLACE),
+        ]),
+        "the back face counts as the front does"
+    );
+    assert!(
+        !stencil(&[
+            (D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+            (D3DRS_STENCILWRITEMASK, 0xFFFF_FF00),
+        ]),
+        "a write with no bit the attachment holds changes nothing"
+    );
+    assert!(
+        stencil(&[
+            (D3DRS_STENCILFUNC, D3DCMP_EQUAL),
+            (D3DRS_STENCILWRITEMASK, 0),
+        ]),
+        "a compare still reads with writes masked off"
+    );
+    assert!(
+        !draw_uses(
+            &[
+                (D3DRS_ZENABLE, 0),
+                (D3DRS_STENCILENABLE, 1),
+                (D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+            ],
+            false,
+        ),
+        "an attachment without a stencil plane has none to read or write"
+    );
+}
+
 #[test]
 fn snapshot_equality_sees_every_byte() {
     let original = base();
