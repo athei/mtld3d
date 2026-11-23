@@ -509,11 +509,23 @@ pub fn names_host(pattern: &str) -> bool {
     !pattern.is_empty() && HOST_ID.contains(pattern)
 }
 
-/// A benchmark launcher with an explicit log filter.
+/// The FEX option, and its value, that fixes each thread's L1 block lookup table at 1M entries.
+///
+/// By default FEX starts the table at 8k entries and, once a second while
+/// the thread keeps missing it, drops and doubles it; the refill faults the
+/// table's pages again. Whether a measured window holds such a step follows
+/// where the linker placed the layer's code, so the benchmarks measure the
+/// table at the size a busy thread ends at. A process that FEX does not
+/// translate ignores it.
+const FEX_FIXED_L1_TABLE: (&str, &str) = ("FEX_DYNAMICL1CACHE", "0");
+
+/// A benchmark launcher with an explicit log filter and FEX's L1 table fixed.
 ///
 /// Timed runs need INFO identity and perf records even if the caller disabled
 /// logging. Shape runs supply their trace filter instead. The unix side takes
-/// the PE side's filter, so one variable covers both.
+/// the PE side's filter, so one variable covers both. Every process of both
+/// legs runs with [`FEX_FIXED_L1_TABLE`], whatever the caller's environment
+/// holds.
 fn leg_launcher(
     spec: &LegSpec,
     exe: &Path,
@@ -525,7 +537,8 @@ fn leg_launcher(
         WineLauncher::new(&spec.wine, exe, log_dir, timeout, Box::new(|_| {}))?
             .ignored_only(true)
             .with_env("WINEPREFIX", &spec.prefix.to_string_lossy())
-            .with_env("RUST_LOG", log_filter),
+            .with_env("RUST_LOG", log_filter)
+            .with_env(FEX_FIXED_L1_TABLE.0, FEX_FIXED_L1_TABLE.1),
     )
 }
 
