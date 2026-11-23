@@ -74,7 +74,7 @@ fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
         height: value.height,
         texture_width: value.texture_size.0,
         texture_height: value.texture_size.1,
-        scale: value.scale.percent(),
+        scale: value.scale.to_wire(),
         format: value.format,
         mip_level: rasterized_level(&value.kind, value.mip_level),
         slice: value.slice.unwrap_or(0),
@@ -82,7 +82,6 @@ fn surface(value: &StretchSurfaceInfo) -> SurfaceRecord {
         sample_count: u32::from(value.sample_count),
         present: u32::from(value.slice.is_some())
             | (u32::from(value.autogen_texture_id.is_some()) << 1),
-        reserved: 0,
     }
 }
 
@@ -349,10 +348,9 @@ capture_control!(BindDepthOp, BindDepth, v, recorder, scratch, tag, {
                 handle: handle.raw(),
                 width: size.0,
                 height: size.1,
-                scale: scale.percent(),
+                scale: scale.to_wire(),
                 sample_count: u32::from(v.sample_count),
-                flags: u32::from(v.flags.bits()),
-                reserved: 0
+                flags: u32::from(v.flags.bits())
             }
         ),
         DepthBinding::Lazy(info, level, scale) => capture_fixed!(
@@ -363,9 +361,10 @@ capture_control!(BindDepthOp, BindDepth, v, recorder, scratch, tag, {
             BindDepthLazyRecord {
                 texture: TextureRecord::capture(info),
                 level: info.rasterized_level(*level),
-                scale: scale.percent(),
+                scale: scale.to_wire(),
                 sample_count: u32::from(v.sample_count),
-                flags: u32::from(v.flags.bits())
+                flags: u32::from(v.flags.bits()),
+                reserved: 0
             }
         ),
     }
@@ -391,9 +390,8 @@ capture_control!(BindColorOp, BindColor, v, recorder, scratch, tag, {
                 width: *width,
                 height: *height,
                 slot: u32::from(v.slot),
-                scale: v.scale.percent(),
-                sample_count: u32::from(*sample_count),
-                reserved: 0
+                scale: v.scale.to_wire(),
+                sample_count: u32::from(*sample_count)
             }
         ),
         RtBinding::StandaloneColor {
@@ -419,11 +417,10 @@ capture_control!(BindColorOp, BindColor, v, recorder, scratch, tag, {
                 width: *width,
                 height: *height,
                 slot: u32::from(v.slot),
-                scale: v.scale.percent(),
+                scale: v.scale.to_wire(),
                 sample_count: u32::from(*sample_count),
                 format: *format as u32,
-                has_alpha: u32::from(*has_alpha),
-                reserved: 0
+                has_alpha: u32::from(*has_alpha)
             }
         ),
         RtBinding::Texture {
@@ -443,11 +440,10 @@ capture_control!(BindColorOp, BindColor, v, recorder, scratch, tag, {
                 width: *width,
                 height: *height,
                 slot: u32::from(v.slot),
-                scale: v.scale.percent(),
+                scale: v.scale.to_wire(),
                 slice: *slice,
                 level: info.rasterized_level(*level),
-                has_alpha: u32::from(*has_alpha),
-                reserved: 0
+                has_alpha: u32::from(*has_alpha)
             }
         ),
     }
@@ -548,13 +544,14 @@ capture_control!(ColorFillOp, ColorFill, v, recorder, scratch, tag, {
             texture_width: v.fill.texture_size.0,
             texture_height: v.fill.texture_size.1,
             format: v.fill.format as u32,
-            scale: v.fill.scale.percent(),
+            scale: v.fill.scale.to_wire(),
             slice: v.fill.subresource.0,
             level: rasterized_level(&v.kind, v.fill.subresource.1),
             rect: v.fill.rect.into(),
             rgba: v.fill.rgba.into(),
             sample_count: u32::from(v.fill.sample_count),
-            regenerate_mipmaps: u32::from(v.fill.regenerate_mipmaps)
+            regenerate_mipmaps: u32::from(v.fill.regenerate_mipmaps),
+            reserved: 0
         }
     );
 });
@@ -757,9 +754,10 @@ capture_control!(
                 logical_height: v.target.logical.1,
                 texture_width: v.target.texture.0,
                 texture_height: v.target.texture.1,
-                scale: v.target.scale.percent(),
+                scale: v.target.scale.to_wire(),
                 stride: v.target.bytes_per_row,
-                level: rasterized_level(&v.kind, v.target.level)
+                level: rasterized_level(&v.kind, v.target.level),
+                reserved: 0
             }
         );
     }

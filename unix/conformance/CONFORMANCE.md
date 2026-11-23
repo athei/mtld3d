@@ -295,6 +295,27 @@ record. A knob, where one makes sense, is named with its default.
   declining the scale for such a texture would pair it with a scaled
   depth-stencil of a different size. A texture created with a shared tail
   logs it once at info. No knob.
+- **A back buffer larger than the panel of a scaled screen rasterizes at the
+  panel's pixels.** In a scaled display mode ("More Space") the screen's
+  backing store is larger than its panel and the display scales every
+  composited frame down to the panel, so a back buffer above the panel on
+  either axis (a maximized window, or fullscreen at the desktop size) shows
+  no more pixels than the panel has. It rasterizes at back buffer x panel /
+  backing per axis, rounded once with the user's `render.scale` when both
+  apply (`panel_fit` and `RenderScale::compose` in
+  `windows/core/src/render_scale.rs`); present then copies it 1:1 into the
+  drawable capped at the panel (`panel_drawable_size` in
+  `unix/shared/src/render_size.rs`, the same rounding). D3D9 renders at the
+  back-buffer size, so what the game reads back (`GetRenderTargetData`,
+  `GetFrontBufferData`, a lockable back buffer) is resampled from the
+  smaller image, the way it is under `render.scale`; what the game observes
+  of the size (`GetDesc`, viewports, the client rect, the mouse) stays
+  logical. Rendering the full size costs about 40% more pixels for nothing
+  the display shows. A local display at its default mode is not scaled, so
+  a local run never engages the fit. The CI runner's screen is scaled down
+  to its panel (1920x1080 under a 2048x1536 desktop), so there the fit
+  engages for a back buffer wider than 1920 or taller than 1080, and CI's
+  legs are the runs that see it. Knob: `render.panelFit`, default `true`.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without
@@ -1125,8 +1146,9 @@ refresh rate user32 lists for it, ordered by width, height and refresh rate,
 so an enumerated mode is one win32u accepts by construction. On a scaled
 desktop, where the desktop is the backing store and larger than the panel,
 it also leaves out every size other than the desktop's larger than the
-primary display's panel. The CI runner's display is a 2x display; what its
-panel reads there is not established.
+primary display's panel. The CI runner's panel reads 1920x1080 under its
+2048x1536 desktop, so there the list leaves out 1600x1200, 1920x1200 and
+1920x1280.
 `display.maxResolutions` can bound it to the largest sizes; the suite sets no
 bound, and a fullscreen request for any mode in the full list is set whether
 or not a bounded list carries it. The test binary, being the process's main

@@ -182,8 +182,10 @@ unless its entry says otherwise.
   a depth or stencil `Clear` by rect or viewport past the colour target
   included. Two such depth surfaces keep the scaled grid, each warned once:
   a multisampled one, which the transfer cannot write, and a level of a depth
-  texture. A scaled colour target over an unscaled depth surface of another
-  size writes and tests that surface on the colour target's scaled grid, and
+  texture. A scaled colour target over a depth surface at another scale
+  (unscaled, or scaled for another back-buffer size, which `render.panelFit`
+  can leave behind a resize) writes and tests that surface on the colour
+  target's grid, and
   a depth or stencil `Clear` by rect or viewport past the colour target keeps
   the colour target's extent there, each warned once. A whole-surface depth or
   stencil `Clear` reaches the whole depth surface at any scale, and at the
@@ -402,6 +404,16 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and stays the adapter display mode, where a driver lists no mode above
   the panel. A fullscreen request for a size left out follows the window.
   The list describes the primary display only. No knob.
+- On a screen scaled down to its panel, a back buffer larger than the panel
+  on either axis (a maximized window, or fullscreen at the desktop size)
+  rasterizes at back buffer x panel / backing per axis, and so do the
+  render targets and depth surfaces the game creates at its size. D3D9
+  renders at the back-buffer size; what the game reads back is resampled
+  from the smaller image. The ratio assumes the back buffer fills the
+  window's pixels, so a windowed back buffer above the panel that differs
+  from its client area renders below the panel's share of the window
+  (3840x2160 in a 4112x2658 window renders 3227x1815). `render.panelFit`,
+  on by default.
 - With `display.maxResolutions` set, the adapter mode list and the main
   module's `EnumDisplaySettings` offer at most that many sizes, the largest
   ones and always the desktop's, where a driver lists every mode it has. The

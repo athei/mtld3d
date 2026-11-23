@@ -2124,6 +2124,7 @@ fn the_upscaled_hdr_present_tone_maps_the_perceptual_scale_texel_for_texel() {
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
             client_surface_request_sink: 0,
+            screen_sizes_sink: 0,
             client_surface: 0,
         },
     );

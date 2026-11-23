@@ -14,7 +14,7 @@ use core::{
     ffi::c_void,
     hash::Hasher,
     ptr::null_mut,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
@@ -86,6 +86,14 @@ pub struct DisplaySinks {
     /// and sends `PresentClientSurface`, which has Wine show the surface
     /// again, sized to the client area.
     client_surface_request: AtomicU32,
+    /// The window's screen sizes, `ScreenSizes::pack`; `0` until published.
+    ///
+    /// The unix side stores them at attach and again from its main-thread
+    /// display-follow pass when the window reaches another screen; the
+    /// device reads them when it sizes its back buffer again (an
+    /// auto-resize, a `Reset`), so `render.panelFit` follows the screen the
+    /// window is on.
+    screen_sizes: AtomicU64,
 }
 
 impl DisplaySinks {
@@ -94,7 +102,23 @@ impl DisplaySinks {
             backing_scale: AtomicU32::new(0),
             cursor_kick: AtomicU32::new(0),
             client_surface_request: AtomicU32::new(0),
+            screen_sizes: AtomicU64::new(0),
         }
+    }
+
+    /// The address `AttachMetalLayerParams::screen_sizes_ptr` carries.
+    pub fn screen_sizes_ptr(&self) -> u64 {
+        (&raw const self.screen_sizes) as u64
+    }
+
+    /// The window's screen sizes as last published, `0` for nothing published.
+    pub fn screen_sizes(&self) -> u64 {
+        self.screen_sizes.load(Ordering::Relaxed)
+    }
+
+    /// Forget the published sizes, ahead of an attach to another window.
+    pub fn clear_screen_sizes(&self) {
+        self.screen_sizes.store(0, Ordering::Relaxed);
     }
 
     /// The address `AttachMetalLayerParams::client_surface_request_ptr` carries.

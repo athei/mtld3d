@@ -1,5 +1,7 @@
 //! Fixed frame metadata borrowed from the publishing runtime until replay completion.
 
+use crate::render_size::RenderScaleWire;
+
 /// An immutable, initialized array retained by the frame owner.
 #[repr(C, align(8))]
 #[derive(Default)]
@@ -11,7 +13,6 @@ pub struct ArrayRef {
 
 /// Matched-build frame state with explicit padding and architecture-independent offsets.
 #[repr(C, align(8))]
-#[derive(Default)]
 pub struct FrameMetadata {
     pub backbuffer_handle: u64,
     pub backbuffer_srgb_handle: u64,
@@ -26,10 +27,10 @@ pub struct FrameMetadata {
     pub backbuffer_width: u32,
     pub backbuffer_height: u32,
     pub backbuffer_format: u32,
-    pub render_scale_percent: u32,
+    /// Render pixels per logical pixel of the back buffer, per axis.
+    pub render_scale: RenderScaleWire,
     pub backbuffer_sample_count: u32,
     pub backbuffer_contents: u32,
-    pub reserved: u32,
     /// The texture a presenting frame shows, 0 for `backbuffer_handle`.
     pub present_texture: u64,
 }
@@ -40,7 +41,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ArrayRef, address) == 0);
     assert!(core::mem::offset_of!(ArrayRef, count) == 8);
     assert!(core::mem::offset_of!(ArrayRef, reserved) == 12);
-    assert!(size_of::<FrameMetadata>() == 120);
+    assert!(size_of::<FrameMetadata>() == 128);
     assert!(align_of::<FrameMetadata>() == 8);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_handle) == 0);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_srgb_handle) == 8);
@@ -55,9 +56,8 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_width) == 84);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_height) == 88);
     assert!(core::mem::offset_of!(FrameMetadata, backbuffer_format) == 92);
-    assert!(core::mem::offset_of!(FrameMetadata, render_scale_percent) == 96);
-    assert!(core::mem::offset_of!(FrameMetadata, backbuffer_sample_count) == 100);
-    assert!(core::mem::offset_of!(FrameMetadata, backbuffer_contents) == 104);
-    assert!(core::mem::offset_of!(FrameMetadata, reserved) == 108);
-    assert!(core::mem::offset_of!(FrameMetadata, present_texture) == 112);
+    assert!(core::mem::offset_of!(FrameMetadata, render_scale) == 96);
+    assert!(core::mem::offset_of!(FrameMetadata, backbuffer_sample_count) == 112);
+    assert!(core::mem::offset_of!(FrameMetadata, backbuffer_contents) == 116);
+    assert!(core::mem::offset_of!(FrameMetadata, present_texture) == 120);
 };

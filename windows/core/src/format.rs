@@ -1204,11 +1204,8 @@ pub fn standalone_surface_bytes(
         StandaloneSurfaceKind::ColorTarget => 1,
         StandaloneSurfaceKind::DepthStencil => u64::from(sample_count.max(1)),
     };
-    let bytes = surface_bytes(
-        render_scale.dimension(width),
-        render_scale.dimension(height),
-        d3d_format,
-    );
+    let (width, height) = render_scale.size((width, height));
+    let bytes = surface_bytes(width, height, d3d_format);
     bytes.saturating_mul(copies)
 }
 

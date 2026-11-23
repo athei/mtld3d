@@ -310,7 +310,7 @@ const CLIP_PLANE_SLOTS: usize = mtld3d_core::vs_draw::MAX_CLIP_PLANES;
 bitflags::bitflags! {
     /// Assorted per-device boolean state.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct DeviceFlags: u8 {
+    pub struct DeviceFlags: u16 {
         /// Set after the app called `SetDepthStencilSurface(NULL)` — depth is explicitly absent.
         ///
         /// Distinguishes "no override, use the auto depth" from "explicitly
@@ -365,6 +365,15 @@ bitflags::bitflags! {
         /// before the first chain still resizes it, off the API lock like any
         /// other (`ARCHITECTURE.md`, "Application multithreading").
         const MADE_SWAP_CHAIN = 1 << 7;
+        /// Set once the back buffer's render scale is not the identity, and never cleared.
+        ///
+        /// A render target or depth surface the game creates at the back
+        /// buffer's size takes that scale and keeps it after the back buffer
+        /// is sized again at another scale (an auto-resize, an extended
+        /// device's `Reset`). So once set, a scaled surface may exist whatever
+        /// the scale is now, and the depth plane classifies the bound targets;
+        /// while clear no surface is scaled and no pass can be mixed.
+        const SCALED_SURFACES = 1 << 8;
     }
 }
 
@@ -425,8 +434,15 @@ pub struct DeviceInner {
     /// `backbuffer_width`/`backbuffer_height` above stay logical — the size
     /// D3D9 reports and the space every game-supplied rect lives in. This
     /// converts those to the Metal texture's own resolution at the point a
-    /// value becomes a Metal command. Identity unless `render.scale` is set.
+    /// value becomes a Metal command. Identity unless `render.scale` is set
+    /// or the back buffer is larger than the panel of a screen scaled down to
+    /// it (`render.panelFit`).
     render_scale: mtld3d_core::render_scale::RenderScale,
+    /// What resolves `render_scale` for a back-buffer size: the user's factor and the screen.
+    ///
+    /// Asked again by `set_backbuffer_dims` and when an attach reports
+    /// another screen ([`Self::follow_screen`]).
+    back_buffer_scale: mtld3d_core::render_scale::BackBufferScale,
     /// Currently-bound vertex declaration (null = none).
     ///
     /// Uses the `Bound` ownership marker — swaps bump the wrapper's
@@ -1898,10 +1914,7 @@ impl DeviceInner {
             && *handle == old_depth
         {
             *handle = self.depth_stencil_handle;
-            *extent = (
-                scale.dimension(self.backbuffer_width),
-                scale.dimension(self.backbuffer_height),
-            );
+            *extent = scale.size((self.backbuffer_width, self.backbuffer_height));
         }
     }
 
@@ -3170,11 +3183,59 @@ impl DeviceInner {
     ///
     /// Every other consumer reads dims off `DeviceInner` (viewport
     /// defaults, `GetBackBuffer`, `GetRenderTarget`, `fresh_frame`), so
-    /// this single setter propagates everywhere.
-    pub const fn set_backbuffer_dims(&mut self, width: u32, height: u32) {
+    /// this single setter propagates everywhere. The render scale follows
+    /// the size and the window's screen, since the panel fit applies only to
+    /// a back buffer larger than the panel of a scaled screen: the screen
+    /// sizes are read from the word the unix side publishes into
+    /// (`DisplaySinks::screen_sizes`, written at attach and by the main
+    /// thread's display-follow pass). A change is logged at debug.
+    pub fn set_backbuffer_dims(&mut self, width: u32, height: u32) {
         self.backbuffer_width = width;
         self.backbuffer_height = height;
+        // The screen the window is on now, as the unix side last published it.
+        self.back_buffer_scale
+            .follow_published(self.cursor.sinks().screen_sizes());
+        let scale = self.back_buffer_scale.for_back_buffer((width, height));
+        if scale != self.render_scale {
+            let (render_width, render_height) = scale.size((width, height));
+            debug!(
+                target: LOG_TARGET,
+                "render size: back buffer {width}x{height} rasterizes at \
+                 {render_width}x{render_height} (panel {:?}, backing {:?})",
+                self.back_buffer_scale.panel(),
+                self.back_buffer_scale.backing(),
+            );
+        }
+        if !scale.is_identity() {
+            self.flags.insert(DeviceFlags::SCALED_SURFACES);
+        }
+        self.render_scale = scale;
         self.depth_plane.forget_targets();
+    }
+
+    /// Adopt the screen sizes a new attach reported.
+    ///
+    /// `true` when the back buffer's render scale changes with them, which a
+    /// `Reset` answers by recreating the back buffer at its size.
+    pub fn follow_screen(&mut self, layer_params: &mtld3d_shared::AttachMetalLayerParams) -> bool {
+        crate::direct3d9::adopt_attached_screen(&mut self.back_buffer_scale, layer_params);
+        self.back_buffer_scale
+            .for_back_buffer((self.backbuffer_width, self.backbuffer_height))
+            != self.render_scale
+    }
+
+    /// Adopt the screen sizes the unix side last published for the device's window.
+    ///
+    /// `true` when the back buffer's render scale changes with them at its
+    /// current size, which a `Reset` on the same window answers by
+    /// recreating the back buffer: the window may have moved to another
+    /// screen since the back buffer was sized.
+    pub fn follow_published_screen(&mut self) -> bool {
+        self.back_buffer_scale
+            .follow_published(self.cursor.sinks().screen_sizes());
+        self.back_buffer_scale
+            .for_back_buffer((self.backbuffer_width, self.backbuffer_height))
+            != self.render_scale
     }
 
     /// Queue a `PresentationInterval` change unless the layer paces that way already.
@@ -3448,11 +3509,12 @@ impl DeviceInner {
     /// without depth. Each failure logs once, at the step that failed.
     /// Returns whether the back buffer was made.
     fn recreate_implicit_surfaces(&mut self, new_width: u32, new_height: u32) -> bool {
+        let (render_width, render_height) = self.render_scale.size((new_width, new_height));
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
             record_handle: self.record_handle,
-            width: self.render_scale.dimension(new_width),
-            height: self.render_scale.dimension(new_height),
+            width: render_width,
+            height: render_height,
             sample_count: u32::from(self.backbuffer_sample_count),
             pad0: 0,
             texture_handle: MetalHandle::NULL,
@@ -3574,8 +3636,10 @@ pub struct DeviceCreateInfo {
     pub backbuffer_sample_count: u8,
     pub backbuffer_width: u32,
     pub backbuffer_height: u32,
-    /// Resolved `render.scale`, already forced to identity where unusable.
+    /// The back buffer's render scale, `back_buffer_scale` resolved for its size.
     pub render_scale: mtld3d_core::render_scale::RenderScale,
+    /// `render.scale` (forced to identity where unusable), `render.panelFit` and the screen.
+    pub back_buffer_scale: mtld3d_core::render_scale::BackBufferScale,
     pub encoder: EncoderThread,
     pub current_frame: FrameData,
     pub render_states: [u32; RENDER_STATE_COUNT],
@@ -3672,13 +3736,18 @@ impl Direct3DDevice9 {
             backbuffer_sample_count: info.backbuffer_sample_count,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
-            flags: info.initial_flags,
+            flags: if info.render_scale.is_identity() {
+                info.initial_flags
+            } else {
+                info.initial_flags | DeviceFlags::SCALED_SURFACES
+            },
             frame_latency: mtld3d_core::frame_latency::FrameLatency::new(
                 info.config.present_max_frame_latency,
             ),
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
+            back_buffer_scale: info.back_buffer_scale,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
             last_fvf_bind: (0, core::ptr::null_mut()),
@@ -5611,25 +5680,32 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     // A `Reset` may name another `hDeviceWindow`. The presentation surface
     // and the window subclass both live on the window the device attached, so
     // they move across before anything is recreated against the new one.
+    // A back buffer sized against another screen's panel and backing is made
+    // again at its size when the window's screen now changes its scale: the
+    // new window's after a retarget, else the one the window moved to.
+    let mut rescaled = !retargeted && dev.follow_published_screen();
     if retargeted {
         // A pending change from an earlier Reset would otherwise ride the
         // frame the retarget flush below sends, which still names the layer
         // the device is leaving. The fresh attach receives this Reset's
         // pacing directly.
         dev.pending_pacing = None;
-        if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
-            log_failed_reset(
-                dev,
-                &log,
-                &pp,
-                format_args!("failed retargeting the device window ({hr:#010x})"),
-                ResetFailureEffect::Unstated,
-            );
-            return hr;
+        match retarget_device_window(dev, &pp, target_window) {
+            Ok(changed) => rescaled = changed,
+            Err(hr) => {
+                log_failed_reset(
+                    dev,
+                    &log,
+                    &pp,
+                    format_args!("failed retargeting the device window ({hr:#010x})"),
+                    ResetFailureEffect::Unstated,
+                );
+                return hr;
+            }
         }
     }
 
-    if resized {
+    if resized || rescaled {
         // reset_recreate_resources rebuilds the depth from depth_stencil_format,
         // so adopt the new auto-DS format before it runs.
         dev.set_depth_stencil_format(new_depth_format);
@@ -5741,7 +5817,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     // window drag after `apply_auto_resize` already followed the client area,
     // and those same-size calls stay at debug, held surfaces or not.
     let mut done = ResetDone::empty();
-    done.set(ResetDone::RESIZED, resized);
+    done.set(ResetDone::RESIZED, resized || rescaled);
     done.set(ResetDone::RECOVERED, log.recovering);
     done.set(ResetDone::EXTENDED, extended);
     done.set(ResetDone::BACK_BUFFER_DETACHED, detached.0);
@@ -5753,7 +5829,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
         !log.recovering && dev.flags.contains(DeviceFlags::RESET_FAILURE_LOGGED),
     );
     dev.flags.remove(DeviceFlags::RESET_FAILURE_LOGGED);
-    let changed = recreated_for_a_change || changes_presentation(&previous, &stored);
+    let changed = recreated_for_a_change || rescaled || changes_presentation(&previous, &stored);
     let level = if success_logs_at_info(changed, done) {
         log::Level::Info
     } else {
@@ -5937,12 +6013,13 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
 ///
 /// An attach that fails leaves the device with no presentation surface, the
 /// same answer `CreateDevice` gives that failure: the device keeps working and
-/// `Present` becomes a no-op.
+/// `Present` becomes a no-op. Returns whether the new window's screen changes
+/// the back buffer's render scale ([`DeviceInner::follow_screen`]).
 fn retarget_device_window(
     dev: &mut DeviceInner,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
     hwnd: usize,
-) -> Result<(), i32> {
+) -> Result<bool, i32> {
     // Ops already queued name the layer that is about to go, and the encoder
     // waits for GPU idle, so nothing in flight references the view once the
     // detach releases it. No texture is destroyed here, so the encoder is
@@ -5956,6 +6033,9 @@ fn retarget_device_window(
         unix_call(&mut detach);
     }
     let config = Arc::clone(&dev.config);
+    // The word names the old window's screen until the attach publishes the
+    // new one's; an attach that publishes nothing leaves the first reading.
+    dev.cursor.sinks().clear_screen_sizes();
     let layer_params = crate::direct3d9::attach_metal_layer(
         hwnd as u64,
         dev.device_handle,
@@ -5986,7 +6066,7 @@ fn retarget_device_window(
         layer_params.view_handle.raw(),
         layer_params.layer_handle.raw(),
     );
-    Ok(())
+    Ok(dev.follow_screen(&layer_params))
 }
 
 /// Steps 1-6 of the Reset protocol.
@@ -6044,11 +6124,14 @@ fn reset_recreate_resources(
     //    the texture rasterization writes into. The drawable is not touched:
     //    it is the layer's own surface, sized by Core Animation from the
     //    view, and present resolves whatever difference remains.
+    let (render_width, render_height) = dev
+        .render_scale
+        .size((pp.back_buffer_width, pp.back_buffer_height));
     let mut bb_params = mtld3d_shared::CreateBackbufferParams {
         device_handle: dev.device_handle,
         record_handle: dev.record_handle,
-        width: dev.render_scale.dimension(pp.back_buffer_width),
-        height: dev.render_scale.dimension(pp.back_buffer_height),
+        width: render_width,
+        height: render_height,
         sample_count: u32::from(dev.backbuffer_sample_count),
         pad0: 0,
         texture_handle: MetalHandle::NULL,
@@ -6174,10 +6257,13 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
         };
         // Render space, matching the backbuffer texture rather than the
         // logical dims the device reports.
+        let (render_width, render_height) = dev
+            .render_scale
+            .size((dev.backbuffer_width, dev.backbuffer_height));
         let mut ds_params = CreateDepthTextureParams {
             device_handle: dev.device_handle,
-            width: dev.render_scale.dimension(dev.backbuffer_width),
-            height: dev.render_scale.dimension(dev.backbuffer_height),
+            width: render_width,
+            height: render_height,
             pixel_format,
             sample_count: u32::from(dev.backbuffer_sample_count),
             texture_handle: MetalHandle::NULL,
@@ -7991,11 +8077,12 @@ fn allocate_color_target(
     // caller of this fn (they hold it from the device thunk).
     let device = unsafe { &*device_inner };
     let scale = device.scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0);
+    let (render_width, render_height) = scale.size((width, height));
     let mut params = CreateColorTargetParams {
         device_handle,
         record_handle: device.record_handle(),
-        width: scale.dimension(width),
-        height: scale.dimension(height),
+        width: render_width,
+        height: render_height,
         pixel_format: mapping.metal_pixel_format(),
         sample_count: u32::from(multi_sample.sample_count),
         texture_handle: MetalHandle::NULL,
@@ -8313,10 +8400,11 @@ extern "system" fn device_create_depth_stencil_surface(
     // reports `width`/`height`. A differently-sized depth surface is a shadow
     // map or similar and keeps its own resolution.
     let scale = obj.inner().scale_for_created_target(width, height, true);
+    let (render_width, render_height) = scale.size((width, height));
     let mut params = CreateDepthTextureParams {
         device_handle,
-        width: scale.dimension(width),
-        height: scale.dimension(height),
+        width: render_width,
+        height: render_height,
         pixel_format,
         sample_count: u32::from(multi_sample.sample_count),
         texture_handle: MetalHandle::NULL,
@@ -11082,14 +11170,7 @@ extern "system" fn device_set_depth_stencil_surface(
         // SAFETY: `surf` is non-null (else-if branch) and points to a live
         // surface.
         let scale = unsafe { (*surf).render_scale() };
-        DepthBinding::Eager(
-            h,
-            (
-                scale.dimension(reported_size.0),
-                scale.dimension(reported_size.1),
-            ),
-            scale,
-        )
+        DepthBinding::Eager(h, scale.size(reported_size), scale)
     };
     // `is_sampleable` distinguishes a sampleable shadow map
     // (`CreateTexture(D24X8, DEPTHSTENCIL)`) from a depth surface no

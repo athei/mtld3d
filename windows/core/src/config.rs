@@ -282,6 +282,16 @@ pub struct Mtld3dConfig {
     /// spatial-upscaler integration guides prescribe. Nothing changes at the
     /// identity. File key: `render.lodBias`.
     pub render_lod_bias: bool,
+    /// Rasterize a back buffer larger than the panel at the panel's pixels.
+    ///
+    /// On a screen scaled down to its panel (a "More Space" mode) the display
+    /// shows no more pixels than the panel's, so on (the default) a back
+    /// buffer larger than the panel in either axis rasterizes at back buffer
+    /// × panel / backing per axis, and present is a 1:1 copy into the
+    /// drawable capped at the panel. What D3D9 reports stays the back
+    /// buffer's size; read-backs resample from the smaller texture. Off
+    /// renders at the back buffer's size. File key: `render.panelFit`.
+    pub render_panel_fit: bool,
     /// Present the adapter as a well-known GPU vendor.
     ///
     /// D3D9-era engines pick vendor-specific render paths (a depth copy
@@ -395,6 +405,7 @@ impl Default for Mtld3dConfig {
             present_max_frame_latency: 0,
             render_scale_percent: 100,
             render_lod_bias: true,
+            render_panel_fit: true,
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
             max_resolutions: 0,
@@ -576,6 +587,7 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         f64::from(cfg.render_scale_percent) / 100.0
     );
     info!(target: crate::LOG_TARGET, "config: render.lodBias = {}", cfg.render_lod_bias);
+    info!(target: crate::LOG_TARGET, "config: render.panelFit = {}", cfg.render_panel_fit);
     info!(
         target: crate::LOG_TARGET,
         "config: adapter.spoof = {}",
@@ -665,6 +677,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
+        "render.panelFit" => assign_bool(source, key, value, &mut cfg.render_panel_fit),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         "display.maxResolutions" => {

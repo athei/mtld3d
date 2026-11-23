@@ -54,6 +54,7 @@ unix/shared/src/mtl.rs VertexStepFunction Clone,Copy,Debug,PartialEq,Eq,Hash,Fro
 unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy,PartialEq,Eq
 unix/shared/src/record_handle.rs DeviceRecordHandle Clone,Copy
+unix/shared/src/render_size.rs RenderScaleWire Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/shader_create.rs DeclUsage Clone,Copy,Debug,PartialEq,Eq
 unix/unix/src/encoder.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 unix/unix/src/encoder.rs FrameEncoderFlags Clone,Copy,Debug,Default,PartialEq,Eq
@@ -66,7 +67,6 @@ unix/unix/src/metal/command.rs BlitSite Clone,Copy
 unix/unix/src/metal/command.rs CopyRejectReason Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/command.rs PresentGeometry Clone,Copy,PartialEq,Eq
 unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
-unix/unix/src/metal/layer.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerMode Clone,Copy,Debug,PartialEq,Eq

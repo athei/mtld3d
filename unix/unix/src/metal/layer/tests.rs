@@ -11,17 +11,12 @@
 //! word an attachment record holds. The round trip is pinned for both vsync
 //! states, with and without a cap, and for the widest cap.
 //!
-//! `panel_drawable_size` caps a drawable at the panel in a scaled display
-//! mode. The cases pin a whole screen landing exactly on the panel, the
-//! per-axis result of a window, the source-fit condition on both sides of
-//! the cap, every input that leaves the layer's own size, and the extreme
-//! inputs. `backing_pixels` takes the screen's frame to the layer's scale,
-//! `scaled_down_to_panel` picks the magnification filter, and `ScreenPixels`
-//! round-trips through its one word.
+//! `backing_pixels` takes the screen's frame to the layer's scale, and
+//! `ScreenPixels` round-trips through its one word. The panel cap itself is
+//! tested where it lives, in `mtld3d_shared::render_size`.
 
 use super::{
-    PresentPacing, ScreenPixels, backing_pixels, min_present_duration, pack_pacing,
-    panel_drawable_size, scaled_down_to_panel, unpack_pacing,
+    PresentPacing, ScreenPixels, backing_pixels, min_present_duration, pack_pacing, unpack_pacing,
 };
 
 /// A 1470x956 "looks like" mode on a 2560x1664 panel: its frame in points.
@@ -112,137 +107,6 @@ fn the_widest_cap_survives_the_round_trip() {
 }
 
 #[test]
-fn a_fullscreen_layer_in_a_scaled_mode_lands_on_the_panel() {
-    let size = panel_drawable_size(
-        AIR_BACKING,
-        Some(AIR_BACKING),
-        Some(AIR_PANEL),
-        Some((2048, 1332)),
-    );
-    assert_eq!(size, AIR_PANEL);
-    // "More Space" on a 3456x2234 panel.
-    let size = panel_drawable_size(
-        (4112, 2658),
-        Some((4112, 2658)),
-        Some((3456, 2234)),
-        Some((2048, 1324)),
-    );
-    assert_eq!(size, (3456, 2234));
-}
-
-#[test]
-fn a_window_is_capped_per_axis() {
-    // 1800 * 1664 / 1912 = 1566.53, rounded to nearest.
-    let size = panel_drawable_size(
-        (2940, 1800),
-        Some(AIR_BACKING),
-        Some(AIR_PANEL),
-        Some((1470, 900)),
-    );
-    assert_eq!(size, (2560, 1567));
-}
-
-#[test]
-fn the_source_has_to_fit_the_cap() {
-    let cap = |source| {
-        panel_drawable_size(
-            AIR_BACKING,
-            Some(AIR_BACKING),
-            Some(AIR_PANEL),
-            Some(source),
-        )
-    };
-    assert_eq!(cap(AIR_PANEL), AIR_PANEL, "a source at the cap is capped");
-    assert_eq!(
-        cap((2561, 1000)),
-        AIR_BACKING,
-        "wider than the cap keeps the layer's size"
-    );
-    assert_eq!(
-        cap((1000, 1665)),
-        AIR_BACKING,
-        "taller than the cap keeps the layer's size"
-    );
-    assert_eq!(
-        cap(AIR_BACKING),
-        AIR_BACKING,
-        "a native-backing source keeps its 1:1 copy"
-    );
-}
-
-#[test]
-fn a_panel_at_or_above_the_backing_never_moves_the_drawable() {
-    let source = Some((1024, 768));
-    // An exact 2x mode: the backing store is the panel.
-    let exact = (3456, 2234);
-    assert_eq!(
-        panel_drawable_size(exact, Some(exact), Some(exact), source),
-        exact
-    );
-    // Retina off: the layer's pixels are points, below the panel.
-    let points = (1470, 956);
-    assert_eq!(
-        panel_drawable_size(points, Some(points), Some(AIR_PANEL), source),
-        points
-    );
-}
-
-#[test]
-fn an_unknown_input_keeps_the_layer_size() {
-    let source = Some((1024, 768));
-    assert_eq!(
-        panel_drawable_size(AIR_BACKING, Some(AIR_BACKING), None, source),
-        AIR_BACKING
-    );
-    assert_eq!(
-        panel_drawable_size(AIR_BACKING, None, Some(AIR_PANEL), source),
-        AIR_BACKING
-    );
-    assert_eq!(
-        panel_drawable_size(AIR_BACKING, Some(AIR_BACKING), Some(AIR_PANEL), None),
-        AIR_BACKING
-    );
-    assert_eq!(
-        panel_drawable_size(AIR_BACKING, Some((0, 1912)), Some(AIR_PANEL), source),
-        AIR_BACKING
-    );
-}
-
-#[test]
-fn a_layer_smaller_than_its_share_of_the_panel_is_left_alone() {
-    // The cap of a 1x1 layer rounds to 1, never to 0, so nothing shrinks.
-    assert_eq!(
-        panel_drawable_size((1, 1), Some(AIR_BACKING), Some(AIR_PANEL), Some((1, 1))),
-        (1, 1)
-    );
-    // A backing smaller than the panel would enlarge; it does not.
-    let natural = (1200, 800);
-    assert_eq!(
-        panel_drawable_size(
-            natural,
-            Some((1470, 956)),
-            Some(AIR_PANEL),
-            Some((640, 480))
-        ),
-        natural
-    );
-}
-
-#[test]
-fn the_extreme_inputs_do_not_overflow() {
-    let max = (u32::MAX, u32::MAX);
-    let panel = (u32::MAX - 1, u32::MAX - 1);
-    assert_eq!(
-        panel_drawable_size(max, Some(max), Some(panel), Some((1, 1))),
-        panel
-    );
-    assert_eq!(
-        panel_drawable_size(max, Some((1, 1)), Some(max), Some((1, 1))),
-        max
-    );
-}
-
-#[test]
 fn the_backing_follows_the_layer_scale() {
     assert_eq!(backing_pixels(Some(AIR_POINTS), 2.0), Some(AIR_BACKING));
     // Retina off: the backing is in the layer's pixels, the points, so a
@@ -250,22 +114,6 @@ fn the_backing_follows_the_layer_scale() {
     assert_eq!(backing_pixels(Some(AIR_POINTS), 1.0), Some(AIR_POINTS));
     assert_eq!(backing_pixels(None, 2.0), None);
     assert_eq!(backing_pixels(Some(AIR_POINTS), 0.0), None);
-}
-
-#[test]
-fn the_screen_is_scaled_down_only_past_the_panel() {
-    assert!(scaled_down_to_panel(Some(AIR_BACKING), Some(AIR_PANEL)));
-    assert!(scaled_down_to_panel(Some((2561, 1000)), Some(AIR_PANEL)));
-    assert!(
-        !scaled_down_to_panel(Some(AIR_PANEL), Some(AIR_PANEL)),
-        "an exact 2x mode"
-    );
-    assert!(
-        !scaled_down_to_panel(Some(AIR_POINTS), Some(AIR_PANEL)),
-        "a layer at scale 1"
-    );
-    assert!(!scaled_down_to_panel(None, Some(AIR_PANEL)));
-    assert!(!scaled_down_to_panel(Some(AIR_BACKING), None));
 }
 
 #[test]

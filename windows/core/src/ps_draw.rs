@@ -15,15 +15,15 @@ pub const PS_DRAW_BYTES: usize = 16;
 
 /// MSL declaration of the uniform, emitted ahead of a pixel function that reads it.
 ///
-/// `vpos_scale = (1 / scale, 1 / scale, 0, 0)`: logical pixels per render
+/// `vpos_scale = (1 / scale_x, 1 / scale_y, 0, 0)`: logical pixels per render
 /// pixel along each axis.
 pub const PS_DRAW_MSL: &str = "struct PsDraw {\n    float4 vpos_scale;\n};\n\n";
 
 /// The uniform's bytes for a target rasterized at `scale`.
 #[must_use]
 pub fn build_ps_draw_bytes(scale: RenderScale) -> [u8; PS_DRAW_BYTES] {
-    let per_render_pixel = 1.0 / scale.factor();
-    let lanes = [per_render_pixel, per_render_pixel, 0.0, 0.0];
+    let (width, height) = scale.axis_factors();
+    let lanes = [1.0 / width, 1.0 / height, 0.0, 0.0];
     let mut out = [0u8; PS_DRAW_BYTES];
     for (chunk, lane) in out.as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
         *chunk = lane.to_le_bytes();

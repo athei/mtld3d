@@ -39,7 +39,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+use mtld3d_shared::{
+    mtl::{ClientSurfaceRequest, ColorSpacePolicy},
+    render_size::ScreenSizes,
+};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -113,6 +116,8 @@ pub struct AttachLatches {
     pub cursor_kick_sink: usize,
     /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
     pub client_surface_request_sink: usize,
+    /// Address of the PE-side `AtomicU64` the screen's sizes are published into, `0` = none.
+    pub screen_sizes_sink: usize,
     /// Wine's client surface the view sits in, `0` = none.
     ///
     /// The record owns one reference on it, taken at attach and given back
@@ -139,6 +144,10 @@ pub struct Attachment {
     cursor_kick_sink: usize,
     /// See [`AttachLatches::client_surface_request_sink`].
     client_surface_request_sink: usize,
+    /// See [`AttachLatches::screen_sizes_sink`].
+    screen_sizes_sink: usize,
+    /// The word last stored into `screen_sizes_sink`, swapped under the registry lock with it.
+    screen_sizes_published: AtomicU64,
     /// See [`AttachLatches::client_surface`].
     client_surface: usize,
     /// The main-thread watch on the hidden state of the view's client view, `0` = none.
@@ -289,6 +298,8 @@ impl Attachment {
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
             client_surface_request_sink: latches.client_surface_request_sink,
+            screen_sizes_sink: latches.screen_sizes_sink,
+            screen_sizes_published: AtomicU64::new(0),
             client_surface: latches.client_surface,
             client_view_watch: AtomicUsize::new(0),
             attached_at: Instant::now(),
@@ -904,6 +915,39 @@ pub fn publish_backing_scale(att: &Arc<Attachment>, scale: u32) {
     // in both images.
     let sink = unsafe { &*(att.backing_scale_sink as *const AtomicU32) };
     sink.store(scale, Ordering::Relaxed);
+}
+
+/// Publish the window's screen sizes into the record's PE-side sink, while the record is live.
+///
+/// Called by attach on the attaching thread and by the recurring
+/// display-follow pass on the main thread. The registry lock orders the two:
+/// the swap into the remembered word and the store into the sink happen
+/// together under it, so the sink always holds the word remembered last, and
+/// a pass that computes the sink's word has nothing to publish.
+///
+/// A word equal to the remembered one returns before the lock, so the
+/// recurring pass pays one load. That skip is safe because the remembered
+/// word only changes together with the sink: a load that races a publisher
+/// under the lock orders this pass before that publication, and the next
+/// pass loads the word again. The store is `Relaxed`: the word stands alone
+/// and the PE side reads it when it sizes its back buffer again. A record
+/// that was unregistered, or that has no sink, publishes nowhere.
+pub fn publish_screen_sizes(att: &Arc<Attachment>, sizes: &ScreenSizes) {
+    let bits = sizes.pack();
+    if att.screen_sizes_sink == 0 || att.screen_sizes_published.load(Ordering::Relaxed) == bits {
+        return;
+    }
+    let map = lock();
+    if !is_live(&map, att) || att.screen_sizes_published.swap(bits, Ordering::Relaxed) == bits {
+        return;
+    }
+    // SAFETY: as in `publish_backing_scale`: the PE side backs this address
+    // with an `AtomicU64` in the box it keeps until after the teardown thunk
+    // that unregisters this record has returned, and the record is live
+    // under the registry lock. The box places it at 8-byte alignment in both
+    // images, which `AtomicU64` needs.
+    let sink = unsafe { &*(att.screen_sizes_sink as *const AtomicU64) };
+    sink.store(bits, Ordering::Relaxed);
 }
 
 /// Ask every live device to re-apply its cursor through Wine.

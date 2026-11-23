@@ -1,8 +1,9 @@
 //! The `CAMetalLayer` code that does not depend on how the layer was obtained.
 //!
 //! It holds the attach request and answer, present pacing, host-time
-//! conversion and drawable sizing, including the panel cap. None of it
-//! depends on Wine or `AppKit`.
+//! conversion and drawable sizing; the panel cap itself is
+//! `mtld3d_shared::render_size`'s, which the API side sizes a back buffer
+//! with too. None of it depends on Wine or `AppKit`.
 
 use log::debug;
 use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
@@ -98,12 +99,13 @@ pub struct LayerAttachRequest {
     pub cursor_kick_sink_ptr: u64,
     /// Where a client surface present request is written on the PE side, `0` = nowhere.
     pub client_surface_request_sink_ptr: u64,
+    /// Where the window's screen sizes are published on the PE side, `0` = nowhere.
+    pub screen_sizes_sink_ptr: u64,
     /// `cursor.software`, resolved by attach against the layer mode it picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
 
 /// What attach answers the PE side about the display and the cursor.
-#[derive(Clone, Copy)]
 pub struct DisplayCaps {
     /// The layer's `contentsScale` rounded + clamped to `[1, 8]`: 2 in retina mode, else 1.
     pub backing_scale: u32,
@@ -111,6 +113,10 @@ pub struct DisplayCaps {
     ///
     /// `cursor.software` resolved against the layer mode; `Auto` follows HDR.
     pub software_cursor_active: bool,
+    /// The native pixel size of the panel under the window's screen, `None` = unknown.
+    pub panel: Option<(u32, u32)>,
+    /// The screen's frame at the layer's scale ([`backing_pixels`]), `None` = unknown.
+    pub backing: Option<(u32, u32)>,
 }
 
 /// Host-time seconds (`CFTimeInterval`) to nanoseconds, saturating.
@@ -183,67 +189,6 @@ pub fn backing_pixels(frame: Option<(u32, u32)>, scale: f64) -> Option<(u32, u32
     (pixels.0 != 0 && pixels.1 != 0).then_some(pixels)
 }
 
-/// Whether the display scales the backing store down to the panel, in either axis.
-///
-/// That is when the drawable can be capped below the layer's size and the
-/// compositor magnifies it back, so the layer's magnification filter is
-/// linear then and nearest otherwise.
-#[must_use]
-pub const fn scaled_down_to_panel(backing: Option<(u32, u32)>, panel: Option<(u32, u32)>) -> bool {
-    matches!(
-        (backing, panel),
-        (Some((backing_w, backing_h)), Some((panel_w, panel_h)))
-            if backing_w > panel_w || backing_h > panel_h
-    )
-}
-
-/// The drawable size for a layer whose own size is `natural`, capped at the panel's pixels.
-///
-/// In a scaled display mode the screen's backing store has more pixels than
-/// the panel, and the display scales every composited frame down to it. The
-/// cap scales `natural` per axis by panel over backing, so a layer covering
-/// the whole screen comes out at exactly the panel size, and the compositor
-/// takes the rest of the way. It applies only when it shrinks the drawable
-/// and the source (the frame being presented) still fits in the capped size:
-/// a source that does not would lose pixels to the cap that the panel can
-/// show. Any unknown input leaves `natural`, and nothing is ever enlarged.
-#[must_use]
-pub fn panel_drawable_size(
-    natural: (u32, u32),
-    backing: Option<(u32, u32)>,
-    panel: Option<(u32, u32)>,
-    source: Option<(u32, u32)>,
-) -> (u32, u32) {
-    let (Some((backing_w, backing_h)), Some((panel_w, panel_h)), Some((source_w, source_h))) =
-        (backing, panel, source)
-    else {
-        return natural;
-    };
-    if backing_w == 0 || backing_h == 0 {
-        return natural;
-    }
-    // Rounded to nearest in integers, so the exact ratios of a whole screen
-    // land on the panel size with no float error. `u128` holds the product
-    // of any three `u32`s, and the result never exceeds `size`.
-    let scale = |size: u32, num: u32, den: u32| {
-        let scaled =
-            (u128::from(size) * u128::from(num) * 2 + u128::from(den)) / (u128::from(den) * 2);
-        u32::try_from(scaled.min(u128::from(size)))
-            .expect("clamped to a u32 above")
-            .max(1)
-    };
-    let (natural_w, natural_h) = natural;
-    let capped_w = scale(natural_w, panel_w, backing_w).min(natural_w);
-    let capped_h = scale(natural_h, panel_h, backing_h).min(natural_h);
-    let shrinks = natural_w > capped_w || natural_h > capped_h;
-    let source_fits = source_w <= capped_w && source_h <= capped_h;
-    if shrinks && source_fits {
-        (capped_w, capped_h)
-    } else {
-        natural
-    }
-}
-
 /// The drawable size the layer's own geometry asks for: `bounds × contentsScale`.
 ///
 /// `(0, 0)` while the view has no frame yet, which the callers treat as "no
@@ -278,9 +223,10 @@ pub struct DrawableSizes {
 /// alone rather than written as a zero size Metal would reject, and answers
 /// `None`.
 ///
-/// `screen` and `source` feed [`panel_drawable_size`]: in a scaled display
-/// mode the drawable is the panel's share of the layer rather than the
-/// backing store's, when the frame fits it.
+/// `screen` and `source` feed
+/// [`panel_drawable_size`](mtld3d_shared::render_size::panel_drawable_size):
+/// in a scaled display mode the drawable is the panel's share of the layer
+/// rather than the backing store's, when the frame fits it.
 ///
 /// The presenter calls this on its own thread. It touches the layer alone,
 /// never the view it backs: `drawableSize` is `CAMetalLayer`'s own and asks
@@ -308,7 +254,8 @@ pub fn sync_drawable_size(
         return None;
     }
     let backing = backing_pixels(screen.frame, scale);
-    let drawable = panel_drawable_size(natural, backing, screen.panel, source);
+    let drawable =
+        mtld3d_shared::render_size::panel_drawable_size(natural, backing, screen.panel, source);
     let sizes = DrawableSizes {
         natural,
         drawable,

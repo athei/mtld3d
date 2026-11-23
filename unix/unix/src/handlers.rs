@@ -318,6 +318,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         backing_scale_sink_ptr: params.backing_scale_ptr,
         cursor_kick_sink_ptr: params.cursor_kick_ptr,
         client_surface_request_sink_ptr: params.client_surface_request_ptr,
+        screen_sizes_sink_ptr: params.screen_sizes_ptr,
         software_cursor: params.software_cursor,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
@@ -326,14 +327,19 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         params.backing_scale = caps.backing_scale;
         params.software_cursor_active = u32::from(caps.software_cursor_active);
         params.metalfx_available = u32::from(metal::upscale_is_supported(params.device_handle));
+        (params.panel_width, params.panel_height) = caps.panel.unwrap_or((0, 0));
+        (params.backing_width, params.backing_height) = caps.backing.unwrap_or((0, 0));
         info!(
             target: LOG_TARGET,
-            "attached Metal layer {}x{} on window {:#x} (vsync {}, maxFps {})",
+            "attached Metal layer {}x{} on window {:#x} (vsync {}, maxFps {}, panel {:?}, \
+             backing {:?})",
             params.width,
             params.height,
             params.hwnd,
             if params.display_sync_enabled != 0 { "on" } else { "off" },
-            params.max_fps
+            params.max_fps,
+            caps.panel,
+            caps.backing,
         );
         crate::hud_state::report_attached();
         STATUS_SUCCESS
@@ -342,6 +348,8 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         params.layer_handle = MetalHandle::NULL;
         params.backing_scale = 1;
         params.software_cursor_active = 0;
+        (params.panel_width, params.panel_height) = (0, 0);
+        (params.backing_width, params.backing_height) = (0, 0);
         error!(
             target: LOG_TARGET,
             "failed to attach Metal layer (hwnd=0x{:x})",

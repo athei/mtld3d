@@ -32,7 +32,10 @@
 //! agree by construction, and games enumerate a bounded subset of it. A request that is no display
 //! mode at all (native would reject it) follows the client rect instead, and
 //! so does a maximized window, where the window manager sizes the window;
-//! `render.scale` decides how many pixels are rasterized in those cases. A
+//! `render.scale` decides how many pixels are rasterized in those cases, and
+//! on a screen scaled down to its panel `render.panelFit` rasterizes a back
+//! buffer larger than the panel at the panel's pixels, the desktop-size
+//! fullscreen mode included. A
 //! mode-set user32 refuses anyway falls back to the monitor-covering window
 //! with the back buffer at the request, mouse in monitor space, with a
 //! warning.
