@@ -56,7 +56,7 @@ use mtld3d_types::{
 use crate::bench::{
     Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model,
     STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section,
-    nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
+    nearest_rank, ok, pattern_texture, ratio, sample_capacity, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -158,9 +158,10 @@ fn poll(name: &str, keys: &'static str, answering: &Answering, read_flags: u32) 
     let capacity = usize::try_from(start.length().as_micros() / FRAME_FLOOR.as_micros())
         .expect("frame capacity fits usize")
         .max(MEASURED_FRAMES);
+    // Allocated before the clock starts, so no measured frame carries the allocation.
+    let mut polls = Vec::with_capacity(capacity.max(sample_capacity::<u64>()));
+    let mut latencies = Vec::with_capacity(capacity.max(sample_capacity::<Duration>()));
     let mut clock = FrameClock::start(capacity);
-    let mut polls = Vec::with_capacity(capacity);
-    let mut latencies = Vec::with_capacity(capacity);
     let (mut ready, mut pending) = (0, 0);
     while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");

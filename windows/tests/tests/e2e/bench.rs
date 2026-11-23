@@ -201,6 +201,19 @@ const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
 /// higher floor.
 pub const SAMPLE_FLOOR: Duration = Duration::from_micros(5);
 
+/// The bytes a vector the benchmarks fill while measuring has room for from its creation.
+///
+/// Wine's heap serves a block past `HEAP_MIN_LARGE_BLOCK_SIZE` in ntdll's
+/// `heap.c` (520184 bytes in a 32-bit process, 1044464 in a 64-bit one) as an
+/// allocation of its own, outside the process heap's subheaps, committed
+/// whole with its header rounded up to 64 KiB: 1.0625 MiB here. Such a vector
+/// never enters a subheap and never reallocates during the measured frames,
+/// so the address space a benchmark reserves does not depend on how full an
+/// earlier benchmark left the subheaps. In `Duration`s that is 65536 samples;
+/// the longest measured window, the fastest benchmark's, is about 28000
+/// frames.
+pub const SAMPLE_BYTES: usize = 1 << 20;
+
 /// The least time a single call takes to count as a spike, whatever the median.
 ///
 /// The `LockRect` stalls a game shows take milliseconds; this keeps a
@@ -340,6 +353,11 @@ impl TscClock {
     }
 }
 
+/// How many `T` fill [`SAMPLE_BYTES`]: 65536 `Duration`s, 131072 `u64`s.
+pub const fn sample_capacity<T>() -> usize {
+    SAMPLE_BYTES / size_of::<T>()
+}
+
 /// Present-to-Present frame times, and the API thread's work before each `Present`.
 ///
 /// Read with [`TscClock`], which the benchmark calibrated before it started this.
@@ -353,12 +371,19 @@ pub struct FrameClock {
 
 impl FrameClock {
     /// A clock whose first frame ends at the next [`Self::present`].
+    ///
+    /// It has room for `capacity` frames, and never for fewer than [`sample_capacity`] gives.
+    /// The vectors are allocated before the clock is read, so the first frame carries no
+    /// allocation.
     pub fn start(capacity: usize) -> Self {
+        let capacity = capacity.max(sample_capacity::<Duration>());
+        let times = Vec::with_capacity(capacity);
+        let work = Vec::with_capacity(capacity);
         Self {
             last: TscClock::now(),
             elapsed: Duration::ZERO,
-            times: Vec::with_capacity(capacity),
-            work: Vec::with_capacity(capacity),
+            times,
+            work,
         }
     }
 
@@ -386,6 +411,11 @@ impl FrameClock {
     /// Frames timed so far.
     pub const fn frames(&self) -> usize {
         self.times.len()
+    }
+
+    /// The frame-time and API-work vectors, whose storage a check can follow.
+    pub(super) const fn sample_vecs(&self) -> [&Vec<Duration>; 2] {
+        [&self.times, &self.work]
     }
 
     /// Wall time the timed frames add up to.
@@ -480,7 +510,6 @@ impl FrameStats {
 /// calls give one sample a frame, rare ones one per several frames. The
 /// slowest single call is kept, and so is every single call of at least
 /// [`SPIKE_FLOOR`], the calls [`Self::spikes`] counts.
-#[derive(Default)]
 pub struct CallTimes {
     open: Duration,
     open_calls: u32,
@@ -488,6 +517,20 @@ pub struct CallTimes {
     calls: u64,
     max: Duration,
     slow: Vec<Duration>,
+}
+
+impl Default for CallTimes {
+    /// No call counted, with [`SAMPLE_BYTES`] of room for samples and as much for slow calls.
+    fn default() -> Self {
+        Self {
+            open: Duration::ZERO,
+            open_calls: 0,
+            samples: Vec::with_capacity(sample_capacity::<Duration>()),
+            calls: 0,
+            max: Duration::ZERO,
+            slow: Vec::with_capacity(sample_capacity::<Duration>()),
+        }
+    }
 }
 
 impl CallTimes {
@@ -514,6 +557,11 @@ impl CallTimes {
     /// Calls counted.
     pub const fn calls(&self) -> u64 {
         self.calls
+    }
+
+    /// The per-call sample and slow-call vectors, whose storage a check can follow.
+    pub(super) const fn sample_vecs(&self) -> [&Vec<Duration>; 2] {
+        [&self.samples, &self.slow]
     }
 
     /// The summary of the per-call samples, or `None` when no sample was closed.
