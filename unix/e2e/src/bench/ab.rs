@@ -511,12 +511,13 @@ pub fn names_host(pattern: &str) -> bool {
 
 /// The FEX option, and its value, that fixes each thread's L1 block lookup table at 1M entries.
 ///
-/// By default FEX starts the table at 8k entries and, once a second while
-/// the thread keeps missing it, drops and doubles it; the refill faults the
-/// table's pages again. Whether a measured window holds such a step follows
-/// where the linker placed the layer's code, so the benchmarks measure the
-/// table at the size a busy thread ends at. A process that FEX does not
-/// translate ignores it.
+/// By default FEX starts the table at 8k entries and resizes it once a
+/// second by the thread's L1 misses: doubled, up to 1M entries, above 250 a
+/// second and halved below 50. A resize drops entries, and refilling them
+/// faults the table's pages again. Whether a measured window holds such a
+/// step follows where the linker placed the layer's code, so the benchmarks
+/// measure the table at the size a busy thread ends at. A process that FEX
+/// does not translate ignores it.
 const FEX_FIXED_L1_TABLE: (&str, &str) = ("FEX_DYNAMICL1CACHE", "0");
 
 /// A benchmark launcher with an explicit log filter and FEX's L1 table fixed.
