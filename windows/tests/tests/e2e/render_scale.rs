@@ -2491,7 +2491,9 @@ fn a_draw_through_a_small_target_samples_the_depth_its_pass_wrote_into_a_depth_t
     assert_eq!(h.set_render_target(0, &small), 0);
     assert_eq!(h.set_texture(0, &intz), 0);
     point_sample_stage_zero(&h);
-    // The diffuse stage reads no texture, so this draw samples nothing.
+    // Stage 0 selects the diffuse colour, but the INTZ is bound there, so the
+    // encoder counts this draw as sampling it. No depth was written since the
+    // span opened, so no carry runs ahead of it.
     depth_draw_setup(&h, D3DCMP_ALWAYS, true);
     assert_eq!(
         h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
@@ -2701,8 +2703,10 @@ fn sampling_draws_after_one_depth_write_carry_the_plane_back_once() {
 ///
 /// The sampling draws have the depth test off and write no depth, so the
 /// plane goes back into the level ahead of the first of them only. With the
-/// span's opening and closing transfers the frame records three; a carry
-/// ahead of every sampling draw would record five.
+/// span's opening and closing transfers the frame records three. The INTZ is
+/// bound in stage 0 for the depth-writing draw as well, so the encoder counts
+/// that draw as sampling it too: a carry ahead of every draw that samples the
+/// INTZ would record six.
 fn write_back_count_workload() {
     let h = depth_harness_at_three_quarters();
     let intz = back_buffer_sized_intz(&h);
