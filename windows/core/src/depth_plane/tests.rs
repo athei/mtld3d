@@ -211,6 +211,25 @@ fn a_classification_is_kept_until_the_targets_are_forgotten() {
 }
 
 #[test]
+fn targets_kept_as_mixed_and_found_unserved_rule_out_the_next_span() {
+    // The device notes "no plane serves the pair" over a kept mixed answer
+    // when the targets it reads again no longer pair as a pass the plane
+    // serves, so the draws after it stop at the kept answer instead of
+    // reading the surface again.
+    let mut planes = DepthPlane::new();
+    planes.note_targets(Some(&surface(PixelFormat::Depth32FloatStencil8)));
+    assert!(!planes.rules_out_span());
+
+    planes.note_targets(None);
+    assert!(planes.targets_known(), "the answer stays kept");
+    assert!(
+        planes.mixed_has_stencil().is_none(),
+        "no plane serves the pair"
+    );
+    assert!(planes.rules_out_span(), "the next draw opens nothing");
+}
+
+#[test]
 fn a_dropped_frame_and_a_taken_plane_forget_the_targets() {
     let mut planes = DepthPlane::new();
     let format = PixelFormat::Depth32Float;

@@ -94,9 +94,17 @@ impl DeviceInner {
     ///
     /// A plane that cannot be allocated leaves the pass on the surface, as
     /// without one, warned once, and the targets count as on one grid until
-    /// one of them changes.
+    /// one of them changes. So do targets kept as mixed that no longer pair
+    /// as a pass the plane serves when read here, which means a writer of
+    /// what the classification reads did not forget it.
     fn open_span_over_mixed_targets(&mut self) {
         let Some(surface) = self.mixed_depth_surface() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "depth plane: targets kept as mixed no longer pair as a pass the plane serves \
+                 when a span opens → the pass draws into the depth surface"
+            );
+            self.depth_plane.note_targets(None);
             return;
         };
         let Some(plane) = self
@@ -110,6 +118,13 @@ impl DeviceInner {
         let logical_size = surface.logical_size;
         let has_stencil = surface.has_stencil();
         let Some(transfer) = self.depth_plane.open(surface) else {
+            let (width, height) = logical_size;
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "depth plane: no span opened over a {width}x{height} depth surface whose plane is \
+                 allocated (a span is open, or the plane's key differs) → the pass draws into \
+                 the depth surface"
+            );
             return;
         };
         if self.frame_dump.active {

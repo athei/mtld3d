@@ -231,6 +231,12 @@ impl DepthStencilSnapshot {
 /// The enum-valued states come through [`crate::render_state::enum_value`], so
 /// a game value outside a state's enum space reads as that state's D3D9
 /// default rather than as a byte of it.
+///
+/// The draw path's render-state section stays its one caller in `d3d9.dll`. A
+/// second caller there costs every draw with a changed render state about
+/// 6 ns on i686 (`ns_per_call.draw_dirty_rs`), so other PE-side code that asks
+/// about the depth or stencil test reads the render states it needs, as
+/// [`draw_reads_or_writes`] does.
 #[must_use]
 pub fn snapshot_from_state(rs: &[u32; RENDER_STATE_COUNT]) -> DepthStencilSnapshot {
     let enum_rs = |state: u32| crate::render_state::enum_value(rs, state);
@@ -271,10 +277,8 @@ pub fn snapshot_from_state(rs: &[u32; RENDER_STATE_COUNT]) -> DepthStencilSnapsh
 /// with no writable bit. The depth-fail operation counts as reachable whatever
 /// the depth test is, so the answer errs towards use.
 ///
-/// Reads the states the answer depends on and builds no snapshot:
-/// [`snapshot_from_state`] keeps the draw path as its one caller, because a
-/// second call site in `d3d9.dll` measured about 6 ns more on every draw with
-/// a changed render state.
+/// Reads the states the answer depends on and builds no snapshot, so
+/// [`snapshot_from_state`] keeps the draw path as its one caller.
 #[must_use]
 pub fn draw_reads_or_writes(rs: &[u32; RENDER_STATE_COUNT], stencil_plane: bool) -> bool {
     let enum_rs = |state: u32| crate::render_state::enum_value(rs, state);
