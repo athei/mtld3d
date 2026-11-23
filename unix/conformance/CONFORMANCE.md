@@ -311,8 +311,11 @@ record. A knob, where one makes sense, is named with its default.
   smaller image, the way it is under `render.scale`; what the game observes
   of the size (`GetDesc`, viewports, the client rect, the mouse) stays
   logical. Rendering the full size costs about 40% more pixels for nothing
-  the display shows. The CI display is not scaled, so no conformance site
-  sees it. Knob: `render.panelFit`, default `true`.
+  the display shows. A local display at its default mode is not scaled, so
+  a local run never engages the fit. The CI runner's screen is scaled down
+  to its panel (1920x1080 under a 2048x1536 desktop), so there the fit
+  engages for a back buffer wider than 1920 or taller than 1080, and CI's
+  legs are the runs that see it. Knob: `render.panelFit`, default `true`.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without

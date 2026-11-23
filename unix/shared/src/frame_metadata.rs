@@ -13,7 +13,6 @@ pub struct ArrayRef {
 
 /// Matched-build frame state with explicit padding and architecture-independent offsets.
 #[repr(C, align(8))]
-#[derive(Default)]
 pub struct FrameMetadata {
     pub backbuffer_handle: u64,
     pub backbuffer_srgb_handle: u64,

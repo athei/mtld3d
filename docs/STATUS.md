@@ -407,7 +407,11 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   rasterizes at back buffer x panel / backing per axis, and so do the
   render targets and depth surfaces the game creates at its size. D3D9
   renders at the back-buffer size; what the game reads back is resampled
-  from the smaller image. `render.panelFit`, on by default.
+  from the smaller image. The ratio assumes the back buffer fills the
+  window's pixels, so a windowed back buffer above the panel that differs
+  from its client area renders below the panel's share of the window
+  (3840x2160 in a 4112x2658 window renders 3227x1815). `render.panelFit`,
+  on by default.
 - With `display.maxResolutions` set, the adapter mode list and the main
   module's `EnumDisplaySettings` offer at most that many sizes, the largest
   ones and always the desktop's, where a driver lists every mode it has. The

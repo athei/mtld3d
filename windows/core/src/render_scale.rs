@@ -143,8 +143,11 @@ impl RenderScale {
     /// The rect conversions move coordinates; a length that D3D9 states in
     /// logical pixels and Metal consumes in render pixels (the point size)
     /// needs the ratio itself. A scale that differs between the axes gives the
-    /// geometric mean of the two, which a panel fit keeps within a fraction of
-    /// a percent of either. Exactly `1.0` at the identity, so multiplying by
+    /// geometric mean of the two. A built-in Mac panel's scaled modes keep the
+    /// panel's aspect, so there the axes differ by under 0.1% and the mean is
+    /// either axis; a screen whose panel has another aspect than its backing
+    /// (the CI runner's 1920x1080 under 2048x1536, 0.9375 by 0.703) puts a
+    /// length off by the spread between them. Exactly `1.0` at the identity, so multiplying by
     /// it is a no-op on the default path, and exactly the percentage's
     /// quotient for a percentage.
     #[must_use]

@@ -37,12 +37,6 @@ impl RenderScaleWire {
     };
 }
 
-impl Default for RenderScaleWire {
-    fn default() -> Self {
-        Self::IDENTITY
-    }
-}
-
 /// `size × num / den`, rounded to nearest with halves up, exact in integers.
 ///
 /// `den` is non-zero. The product of two `u32`s fits a `u64`, and so does
