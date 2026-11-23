@@ -2,7 +2,7 @@
 //!
 //! No `AppKit` runs here. The view, layer and window addresses are opaque
 //! numbers the registry only ever compares, and the PE-side sinks are
-//! local `AtomicU32`s whose addresses stand in for the device-owned box, so
+//! local atomics whose addresses stand in for the device-owned box, so
 //! the publish helpers write into real words the test can read back. Every
 //! test takes the addresses it registers from a block `test_address_block`
 //! hands it alone, and the test that looks records up by window takes that
@@ -12,10 +12,11 @@
 //! What they pin is that two records coexist and are torn down one at a
 //! time, that each record seeds and carries its own derived state, that the
 //! present-geometry streaks are independent, that nothing is written into a
-//! sink once its record is unregistered, that a view address handed out
-//! again names a new record rather than the old one, and that a Reset's
-//! re-pacing makes one record's reconciliation due at once, defers to a
-//! refresh already in flight, and leaves the other records' cadence alone.
+//! sink once its record is unregistered, that the screen-sizes sink holds the
+//! word the record remembers after every publication, that a view address
+//! handed out again names a new record rather than the old one, and that a
+//! Reset's re-pacing makes one record's reconciliation due at once, defers to
+//! a refresh already in flight, and leaves the other records' cadence alone.
 //! They also pin which client surface a window's departing device hands the
 //! window to: the newest live record's on that window that holds one, and
 //! only once that record's device has submitted a frame. Every attached
@@ -27,20 +28,23 @@
 //! another window takes that window's occlusion in place of the old one's,
 //! and that a view in no window clears both the window and the occlusion.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+use mtld3d_shared::{
+    mtl::{ClientSurfaceRequest, ColorSpacePolicy},
+    render_size::ScreenSizes,
+};
 
 use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, NewestSurface,
     UNDISPLAYED_PACED_LIMIT, find, find_by_layer, live, next_unshown_release,
-    publish_backing_scale, register, request_client_surface, request_cursor_kick_all,
-    request_first_frame_present, retain_newest_surface_on, test_address_block,
-    undisplayed_run_edge, unregister,
+    publish_backing_scale, publish_screen_sizes, register, request_client_surface,
+    request_cursor_kick_all, request_first_frame_present, retain_newest_surface_on,
+    test_address_block, undisplayed_run_edge, unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -426,6 +430,54 @@ fn a_detached_record_publishes_nowhere() {
         sinks.1.load(Ordering::Acquire),
         0,
         "nothing is kicked after the teardown"
+    );
+}
+
+/// Screen sizes for a test publication: a panel of `width` by `height`, backed at twice that.
+fn screen(width: u32, height: u32) -> ScreenSizes {
+    ScreenSizes {
+        panel: Some((width, height)),
+        backing: Some((width * 2, height * 2)),
+    }
+}
+
+#[test]
+fn the_sink_holds_the_screen_sizes_remembered_last() {
+    let view = test_address_block();
+    let sink = AtomicU64::new(0);
+    let att = register(
+        view,
+        view + 8,
+        &AttachLatches {
+            screen_sizes_sink: core::ptr::from_ref(&sink) as usize,
+            ..latches(AttachFlags::empty(), 1, None)
+        },
+    );
+    let (a, b) = (screen(1920, 1080), screen(2560, 1440));
+    for order in [[&a, &b, &a], [&b, &a, &b]] {
+        for sizes in order {
+            publish_screen_sizes(&att, sizes);
+            assert_eq!(sink.load(Ordering::Relaxed), sizes.pack());
+            assert_eq!(
+                att.screen_sizes_published.load(Ordering::Relaxed),
+                sizes.pack(),
+                "the remembered word is the one the sink holds"
+            );
+        }
+    }
+
+    assert!(unregister(view).is_some());
+    let remembered = att.screen_sizes_published.load(Ordering::Relaxed);
+    publish_screen_sizes(&att, &screen(1280, 800));
+    assert_eq!(
+        sink.load(Ordering::Relaxed),
+        remembered,
+        "nothing is written after the teardown"
+    );
+    assert_eq!(
+        att.screen_sizes_published.load(Ordering::Relaxed),
+        remembered,
+        "a word that reached no sink is not remembered"
     );
 }
 

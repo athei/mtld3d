@@ -146,7 +146,7 @@ pub struct Attachment {
     client_surface_request_sink: usize,
     /// See [`AttachLatches::screen_sizes_sink`].
     screen_sizes_sink: usize,
-    /// The word last published into `screen_sizes_sink`, so an unchanged screen takes no lock.
+    /// The word last stored into `screen_sizes_sink`, swapped under the registry lock with it.
     screen_sizes_published: AtomicU64,
     /// See [`AttachLatches::client_surface`].
     client_surface: usize,
@@ -920,20 +920,25 @@ pub fn publish_backing_scale(att: &Arc<Attachment>, scale: u32) {
 /// Publish the window's screen sizes into the record's PE-side sink, while the record is live.
 ///
 /// Called by attach on the attaching thread and by the recurring
-/// display-follow pass on the main thread; a word equal to the last one
-/// published returns before the registry lock, so the recurring pass pays
-/// one swap. The store is `Relaxed`: the word stands alone and the PE side
-/// reads it when it sizes its back buffer again. A record that was
-/// unregistered, or that has no sink, publishes nowhere.
+/// display-follow pass on the main thread. The registry lock orders the two:
+/// the swap into the remembered word and the store into the sink happen
+/// together under it, so the sink always holds the word remembered last, and
+/// a pass that computes the sink's word has nothing to publish.
+///
+/// A word equal to the remembered one returns before the lock, so the
+/// recurring pass pays one load. That skip is safe because the remembered
+/// word only changes together with the sink: a load that races a publisher
+/// under the lock orders this pass before that publication, and the next
+/// pass loads the word again. The store is `Relaxed`: the word stands alone
+/// and the PE side reads it when it sizes its back buffer again. A record
+/// that was unregistered, or that has no sink, publishes nowhere.
 pub fn publish_screen_sizes(att: &Arc<Attachment>, sizes: &ScreenSizes) {
     let bits = sizes.pack();
-    if att.screen_sizes_sink == 0
-        || att.screen_sizes_published.swap(bits, Ordering::Relaxed) == bits
-    {
+    if att.screen_sizes_sink == 0 || att.screen_sizes_published.load(Ordering::Relaxed) == bits {
         return;
     }
     let map = lock();
-    if !is_live(&map, att) {
+    if !is_live(&map, att) || att.screen_sizes_published.swap(bits, Ordering::Relaxed) == bits {
         return;
     }
     // SAFETY: as in `publish_backing_scale`: the PE side backs this address
