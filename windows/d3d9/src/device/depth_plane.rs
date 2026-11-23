@@ -1,25 +1,32 @@
 //! When a pass draws into the depth plane instead of the depth surface the application bound.
 //!
 //! `mtld3d_core::depth_plane` says what the plane is and builds its transfers.
-//! The device decides here when a span opens (a draw that tests or writes
-//! depth or stencil, or a depth or stencil clear, about to open a pass through
-//! an unscaled render target 0 over a scaled depth surface) and when it closes
-//! (render target 0 or the depth binding changes, a `StretchRect` or a RESZ
-//! resolve reads or writes a depth surface, the frame is submitted, `Reset`,
-//! release), allocates and retires the plane, and records the transfers and
-//! the depth bindings into the frame. The saved bindings keep naming the
-//! surface the application bound, so a fresh frame starts on it and opens a
-//! span of its own when its first pass needs one.
+//! The device decides here when a span opens (a draw that reads or writes
+//! depth or stencil, as `draw_needs_plane` says, or a depth or stencil clear,
+//! about to open a pass through an unscaled render target 0 over a scaled
+//! depth surface) and when it closes (render target 0 or the depth binding
+//! changes, a `StretchRect` or a RESZ resolve reads or writes a depth surface,
+//! the frame is submitted, `Reset`, release), allocates and retires the plane,
+//! and records the transfers and the depth bindings into the frame. The saved
+//! bindings keep naming the surface the application bound, so a fresh frame
+//! starts on it and opens a span of its own when its first pass needs one.
+//!
+//! What the bound targets pair as is classified once and kept on the plane's
+//! state. Every writer of what the classification reads forgets it:
+//! `bound_rt_mut` (render targets, the depth binding and both teardowns; the
+//! explicit-unbind flag is written only beside one of its calls), the setters
+//! of the implicit depth surface's handle and format and of the back buffer's
+//! size and sample count, `Reset` and release (which take the plane) and a
+//! dropped frame (which abandons the span). A surface's own extent, scale,
+//! format and sample count are fixed while it is bound.
 
 use mtld3d_core::{
-    depth_plane::{DepthSurface, Pairing, PassTargets, pairing},
+    depth_plane::{DepthSurface, Pairing, PassTargets, draw_needs_plane, pairing},
+    depth_stencil_state::snapshot_from_state,
     format::{is_null_render_target, map_d3d_depth_format},
     render_scale::RenderScale,
 };
-use mtld3d_shared::{
-    CreateDepthTextureParams, MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind,
-};
-use mtld3d_types::{D3DRS_STENCILENABLE, D3DRS_ZENABLE};
+use mtld3d_shared::{CreateDepthTextureParams, MetalHandle, mtl_handle::MTLTextureKind};
 
 use super::{
     DepthBinding, DeviceFlags, DeviceInner, LOG_TARGET, ResolveDepthSurfaceOp, SnapshotDirty,
@@ -29,34 +36,67 @@ use crate::unix_call::unix_call;
 impl DeviceInner {
     /// Open a span ahead of a draw whose targets or render states changed, if the draw needs one.
     ///
-    /// A draw that neither tests nor writes depth or stencil leaves the
-    /// depth surface as it is, so it opens nothing; the draw after it that
-    /// turns either test on does.
+    /// At the identity scale no pass is mixed and this is the one test a
+    /// draw pays.
+    #[inline]
     pub fn open_depth_span_for_draw(&mut self) {
         if self.render_scale.is_identity() {
             return;
         }
-        if self.render_state(D3DRS_ZENABLE as usize) == 0
-            && self.render_state(D3DRS_STENCILENABLE as usize) == 0
+        self.open_depth_span_for_scaled_draw();
+    }
+
+    /// Open a span ahead of a depth or stencil clear, if its pass is mixed.
+    ///
+    /// The transfer into the plane and the plane's bind go into the frame
+    /// before the clear, so its pass opens on the plane.
+    pub fn open_depth_span(&mut self) {
+        if self.render_scale.is_identity()
+            || self.depth_plane.span_open()
+            || !self.depth_targets_are_mixed()
         {
             return;
         }
-        self.open_depth_span();
+        self.open_span_over_mixed_targets();
     }
 
-    /// Open a span if the pass about to open pairs an unscaled render target 0 with a scaled depth.
+    /// The draw half of [`Self::open_depth_span_for_draw`] at a scale below one.
     ///
-    /// Called ahead of a draw that tests or writes depth or stencil and ahead
-    /// of a depth or stencil clear. The transfer into the plane and the
-    /// plane's bind go into the frame before the draw or clear, so its pass
-    /// opens on the plane. A plane that cannot be allocated leaves the pass on
-    /// the surface, as without one, warned once, and is not asked for again
-    /// until its size or format changes or the device resets.
-    pub fn open_depth_span(&mut self) {
-        if self.render_scale.is_identity() || self.depth_plane.span_open() {
+    /// A draw over targets on one grid stops at the kept classification. Over
+    /// mixed targets a draw that neither reads nor writes depth or stencil
+    /// leaves the depth surface as it is, so it opens nothing; the draw after
+    /// it that does opens the span.
+    fn open_depth_span_for_scaled_draw(&mut self) {
+        if self.depth_plane.span_open() || !self.depth_targets_are_mixed() {
             return;
         }
-        let Some(surface) = self.mixed_depth_surface() else {
+        let has_stencil = self
+            .depth_plane
+            .mixed()
+            .is_some_and(DepthSurface::has_stencil);
+        if draw_needs_plane(&snapshot_from_state(self.render_states()), has_stencil) {
+            self.open_span_over_mixed_targets();
+        }
+    }
+
+    /// Whether the bound targets pair an unscaled render target 0 with a scaled depth surface.
+    ///
+    /// Classifies them when nothing is kept since they last changed.
+    fn depth_targets_are_mixed(&mut self) -> bool {
+        if !self.depth_plane.targets_known() {
+            let mixed = self.mixed_depth_surface();
+            self.depth_plane.note_targets(mixed);
+        }
+        self.depth_plane.mixed().is_some()
+    }
+
+    /// Open a span over the targets classified as mixed: transfer in, then bind the plane.
+    ///
+    /// A plane that cannot be allocated leaves the pass on the surface, as
+    /// without one, warned once, and is not asked for again until its size or
+    /// format changes or the device resets.
+    fn open_span_over_mixed_targets(&mut self) {
+        let Some(surface) = self.depth_plane.take_mixed() else {
             return;
         };
         let Some(plane) = self
@@ -64,10 +104,11 @@ impl DeviceInner {
             .plane_for(&surface)
             .or_else(|| self.allocate_depth_plane(&surface))
         else {
+            self.depth_plane.note_targets(Some(surface));
             return;
         };
         let logical_size = surface.logical_size;
-        let has_stencil = surface.format == PixelFormat::Depth32FloatStencil8;
+        let has_stencil = surface.has_stencil();
         let Some(transfer) = self.depth_plane.open(surface) else {
             return;
         };
@@ -97,7 +138,7 @@ impl DeviceInner {
             self.frame_dump_event("depth plane: span closed");
         }
         self.push_control(ResolveDepthSurfaceOp { transfer });
-        let has_stencil = surface.format == PixelFormat::Depth32FloatStencil8;
+        let has_stencil = surface.has_stencil();
         // A span only opens over a surface no sampler can reach, which is
         // what the binding `SetDepthStencilSurface` made for it says too.
         self.push_depth_binding_op(

@@ -292,6 +292,63 @@ fn only_a_test_that_can_fail_or_a_write_uses_depth() {
 }
 
 #[test]
+fn only_a_test_that_can_fail_or_a_reachable_write_uses_stencil() {
+    const REPLACE: u8 = 3;
+    assert_eq!(u32::from(REPLACE), D3DSTENCILOP_REPLACE);
+    let with = |f: fn(&mut DepthStencilSnapshot)| {
+        let mut s = base();
+        f(&mut s);
+        s.uses_stencil()
+    };
+    assert!(
+        !base().uses_stencil(),
+        "STENCILENABLE with the default always-pass, keep-everything state"
+    );
+    assert!(
+        !with(|s| {
+            s.stencil_enable = 0;
+            s.front.pass_op = REPLACE;
+        }),
+        "STENCILENABLE off gates the rest"
+    );
+    assert!(
+        with(|s| s.front.func = narrow(D3DCMP_EQUAL)),
+        "a compare that can fail reads the plane"
+    );
+    assert!(with(|s| s.front.pass_op = REPLACE), "the pass write");
+    assert!(
+        with(|s| s.front.depth_fail_op = REPLACE),
+        "the depth-fail write"
+    );
+    assert!(
+        !with(|s| s.front.fail_op = REPLACE),
+        "the fail write is unreachable under an always-pass compare"
+    );
+    assert!(
+        with(|s| s.back.pass_op = REPLACE),
+        "the back face counts as the front does"
+    );
+    assert!(
+        !with(|s| {
+            s.front.pass_op = REPLACE;
+            s.write_mask = 0xFFFF_FF00;
+        }),
+        "a write with no bit the attachment holds changes nothing"
+    );
+    assert!(
+        with(|s| {
+            s.front.func = narrow(D3DCMP_EQUAL);
+            s.write_mask = 0;
+        }),
+        "a compare still reads with writes masked off"
+    );
+    assert!(
+        DepthStencilSnapshot::stencil_overwrite().uses_stencil(),
+        "stencil clear-quad"
+    );
+}
+
+#[test]
 fn snapshot_equality_sees_every_byte() {
     let original = base();
     assert_eq!(original, base());

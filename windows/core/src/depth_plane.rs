@@ -7,16 +7,21 @@
 //! surface for colour pixel (x, y), a texel that stands for another reported
 //! pixel. Such a pass binds a depth texture of the surface's reported size and
 //! format instead, the plane, which shares the colour target's grid. A
-//! nearest-texel transfer carries the surface into the plane when a pass first
-//! opens with the pairing, and back when render target 0 or the depth binding
-//! changes, before anything else reads the surface, and before the frame is
-//! submitted; the passes in between share the one span. Nearest up then
+//! nearest-texel transfer carries the surface into the plane at the first draw
+//! of the pairing that reads or writes depth or stencil, or at a depth or
+//! stencil clear, and back when render target 0 or the depth binding changes,
+//! before anything else reads the surface, and before the frame is submitted;
+//! the passes in between share the one span. A draw that can neither fail a
+//! test nor change a value needs no plane and opens none. Nearest up then
 //! nearest down is the identity at any scale up to one, so depth the passes do
 //! not touch survives the round trip unchanged.
 
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
-use crate::{encoder_data::DepthTransfer, render_scale::RenderScale};
+use crate::{
+    depth_stencil_state::DepthStencilSnapshot, encoder_data::DepthTransfer,
+    render_scale::RenderScale,
+};
 
 /// How render target 0 and the depth surface share a raster grid.
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +74,17 @@ pub const fn pairing(targets: &PassTargets) -> Pairing {
     }
 }
 
+/// Whether a draw under `state` has to see the depth surface's values on its own grid.
+///
+/// A draw that reads or writes depth does, and so does one that reads or
+/// writes stencil when the surface has a stencil plane. A draw with the depth
+/// test on, a compare that always passes and depth writes off, the state of
+/// a glow or interface pass, reads and changes nothing and needs no plane.
+#[must_use]
+pub fn draw_needs_plane(state: &DepthStencilSnapshot, surface_has_stencil: bool) -> bool {
+    state.uses_depth() || (surface_has_stencil && state.uses_stencil())
+}
+
 /// The scaled depth surface a span carries into the plane and back.
 pub struct DepthSurface {
     /// The surface's Metal texture.
@@ -83,27 +99,79 @@ pub struct DepthSurface {
     pub scale: RenderScale,
 }
 
+impl DepthSurface {
+    /// Whether the surface has a stencil plane.
+    #[must_use]
+    pub fn has_stencil(&self) -> bool {
+        self.format == PixelFormat::Depth32FloatStencil8
+    }
+}
+
 /// The plane a device owns and the span that has it standing in for a depth surface.
 ///
 /// The device allocates the plane, binds it while the span is open and
 /// retires it; this keeps which surface the plane holds and builds the
-/// transfers in and out.
+/// transfers in and out. It also keeps what the device classified the bound
+/// targets as, so a draw whose render states changed asks no surface again:
+/// the device forgets the answer wherever render target 0, the depth binding
+/// or an implicit surface changes.
 pub struct DepthPlane {
     plane: Option<Plane>,
     /// The surface whose depth the plane holds while a span is open.
     span: Option<DepthSurface>,
     /// The reported size and format of a plane the device was refused, not asked for again.
     refused: Option<PlaneKey>,
+    targets: Targets,
 }
 
 impl DepthPlane {
-    /// No plane allocated and no span open.
+    /// No plane allocated, no span open, and the targets not classified.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             plane: None,
             span: None,
             refused: None,
+            targets: Targets::Unknown,
+        }
+    }
+
+    /// Whether the bound targets are classified since they last changed.
+    #[must_use]
+    pub const fn targets_known(&self) -> bool {
+        !matches!(self.targets, Targets::Unknown)
+    }
+
+    /// Keep the classification of the bound targets: the mixed depth surface, or none.
+    pub fn note_targets(&mut self, mixed: Option<DepthSurface>) {
+        self.targets = mixed.map_or(Targets::Unserved, Targets::Mixed);
+    }
+
+    /// Forget the classification: a target, the depth binding or an implicit surface changed.
+    pub const fn forget_targets(&mut self) {
+        self.targets = Targets::Unknown;
+    }
+
+    /// The depth surface the bound targets were classified as mixed over, when they were.
+    #[must_use]
+    pub const fn mixed(&self) -> Option<&DepthSurface> {
+        match &self.targets {
+            Targets::Mixed(surface) => Some(surface),
+            Targets::Unknown | Targets::Unserved => None,
+        }
+    }
+
+    /// Take the mixed depth surface out to open a span over it, leaving the targets unclassified.
+    ///
+    /// A caller that opens no span hands the surface back through
+    /// [`Self::note_targets`].
+    pub const fn take_mixed(&mut self) -> Option<DepthSurface> {
+        match core::mem::replace(&mut self.targets, Targets::Unknown) {
+            Targets::Mixed(surface) => Some(surface),
+            kept @ (Targets::Unknown | Targets::Unserved) => {
+                self.targets = kept;
+                None
+            }
         }
     }
 
@@ -205,17 +273,25 @@ impl DepthPlane {
     }
 
     /// Forget an open span without carrying the plane back, for a frame that is dropped whole.
+    ///
+    /// The frame's bindings are reasserted after it, so the targets'
+    /// classification goes with the span.
     pub const fn abandon_span(&mut self) {
         self.span = None;
+        self.targets = Targets::Unknown;
     }
 
-    /// Take the plane for retirement, and forget a remembered refusal.
+    /// Take the plane for retirement, and forget a remembered refusal and the targets.
+    ///
+    /// `Reset` and the device's release call this; both replace what the
+    /// targets were classified from.
     ///
     /// # Panics
     /// Panics while a span is open: close it first.
     pub fn take_plane(&mut self) -> Option<MetalHandle<MTLTextureKind>> {
         assert!(self.span.is_none(), "the plane of an open span is taken");
         self.refused = None;
+        self.targets = Targets::Unknown;
         self.plane.take().map(|plane| plane.handle)
     }
 }
@@ -224,6 +300,16 @@ impl Default for DepthPlane {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What the device classified the bound render target 0 and depth surface as.
+enum Targets {
+    /// Not classified since a target, the depth binding or an implicit surface changed.
+    Unknown,
+    /// No plane serves the pair: both on one grid, or a pairing left on the surface's grid.
+    Unserved,
+    /// An unscaled render target 0 over this scaled depth surface.
+    Mixed(DepthSurface),
 }
 
 /// The device's plane: a Private depth texture of one key.

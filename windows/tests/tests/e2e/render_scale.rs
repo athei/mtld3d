@@ -32,16 +32,20 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_SYSTEMMEM, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT,
-    D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_INTZ,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
+    D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP,
+    D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_STENCILENABLE,
+    D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
-use super::render_target::{draw_fill, read_back, sample_mip_level_4};
+use super::{
+    device::{await_logged_lines, logged_lines, run_in_private_log_child, running_as},
+    render_target::{draw_fill, read_back, sample_mip_level_4},
+};
 
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
@@ -2386,4 +2390,161 @@ fn a_resz_resolve_after_a_small_target_copies_the_depth_it_drew() {
     assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
     probe_quad_over_the_back_buffer(&h, &back_buffer);
     assert_small_extent_holds_the_near_depth(&h);
+}
+
+#[test]
+fn a_depth_surface_of_another_format_under_a_small_target_takes_its_draws_in_place() {
+    // A pass through an unscaled 400x300 target over the implicit D24S8
+    // surface, then one over a D24X8 surface at the back buffer's size: the
+    // second surface has no stencil plane, so the pass draws into a plane of
+    // another format and the first one's is given up. Each surface holds the
+    // depth its pass drew, in place.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("the auto depth surface");
+    let other = h.create_depth_stencil_surface(640, 480, D3DFMT_D24X8);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    assert_eq!(h.set_depth_stencil_surface(&other), 0);
+    assert_eq!(h.set_viewport(&FULL_FRAME), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, RED)),
+        0
+    );
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_depth_stencil_surface(&implicit), 0);
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    probe_quad_over_the_back_buffer(&h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(&h);
+}
+
+/// Draw depth 0.25 through a new 400x300 target and read it in place through the back buffer.
+///
+/// Every reference it takes is released on return, so a `Reset` may follow.
+fn small_target_pass_holds_its_depth(h: &Harness) {
+    let back_buffer = h.render_target(0);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    depth_draw_setup(h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    probe_quad_over_the_back_buffer(h, &back_buffer);
+    assert_small_extent_holds_the_near_depth(h);
+}
+
+#[test]
+fn a_reset_between_two_passes_through_a_small_target_leaves_the_second_its_depth() {
+    // `Reset` gives up the plane the first pass drew into, with the implicit
+    // depth surface it stood in for. The pass after it draws into a new one
+    // over the new surface, at the same size and then at another.
+    let h = depth_harness_at_three_quarters();
+    small_target_pass_holds_its_depth(&h);
+    assert_eq!(h.reset(640, 480), 0, "Reset between the two passes");
+    small_target_pass_holds_its_depth(&h);
+    assert_eq!(h.reset(800, 600), 0, "Reset to another size");
+    small_target_pass_holds_its_depth(&h);
+}
+
+/// The name the workload child of the span-counting test runs under.
+const SPAN_COUNT_CHILD_NAME: &str = "depth-plane-spans.exe";
+
+/// That child's log filter: the unix side's command records, one per depth transfer.
+const SPAN_COUNT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug";
+
+/// What the record of every depth transfer carries.
+const DEPTH_TRANSFER_RECORD: &str = "site=depth-transfer/0";
+
+#[test]
+fn a_draw_that_cannot_read_or_write_depth_opens_no_span() {
+    if running_as(SPAN_COUNT_CHILD_NAME) {
+        span_count_workload();
+        return;
+    }
+    // The transfers are counted out of the process log, where every other
+    // test's would land beside them, so the workload runs in a process of
+    // its own, alone in its log directory.
+    run_in_private_log_child(
+        SPAN_COUNT_CHILD_NAME,
+        "render_scale::a_draw_that_cannot_read_or_write_depth_opens_no_span",
+        SPAN_COUNT_LOG_FILTER,
+    );
+}
+
+/// Draws through a 400x300 target that leave the depth surface alone, then one that writes it.
+///
+/// A draw with the depth test on, a compare that always passes and depth
+/// writes off (the state of a glow pass), and one with the stencil test on
+/// in its default always-pass, keep-everything state, read and change no
+/// depth or stencil value, so neither carries the depth surface into a plane.
+/// Each read-back sends its submission, and the unix side writes a transfer's
+/// record before the read-back returns. The depth-writing draw after them
+/// records the two transfers of one span, which also shows the count sees
+/// transfers at all.
+fn span_count_workload() {
+    let h = depth_harness_at_three_quarters();
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+
+    depth_draw_setup(&h, D3DCMP_ALWAYS, false);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+    assert_pixel_eq(h.read_pixel(200, 150), BLUE, "the always-passing draw");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, RED)),
+        0
+    );
+    assert_pixel_eq(h.read_pixel(200, 150), RED, "the idle-stencil draw");
+    assert!(
+        !logged_lines("readback-copy").is_empty(),
+        "the log carries the command records of the submissions so far"
+    );
+    assert_eq!(
+        logged_lines(DEPTH_TRANSFER_RECORD),
+        Vec::<String>::new(),
+        "a draw that reads and writes no depth or stencil carried the depth surface"
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, GREEN)),
+        0
+    );
+    assert_pixel_eq(h.read_pixel(200, 150), GREEN, "the depth-writing draw");
+    assert_eq!(
+        await_logged_lines(DEPTH_TRANSFER_RECORD, 2).len(),
+        2,
+        "one span: the transfer into the plane and the one back"
+    );
+    assert_eq!(h.end_scene(), 0);
 }

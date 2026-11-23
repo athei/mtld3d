@@ -163,3 +163,119 @@ fn an_abandoned_span_carries_nothing_back() {
     assert_eq!(planes.take_plane().map(MetalHandle::raw), Some(0x20));
     assert!(planes.take_plane().is_none());
 }
+
+#[test]
+fn a_classification_is_kept_until_the_targets_are_forgotten() {
+    let mut planes = DepthPlane::new();
+    let format = PixelFormat::Depth32FloatStencil8;
+    assert!(
+        !planes.targets_known(),
+        "a new device has classified nothing"
+    );
+
+    planes.note_targets(None);
+    assert!(planes.targets_known());
+    assert!(planes.mixed().is_none(), "no plane serves the pair");
+    assert!(planes.take_mixed().is_none());
+    assert!(planes.targets_known(), "taking nothing keeps the answer");
+
+    planes.forget_targets();
+    assert!(!planes.targets_known(), "a changed target asks again");
+
+    planes.note_targets(Some(surface(format)));
+    assert_eq!(
+        planes.mixed().map(|mixed| mixed.logical_size),
+        Some((640, 480))
+    );
+    let taken = planes.take_mixed().expect("the mixed surface");
+    assert!(
+        !planes.targets_known(),
+        "the surface a span takes is classified again after it"
+    );
+
+    planes.note_targets(Some(taken));
+    planes.forget_targets();
+    assert!(
+        planes.mixed().is_none(),
+        "a forgotten answer serves no draw"
+    );
+}
+
+#[test]
+fn a_dropped_frame_and_a_taken_plane_forget_the_targets() {
+    let mut planes = DepthPlane::new();
+    let format = PixelFormat::Depth32Float;
+    planes.replace_plane(handle(0x20), &surface(format));
+
+    planes.note_targets(Some(surface(format)));
+    planes.abandon_span();
+    assert!(!planes.targets_known(), "the dropped frame's bindings");
+
+    planes.note_targets(None);
+    assert_eq!(planes.take_plane().map(MetalHandle::raw), Some(0x20));
+    assert!(
+        !planes.targets_known(),
+        "Reset and release replace the targets"
+    );
+}
+
+#[test]
+fn a_draw_needs_the_plane_only_for_a_plane_it_reads_or_writes() {
+    use mtld3d_types::{
+        D3DCMP_ALWAYS, D3DCMP_LESSEQUAL, D3DRS_STENCILENABLE, D3DRS_STENCILPASS, D3DRS_ZENABLE,
+        D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSTENCILOP_REPLACE, render_state_defaults,
+    };
+
+    use crate::depth_stencil_state::snapshot_from_state;
+
+    let state = |writes: &[(u32, u32)]| {
+        let mut rs = render_state_defaults();
+        for &(index, value) in writes {
+            rs[index as usize] = value;
+        }
+        snapshot_from_state(&rs)
+    };
+    let depth_off = state(&[(D3DRS_ZENABLE, 0)]);
+    assert!(!draw_needs_plane(&depth_off, true), "no test at all");
+
+    let glow = state(&[
+        (D3DRS_ZENABLE, 1),
+        (D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        (D3DRS_ZWRITEENABLE, 0),
+    ]);
+    assert!(
+        !draw_needs_plane(&glow, true),
+        "depth on, always passing, not writing"
+    );
+
+    let tested = state(&[
+        (D3DRS_ZENABLE, 1),
+        (D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+        (D3DRS_ZWRITEENABLE, 0),
+    ]);
+    assert!(draw_needs_plane(&tested, false), "a depth test reads");
+
+    let written = state(&[
+        (D3DRS_ZENABLE, 1),
+        (D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        (D3DRS_ZWRITEENABLE, 1),
+    ]);
+    assert!(draw_needs_plane(&written, false), "a depth write");
+
+    let stencil_idle = state(&[(D3DRS_ZENABLE, 0), (D3DRS_STENCILENABLE, 1)]);
+    assert!(
+        !draw_needs_plane(&stencil_idle, true),
+        "stencil on with its default always-pass, keep state"
+    );
+
+    let stencil_written = state(&[
+        (D3DRS_ZENABLE, 0),
+        (D3DRS_STENCILENABLE, 1),
+        (D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+    ]);
+    assert!(draw_needs_plane(&stencil_written, true), "a stencil write");
+    assert!(
+        !draw_needs_plane(&stencil_written, false),
+        "a surface without a stencil plane has none to carry"
+    );
+}

@@ -222,6 +222,21 @@ impl DepthStencilSnapshot {
             && (self.depth_write != 0
                 || d3d_to_metal_cmp(u32::from(self.depth_func)) != CompareFunc::Always)
     }
+
+    /// Whether a draw under this state reads or writes the stencil plane.
+    ///
+    /// `D3DRS_STENCILENABLE` alone does not decide it: a test that always
+    /// passes and keeps the value on every outcome it can reach, the D3D9
+    /// defaults, reads no stencil value and changes none, and neither does
+    /// one that always passes with no writable bit. The depth-fail operation
+    /// counts as reachable whatever the depth test is, so the answer errs
+    /// towards use.
+    #[must_use]
+    pub fn uses_stencil(&self) -> bool {
+        let writable = self.write_mask & STENCIL_MASK_BITS != 0;
+        self.stencil_enable != 0
+            && (face_uses_stencil(self.front, writable) || face_uses_stencil(self.back, writable))
+    }
 }
 
 /// Build a `DepthStencilSnapshot` from the device's render-state array.
@@ -405,6 +420,13 @@ const fn face_word(face: StencilFaceState) -> u32 {
         pass_op,
     } = face;
     u32::from_le_bytes([func, fail_op, depth_fail_op, pass_op])
+}
+
+/// Whether one face's test can reject a fragment or its operations can change a stencil value.
+fn face_uses_stencil(face: StencilFaceState, writable: bool) -> bool {
+    let keeps = |op: u8| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep;
+    d3d_to_metal_cmp(u32::from(face.func)) != CompareFunc::Always
+        || (writable && !(keeps(face.pass_op) && keeps(face.depth_fail_op)))
 }
 
 #[cfg(test)]

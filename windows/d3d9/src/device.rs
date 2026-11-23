@@ -1169,7 +1169,12 @@ impl DeviceInner {
         &self.bound_rt
     }
 
+    /// The bound render targets and depth stencil, for a caller that replaces one.
+    ///
+    /// Every change to them goes through here, so what the depth plane
+    /// classified the old pair as is forgotten with it.
     pub const fn bound_rt_mut(&mut self) -> &mut BoundRt {
+        self.depth_plane.forget_targets();
         &mut self.bound_rt
     }
 
@@ -3062,7 +3067,7 @@ impl DeviceInner {
         for old_id in autogen.into_iter().flatten() {
             self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
         }
-        self.bound_rt.teardown();
+        self.bound_rt_mut().teardown();
         // The encoder's frame reset already drops render targets 1..3; the
         // explicit unbind covers the frame in flight.
         self.last_color_rt_binding = None;
@@ -3142,13 +3147,23 @@ impl DeviceInner {
         self.backbuffer_multi_sample_type = multi_sample_type;
         self.backbuffer_multi_sample_quality = multi_sample_quality;
         self.backbuffer_sample_count = sample_count;
+        self.depth_plane.forget_targets();
     }
 
     /// Update the implicit depth/stencil Metal handle after `device_reset` recreates it.
     ///
-    /// Same lifecycle as `set_backbuffer_handle`.
+    /// Same lifecycle as `set_backbuffer_handle`. The depth plane classifies
+    /// the implicit surface from its handle, format, size and sample count,
+    /// so each of their setters forgets that classification.
     pub const fn set_depth_stencil_handle(&mut self, handle: MetalHandle<MTLTextureKind>) {
         self.depth_stencil_handle = handle;
+        self.depth_plane.forget_targets();
+    }
+
+    /// Adopt the implicit depth surface's format, 0 for none.
+    pub const fn set_depth_stencil_format(&mut self, format: u32) {
+        self.depth_stencil_format = format;
+        self.depth_plane.forget_targets();
     }
 
     /// Update the device's backbuffer dimensions after `device_reset` honours a resize.
@@ -3159,6 +3174,7 @@ impl DeviceInner {
     pub const fn set_backbuffer_dims(&mut self, width: u32, height: u32) {
         self.backbuffer_width = width;
         self.backbuffer_height = height;
+        self.depth_plane.forget_targets();
     }
 
     /// Queue a `PresentationInterval` change unless the layer paces that way already.
@@ -5616,7 +5632,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     if resized {
         // reset_recreate_resources rebuilds the depth from depth_stencil_format,
         // so adopt the new auto-DS format before it runs.
-        dev.depth_stencil_format = new_depth_format;
+        dev.set_depth_stencil_format(new_depth_format);
         if let Err(hr) = reset_recreate_resources(dev, &pp, held) {
             log_failed_reset(
                 dev,
@@ -6056,7 +6072,7 @@ fn reset_recreate_resources(
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
-        dev.depth_stencil_format = 0;
+        dev.set_depth_stencil_format(0);
         return Err(D3DERR_INVALIDCALL);
     }
     dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
@@ -6080,7 +6096,7 @@ fn reset_recreate_resources(
             // No implicit depth surface exists now, and the format says so,
             // as `reconcile_implicit_depth` leaves it on the same failure.
             dev.set_depth_stencil_handle(MetalHandle::NULL);
-            dev.depth_stencil_format = 0;
+            dev.set_depth_stencil_format(0);
             return Err(D3DERR_INVALIDCALL);
         };
         // Render space, matching the colour attachment exactly — Metal
@@ -6097,7 +6113,7 @@ fn reset_recreate_resources(
         if status != 0 || ds_params.texture_handle.is_null() {
             error!(target: LOG_TARGET, "Reset: CreateDepthTexture failed (0x{status:08X}) — device unusable");
             dev.set_depth_stencil_handle(MetalHandle::NULL);
-            dev.depth_stencil_format = 0;
+            dev.set_depth_stencil_format(0);
             return Err(D3DERR_INVALIDCALL);
         }
         dev.set_depth_stencil_handle(ds_params.texture_handle);
@@ -6146,14 +6162,14 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
         unix_call(&mut destroy);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
     }
-    dev.depth_stencil_format = new_depth_format;
+    dev.set_depth_stencil_format(new_depth_format);
     if want_depth {
         let Some(pixel_format) = mtld3d_core::format::map_d3d_depth_format(new_depth_format) else {
             error!(
                 target: LOG_TARGET,
                 "Reset: AutoDepthStencilFormat {new_depth_format} has no Metal mapping"
             );
-            dev.depth_stencil_format = 0;
+            dev.set_depth_stencil_format(0);
             return Err(D3DERR_INVALIDCALL);
         };
         // Render space, matching the backbuffer texture rather than the
@@ -6169,7 +6185,7 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
         let status = unix_call(&mut ds_params);
         if status != 0 || ds_params.texture_handle.is_null() {
             error!(target: LOG_TARGET, "Reset: CreateDepthTexture failed (0x{status:08X})");
-            dev.depth_stencil_format = 0;
+            dev.set_depth_stencil_format(0);
             return Err(D3DERR_INVALIDCALL);
         }
         dev.set_depth_stencil_handle(ds_params.texture_handle);
