@@ -75,6 +75,76 @@ fn typed_query_retains_original_owner_and_captured_generation() {
 }
 
 #[test]
+fn a_depth_transfer_names_a_texture_end_by_its_texture_and_level() {
+    use mtld3d_shared::{
+        MetalHandle,
+        mtl::{PixelFormat, Swizzle, TextureCreateFlags, TextureUsage},
+    };
+
+    use crate::{
+        encoder_data::{ResolveDepthSurfaceOp, TextureInfo},
+        ids::TextureId,
+    };
+
+    let id = TextureId::new_unique();
+    let info = TextureInfo {
+        texture_id: id,
+        d3d_format: mtld3d_types::D3DFMT_INTZ,
+        width: 480,
+        height: 360,
+        depth: 1,
+        levels: 2,
+        pixel_format: PixelFormat::Depth32FloatStencil8,
+        create_flags: TextureCreateFlags::empty(),
+        swizzle: [Swizzle::Zero; 4],
+        usage_flags: TextureUsage::DEPTH_STENCIL,
+    };
+    // SAFETY: an opaque test value nothing dereferences.
+    let plane = unsafe { MetalHandle::new(0x20) };
+    let mut scratch = ScratchArena::new();
+    let mut recorder = FrameRecorder::new();
+    recorder
+        .record_typed(
+            &mut scratch,
+            ResolveDepthSurfaceOp {
+                transfer: DepthTransfer {
+                    source: StretchKind::DepthStencil(plane),
+                    source_level: 0,
+                    source_size: (320, 240),
+                    source_format: PixelFormat::Depth32FloatStencil8,
+                    source_samples: 1,
+                    destination: StretchKind::Texture(info),
+                    destination_level: 1,
+                    destination_size: (240, 180),
+                    destination_format: PixelFormat::Depth32FloatStencil8,
+                },
+            },
+        )
+        .unwrap();
+    let record = first_payload::<DepthTransferRecord>(&mut scratch);
+    assert_eq!(record.source.texture_id(), None, "the plane is a handle");
+    assert_eq!((record.source.kind, record.source.handle), (2, 0x20));
+    assert_eq!(record.destination.texture_id(), Some(id));
+    assert_eq!(record.destination.kind, 0);
+    assert_eq!(record.destination.handle, 0);
+    assert_eq!(
+        (
+            record.destination.texture.width,
+            record.destination.texture.levels
+        ),
+        (480, 2)
+    );
+    assert_eq!((record.source_level, record.destination_level), (0, 1));
+    assert_eq!((record.source_width, record.source_height), (320, 240));
+    assert_eq!(
+        (record.destination_width, record.destination_height),
+        (240, 180)
+    );
+    assert_eq!(record.reserved, 0);
+    assert!(recorder.rejected_ops.is_empty());
+}
+
+#[test]
 fn latched_failure_retains_typed_owner_without_publishing_command() {
     let mut scratch = ScratchArena::new();
     let mut recorder = FrameRecorder::new();

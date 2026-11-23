@@ -89,11 +89,12 @@ const fn region(value: &crate::stretch_rect::StretchRegion) -> [u32; 4] {
     [value.x, value.y, value.w, value.h]
 }
 
-fn depth(value: &DepthTransfer) -> DepthTransferRecord {
+fn depth(value: &DepthTransfer<StretchKind>) -> DepthTransferRecord {
     DepthTransferRecord {
-        source: value.source.raw(),
-        destination: value.destination.raw(),
+        source: identity(&value.source),
+        destination: identity(&value.destination),
         source_level: value.source_level,
+        destination_level: value.destination_level,
         source_width: value.source_size.0,
         source_height: value.source_size.1,
         source_format: value.source_format as u32,
@@ -101,6 +102,7 @@ fn depth(value: &DepthTransfer) -> DepthTransferRecord {
         destination_width: value.destination_size.0,
         destination_height: value.destination_size.1,
         destination_format: value.destination_format as u32,
+        reserved: 0,
     }
 }
 

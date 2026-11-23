@@ -181,6 +181,7 @@ impl FrameEncoder {
             source_format,
             source_samples,
             destination,
+            destination_level,
             destination_size: (width, height),
             destination_format,
         } = transfer;
@@ -203,6 +204,7 @@ impl FrameEncoder {
             height,
         );
         command.mip_level = source_level;
+        command.dst_mip_level = destination_level;
         let same_extent = source_size == (width, height);
         // A same-shaped single-sample pair is a plain texture copy; anything
         // else goes through the transfer, which resamples only when it must.
@@ -275,6 +277,7 @@ impl FrameEncoder {
             source_format,
             source_samples: self.pass_state.current_depth_sample_count(),
             destination,
+            destination_level: 0,
             destination_size: (info.width(), info.height()),
             destination_format: info.pixel_format(),
         });

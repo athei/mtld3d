@@ -180,9 +180,12 @@ unless its entry says otherwise.
   the surface, carried in and back by a nearest-texel transfer, so its depth
   lands on the pixels D3D9 reports, a 1x1 render target 0 left unwritten and
   a depth or stencil `Clear` by rect or viewport past the colour target
-  included. Two such depth surfaces keep the scaled grid, each warned once:
-  a multisampled one, which the transfer cannot write, and a level of a depth
-  texture. A scaled colour target over a depth surface at another scale
+  included. A level of a sampleable depth texture (INTZ, DF16, DF24) takes
+  the same copy, and a draw that samples that texture while the copy stands
+  in for it reads the copy's depth. Two such depth surfaces keep the scaled
+  grid, each warned once: a multisampled one, which the transfer cannot
+  write, and a face of a cube depth texture, since the transfer addresses
+  one 2D slice. A scaled colour target over a depth surface at another scale
   (unscaled, or scaled for another back-buffer size, which `render.panelFit`
   can leave behind a resize) writes and tests that surface on the colour
   target's grid, and

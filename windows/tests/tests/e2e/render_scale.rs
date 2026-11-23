@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, Surface, Texture,
-    TexturedVertex, assert_pixel_eq, spawn_scoped,
+    TexturedVertex, assert_pixel_approx, assert_pixel_eq, spawn_scoped,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
@@ -45,6 +45,7 @@ use mtld3d_types::{
 use super::{
     device::{await_logged_lines, logged_lines, run_in_private_log_child, running_as},
     render_target::{draw_fill, read_back, sample_mip_level_4},
+    samplers::PS_SAMPLE_TEXTURE,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -2390,6 +2391,132 @@ fn a_resz_resolve_after_a_small_target_copies_the_depth_it_drew() {
     assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
     probe_quad_over_the_back_buffer(&h, &back_buffer);
     assert_small_extent_holds_the_near_depth(&h);
+}
+
+/// An INTZ texture at the back buffer's size, which scales with the back buffer.
+fn back_buffer_sized_intz(h: &Harness) -> Texture<'_> {
+    h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    )
+}
+
+#[test]
+fn a_small_target_over_a_back_buffer_sized_depth_texture_keeps_its_depth_writes_inside_its_extent()
+{
+    // As over the implicit depth surface: a 400x300 target rasterizes
+    // unscaled over a level of an INTZ texture that scales with the back
+    // buffer, and the depth the draw writes stays inside x < 400 and y < 300.
+    let h = depth_harness_at_three_quarters();
+    let back_buffer = h.render_target(0);
+    let intz = back_buffer_sized_intz(&h);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    depth_draw_setup(&h, D3DCMP_LESSEQUAL, true);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    let lower = D3DVIEWPORT9 {
+        x: 0,
+        y: 60,
+        width: 640,
+        height: 420,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&lower), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.5, RED)),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &back_buffer), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(1.0, GREEN)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(200, 90),
+        BLACK,
+        "inside the small target the drawn depth rejects the quad",
+    );
+    for (x, y) in [(440, 90), (520, 90), (520, 150)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("({x}, {y}) is past the small target and keeps the cleared depth"),
+        );
+    }
+}
+
+#[test]
+fn a_draw_through_a_small_target_samples_the_depth_its_pass_wrote_into_a_depth_texture() {
+    // An INTZ texture at the back buffer's size is the depth surface of a
+    // pass through an unscaled 400x300 target and is bound at stage 0 before
+    // the pass draws. A draw writes depth 0.25 over the target, then a draw
+    // without a depth test samples the INTZ across the target: D3D9 hands it
+    // the depth the pass wrote, 0.25 inside reported x < 400 and y < 300 and
+    // the cleared 1.0 past it. The quad maps the whole texture onto the
+    // target, so target pixel (x, y) reads texture pixel (1.6 x, 1.6 y).
+    let h = depth_harness_at_three_quarters();
+    let intz = back_buffer_sized_intz(&h);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(h.set_texture(0, &intz), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_NONE),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    // The diffuse stage reads no texture, so this draw samples nothing.
+    depth_draw_setup(&h, D3DCMP_ALWAYS, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &FULLSCREEN_TEXTURED_QUAD),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(100, 100),
+        0x4040_4040,
+        1,
+        "texture pixel (160, 160) holds the depth the pass wrote",
+    );
+    for (x, y) in [(300, 100), (100, 250)] {
+        assert_pixel_approx(
+            h.read_pixel(x, y),
+            WHITE,
+            1,
+            &format!("target pixel ({x}, {y}) reads past the pass's extent, the cleared depth"),
+        );
+    }
 }
 
 #[test]

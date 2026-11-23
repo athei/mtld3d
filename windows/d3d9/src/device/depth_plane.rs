@@ -24,7 +24,7 @@
 //! scale, format and sample count are fixed while it is bound.
 
 use mtld3d_core::{
-    depth_plane::{DepthSurface, Pairing, PassTargets, pairing},
+    depth_plane::{DepthSurface, DepthTexture, Pairing, PassTargets, pairing},
     depth_stencil_state::draw_reads_or_writes,
     format::{is_null_render_target, map_d3d_depth_format},
     render_scale::RenderScale,
@@ -160,14 +160,10 @@ impl DeviceInner {
         }
         self.push_control(ResolveDepthSurfaceOp { transfer });
         let has_stencil = surface.has_stencil();
-        // A span only opens over a surface no sampler can reach, which is
-        // what the binding `SetDepthStencilSurface` made for it says too.
-        self.push_depth_binding_op(
-            DepthBinding::Eager(surface.handle, surface.texture_size, surface.scale),
-            false,
-            has_stencil,
-            1,
-        );
+        let sampleable = surface.is_sampleable();
+        // The binding `SetDepthStencilSurface` made for the surface, sampleable
+        // flag included.
+        self.push_depth_binding_op(surface.binding(), sampleable, has_stencil, 1);
         self.mark_snapshot_dirty(SnapshotDirty::RT_DS);
     }
 
@@ -186,12 +182,13 @@ impl DeviceInner {
 
     /// The depth surface a pass would pair with an unscaled render target 0 on another grid.
     ///
-    /// `None` for every pairing on one grid. A texture-backed depth surface
-    /// has no Metal handle on this side, the transfer cannot write a
-    /// multisampled one, and a scaled render target 0 over a depth surface at
-    /// another scale (unscaled, or scaled for another back-buffer size) has no
-    /// plane at all, so each keeps the pass on one grid, warned once. Only a
-    /// device with `DeviceFlags::SCALED_SURFACES` set reaches this.
+    /// `None` for every pairing on one grid. The transfer addresses one 2D
+    /// slice and cannot write a multisampled surface, so a face of a cube
+    /// depth texture and a multisampled surface keep the pass on one grid, as
+    /// does a scaled render target 0 over a depth surface at another scale
+    /// (unscaled, or scaled for another back-buffer size), which has no plane
+    /// at all; each is warned once. Only a device with
+    /// `DeviceFlags::SCALED_SURFACES` set reaches this.
     fn mixed_depth_surface(&self) -> Option<DepthSurface> {
         let rt0 = self.bound_rt.render_target(0);
         let (rt0_scale, rt0_is_null, rt0_samples) = if rt0.is_null() {
@@ -206,7 +203,7 @@ impl DeviceInner {
             )
         };
         let depth = self.bound_rt.depth_stencil();
-        let (surface, sampleable, depth_samples) = if depth.is_null() {
+        let (surface, cube_face, depth_samples) = if depth.is_null() {
             if self.flags.contains(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND)
                 || self.depth_stencil_handle.is_null()
             {
@@ -216,7 +213,7 @@ impl DeviceInner {
             let scale = self.render_scale;
             (
                 DepthSurface {
-                    handle: self.depth_stencil_handle,
+                    texture: DepthTexture::Surface(self.depth_stencil_handle),
                     texture_size: scale.size(logical_size),
                     logical_size,
                     format: map_d3d_depth_format(self.depth_stencil_format)?,
@@ -229,15 +226,30 @@ impl DeviceInner {
             // SAFETY: a bound depth surface is kept live by its binding.
             let depth = unsafe { &*depth };
             let (logical_size, scale) = depth.reported_extent();
+            // A level of a depth texture is named by the texture's info, and
+            // its Metal extent is the Metal level's, as its binding takes it.
+            let (texture, texture_size) = depth.depth_texture_info().map_or_else(
+                || {
+                    (
+                        DepthTexture::Surface(depth.metal_depth_handle()),
+                        scale.size(logical_size),
+                    )
+                },
+                |info| {
+                    let level = info.rasterized_level(depth.mip_level());
+                    let size = ((info.width >> level).max(1), (info.height >> level).max(1));
+                    (DepthTexture::Level(info, depth.mip_level()), size)
+                },
+            );
             (
                 DepthSurface {
-                    handle: depth.metal_depth_handle(),
-                    texture_size: scale.size(logical_size),
+                    texture,
+                    texture_size,
                     logical_size,
                     format: map_d3d_depth_format(depth.depth_attachment_format())?,
                     scale,
                 },
-                depth.depth_is_sampleable(),
+                depth.cube_face().is_some(),
                 depth.multi_sample().sample_count,
             )
         };
@@ -250,15 +262,19 @@ impl DeviceInner {
         };
         match pairing(&targets) {
             Pairing::Shared => None,
-            Pairing::Mixed if sampleable => {
+            Pairing::Mixed if cube_face => {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
-                    "a pass through an unscaled render target over a scaled depth texture draws \
-                     into the texture's scaled grid: its depth lands off the reported pixels"
+                    "a pass through an unscaled render target over a face of a scaled cube depth \
+                     texture draws into the texture's scaled grid: its depth lands off the \
+                     reported pixels"
                 );
                 None
             }
-            Pairing::Mixed => (!surface.handle.is_null()).then_some(surface),
+            Pairing::Mixed => match surface.texture {
+                DepthTexture::Surface(handle) if handle.is_null() => None,
+                DepthTexture::Surface(_) | DepthTexture::Level(..) => Some(surface),
+            },
             Pairing::MixedMultisampled => {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,

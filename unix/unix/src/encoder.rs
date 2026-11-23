@@ -398,6 +398,22 @@ struct DepthSnapshot {
     epoch: u64,
 }
 
+/// A depth plane bound in place of a level of a sampleable depth texture.
+///
+/// Noted when a depth transfer carries a texture level into a depth surface
+/// handle, which only the transfer that opens a span does, and dropped by the
+/// next depth transfer, the one that closes the span. A draw that samples the
+/// texture while the plane is the depth attachment has to read the plane's
+/// depth, so the plane is carried back into the level ahead of such a draw.
+struct DepthStandIn {
+    /// The span's carry back into the level, with the plane as its source.
+    write_back: DepthTransfer,
+    /// The texture the level belongs to, as draws bind it.
+    texture: TextureId,
+    /// `depth_write_epoch` the level matches the plane at.
+    epoch: u64,
+}
+
 /// Take the scratch copies cached for `source`, whose texture is being destroyed.
 ///
 /// `depth_snapshots` and `stretch_scratch` are keyed by the source's handle,
@@ -982,6 +998,8 @@ pub struct FrameEncoder {
     depth_write_epoch: u64,
     /// Scratch copies of depth attachments that draws sampled while bound, by source handle.
     depth_snapshots: FxHashMap<u64, DepthSnapshot>,
+    /// The depth plane of an open span over a level of a sampleable depth texture.
+    depth_stand_in: Option<DepthStandIn>,
     /// Scratch textures staging same-texture `StretchRect` copies, by source handle.
     stretch_scratch: FxHashMap<u64, StretchScratch>,
 
@@ -1723,6 +1741,7 @@ impl FrameEncoder {
             depth_attachment_desc: (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
             depth_write_epoch: 0,
             depth_snapshots: FxHashMap::default(),
+            depth_stand_in: None,
             stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
             hud_stats: HudFrameStats::default(),
@@ -3160,6 +3179,7 @@ impl FrameEncoder {
                 // SAFETY: `dst` is a Metal texture handle the encoder's typed
                 // cache produced through `.raw()` and checked non-zero above.
                 destination: unsafe { MetalHandle::<MTLTextureKind>::new(dst) },
+                destination_level: 0,
                 destination_size: (dst_w, dst_h),
                 destination_format: dst_format,
             });
@@ -3210,10 +3230,37 @@ impl FrameEncoder {
     /// depth surface are rasterized on different grids, single-sampled at
     /// both ends, into the plane before the pass and back after it. Both
     /// handles address the whole surface, which the caller has established.
-    pub fn resolve_depth_surface(&mut self, transfer: &DepthTransfer) {
+    ///
+    /// `source_texture` names the texture whose level the source is, when it
+    /// is one. Only a span over a level of a sampleable depth texture carries
+    /// one into a depth surface handle, the plane, so that transfer notes the
+    /// plane as standing in for the level, and every other transfer ends the
+    /// stand-in (see [`Self::write_back_depth_stand_in`]).
+    pub fn resolve_depth_surface(
+        &mut self,
+        transfer: &DepthTransfer,
+        source_texture: Option<TextureId>,
+    ) {
         let (width, height) = transfer.source_size;
         let (to_width, to_height) = transfer.destination_size;
         let queued = self.queue_depth_transfer(transfer);
+        self.depth_stand_in = source_texture
+            .filter(|_| queued)
+            .map(|texture| DepthStandIn {
+                write_back: DepthTransfer {
+                    source: transfer.destination,
+                    source_level: transfer.destination_level,
+                    source_size: transfer.destination_size,
+                    source_format: transfer.destination_format,
+                    source_samples: 1,
+                    destination: transfer.source,
+                    destination_level: transfer.source_level,
+                    destination_size: transfer.source_size,
+                    destination_format: transfer.source_format,
+                },
+                texture,
+                epoch: self.depth_write_epoch,
+            });
         if transfer.source_samples > 1 {
             if queued {
                 mtld3d_shared::log_once_info!(
@@ -3303,6 +3350,48 @@ impl FrameEncoder {
         // As for the RESZ copy: the destination's depth changed under any
         // snapshot taken of it.
         self.bump_depth_write_epoch();
+    }
+
+    /// The texture whose level the bound depth attachment stands in for, if it does.
+    ///
+    /// `None` unless a span over a level of a sampleable depth texture is
+    /// open and its plane is the depth attachment bound now.
+    #[inline]
+    pub fn depth_stand_in_texture(&self) -> Option<TextureId> {
+        let stand_in = self.depth_stand_in.as_ref()?;
+        (stand_in.write_back.source.raw() == self.pass_state.current_depth_texture().raw())
+            .then_some(stand_in.texture)
+    }
+
+    /// Carry the bound plane back into its texture level, ahead of a draw that samples the texture.
+    ///
+    /// D3D9 has the draw sample the depth written through the level, which
+    /// the plane holds while the span is open. The carry is the span's own
+    /// closing transfer, queued ahead of the next pass with the plane staying
+    /// bound, so it costs a pass break and one transfer. It runs only when
+    /// depth was written since the level last matched the plane, so a run of
+    /// draws that sample without writing pays it once.
+    pub fn write_back_depth_stand_in(&mut self) {
+        let Some(mut stand_in) = self.depth_stand_in.take() else {
+            return;
+        };
+        if stand_in.epoch != self.depth_write_epoch {
+            if self.queue_depth_transfer(&stand_in.write_back) {
+                mtld3d_shared::log_once_info!(
+                    target: LOG_TARGET,
+                    "depth plane: a draw samples the depth texture whose plane is bound; carrying \
+                     the plane back into the texture before such draws"
+                );
+            } else {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "depth plane: carrying the plane back into the depth texture a draw samples \
+                     was not queued → the draw samples the depth from before the span"
+                );
+            }
+            stand_in.epoch = self.depth_write_epoch;
+        }
+        self.depth_stand_in = Some(stand_in);
     }
 
     /// A readable copy of the bound depth attachment, for a draw that samples it.

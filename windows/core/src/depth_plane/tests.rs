@@ -1,4 +1,7 @@
+use mtld3d_shared::mtl::{Swizzle, TextureCreateFlags, TextureUsage};
+
 use super::*;
+use crate::ids::TextureId;
 
 fn handle(raw: u64) -> MetalHandle<MTLTextureKind> {
     // SAFETY: an opaque test value nothing dereferences.
@@ -13,11 +16,59 @@ fn surface(format: PixelFormat) -> DepthSurface {
 
 fn sized_surface(logical_size: (u32, u32), format: PixelFormat) -> DepthSurface {
     DepthSurface {
-        handle: handle(0x10),
+        texture: DepthTexture::Surface(handle(0x10)),
         texture_size: THREE_QUARTERS.size(logical_size),
         logical_size,
         format,
         scale: THREE_QUARTERS,
+    }
+}
+
+/// An INTZ texture at 640x480 under three quarters, three levels, as `texture_info` builds it.
+fn intz(id: TextureId) -> TextureInfo {
+    let (width, height) = THREE_QUARTERS.size((640, 480));
+    TextureInfo {
+        texture_id: id,
+        d3d_format: mtld3d_types::D3DFMT_INTZ,
+        width,
+        height,
+        depth: 1,
+        levels: 3,
+        pixel_format: PixelFormat::Depth32FloatStencil8,
+        create_flags: TextureCreateFlags::empty(),
+        swizzle: [Swizzle::Zero; 4],
+        usage_flags: TextureUsage::DEPTH_STENCIL,
+    }
+}
+
+/// Level `level` of [`intz`], as the device reads it for a span.
+fn intz_level(id: TextureId, level: u32) -> DepthSurface {
+    let info = intz(id);
+    let texture_size = ((info.width >> level).max(1), (info.height >> level).max(1));
+    DepthSurface {
+        texture: DepthTexture::Level(info, level),
+        texture_size,
+        logical_size: (640 >> level, 480 >> level),
+        format: PixelFormat::Depth32FloatStencil8,
+        scale: THREE_QUARTERS,
+    }
+}
+
+/// The handle a transfer end names; panics on a texture end.
+fn end_handle(end: &StretchKind) -> u64 {
+    match end {
+        StretchKind::DepthStencil(handle) | StretchKind::Backbuffer(handle) => handle.raw(),
+        StretchKind::Texture(_) => panic!("a texture end where a handle was expected"),
+    }
+}
+
+/// The texture a transfer end names; panics on a handle end.
+fn end_texture(end: &StretchKind) -> TextureId {
+    match end {
+        StretchKind::Texture(info) => info.texture_id,
+        StretchKind::DepthStencil(_) | StretchKind::Backbuffer(_) => {
+            panic!("a handle end where a texture was expected")
+        }
     }
 }
 
@@ -140,23 +191,88 @@ fn a_span_carries_the_surface_into_the_plane_and_back() {
         .open(surface(format))
         .expect("a plane of the surface's size and format");
     assert!(planes.span_open());
-    assert_eq!(into.source.raw(), 0x10);
+    assert_eq!(end_handle(&into.source), 0x10);
+    assert_eq!((into.source_level, into.destination_level), (0, 0));
     assert_eq!(into.source_size, (480, 360));
-    assert_eq!(into.destination.raw(), 0x20);
+    assert_eq!(end_handle(&into.destination), 0x20);
     assert_eq!(into.destination_size, (640, 480));
     assert_eq!(into.source_samples, 1);
     assert!(planes.open(surface(format)).is_none(), "one span at a time");
 
     let (back, rebind) = planes.close().expect("the open span");
     assert!(!planes.span_open());
-    assert_eq!(back.source.raw(), 0x20);
+    assert_eq!(end_handle(&back.source), 0x20);
     assert_eq!(back.source_size, (640, 480));
-    assert_eq!(back.destination.raw(), 0x10);
+    assert_eq!(end_handle(&back.destination), 0x10);
+    assert_eq!((back.source_level, back.destination_level), (0, 0));
     assert_eq!(back.destination_size, (480, 360));
     assert_eq!(back.destination_format, format);
-    assert_eq!(rebind.handle.raw(), 0x10);
-    assert_eq!(rebind.scale, THREE_QUARTERS);
+    assert!(!rebind.is_sampleable());
+    let DepthBinding::Eager(rebound, extent, scale) = rebind.binding() else {
+        panic!("a depth surface binds again by its handle");
+    };
+    assert_eq!(
+        (rebound.raw(), extent, scale),
+        (0x10, (480, 360), THREE_QUARTERS)
+    );
     assert!(planes.close().is_none(), "closed once");
+}
+
+#[test]
+fn a_span_over_a_depth_texture_level_names_the_texture_and_its_level() {
+    let id = TextureId::new_unique();
+    let mut planes = DepthPlane::new();
+    assert!(
+        planes
+            .replace_plane(handle(0x20), &intz_level(id, 1))
+            .is_none()
+    );
+    assert!(
+        planes.plane_for(&intz_level(id, 0)).is_none(),
+        "a plane takes the level's reported size"
+    );
+    let into = planes
+        .open(intz_level(id, 1))
+        .expect("a plane of the level's size and format");
+    assert_eq!(end_texture(&into.source), id);
+    assert_eq!(into.source_level, 1);
+    assert_eq!(into.source_size, (240, 180), "the Metal level's extent");
+    assert_eq!(end_handle(&into.destination), 0x20);
+    assert_eq!(into.destination_level, 0);
+    assert_eq!(into.destination_size, (320, 240));
+
+    let (back, rebind) = planes.close().expect("the open span");
+    assert_eq!(end_handle(&back.source), 0x20);
+    assert_eq!(back.source_level, 0);
+    assert_eq!(end_texture(&back.destination), id);
+    assert_eq!(back.destination_level, 1);
+    assert_eq!(back.destination_size, (240, 180));
+    assert!(rebind.is_sampleable());
+    let DepthBinding::Lazy(texture, level, scale) = rebind.binding() else {
+        panic!("a texture level binds again through its texture's info");
+    };
+    assert_eq!((texture.texture_id, level, scale), (id, 1, THREE_QUARTERS));
+}
+
+#[test]
+fn a_level_past_a_shortened_chain_transfers_the_last_metal_level() {
+    // The reported level the binding names is kept; the transfer addresses
+    // the Metal level it lands on, as every other texture-level record does.
+    let id = TextureId::new_unique();
+    let mut surface = intz_level(id, 2);
+    if let DepthTexture::Level(info, _) = &mut surface.texture {
+        info.levels = 2;
+    }
+    let mut planes = DepthPlane::new();
+    planes.replace_plane(handle(0x20), &surface);
+    let into = planes.open(surface).expect("a plane");
+    assert_eq!(into.source_level, 1);
+    let (back, rebind) = planes.close().expect("the open span");
+    assert_eq!(back.destination_level, 1);
+    let DepthBinding::Lazy(_, level, _) = rebind.binding() else {
+        panic!("a texture level");
+    };
+    assert_eq!(level, 2);
 }
 
 #[test]

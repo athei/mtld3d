@@ -707,7 +707,7 @@ fn srgbtexture_x8_twin_keeps_alpha_swizzle() {
 /// across bits `[30:28]` and `[12:11]`, `0xE4` the `.xyzw` swizzle and `0xF`
 /// the write mask. `texld` computes its own LOD, so the sampler bias applies.
 #[rustfmt::skip]
-const PS_SAMPLE_TEXTURE: [u32; 15] = [
+pub const PS_SAMPLE_TEXTURE: [u32; 15] = [
     0xFFFF_0300,                                        // ps_3_0
     0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
     0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
