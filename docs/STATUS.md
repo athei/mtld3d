@@ -402,6 +402,12 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and stays the adapter display mode, where a driver lists no mode above
   the panel. A fullscreen request for a size left out follows the window.
   The list describes the primary display only. No knob.
+- On a screen scaled down to its panel, a back buffer larger than the panel
+  on either axis (a maximized window, or fullscreen at the desktop size)
+  rasterizes at back buffer x panel / backing per axis, and so do the
+  render targets and depth surfaces the game creates at its size. D3D9
+  renders at the back-buffer size; what the game reads back is resampled
+  from the smaller image. `render.panelFit`, on by default.
 - With `display.maxResolutions` set, the adapter mode list and the main
   module's `EnumDisplaySettings` offer at most that many sizes, the largest
   ones and always the desktop's, where a driver lists every mode it has. The

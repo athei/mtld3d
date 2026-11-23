@@ -3053,7 +3053,7 @@ fn backbuffer_page_upload(inner: &mut SurfaceInner) {
         color_handle,
         format,
         logical: (width, height),
-        texture: (scale.dimension(width), scale.dimension(height)),
+        texture: scale.size((width, height)),
         bytes_per_row: src_stride,
         msaa: inner.live_msaa_handle(),
         msaa_srgb: inner.live_msaa_srgb_handle(),

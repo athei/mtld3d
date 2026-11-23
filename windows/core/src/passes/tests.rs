@@ -102,6 +102,58 @@ fn scaled_viewport_and_scissor_convert_on_the_backbuffer() {
     );
 }
 
+/// A back buffer scaled differently per axis converts each viewport edge by its own axis.
+#[test]
+fn a_non_uniform_scale_pins_each_viewport_axis() {
+    // The panel fit of a 2940x1912 back buffer on a 2560x1664 panel.
+    let logical = (2940, 1912);
+    let scale = crate::render_scale::panel_fit(true, logical, Some((2560, 1664)), Some(logical));
+    let mut s = PassState::new();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: logical,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth(),
+        depth_size: (2560, 1664),
+        depth_has_stencil: false,
+        render_scale: scale,
+        continues_frame: false,
+    });
+    assert_eq!(s.current_color_size, (2560, 1664));
+    s.set_viewport(0, 0, logical.0, logical.1, 0.0, 1.0);
+    assert_eq!(
+        s.effective_viewport(),
+        (0, 0, 2560, 1664),
+        "a full viewport"
+    );
+    assert!(s.viewport_covers_color_attachment());
+    // Two viewports split at any edge share it, in each axis. A viewport of
+    // no width or height is not a split, so the ends are left out.
+    for split in (1..1912).step_by(7) {
+        s.set_viewport(0, 0, split, split, 0.0, 1.0);
+        let (_, _, aw, ah) = s.effective_viewport();
+        s.set_viewport(split, split, logical.0 - split, logical.1 - split, 0.0, 1.0);
+        let (bx, by, bw, bh) = s.effective_viewport();
+        assert_eq!((aw, ah), (bx, by), "split at {split} seams");
+        assert_eq!((bx + bw, by + bh), (2560, 1664), "split at {split}");
+        // 2560/2940 and 1664/1912 round the same edge differently.
+        assert_eq!(
+            (bx, by),
+            scale.size((split, split)),
+            "split at {split} scales by each axis's ratio"
+        );
+    }
+    assert_eq!(
+        s.resolved_scissor_rect(true, [0, 0, logical.0, logical.1]),
+        (0, 0, 2560, 1664)
+    );
+}
+
 #[test]
 fn a_game_render_target_is_never_scaled() {
     // The game sized this texture itself, so its coordinates are already
@@ -9861,10 +9913,19 @@ fn rule_j_keeps_passes_apart_when_a_loaded_depth_plane_was_not_stored() {
 fn a_scaled_mip_level_binds_at_the_extent_metal_allocated() {
     let rt = tex(0x3000);
     let mut s = fresh();
-    for percent in [50, 67, 75, 99, 100] {
-        let scale = RenderScale::from_percent(percent);
+    // A percentage, and a panel fit that scales the two axes differently.
+    let scales = [50, 67, 75, 99, 100]
+        .map(RenderScale::from_percent)
+        .into_iter()
+        .chain([crate::render_scale::panel_fit(
+            true,
+            (2940, 1912),
+            Some((2560, 1664)),
+            Some((2940, 1912)),
+        )]);
+    for scale in scales {
         for base in 1..=2048u32 {
-            let base_texture = (scale.dimension(base), scale.dimension(base + 1));
+            let base_texture = scale.size((base, base + 1));
             for level in 0..=3u32 {
                 let logical = ((base >> level).max(1), ((base + 1) >> level).max(1));
                 let texture = (
@@ -9873,7 +9934,7 @@ fn a_scaled_mip_level_binds_at_the_extent_metal_allocated() {
                 );
                 let extent = TargetExtent::mip_level(scale, logical, base_texture, level);
                 s.set_color_render_target_subresource(rt, &extent, RT_FORMAT, (0, level));
-                let what = format!("{percent}% of {base} at level {level}");
+                let what = format!("{scale:?} of {base} at level {level}");
                 assert_eq!(s.current_color_size(), texture, "{what}: recorded extent");
                 s.set_viewport(0, 0, logical.0, logical.1, 0.0, 1.0);
                 assert_eq!(

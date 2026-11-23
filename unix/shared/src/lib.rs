@@ -23,6 +23,7 @@ mod params;
 pub mod perf;
 pub mod query_mailbox;
 pub mod record_handle;
+pub mod render_size;
 pub mod shader_create;
 pub mod texture_views;
 pub mod trig;

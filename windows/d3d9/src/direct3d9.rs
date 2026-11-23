@@ -1881,17 +1881,30 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         cfg.cursor_software,
     );
 
-    // `render.scale` splits the back buffer in two from here on: `pp` keeps
+    // The render scale splits the back buffer in two from here on: `pp` keeps
     // the logical size D3D9 reports, while the Metal texture is rasterized at
-    // `render_scale` of it and MetalFX resamples on present. Without MetalFX
-    // there is nothing that could resample, so the scale is forced to
-    // identity rather than silently presenting a mis-sized frame.
-    let render_scale = resolve_render_scale(
-        layer_params.metalfx_available != 0,
-        cfg.render_scale_percent,
+    // `render_scale` of it. `render.scale` needs MetalFX to resample on
+    // present; without it the user's factor is forced to identity rather
+    // than silently presenting a mis-sized frame. `render.panelFit` needs
+    // none: at the panel's pixels present is a 1:1 copy into the capped
+    // drawable. The attach above reported the window's own screen, so the
+    // first back buffer is sized against it.
+    let mut back_buffer_scale = mtld3d_core::render_scale::BackBufferScale::new(
+        resolve_render_scale(
+            layer_params.metalfx_available != 0,
+            cfg.render_scale_percent,
+        ),
+        cfg.render_panel_fit,
     );
-    let render_width = render_scale.dimension(pp.back_buffer_width);
-    let render_height = render_scale.dimension(pp.back_buffer_height);
+    adopt_attached_screen(&mut back_buffer_scale, &layer_params);
+    let back_buffer = (pp.back_buffer_width, pp.back_buffer_height);
+    let render_scale = back_buffer_scale.for_back_buffer(back_buffer);
+    let (render_width, render_height) = render_scale.size(back_buffer);
+    log_render_size(
+        &back_buffer_scale,
+        back_buffer,
+        (render_width, render_height),
+    );
 
     // The swap chain's multisample type applies to the back buffer and to the
     // auto depth-stencil surface alike; the two attachments have to agree for
@@ -2007,6 +2020,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         backbuffer_width: pp.back_buffer_width,
         backbuffer_height: pp.back_buffer_height,
         render_scale,
+        back_buffer_scale,
         encoder,
         current_frame: FrameData::new(&FrameInit {
             device_handle: cq_params.device_handle,
@@ -2131,11 +2145,43 @@ pub fn attach_metal_layer(
         software_cursor_active: 0,
         cursor_kick_ptr: sinks.cursor_kick_ptr(),
         client_surface_request_ptr: sinks.client_surface_request_ptr(),
+        panel_width: 0,
+        panel_height: 0,
+        backing_width: 0,
+        backing_height: 0,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);
     }
     layer_params
+}
+
+/// Size `scale` against the window's screen an attach reported; `true` when its sizes changed.
+///
+/// An attach that found the window's screen reports its backing, and its
+/// panel when the display names one. One that reported no screen (no window
+/// to attach to, or a failed attach) leaves the first reading: the primary
+/// display's panel and the adapter mode table's desktop entry, which is the
+/// primary screen's backing store in Wine's retina mode and its points
+/// otherwise.
+pub fn adopt_attached_screen(
+    scale: &mut mtld3d_core::render_scale::BackBufferScale,
+    layer_params: &AttachMetalLayerParams,
+) -> bool {
+    let known = |width: u32, height: u32| (width != 0 && height != 0).then_some((width, height));
+    let backing = known(layer_params.backing_width, layer_params.backing_height);
+    if backing.is_some() {
+        return scale.set_screen(
+            known(layer_params.panel_width, layer_params.panel_height),
+            backing,
+        );
+    }
+    let (panel_width, panel_height) = device_info().panel;
+    let desktop = ADAPTER_MODES.desktop;
+    scale.set_screen(
+        known(panel_width, panel_height),
+        known(desktop.width, desktop.height),
+    )
 }
 
 /// The pacing an attach was called with, read back off its parameters.
@@ -2265,17 +2311,37 @@ fn resolve_render_scale(
             target: LOG_TARGET,
             "render.scale = {} ignored — this GPU has no MetalFX spatial upscaler, so the \
              frame is rendered at full resolution",
-            f64::from(requested.percent()) / 100.0,
+            f64::from(render_scale_percent) / 100.0,
         );
         return RenderScale::IDENTITY;
     }
     info!(
         target: LOG_TARGET,
-        "render.scale = {} — rendering at {}% of the presented resolution",
-        f64::from(requested.percent()) / 100.0,
-        requested.percent(),
+        "render.scale = {} — rendering at {render_scale_percent}% of the presented resolution",
+        f64::from(render_scale_percent) / 100.0,
     );
     requested
+}
+
+/// Say once per device what the back buffer rasterizes at and the screen it was sized against.
+fn log_render_size(
+    scale: &mtld3d_core::render_scale::BackBufferScale,
+    back_buffer: (u32, u32),
+    render: (u32, u32),
+) {
+    let size = |size: Option<(u32, u32)>| {
+        size.map_or_else(|| "unknown".to_owned(), |(w, h)| format!("{w}x{h}"))
+    };
+    info!(
+        target: LOG_TARGET,
+        "render size: back buffer {}x{} rasterizes at {}x{} (panel {}, backing {})",
+        back_buffer.0,
+        back_buffer.1,
+        render.0,
+        render.1,
+        size(scale.panel()),
+        size(scale.backing()),
+    );
 }
 
 /// Give the window back when device creation fails mid-way.

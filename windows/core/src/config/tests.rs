@@ -433,6 +433,17 @@ fn render_lod_bias_defaults_on_and_parses_off() {
 }
 
 #[test]
+fn render_panel_fit_defaults_on_and_parses_off() {
+    assert!(parse(None, "", None).render_panel_fit, "on by default");
+    assert!(!parse(None, "render.panelFit = false\n", None).render_panel_fit);
+    assert!(parse(None, "render.panelFit = true\n", None).render_panel_fit);
+    assert!(
+        parse(None, "render.panelFit = maybe\n", None).render_panel_fit,
+        "an unparsable value keeps the default"
+    );
+}
+
+#[test]
 fn boolean_keys_round_trip_both_values() {
     let cfg = parse(
         None,

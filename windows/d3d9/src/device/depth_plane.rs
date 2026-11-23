@@ -210,10 +210,7 @@ impl DeviceInner {
             (
                 DepthSurface {
                     handle: self.depth_stencil_handle,
-                    texture_size: (
-                        scale.dimension(logical_size.0),
-                        scale.dimension(logical_size.1),
-                    ),
+                    texture_size: scale.size(logical_size),
                     logical_size,
                     format: map_d3d_depth_format(self.depth_stencil_format)?,
                     scale,
@@ -228,10 +225,7 @@ impl DeviceInner {
             (
                 DepthSurface {
                     handle: depth.metal_depth_handle(),
-                    texture_size: (
-                        scale.dimension(logical_size.0),
-                        scale.dimension(logical_size.1),
-                    ),
+                    texture_size: scale.size(logical_size),
                     logical_size,
                     format: map_d3d_depth_format(depth.depth_attachment_format())?,
                     scale,

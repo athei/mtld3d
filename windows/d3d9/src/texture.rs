@@ -1187,10 +1187,7 @@ impl TextureInner {
     /// that addresses the Metal texture directly (a full-surface blit, an
     /// attachment extent) has to be measured here instead.
     pub fn render_extent(&self) -> (u32, u32) {
-        (
-            self.render_scale.dimension(self.width),
-            self.render_scale.dimension(self.height),
-        )
+        self.render_scale.size((self.width, self.height))
     }
 
     /// Mip levels the backing Metal texture holds.
@@ -2468,12 +2465,9 @@ impl TextureInner {
         // and for every rect the game supplies. A planar YUV level is backed
         // by a texture of its whole allocation, chroma rows included, which no
         // scale applies to: it is never a render target.
-        let (width, height) = self.planar_storage_extent().unwrap_or_else(|| {
-            (
-                self.render_scale.dimension(self.width),
-                self.render_scale.dimension(self.height),
-            )
-        });
+        let (width, height) = self
+            .planar_storage_extent()
+            .unwrap_or_else(|| self.render_scale.size((self.width, self.height)));
         TextureInfo {
             texture_id: self.texture_id,
             d3d_format: self.d3d_format,

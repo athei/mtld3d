@@ -14,10 +14,7 @@ fn surface(format: PixelFormat) -> DepthSurface {
 fn sized_surface(logical_size: (u32, u32), format: PixelFormat) -> DepthSurface {
     DepthSurface {
         handle: handle(0x10),
-        texture_size: (
-            THREE_QUARTERS.dimension(logical_size.0),
-            THREE_QUARTERS.dimension(logical_size.1),
-        ),
+        texture_size: THREE_QUARTERS.size(logical_size),
         logical_size,
         format,
         scale: THREE_QUARTERS,

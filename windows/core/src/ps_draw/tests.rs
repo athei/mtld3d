@@ -40,6 +40,17 @@ fn a_reduced_scale_maps_one_render_pixel_to_its_inverse_in_logical_pixels() {
     );
 }
 
+/// A scale that differs between the axes maps each axis by its own ratio.
+#[test]
+fn a_non_uniform_scale_maps_each_axis_by_its_own_ratio() {
+    let scale =
+        crate::render_scale::panel_fit(true, (2940, 1912), Some((2560, 1664)), Some((2940, 1912)));
+    let [x, y, z, w] = lanes(&build_ps_draw_bytes(scale));
+    assert!((x - 2940.0 / 2560.0).abs() < 1e-6, "width lane {x}");
+    assert!((y - 1912.0 / 1664.0).abs() < 1e-6, "height lane {y}");
+    assert_eq!([z, w].map(f32::to_bits), [0.0f32, 0.0].map(f32::to_bits));
+}
+
 #[test]
 fn the_msl_view_names_the_one_row_the_bytes_carry() {
     assert!(PS_DRAW_MSL.contains("float4 vpos_scale;"));

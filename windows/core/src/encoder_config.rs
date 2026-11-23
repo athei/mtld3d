@@ -44,6 +44,7 @@ impl WireValue for Mtld3dConfig {
         self.present_max_frame_latency.write_wire(writer)?;
         self.render_scale_percent.write_wire(writer)?;
         self.render_lod_bias.write_wire(writer)?;
+        self.render_panel_fit.write_wire(writer)?;
         self.adapter_spoof.write_wire(writer)?;
         self.df_formats.write_wire(writer)?;
         self.max_resolutions.write_wire(writer)?;
@@ -78,6 +79,7 @@ impl WireValue for Mtld3dConfig {
             present_max_frame_latency: <u32>::read_wire(reader)?,
             render_scale_percent: <u32>::read_wire(reader)?,
             render_lod_bias: <bool>::read_wire(reader)?,
+            render_panel_fit: <bool>::read_wire(reader)?,
             adapter_spoof: <AdapterSpoof>::read_wire(reader)?,
             df_formats: <bool>::read_wire(reader)?,
             max_resolutions: <u32>::read_wire(reader)?,

@@ -2095,10 +2095,7 @@ impl PassState {
         self.current_color_sample_count = backbuffer_sample_count.max(1);
         self.current_depth_sample_count = backbuffer_sample_count.max(1);
         self.current_color_subresource = 0;
-        self.current_color_size = (
-            render_scale.dimension(backbuffer_size.0),
-            render_scale.dimension(backbuffer_size.1),
-        );
+        self.current_color_size = render_scale.size(backbuffer_size);
         self.current_color_format = backbuffer_format;
         // The device re-asserts any extra render targets it holds into the
         // fresh frame, exactly as it does render target 0.
@@ -5067,10 +5064,10 @@ impl PassState {
         if covers(width, bw) && covers(height, bh) {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
-                "render.scale = {}% saves less than it looks like here: the game renders into its \
-                 own {width}x{height} target, which is close to the {bw}x{bh} back buffer but not \
-                 equal to it, so it keeps its own size and rasterizes at full resolution",
-                self.render_scale.percent(),
+                "render scale {:.3}x saves less than it looks like here: the game renders into \
+                 its own {width}x{height} target, which is close to the {bw}x{bh} back buffer but \
+                 not equal to it, so it keeps its own size and rasterizes at full resolution",
+                self.render_scale.factor(),
             );
         }
     }

@@ -203,7 +203,7 @@ fn execute_control(
                 logical_size: (r.logical_width, r.logical_height),
                 texture_size: (r.texture_width, r.texture_height),
                 format: pixel_format(r.format)?,
-                scale: RenderScale::from_percent(r.scale),
+                scale: RenderScale::from_wire(&r.scale),
                 subresource: (r.slice, r.level),
                 rect: r.rect.into(),
                 rgba: r.rgba.into(),
@@ -346,7 +346,7 @@ fn execute_control(
                     extent: (r.width, r.height),
                     logical: (r.logical_width, r.logical_height),
                     texture: (r.texture_width, r.texture_height),
-                    scale: RenderScale::from_percent(r.scale),
+                    scale: RenderScale::from_wire(&r.scale),
                     bytes_per_row: r.stride,
                 },
                 retained_bytes(&r.bytes)?,
@@ -486,11 +486,11 @@ fn scale_stretch_region(
     info: &records::SurfaceRecord,
     region: mtld3d_core::stretch_rect::StretchRegion,
 ) -> mtld3d_core::stretch_rect::StretchRegion {
-    if RenderScale::from_percent(info.scale).is_identity() {
+    if RenderScale::from_wire(&info.scale).is_identity() {
         return region;
     }
     let extent = TargetExtent::new(
-        RenderScale::from_percent(info.scale),
+        RenderScale::from_wire(&info.scale),
         (info.width, info.height),
         (info.texture_width, info.texture_height),
     );
@@ -936,7 +936,7 @@ fn surface_slice(info: &records::SurfaceRecord) -> Option<u32> {
 }
 
 fn bind_depth(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<(), WireError> {
-    let (handle, level, width, height, format, scale, samples, flags) = match operand {
+    let (handle, level, width, height, format, unscaled, samples, flags) = match operand {
         0 => {
             let r = borrow::<records::BindDepthNoneRecord>(payload)?;
             (
@@ -945,7 +945,7 @@ fn bind_depth(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
                 0,
                 0,
                 PixelFormat::Depth32Float,
-                0,
+                false,
                 r.sample_count,
                 r.flags,
             )
@@ -965,7 +965,7 @@ fn bind_depth(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
                 r.width,
                 r.height,
                 format,
-                r.scale,
+                RenderScale::from_wire(&r.scale).is_identity(),
                 r.sample_count,
                 r.flags,
             )
@@ -978,7 +978,7 @@ fn bind_depth(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
                 (r.texture.width >> r.level).max(1),
                 (r.texture.height >> r.level).max(1),
                 r.texture.format()?,
-                r.scale,
+                RenderScale::from_wire(&r.scale).is_identity(),
                 r.sample_count,
                 r.flags,
             )
@@ -995,7 +995,7 @@ fn bind_depth(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
         flags.contains(BindDepthOpFlags::HAS_STENCIL),
     );
     enc.set_depth_sample_count(byte(samples)?);
-    enc.set_depth_unscaled(scale == 100);
+    enc.set_depth_unscaled(unscaled);
     Ok(())
 }
 
@@ -1015,7 +1015,7 @@ fn bind_color(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
     ) = match operand {
         0 => {
             let r = borrow::<records::BindColorBackbufferRecord>(payload)?;
-            let scale = RenderScale::from_percent(r.scale);
+            let scale = RenderScale::from_wire(&r.scale);
             (
                 r.handle,
                 r.msaa,
@@ -1033,7 +1033,7 @@ fn bind_color(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
         1 => {
             let r = borrow::<records::BindColorStandaloneRecord>(payload)?;
             enc.register_srgb_twin(texture_handle(r.srgb), texture_handle(r.handle));
-            let scale = RenderScale::from_percent(r.scale);
+            let scale = RenderScale::from_wire(&r.scale);
             (
                 r.handle,
                 r.msaa,
@@ -1050,7 +1050,7 @@ fn bind_color(enc: &mut FrameEncoder, operand: u16, payload: &[u8]) -> Result<()
         }
         2 => {
             let r = borrow::<records::BindColorTextureRecord>(payload)?;
-            let scale = RenderScale::from_percent(r.scale);
+            let scale = RenderScale::from_wire(&r.scale);
             (
                 enc.get_or_create_texture_record(&r.texture)?,
                 0,

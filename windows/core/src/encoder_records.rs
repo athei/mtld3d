@@ -3,7 +3,7 @@
 //! Fields have one representation on every supported target. Owners stay in the
 //! packet ledgers; these records contain only scalar values and retained spans.
 
-use mtld3d_shared::encoder_wire::WireError;
+use mtld3d_shared::{encoder_wire::WireError, render_size::RenderScaleWire};
 
 use crate::{
     guest_pages::{GuestOwnedPageDescriptor, GuestPageDescriptor},
@@ -57,8 +57,9 @@ macro_rules! record {
             $(assert!(core::mem::offset_of!($name, $field) == offset); offset += size_of::<$ty>();)+
             assert!(size_of::<$name>() == offset);
         };
-        // SAFETY: every field is an integer, float, or canonical record. The assertions
-        // check every field offset and the total size, excluding implicit padding.
+        // SAFETY: every field is an integer, float, canonical record, or `RenderScaleWire`,
+        // four `u32`s. The assertions check every field offset and the total size,
+        // excluding implicit padding.
         unsafe impl CommandRecord for $name {}
     };
 }
@@ -123,17 +124,17 @@ record!(BindDepthEagerRecord {
     handle: u64,
     width: u32,
     height: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     sample_count: u32,
-    flags: u32,
-    reserved: u32
+    flags: u32
 });
 record!(BindDepthLazyRecord {
     texture: TextureRecord,
     level: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     sample_count: u32,
-    flags: u32
+    flags: u32,
+    reserved: u32
 });
 record!(BindColorBackbufferRecord {
     handle: u64,
@@ -142,9 +143,8 @@ record!(BindColorBackbufferRecord {
     width: u32,
     height: u32,
     slot: u32,
-    scale: u32,
-    sample_count: u32,
-    reserved: u32
+    scale: RenderScaleWire,
+    sample_count: u32
 });
 record!(BindColorStandaloneRecord {
     handle: u64,
@@ -154,22 +154,20 @@ record!(BindColorStandaloneRecord {
     width: u32,
     height: u32,
     slot: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     sample_count: u32,
     format: u32,
-    has_alpha: u32,
-    reserved: u32
+    has_alpha: u32
 });
 record!(BindColorTextureRecord {
     texture: TextureRecord,
     width: u32,
     height: u32,
     slot: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     slice: u32,
     level: u32,
-    has_alpha: u32,
-    reserved: u32
+    has_alpha: u32
 });
 record!(IdRecord { id: u64 });
 record!(SlotRecord {
@@ -244,9 +242,10 @@ record!(UpdateColorRegionRecord {
     logical_height: u32,
     texture_width: u32,
     texture_height: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     stride: u32,
-    level: u32
+    level: u32,
+    reserved: u32
 });
 record!(ResampledTargetRecord {
     handle: u64,
@@ -281,14 +280,13 @@ record!(SurfaceRecord {
     height: u32,
     texture_width: u32,
     texture_height: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     format: u32,
     mip_level: u32,
     slice: u32,
     flags: u32,
     sample_count: u32,
-    present: u32,
-    reserved: u32
+    present: u32
 });
 record!(StretchBlitRecord {
     source: SurfaceRecord,
@@ -309,13 +307,14 @@ record!(ColorFillRecord {
     texture_width: u32,
     texture_height: u32,
     format: u32,
-    scale: u32,
+    scale: RenderScaleWire,
     slice: u32,
     level: u32,
     rect: [u32; 4],
     rgba: [u32; 4],
     sample_count: u32,
-    regenerate_mipmaps: u32
+    regenerate_mipmaps: u32,
+    reserved: u32
 });
 record!(StageUploadRecord {
     id: u64,

@@ -1,10 +1,16 @@
 //! Conversion between the resolution D3D9 reports and the one we rasterize on.
 //!
-//! `render.scale` splits the back buffer in two. **Logical** is what D3D9
+//! A render scale splits the back buffer in two. **Logical** is what D3D9
 //! reports and the space every game-supplied coordinate lives in: viewports,
 //! scissor rects, `Clear` rects, `StretchRect` regions, surface descriptors.
-//! **Render** is the Metal texture we actually draw into, `logical × scale`.
-//! Present bridges the two.
+//! **Render** is the Metal texture we actually draw into, `logical × scale`
+//! per axis. Present bridges the two.
+//!
+//! Two settings make the scale. `render.scale` is one fraction for both
+//! axes. `render.panelFit` rasterizes a back buffer larger than the panel of
+//! a screen scaled down to it at the panel's share, panel over backing per
+//! axis ([`panel_fit`]). The two compose into one exact ratio per axis
+//! ([`RenderScale::compose`]), and every size and edge rounds once from it.
 //!
 //! The rule is that a value only converts where it becomes a Metal command,
 //! and only when the bound render target is the back buffer. Anything the game
@@ -21,36 +27,82 @@
 //! texture itself, an attachment extent or a full-surface blit, measures it in
 //! render space.
 //!
-//! A scale of 100% is an exact identity on every conversion here, so the
-//! default configuration cannot perturb a single pixel.
+//! The identity is an exact identity on every conversion here, so the
+//! default configuration on an unscaled screen cannot perturb a single pixel.
 
-/// Fraction of the logical resolution that gets rasterized, as a percentage.
+use mtld3d_shared::render_size::{RenderScaleWire, scale_rounded, scaled_down_to_panel};
+
+/// The largest screen dimension [`panel_fit`] takes a ratio from.
 ///
-/// Constructed from `Mtld3dConfig::render_scale_percent`, which the parser has
-/// already bounded, and clamped again here so a caller cannot smuggle a zero
-/// in and collapse a texture dimension.
+/// Screens are far below it. The bound keeps a composed denominator, a
+/// `render.scale` denominator of at most 100 times a backing dimension,
+/// inside a `u32`.
+const MAX_SCREEN_DIMENSION: u32 = 1 << 16;
+
+/// Render pixels per logical pixel, an exact ratio per axis.
+///
+/// Each axis holds a reduced fraction in `(0, 1]`: rendering above the
+/// presented size would need a downscale on present, and `MTLFXSpatialScaler`
+/// only enlarges. A percentage builds the same ratio in both axes; the panel
+/// fit builds panel over backing per axis. Every constructor keeps the
+/// fraction reduced, so two scales that convert alike compare equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RenderScale(u32);
+pub struct RenderScale(RenderScaleWire);
 
 impl RenderScale {
     /// The identity scale: render and logical resolutions are the same.
-    pub const IDENTITY: Self = Self(100);
+    pub const IDENTITY: Self = Self(RenderScaleWire::IDENTITY);
 
-    /// Build from a percentage, clamping to a range that cannot degenerate.
+    /// Build from a percentage for both axes, clamping to a range that cannot degenerate.
+    ///
+    /// Constructed from `Mtld3dConfig::render_scale_percent`, which the parser
+    /// has already bounded, and clamped again here so a caller cannot smuggle
+    /// a zero in. The floor only keeps the percentage itself non-zero;
+    /// [`Self::size`] separately guarantees a non-zero result.
     #[must_use]
     pub const fn from_percent(percent: u32) -> Self {
-        // Clamped to `[1, 100]` to match the parser. The ceiling is real:
-        // rendering above the presented size would need a downscale on
-        // present and `MTLFXSpatialScaler` only enlarges. The floor only
-        // keeps the percentage itself non-zero; `dimension` separately
-        // guarantees a non-zero result.
-        Self(if percent == 0 {
+        let percent = if percent == 0 {
             1
         } else if percent > 100 {
             100
         } else {
             percent
+        };
+        let (num, den) = reduce(percent, 100);
+        Self(RenderScaleWire {
+            width_num: num,
+            width_den: den,
+            height_num: num,
+            height_den: den,
         })
+    }
+
+    /// Read a scale back from the wire.
+    ///
+    /// An axis outside `(0, 1]`, which [`Self::is_valid_wire`] rejects, reads
+    /// as the identity, so a dimension never collapses or grows.
+    #[must_use]
+    pub const fn from_wire(wire: &RenderScaleWire) -> Self {
+        let (width_num, width_den) = checked_axis(wire.width_num, wire.width_den);
+        let (height_num, height_den) = checked_axis(wire.height_num, wire.height_den);
+        Self(RenderScaleWire {
+            width_num,
+            width_den,
+            height_num,
+            height_den,
+        })
+    }
+
+    /// Whether every axis of `wire` is a ratio in `(0, 1]`.
+    #[must_use]
+    pub const fn is_valid_wire(wire: &RenderScaleWire) -> bool {
+        valid_axis(wire.width_num, wire.width_den) && valid_axis(wire.height_num, wire.height_den)
+    }
+
+    /// The scale as it crosses the boundary.
+    #[must_use]
+    pub const fn to_wire(self) -> RenderScaleWire {
+        self.0
     }
 
     /// `true` when no conversion changes anything.
@@ -59,29 +111,73 @@ impl RenderScale {
     /// configuration runs the same code path it did before the knob existed.
     #[must_use]
     pub const fn is_identity(self) -> bool {
-        self.0 == 100
+        self.0.width_num == self.0.width_den && self.0.height_num == self.0.height_den
     }
 
-    /// The scale as a percentage, for logging.
+    /// `self` applied after `other`: the product of the two ratios per axis.
+    ///
+    /// The product is exact, so a size scaled by the composition rounds once
+    /// rather than once per factor. A product whose reduced denominator would
+    /// not fit a `u32`, which no percentage and [`panel_fit`] pair reaches,
+    /// is halved until it does.
     #[must_use]
-    pub const fn percent(self) -> u32 {
-        self.0
+    pub fn compose(self, other: Self) -> Self {
+        let (width_num, width_den) = compose_axis(
+            (self.0.width_num, self.0.width_den),
+            (other.0.width_num, other.0.width_den),
+        );
+        let (height_num, height_den) = compose_axis(
+            (self.0.height_num, self.0.height_den),
+            (other.0.height_num, other.0.height_den),
+        );
+        Self(RenderScaleWire {
+            width_num,
+            width_den,
+            height_num,
+            height_den,
+        })
     }
 
     /// Render pixels per logical pixel, for the shader-side length conversions.
     ///
-    /// The rect conversions above move coordinates; a length that D3D9 states
-    /// in logical pixels and Metal consumes in render pixels (the point size)
-    /// needs the ratio itself. Exactly `1.0` at the identity, so multiplying
-    /// by it is a no-op on the default path.
+    /// The rect conversions move coordinates; a length that D3D9 states in
+    /// logical pixels and Metal consumes in render pixels (the point size)
+    /// needs the ratio itself. A scale that differs between the axes gives the
+    /// geometric mean of the two, which a panel fit keeps within a fraction of
+    /// a percent of either. Exactly `1.0` at the identity, so multiplying by
+    /// it is a no-op on the default path, and exactly the percentage's
+    /// quotient for a percentage.
     #[must_use]
     pub fn factor(self) -> f32 {
         if self.is_identity() {
             return 1.0;
         }
-        // The percentage is bounded to `[1, 100]`, so both operands are
-        // exactly representable and the quotient carries no surprise.
-        f32::from(u8::try_from(self.0).unwrap_or(100)) / 100.0
+        let (width, height) = self.axis_factors();
+        if self.0.width_num == self.0.height_num && self.0.width_den == self.0.height_den {
+            return width;
+        }
+        (width * height).sqrt()
+    }
+
+    /// Render pixels per logical pixel along each axis, for a position the shader converts.
+    ///
+    /// `vPos` maps a rasterized position back to the reported one, which needs
+    /// each axis's own ratio rather than [`Self::factor`]'s mean. Each is
+    /// exactly `1.0` at the identity and exactly the percentage's quotient for
+    /// a percentage.
+    #[must_use]
+    pub fn axis_factors(self) -> (f32, f32) {
+        let ratio = |num: u32, den: u32| {
+            if num == den {
+                1.0
+            } else {
+                u32_to_f32(num) / u32_to_f32(den)
+            }
+        };
+        (
+            ratio(self.0.width_num, self.0.width_den),
+            ratio(self.0.height_num, self.0.height_den),
+        )
     }
 
     /// The mip LOD bias that keeps texture detail at the logical resolution.
@@ -99,13 +195,14 @@ impl RenderScale {
         self.factor().log2()
     }
 
-    /// Convert one logical dimension, or one rect edge, to render resolution.
+    /// Convert a logical `(width, height)` size, or a point's two edges, to render resolution.
     ///
-    /// Rounds to nearest. This is the one rule every conversion here goes
-    /// through: a texture is created at `dimension` of its logical extent and
-    /// [`Self::rect`] scales each rect edge with it, so a rect that ends at the
-    /// logical extent ends exactly at the texture's, and a shared edge maps to
-    /// one value from both rects that meet on it.
+    /// Rounds each axis to nearest by its own ratio, halves up. This is the
+    /// one rule every conversion here goes through: a texture is created at
+    /// `size` of its logical extent and [`Self::rect`] scales each rect edge
+    /// with it, so a rect that ends at the logical extent ends exactly at the
+    /// texture's, and a shared edge maps to one value from both rects that
+    /// meet on it. A percentage gives `(logical × percent + 50) / 100`.
     ///
     /// Never returns zero for a non-zero input: a back buffer dimension of `0`
     /// is rejected long before this, but a small render target scaled down
@@ -113,15 +210,8 @@ impl RenderScale {
     /// floor the mapping is still non-decreasing, so a converted rect never
     /// inverts.
     #[must_use]
-    pub fn dimension(self, logical: u32) -> u32 {
-        if self.is_identity() || logical == 0 {
-            return logical;
-        }
-        let scaled = (u64::from(logical) * u64::from(self.0) + 50) / 100;
-        // `logical` is a texture dimension or a rect edge and the scale is at
-        // most 100%, so the product cannot approach `u32::MAX`; saturate
-        // rather than cast so the conversion stays total either way.
-        u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+    pub fn size(self, logical: (u32, u32)) -> (u32, u32) {
+        (self.width_edge(logical.0), self.height_edge(logical.1))
     }
 
     /// Convert a logical `(x, y, width, height)` rect to render resolution.
@@ -135,8 +225,11 @@ impl RenderScale {
         if self.is_identity() {
             return (x, y, width, height);
         }
-        let (x1, x2) = (self.dimension(x), self.dimension(x.saturating_add(width)));
-        let (y1, y2) = (self.dimension(y), self.dimension(y.saturating_add(height)));
+        let (x1, x2) = (self.width_edge(x), self.width_edge(x.saturating_add(width)));
+        let (y1, y2) = (
+            self.height_edge(y),
+            self.height_edge(y.saturating_add(height)),
+        );
         (x1, y1, x2 - x1, y2 - y1)
     }
 
@@ -155,11 +248,22 @@ impl RenderScale {
         if self.is_identity() {
             return r;
         }
-        let e = |v: i32| {
-            let scaled = self.dimension(v.max(0).cast_unsigned());
-            i32::try_from(scaled).unwrap_or(i32::MAX)
-        };
-        (e(r.0), e(r.1), e(r.2), e(r.3))
+        let signed = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+        let unsigned = |v: i32| v.max(0).cast_unsigned();
+        (
+            signed(self.width_edge(unsigned(r.0))),
+            signed(self.height_edge(unsigned(r.1))),
+            signed(self.width_edge(unsigned(r.2))),
+            signed(self.height_edge(unsigned(r.3))),
+        )
+    }
+
+    fn width_edge(self, v: u32) -> u32 {
+        scale_axis(v, self.0.width_num, self.0.width_den)
+    }
+
+    fn height_edge(self, v: u32) -> u32 {
+        scale_axis(v, self.0.height_num, self.0.height_den)
     }
 }
 
@@ -167,14 +271,14 @@ impl RenderScale {
 ///
 /// `logical` is the size D3D9 reports for the bound surface or mip level, the
 /// space every rect the game supplies lives in. `texture` is the extent Metal
-/// allocated for it. For a surface and for level 0 that is `dimension` of
+/// allocated for it. For a surface and for level 0 that is `size` of
 /// `logical`, but a deeper level of a scaled texture is Metal's own halving of
-/// the scaled base, which can differ from `dimension` of the level's logical
-/// size by a texel. The rect conversions here scale through `dimension` and
-/// then pin the far edge: an edge at the logical extent lands exactly on the
-/// texture's, an edge inside it never passes it, and an edge beyond it never
-/// falls short. So a full-target rect covers the attachment at every level,
-/// and adjacent rects still share an edge.
+/// the scaled base, which can differ from `size` of the level's logical
+/// size by a texel. The rect conversions here scale each axis through its own
+/// ratio and then pin the far edge: an edge at the logical extent lands
+/// exactly on the texture's, an edge inside it never passes it, and an edge
+/// beyond it never falls short. So a full-target rect covers the attachment at
+/// every level, and adjacent rects still share an edge.
 pub struct TargetExtent {
     scale: RenderScale,
     logical: (u32, u32),
@@ -194,11 +298,10 @@ impl TargetExtent {
         }
     }
 
-    /// A surface, or level 0 of a texture: the texture is `dimension` of `logical`.
+    /// A surface, or level 0 of a texture: the texture is `size` of `logical`.
     #[must_use]
     pub fn whole(scale: RenderScale, logical: (u32, u32)) -> Self {
-        let texture = (scale.dimension(logical.0), scale.dimension(logical.1));
-        Self::new(scale, logical, texture)
+        Self::new(scale, logical, scale.size(logical))
     }
 
     /// Mip `level` of a texture Metal created at `base_texture`, reported as `logical`.
@@ -268,12 +371,115 @@ impl TargetExtent {
     }
 
     fn edge_x(&self, v: u32) -> u32 {
-        pinned_edge(self.scale.dimension(v), v, self.logical.0, self.texture.0)
+        pinned_edge(self.scale.width_edge(v), v, self.logical.0, self.texture.0)
     }
 
     fn edge_y(&self, v: u32) -> u32 {
-        pinned_edge(self.scale.dimension(v), v, self.logical.1, self.texture.1)
+        pinned_edge(self.scale.height_edge(v), v, self.logical.1, self.texture.1)
     }
+}
+
+/// What decides a back buffer's render scale besides its size.
+///
+/// The user's `render.scale` (already resolved against what the GPU can
+/// resample), `render.panelFit`, and the panel and backing sizes of the
+/// window's screen. A device keeps one and asks it again whenever its back
+/// buffer is sized: at creation, `Reset` and an auto-resize.
+pub struct BackBufferScale {
+    user: RenderScale,
+    panel_fit: bool,
+    panel: Option<(u32, u32)>,
+    backing: Option<(u32, u32)>,
+}
+
+impl BackBufferScale {
+    /// The user's scale and `render.panelFit`, on a screen whose sizes are not known yet.
+    #[must_use]
+    pub const fn new(user: RenderScale, panel_fit: bool) -> Self {
+        Self {
+            user,
+            panel_fit,
+            panel: None,
+            backing: None,
+        }
+    }
+
+    /// Adopt the panel and backing sizes of the window's screen; `true` when either changed.
+    pub fn set_screen(&mut self, panel: Option<(u32, u32)>, backing: Option<(u32, u32)>) -> bool {
+        let changed = self.panel != panel || self.backing != backing;
+        self.panel = panel;
+        self.backing = backing;
+        changed
+    }
+
+    /// The panel size the scale was taken against, `None` when unknown.
+    #[must_use]
+    pub const fn panel(&self) -> Option<(u32, u32)> {
+        self.panel
+    }
+
+    /// The backing size the scale was taken against, `None` when unknown.
+    #[must_use]
+    pub const fn backing(&self) -> Option<(u32, u32)> {
+        self.backing
+    }
+
+    /// The scale a back buffer of `size` rasterizes at: the user's after the panel fit.
+    #[must_use]
+    pub fn for_back_buffer(&self, size: (u32, u32)) -> RenderScale {
+        self.user
+            .compose(panel_fit(self.panel_fit, size, self.panel, self.backing))
+    }
+}
+
+/// The scale that rasterizes `back_buffer` at the panel's pixels, or the identity.
+///
+/// A screen scaled down to its panel (its backing store larger than the
+/// panel in either axis) composites every frame at the backing size and the
+/// display scales it down. A back buffer larger than the panel in either axis
+/// then rasterizes at back buffer × panel / backing per axis, the size
+/// present caps the drawable at
+/// ([`panel_drawable_size`](mtld3d_shared::render_size::panel_drawable_size)),
+/// so present is a 1:1 copy. `enabled` is `render.panelFit`. An unknown or
+/// out-of-range size, an unscaled screen, a back buffer within the panel and
+/// a disabled fit give the identity; an axis whose panel is not smaller than
+/// its backing keeps its own size.
+#[must_use]
+pub fn panel_fit(
+    enabled: bool,
+    back_buffer: (u32, u32),
+    panel: Option<(u32, u32)>,
+    backing: Option<(u32, u32)>,
+) -> RenderScale {
+    let in_range = |size: Option<(u32, u32)>| {
+        size.filter(|&(width, height)| {
+            (1..=MAX_SCREEN_DIMENSION).contains(&width)
+                && (1..=MAX_SCREEN_DIMENSION).contains(&height)
+        })
+    };
+    let (panel, backing) = (in_range(panel), in_range(backing));
+    let (Some(panel_size), Some(backing_size)) = (panel, backing) else {
+        return RenderScale::IDENTITY;
+    };
+    let above_panel = back_buffer.0 > panel_size.0 || back_buffer.1 > panel_size.1;
+    if !enabled || !above_panel || !scaled_down_to_panel(backing, panel) {
+        return RenderScale::IDENTITY;
+    }
+    let axis = |panel: u32, backing: u32| {
+        if panel < backing {
+            reduce(panel, backing)
+        } else {
+            (1, 1)
+        }
+    };
+    let (width_num, width_den) = axis(panel_size.0, backing_size.0);
+    let (height_num, height_den) = axis(panel_size.1, backing_size.1);
+    RenderScale(RenderScaleWire {
+        width_num,
+        width_den,
+        height_num,
+        height_den,
+    })
 }
 
 /// How many mip levels the Metal texture of a texture rasterized at `scale` holds.
@@ -288,9 +494,8 @@ pub fn rasterized_level_count(scale: RenderScale, logical: (u32, u32), levels: u
     if scale.is_identity() {
         return levels;
     }
-    let base =
-        crate::format::compute_mip_count(scale.dimension(logical.0), scale.dimension(logical.1));
-    levels.min(base)
+    let (width, height) = scale.size(logical);
+    levels.min(crate::format::compute_mip_count(width, height))
 }
 
 /// The Metal level a reported mip `level` lands on in a chain of `rasterized_levels`.
@@ -312,6 +517,70 @@ impl Default for RenderScale {
     fn default() -> Self {
         Self::IDENTITY
     }
+}
+
+/// Scale one logical edge by `num / den`, never to zero from a non-zero edge.
+fn scale_axis(v: u32, num: u32, den: u32) -> u32 {
+    if num == den || v == 0 {
+        return v;
+    }
+    // `num < den`, so the result is at most `v`; saturate rather than cast
+    // so the conversion stays total either way.
+    u32::try_from(scale_rounded(v, num, den))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// `num / den` in lowest terms; `den` is non-zero.
+const fn reduce(num: u32, den: u32) -> (u32, u32) {
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (num / a, den / a)
+}
+
+/// Whether `num / den` is a ratio in `(0, 1]`.
+const fn valid_axis(num: u32, den: u32) -> bool {
+    num != 0 && num <= den
+}
+
+/// `num / den` in lowest terms when it lies in `(0, 1]`, else the identity.
+const fn checked_axis(num: u32, den: u32) -> (u32, u32) {
+    if valid_axis(num, den) {
+        reduce(num, den)
+    } else {
+        (1, 1)
+    }
+}
+
+/// The product of two ratios in lowest terms, held to a `u32` denominator.
+fn compose_axis(a: (u32, u32), b: (u32, u32)) -> (u32, u32) {
+    let mut num = u64::from(a.0) * u64::from(b.0);
+    let mut den = u64::from(a.1) * u64::from(b.1);
+    let (mut x, mut y) = (num, den);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    (num, den) = (num / x, den / x);
+    while den > u64::from(u32::MAX) {
+        (num, den) = ((num >> 1).max(1), den >> 1);
+    }
+    // Both fit: the denominator was halved into a `u32` above and the
+    // numerator is at most the denominator.
+    (
+        u32::try_from(num).unwrap_or(u32::MAX),
+        u32::try_from(den).unwrap_or(u32::MAX),
+    )
+}
+
+/// The nearest `f32` to `v`, with no lossy cast.
+///
+/// The high half scaled by 2^16 is exact, so the one rounding is the add's.
+fn u32_to_f32(v: u32) -> f32 {
+    let [b0, b1, b2, b3] = v.to_le_bytes();
+    let high = f32::from(u16::from_le_bytes([b2, b3])) * 65_536.0;
+    high + f32::from(u16::from_le_bytes([b0, b1]))
 }
 
 /// Pin a scaled edge `scaled` of logical edge `v` against an axis's two extents.

@@ -2364,14 +2364,10 @@ impl FrameEncoder {
         let depth_size = if frame.depth_texture().is_null() {
             (0, 0)
         } else {
-            (
-                frame
-                    .render_scale()
-                    .dimension(frame.header().backbuffer_width),
-                frame
-                    .render_scale()
-                    .dimension(frame.header().backbuffer_height),
-            )
+            frame.render_scale().size((
+                frame.header().backbuffer_width,
+                frame.header().backbuffer_height,
+            ))
         };
         let depth_has_stencil = frame.flags().contains(FrameDataFlags::DEPTH_HAS_STENCIL);
         // The default attachment arrives with the frame, not through a

@@ -112,11 +112,10 @@ impl MetadataStorage {
             backbuffer_width: frame.backbuffer_width,
             backbuffer_height: frame.backbuffer_height,
             backbuffer_format: frame.backbuffer_format as u32,
-            render_scale_percent: frame.render_scale.percent(),
+            render_scale: frame.render_scale.to_wire(),
             backbuffer_sample_count: u32::from(frame.backbuffer_sample_count),
             backbuffer_contents: frame.backbuffer_contents as u32,
             present_texture: frame.present_texture.raw(),
-            ..FrameMetadata::default()
         };
         let target = frame.scratch.alloc_uninit::<FrameMetadata>();
         // SAFETY: every scalar and explicit reserved field is initialized, and the arena retains it.
@@ -286,14 +285,10 @@ impl<'a> FrameView<'a> {
             return Err(WireError::InvalidValue);
         }
         let header = headers.first().ok_or(WireError::InvalidValue)?;
-        if header.reserved != 0 {
-            return Err(WireError::InvalidValue);
-        }
         if mtld3d_shared::mtl::PixelFormat::from_repr(header.backbuffer_format).is_none()
             || header.backbuffer_contents > 1
             || header.backbuffer_sample_count > 255
-            || header.render_scale_percent == 0
-            || header.render_scale_percent > 100
+            || !crate::render_scale::RenderScale::is_valid_wire(&header.render_scale)
             || u8::try_from(header.flags)
                 .ok()
                 .and_then(crate::encoder_data::FrameDataFlags::from_bits)
@@ -392,7 +387,7 @@ impl<'a> FrameView<'a> {
     }
     #[must_use]
     pub const fn render_scale(&self) -> crate::render_scale::RenderScale {
-        crate::render_scale::RenderScale::from_percent(self.header.render_scale_percent)
+        crate::render_scale::RenderScale::from_wire(&self.header.render_scale)
     }
     #[must_use]
     pub const fn backbuffer_contents(&self) -> crate::passes::BackbufferContents {

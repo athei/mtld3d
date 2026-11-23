@@ -11,6 +11,7 @@ use mtld3d_shared::{
     MetalHandle,
     mtl::ColorSpacePolicy,
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
+    render_size::scaled_down_to_panel,
 };
 use objc2::{
     MainThreadMarker, MainThreadOnly, extern_class, extern_methods,
@@ -25,8 +26,8 @@ use super::{
     bounded_cast,
     layer::{
         DisplayCaps, LayerAttachRequest, PresentPacing, ScreenPixels, backing_pixels,
-        min_present_duration, natural_drawable_size, pack_pacing, scaled_down_to_panel,
-        sync_drawable_size, unpack_pacing,
+        min_present_duration, natural_drawable_size, pack_pacing, sync_drawable_size,
+        unpack_pacing,
     },
 };
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -728,8 +729,9 @@ bitflags::bitflags! {
 
 /// Bundle of `NSScreen`-derived properties used at attach time.
 ///
-/// All of them drive layer configuration unix-side; what travels back to the
-/// PE side comes from the layer, not the screen.
+/// All but the panel and the frame drive layer configuration unix-side; those
+/// two travel back to the PE side, which sizes a back buffer larger than the
+/// panel by them (`render.panelFit`).
 struct DisplayHint {
     /// `maximumPotentialExtendedDynamicRangeColorComponentValue` — static panel ceiling.
     ///
@@ -759,6 +761,10 @@ struct DisplayHint {
     /// virtualised display). Drives the present-throttle duration computed
     /// at attach.
     panel_max_hz: f64,
+    /// The native pixel size of the screen's panel, `None` = unknown.
+    panel: Option<(u32, u32)>,
+    /// The screen's frame in points, `None` = unknown.
+    frame: Option<(u32, u32)>,
 }
 
 type GetWinDataFn = unsafe extern "C" fn(*mut c_void) -> *mut MacdrvWinData;
@@ -1096,7 +1102,11 @@ pub fn attach_metal_layer(
     // carries as its contents scale, not the display's own factor: in
     // non-retina mode macOS already doubles everything the game draws,
     // its cursor included.
-    let backing_scale = backing_scale_from(layer_contents_scale(layer));
+    let contents_scale = layer_contents_scale(layer);
+    let backing_scale = backing_scale_from(contents_scale);
+    // The screen's frame at the layer's own scale, as present measures the
+    // drawable cap against it.
+    let backing = backing_pixels(hint.frame, contents_scale);
     // Decide HDR vs SDR layer configuration from the panel's
     // static potential + the user's `color.hdr.enable` setting. The
     // result is the configuration the layer now carries; the user
@@ -1207,6 +1217,8 @@ pub fn attach_metal_layer(
     let caps = DisplayCaps {
         backing_scale,
         software_cursor_active,
+        panel: hint.panel,
+        backing,
     };
     Some((view_handle, layer_handle, caps))
 }
@@ -2285,6 +2297,18 @@ fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> Display
     // The panel ceiling drives the present-throttle duration computed at
     // attach; a display move re-derives it from the same helper.
     let panel_max_hz = screen.as_deref().map_or(0.0_f64, screen_max_hz);
+    let panel = screen
+        .as_deref()
+        .and_then(screen_display_id)
+        .and_then(native_panel_pixels);
+    let frame = screen.as_deref().and_then(|s| {
+        let size = s.frame().size;
+        let frame = (
+            bounded_cast::f64_to_u32_saturating(size.width.round()),
+            bounded_cast::f64_to_u32_saturating(size.height.round()),
+        );
+        (frame.0 != 0 && frame.1 != 0).then_some(frame)
+    });
     let mut colorspace_flags = ColorspaceFlags::empty();
     colorspace_flags.set(ColorspaceFlags::IS_HDR, colorspace_is_hdr);
     colorspace_flags.set(ColorspaceFlags::IS_WIDE_GAMUT, colorspace_is_wide_gamut);
@@ -2295,6 +2319,8 @@ fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> Display
         screen_profile_name,
         colorspace_flags,
         panel_max_hz,
+        panel,
+        frame,
     }
 }
 
