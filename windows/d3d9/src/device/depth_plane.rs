@@ -36,14 +36,15 @@ use crate::unix_call::unix_call;
 impl DeviceInner {
     /// Open a span ahead of a draw whose targets or render states changed, if the draw needs one.
     ///
-    /// At the identity scale no pass is mixed and this is the one test a
-    /// draw pays.
+    /// At the identity scale no pass is mixed, and below it a draw over
+    /// targets on one grid stops at the kept classification, so either pays
+    /// the tests here and no call.
     #[inline]
     pub fn open_depth_span_for_draw(&mut self) {
-        if self.render_scale.is_identity() {
+        if self.render_scale.is_identity() || self.depth_plane.rules_out_span() {
             return;
         }
-        self.open_depth_span_for_scaled_draw();
+        self.open_depth_span_for_mixed_draw();
     }
 
     /// Open a span ahead of a depth or stencil clear, if its pass is mixed.
@@ -52,51 +53,49 @@ impl DeviceInner {
     /// before the clear, so its pass opens on the plane.
     pub fn open_depth_span(&mut self) {
         if self.render_scale.is_identity()
-            || self.depth_plane.span_open()
-            || !self.depth_targets_are_mixed()
+            || self.depth_plane.rules_out_span()
+            || self.classified_mixed_targets().is_none()
         {
             return;
         }
         self.open_span_over_mixed_targets();
     }
 
-    /// The draw half of [`Self::open_depth_span_for_draw`] at a scale below one.
+    /// The draw half of [`Self::open_depth_span_for_draw`] over targets that may be mixed.
     ///
-    /// A draw over targets on one grid stops at the kept classification. Over
-    /// mixed targets a draw that neither reads nor writes depth or stencil
-    /// leaves the depth surface as it is, so it opens nothing; the draw after
-    /// it that does opens the span.
-    fn open_depth_span_for_scaled_draw(&mut self) {
-        if self.depth_plane.span_open() || !self.depth_targets_are_mixed() {
+    /// Over mixed targets a draw that neither reads nor writes depth or
+    /// stencil leaves the depth surface as it is, so it opens nothing; the
+    /// draw after it that does opens the span. Kept out of line, so the draw
+    /// path carries only the tests of its caller; the identity scale and
+    /// targets on one grid never reach it.
+    #[inline(never)]
+    fn open_depth_span_for_mixed_draw(&mut self) {
+        let Some(has_stencil) = self.classified_mixed_targets() else {
             return;
-        }
-        let has_stencil = self
-            .depth_plane
-            .mixed()
-            .is_some_and(DepthSurface::has_stencil);
+        };
         if draw_needs_plane(&snapshot_from_state(self.render_states()), has_stencil) {
             self.open_span_over_mixed_targets();
         }
     }
 
-    /// Whether the bound targets pair an unscaled render target 0 with a scaled depth surface.
+    /// Whether the bound targets are mixed, and then whether the depth surface has a stencil plane.
     ///
     /// Classifies them when nothing is kept since they last changed.
-    fn depth_targets_are_mixed(&mut self) -> bool {
+    fn classified_mixed_targets(&mut self) -> Option<bool> {
         if !self.depth_plane.targets_known() {
             let mixed = self.mixed_depth_surface();
-            self.depth_plane.note_targets(mixed);
+            self.depth_plane.note_targets(mixed.as_ref());
         }
-        self.depth_plane.mixed().is_some()
+        self.depth_plane.mixed_has_stencil()
     }
 
     /// Open a span over the targets classified as mixed: transfer in, then bind the plane.
     ///
     /// A plane that cannot be allocated leaves the pass on the surface, as
-    /// without one, warned once, and is not asked for again until its size or
-    /// format changes or the device resets.
+    /// without one, warned once, and the targets count as on one grid until
+    /// one of them changes.
     fn open_span_over_mixed_targets(&mut self) {
-        let Some(surface) = self.depth_plane.take_mixed() else {
+        let Some(surface) = self.mixed_depth_surface() else {
             return;
         };
         let Some(plane) = self
@@ -104,7 +103,7 @@ impl DeviceInner {
             .plane_for(&surface)
             .or_else(|| self.allocate_depth_plane(&surface))
         else {
-            self.depth_plane.note_targets(Some(surface));
+            self.depth_plane.note_targets(None);
             return;
         };
         let logical_size = surface.logical_size;

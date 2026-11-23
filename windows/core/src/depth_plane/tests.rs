@@ -175,28 +175,37 @@ fn a_classification_is_kept_until_the_targets_are_forgotten() {
 
     planes.note_targets(None);
     assert!(planes.targets_known());
-    assert!(planes.mixed().is_none(), "no plane serves the pair");
-    assert!(planes.take_mixed().is_none());
-    assert!(planes.targets_known(), "taking nothing keeps the answer");
+    assert!(
+        planes.mixed_has_stencil().is_none(),
+        "no plane serves the pair"
+    );
+    assert!(planes.rules_out_span(), "targets on one grid open nothing");
 
     planes.forget_targets();
     assert!(!planes.targets_known(), "a changed target asks again");
-
-    planes.note_targets(Some(surface(format)));
-    assert_eq!(
-        planes.mixed().map(|mixed| mixed.logical_size),
-        Some((640, 480))
-    );
-    let taken = planes.take_mixed().expect("the mixed surface");
     assert!(
-        !planes.targets_known(),
-        "the surface a span takes is classified again after it"
+        !planes.rules_out_span(),
+        "unclassified targets are asked, not assumed to share a grid"
     );
 
-    planes.note_targets(Some(taken));
+    planes.note_targets(Some(&surface(format)));
+    assert_eq!(planes.mixed_has_stencil(), Some(true));
+    assert!(!planes.rules_out_span(), "a mixed pair may open a span");
+    planes.note_targets(Some(&surface(PixelFormat::Depth32Float)));
+    assert_eq!(planes.mixed_has_stencil(), Some(false));
+
+    planes.replace_plane(handle(0x20), &surface(format));
+    assert!(planes.open(surface(format)).is_some());
+    assert!(planes.rules_out_span(), "an open span opens no second one");
+    assert!(planes.close().is_some());
+    assert!(
+        planes.targets_known() && !planes.rules_out_span(),
+        "the targets a span closed over are still the mixed pair"
+    );
+
     planes.forget_targets();
     assert!(
-        planes.mixed().is_none(),
+        planes.mixed_has_stencil().is_none(),
         "a forgotten answer serves no draw"
     );
 }
@@ -207,7 +216,7 @@ fn a_dropped_frame_and_a_taken_plane_forget_the_targets() {
     let format = PixelFormat::Depth32Float;
     planes.replace_plane(handle(0x20), &surface(format));
 
-    planes.note_targets(Some(surface(format)));
+    planes.note_targets(Some(&surface(format)));
     planes.abandon_span();
     assert!(!planes.targets_known(), "the dropped frame's bindings");
 

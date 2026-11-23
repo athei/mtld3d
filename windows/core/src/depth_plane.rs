@@ -143,8 +143,13 @@ impl DepthPlane {
     }
 
     /// Keep the classification of the bound targets: the mixed depth surface, or none.
-    pub fn note_targets(&mut self, mixed: Option<DepthSurface>) {
-        self.targets = mixed.map_or(Targets::Unserved, Targets::Mixed);
+    ///
+    /// Only whether the surface has a stencil plane is kept of it; the device
+    /// reads the surface again when it opens a span.
+    pub fn note_targets(&mut self, mixed: Option<&DepthSurface>) {
+        self.targets = mixed.map_or(Targets::Unserved, |surface| Targets::Mixed {
+            has_stencil: surface.has_stencil(),
+        });
     }
 
     /// Forget the classification: a target, the depth binding or an implicit surface changed.
@@ -152,27 +157,22 @@ impl DepthPlane {
         self.targets = Targets::Unknown;
     }
 
-    /// The depth surface the bound targets were classified as mixed over, when they were.
+    /// Whether the bound targets were classified as mixed, and then whether the surface has stencil.
     #[must_use]
-    pub const fn mixed(&self) -> Option<&DepthSurface> {
-        match &self.targets {
-            Targets::Mixed(surface) => Some(surface),
+    pub const fn mixed_has_stencil(&self) -> Option<bool> {
+        match self.targets {
+            Targets::Mixed { has_stencil } => Some(has_stencil),
             Targets::Unknown | Targets::Unserved => None,
         }
     }
 
-    /// Take the mixed depth surface out to open a span over it, leaving the targets unclassified.
+    /// Whether no draw or clear can open a span now, from what is kept alone.
     ///
-    /// A caller that opens no span hands the surface back through
-    /// [`Self::note_targets`].
-    pub const fn take_mixed(&mut self) -> Option<DepthSurface> {
-        match core::mem::replace(&mut self.targets, Targets::Unknown) {
-            Targets::Mixed(surface) => Some(surface),
-            kept @ (Targets::Unknown | Targets::Unserved) => {
-                self.targets = kept;
-                None
-            }
-        }
+    /// True while a span is open and while the targets are classified as
+    /// pairing on one grid: the one test a draw over such targets pays.
+    #[must_use]
+    pub const fn rules_out_span(&self) -> bool {
+        self.span.is_some() || matches!(self.targets, Targets::Unserved)
     }
 
     /// Whether a plane for `surface` was refused, so allocating one again is not worth a try.
@@ -308,8 +308,11 @@ enum Targets {
     Unknown,
     /// No plane serves the pair: both on one grid, or a pairing left on the surface's grid.
     Unserved,
-    /// An unscaled render target 0 over this scaled depth surface.
-    Mixed(DepthSurface),
+    /// An unscaled render target 0 over a scaled depth surface the plane can serve.
+    Mixed {
+        /// Whether that surface has a stencil plane.
+        has_stencil: bool,
+    },
 }
 
 /// The device's plane: a Private depth texture of one key.
