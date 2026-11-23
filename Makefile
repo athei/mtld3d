@@ -1617,9 +1617,12 @@ conformance-isolate: install-windows-$(ARCH) install-unix-arm64
 # and neither is under test. MTL_CAPTURE_ENABLED is unset for the same
 # reason, here and in `bench-ab`: Metal's capture layer
 # sits under every Metal call (docs/ARCHITECTURE.md gives its measured cost
-# beside the Ctrl+Shift+P capture). The configuration is the suite's
-# without the Main Thread Checker, then BENCH_CONFIG='key=value;key=value',
-# appended last the way SCALE is, so its entries win over the ones before it
+# beside the Ctrl+Shift+P capture). FEX_DYNAMICL1CACHE=0 fixes FEX's
+# per-thread L1 lookup table at its largest size, here and in the processes
+# `bench-ab` starts (CONTRIBUTING.md, Benchmarks). The configuration is the
+# suite's without the Main Thread Checker, then
+# BENCH_CONFIG='key=value;key=value', appended last the way SCALE is, so its
+# entries win over the ones before it
 # (the stutter benchmark's own `shaderCache.enable=false` still wins over
 # them). PERF=1 builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
@@ -1707,7 +1710,7 @@ bench: install-windows-$(ARCH) install-unix-arm64
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
 	$(BENCH_SUITE_COPY) && cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
-		RUST_LOG=info \
+		RUST_LOG=info FEX_DYNAMICL1CACHE=0 \
 		$(E2E_RUNNER) --wine $(WINE_LOADER) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
 	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \

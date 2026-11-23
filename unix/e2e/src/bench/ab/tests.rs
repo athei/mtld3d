@@ -442,24 +442,33 @@ fn a_selection_notes_each_unmatched_filter_once_and_needs_something_to_compare()
 }
 
 #[test]
-fn benchmark_children_override_hostile_inherited_logging() {
-    for inherited in [Some("warn"), Some("off"), None, Some("mtld3d=off")] {
+fn benchmark_children_override_hostile_inherited_environment() {
+    for (log, fex) in [
+        (Some("warn"), Some("1")),
+        (Some("off"), None),
+        (None, Some("")),
+        (Some("mtld3d=off"), Some("0")),
+    ] {
         let mut child = Command::new(std::env::current_exe().expect("test executable"));
         child.args([
             "--exact",
-            "bench::ab::tests::benchmark_log_environment_fixture",
+            "bench::ab::tests::benchmark_environment_fixture",
             "--ignored",
             "--nocapture",
         ]);
-        if let Some(value) = inherited {
-            child.env("RUST_LOG", value);
-        } else {
-            child.env_remove("RUST_LOG");
+        for (key, inherited) in [("RUST_LOG", log), (FEX_FIXED_L1_TABLE.0, fex)] {
+            if let Some(value) = inherited {
+                child.env(key, value);
+            } else {
+                child.env_remove(key);
+            }
         }
-        let result = child.output().expect("run fixture with inherited filters");
+        let result = child
+            .output()
+            .expect("run fixture with inherited environment");
         assert!(
             result.status.success(),
-            "{inherited:?}: {}{}",
+            "{log:?} {fex:?}: {}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
@@ -467,9 +476,12 @@ fn benchmark_children_override_hostile_inherited_logging() {
 }
 
 /// A separate test process owns the hostile environment, so parallel tests cannot race it.
+///
+/// The script lists two tests, named after the `RUST_LOG` and the FEX L1
+/// table option it sees.
 #[test]
-#[ignore = "spawned with inherited filters by the parent regression test"]
-fn benchmark_log_environment_fixture() {
+#[ignore = "spawned with an inherited environment by the parent regression test"]
+fn benchmark_environment_fixture() {
     let common = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -484,8 +496,14 @@ fn benchmark_log_environment_fixture() {
         .join(std::process::id().to_string());
     fs::create_dir_all(&dir).unwrap();
     let script = dir.join("logging.sh");
-    fs::write(&script, "printf '%s: test\n' \"${RUST_LOG-unset}\"\n").unwrap();
-    let expected_inherited = std::env::var("RUST_LOG").unwrap_or_else(|_| "unset".to_owned());
+    let (fex_key, fex_value) = FEX_FIXED_L1_TABLE;
+    fs::write(
+        &script,
+        format!("printf '%s: test\\n' \"${{RUST_LOG-unset}}\" \"fex=${{{fex_key}-unset}}\"\n"),
+    )
+    .unwrap();
+    let inherited = |key| std::env::var(key).unwrap_or_else(|_| "unset".to_owned());
+    let expected_inherited = [inherited("RUST_LOG"), format!("fex={}", inherited(fex_key))];
     let timeout = Duration::from_secs(5);
     let mut ordinary = WineLauncher::new(
         Path::new("/bin/sh"),
@@ -495,14 +513,17 @@ fn benchmark_log_environment_fixture() {
         Box::new(|_| {}),
     )
     .unwrap();
-    assert_eq!(ordinary.list().unwrap(), [expected_inherited]);
+    assert_eq!(ordinary.list().unwrap(), expected_inherited);
     for name in ["base", "cand"] {
         let mut leg = spec(name);
         leg.wine = PathBuf::from("/bin/sh");
         leg.prefix = dir.join(name);
         for filter in ["info", SHAPE_RUST_LOG] {
             let mut launcher = leg_launcher(&leg, &script, Some(&dir), timeout, filter).unwrap();
-            assert_eq!(launcher.list().unwrap(), [filter]);
+            assert_eq!(
+                launcher.list().unwrap(),
+                [filter.to_owned(), format!("fex={fex_value}")]
+            );
         }
     }
     fs::remove_dir_all(dir).unwrap();

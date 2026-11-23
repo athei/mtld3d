@@ -235,6 +235,18 @@ from the PE side. Untimed shape processes set `RUST_LOG` to the pass-trace
 filter described below.
 Ordinary test runs keep the caller's logging settings.
 
+The same launchers set `FEX_DYNAMICL1CACHE=0` for every Wine process they
+start, shape processes included, whatever the shell holds. FEX starts each
+thread's L1 block lookup table at 8k entries and resizes it once a second
+by the thread's L1 misses: it doubles it, up to 1M entries, above 250
+misses a second and halves it below 50. A resize drops entries, refilling
+them faults the table's pages again, and `perf.faults_minor_pf` counts
+those faults. Whether a build's measured window holds such a step follows
+where the linker placed the layer's code, so without the option a change
+that touches no memory can move that row. With it the table stays at 1M
+entries, the size a busy thread ends at. It is an option of FEX, not of
+the layer; a process FEX does not translate ignores it.
+
 The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so
 `make test` lists them as ignored and never runs them. `make bench` runs them
 once against this checkout and writes a report per benchmark. `make bench-ab
