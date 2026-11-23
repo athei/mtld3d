@@ -2457,6 +2457,19 @@ fn a_small_target_over_a_back_buffer_sized_depth_texture_keeps_its_depth_writes_
     }
 }
 
+/// Point-sample stage 0 with clamped addressing, so each target pixel reads one texel.
+fn point_sample_stage_zero(h: &Harness) {
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_NONE),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+}
+
 #[test]
 fn a_draw_through_a_small_target_samples_the_depth_its_pass_wrote_into_a_depth_texture() {
     // An INTZ texture at the back buffer's size is the depth surface of a
@@ -2477,15 +2490,7 @@ fn a_draw_through_a_small_target_samples_the_depth_its_pass_wrote_into_a_depth_t
     );
     assert_eq!(h.set_render_target(0, &small), 0);
     assert_eq!(h.set_texture(0, &intz), 0);
-    for (state, value) in [
-        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
-        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
-        (D3DSAMP_MIPFILTER, D3DTEXF_NONE),
-        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
-        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
-    ] {
-        assert_eq!(h.set_sampler_state(0, state, value), 0);
-    }
+    point_sample_stage_zero(&h);
     // The diffuse stage reads no texture, so this draw samples nothing.
     depth_draw_setup(&h, D3DCMP_ALWAYS, true);
     assert_eq!(
@@ -2596,7 +2601,7 @@ fn a_reset_between_two_passes_through_a_small_target_leaves_the_second_its_depth
 /// The name the workload child of the span-counting test runs under.
 const SPAN_COUNT_CHILD_NAME: &str = "depth-plane-spans.exe";
 
-/// That child's log filter: the unix side's command records, one per depth transfer.
+/// The log filter of the children that count depth transfers: the unix side's command records.
 const SPAN_COUNT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug";
 
 /// What the record of every depth transfer carries.
@@ -2674,4 +2679,71 @@ fn span_count_workload() {
         "one span: the transfer into the plane and the one back"
     );
     assert_eq!(h.end_scene(), 0);
+}
+
+/// The name the workload child of the write-back-counting test runs under.
+const WRITE_BACK_COUNT_CHILD_NAME: &str = "depth-plane-write-backs.exe";
+
+#[test]
+fn sampling_draws_after_one_depth_write_carry_the_plane_back_once() {
+    if running_as(WRITE_BACK_COUNT_CHILD_NAME) {
+        write_back_count_workload();
+        return;
+    }
+    run_in_private_log_child(
+        WRITE_BACK_COUNT_CHILD_NAME,
+        "render_scale::sampling_draws_after_one_depth_write_carry_the_plane_back_once",
+        SPAN_COUNT_LOG_FILTER,
+    );
+}
+
+/// One depth-writing draw through a 400x300 target over an INTZ level, then three that sample it.
+///
+/// The sampling draws have the depth test off and write no depth, so the
+/// plane goes back into the level ahead of the first of them only. With the
+/// span's opening and closing transfers the frame records three; a carry
+/// ahead of every sampling draw would record five.
+fn write_back_count_workload() {
+    let h = depth_harness_at_three_quarters();
+    let intz = back_buffer_sized_intz(&h);
+    let small = h.create_render_target(400, 300, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(h.set_texture(0, &intz), 0);
+    point_sample_stage_zero(&h);
+    depth_draw_setup(&h, D3DCMP_ALWAYS, true);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &viewport_quad(0.25, BLUE)),
+        0
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    for _ in 0..3 {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &FULLSCREEN_TEXTURED_QUAD),
+            0
+        );
+    }
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(100, 100),
+        0x4040_4040,
+        1,
+        "the sampling draws read the depth the pass wrote",
+    );
+    let transfers = await_logged_lines(DEPTH_TRANSFER_RECORD, 3);
+    assert_eq!(
+        transfers.len(),
+        3,
+        "the span's two transfers and one carry back ahead of the sampling draws: {transfers:#?}"
+    );
 }
