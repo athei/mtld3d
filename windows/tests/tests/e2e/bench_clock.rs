@@ -3,11 +3,11 @@
 use std::time::Duration;
 
 use super::bench::{
-    CallTimes, FRAME_SPIKE_FLOOR, FrameClock, FrameStats, SAMPLE_CAPACITY, SPIKE_FLOOR, TscClock,
+    CallTimes, FRAME_SPIKE_FLOOR, FrameClock, FrameStats, SPIKE_FLOOR, TscClock, sample_capacity,
 };
 
-/// The least storage a sample vector starts with, 1 MiB.
-const SAMPLE_BYTES: usize = 1 << 20;
+/// The least storage every sample vector starts with, whatever its element: 1 MiB.
+const MIB: usize = 1 << 20;
 
 #[test]
 fn elapsed_matches_recorded_intervals_and_present_boundaries() {
@@ -75,13 +75,19 @@ fn frame_spikes_over_the_floor_and_twice_the_median_are_counted() {
 
 #[test]
 fn sample_vectors_keep_their_first_buffer_through_sample_capacity() {
+    // The query benchmark's poll counts are `u64`s, half a `Duration`, and get as many bytes.
+    let polls = Vec::<u64>::with_capacity(sample_capacity::<u64>());
+    let bytes = polls.capacity() * size_of::<u64>();
+    assert!(bytes >= MIB, "poll counts start with {bytes} bytes");
+    let samples = sample_capacity::<Duration>();
+
     // A clock asked for no room at all still starts with the full capacity.
     let mut clock = FrameClock::start(0);
     let first = storage(clock.sample_vecs());
-    for _ in 0..SAMPLE_CAPACITY {
+    for _ in 0..samples {
         clock.record_present(0, 0);
     }
-    assert_eq!(clock.frames(), SAMPLE_CAPACITY);
+    assert_eq!(clock.frames(), samples);
     assert_eq!(
         storage(clock.sample_vecs()),
         first,
@@ -91,14 +97,11 @@ fn sample_vectors_keep_their_first_buffer_through_sample_capacity() {
     // Each call is slow and closes a sample, so both vectors take one entry a frame.
     let mut calls = CallTimes::default();
     let first = storage(calls.sample_vecs());
-    for _ in 0..SAMPLE_CAPACITY {
+    for _ in 0..samples {
         calls.add(SPIKE_FLOOR);
         calls.end_frame();
     }
-    assert_eq!(
-        calls.stats().map(|stats| stats.frames),
-        Some(SAMPLE_CAPACITY)
-    );
+    assert_eq!(calls.stats().map(|stats| stats.frames), Some(samples));
     assert_eq!(
         storage(calls.sample_vecs()),
         first,
@@ -106,13 +109,13 @@ fn sample_vectors_keep_their_first_buffer_through_sample_capacity() {
     );
 }
 
-/// Each vector's buffer and capacity, after checking that it holds [`SAMPLE_BYTES`] or more.
+/// Each vector's buffer and capacity, after checking that it holds [`MIB`] or more.
 fn storage(vecs: [&Vec<Duration>; 2]) -> [(*const Duration, usize); 2] {
     vecs.map(|samples| {
         let bytes = samples.capacity() * size_of::<Duration>();
         assert!(
-            bytes >= SAMPLE_BYTES,
-            "a sample vector starts with {bytes} bytes, under {SAMPLE_BYTES}"
+            bytes >= MIB,
+            "a sample vector starts with {bytes} bytes, under {MIB}"
         );
         (samples.as_ptr(), samples.capacity())
     })

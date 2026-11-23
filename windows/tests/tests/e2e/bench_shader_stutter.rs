@@ -153,8 +153,8 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     let log = LayerLog::find(since);
     let warm = MemorySample::now();
     let from = log.mark();
-    let started = TscClock::now();
     let mut clock = FrameClock::start(usize::try_from(MEASURED_FRAMES).expect("fits usize"));
+    let started = TscClock::now();
     for frame in 0..MEASURED_FRAMES {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         bench.base_frame();
