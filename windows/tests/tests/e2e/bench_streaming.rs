@@ -360,8 +360,8 @@ impl<'h> Scene<'h> {
             (D3DFMT_A8R8G8B8, ATLAS_EDGE),
             &scene.pattern,
             0,
-            &mut CallTimes::default(),
-            &mut CallTimes::default(),
+            &mut scene.times.lock,
+            &mut scene.times.fill,
         );
         for (format, edge) in UPDATES {
             let create = |pool| h.create_texture(edge, edge, 0, 0, format, pool);
@@ -376,8 +376,8 @@ impl<'h> Scene<'h> {
                 (format, edge),
                 &scene.pattern,
                 1,
-                &mut CallTimes::default(),
-                &mut CallTimes::default(),
+                &mut scene.times.lock,
+                &mut scene.times.fill,
             );
             ok(
                 h.update_texture_hr(&update.source, &update.target),

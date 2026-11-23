@@ -1,8 +1,13 @@
-//! Frame-clock bookkeeping without a device or GPU workload.
+//! Frame-clock and call-timer bookkeeping without a device or GPU workload.
 
 use std::time::Duration;
 
-use super::bench::{FRAME_SPIKE_FLOOR, FrameClock, FrameStats, TscClock};
+use super::bench::{
+    CallTimes, FRAME_SPIKE_FLOOR, FrameClock, FrameStats, SAMPLE_CAPACITY, SPIKE_FLOOR, TscClock,
+};
+
+/// The least storage a sample vector starts with, 1 MiB.
+const SAMPLE_BYTES: usize = 1 << 20;
 
 #[test]
 fn elapsed_matches_recorded_intervals_and_present_boundaries() {
@@ -66,6 +71,51 @@ fn frame_spikes_over_the_floor_and_twice_the_median_are_counted() {
     let mut times = vec![median; 199];
     times.push(Duration::from_micros(46_435));
     assert_eq!(FrameClock::spikes_of(&times), (1, median * 2));
+}
+
+#[test]
+fn sample_vectors_keep_their_first_buffer_through_sample_capacity() {
+    // A clock asked for no room at all still starts with the full capacity.
+    let mut clock = FrameClock::start(0);
+    let first = storage(clock.sample_vecs());
+    for _ in 0..SAMPLE_CAPACITY {
+        clock.record_present(0, 0);
+    }
+    assert_eq!(clock.frames(), SAMPLE_CAPACITY);
+    assert_eq!(
+        storage(clock.sample_vecs()),
+        first,
+        "the frame clock reallocated"
+    );
+
+    // Each call is slow and closes a sample, so both vectors take one entry a frame.
+    let mut calls = CallTimes::default();
+    let first = storage(calls.sample_vecs());
+    for _ in 0..SAMPLE_CAPACITY {
+        calls.add(SPIKE_FLOOR);
+        calls.end_frame();
+    }
+    assert_eq!(
+        calls.stats().map(|stats| stats.frames),
+        Some(SAMPLE_CAPACITY)
+    );
+    assert_eq!(
+        storage(calls.sample_vecs()),
+        first,
+        "the call timer reallocated"
+    );
+}
+
+/// Each vector's buffer and capacity, after checking that it holds [`SAMPLE_BYTES`] or more.
+fn storage(vecs: [&Vec<Duration>; 2]) -> [(*const Duration, usize); 2] {
+    vecs.map(|samples| {
+        let bytes = samples.capacity() * size_of::<Duration>();
+        assert!(
+            bytes >= SAMPLE_BYTES,
+            "a sample vector starts with {bytes} bytes, under {SAMPLE_BYTES}"
+        );
+        (samples.as_ptr(), samples.capacity())
+    })
 }
 
 fn assert_stats(actual: &FrameStats, expected: &FrameStats) {
