@@ -54,8 +54,8 @@ fn only_an_unscaled_target_over_a_scaled_surface_is_mixed() {
     );
     assert_eq!(
         pairing(&targets(THREE_QUARTERS, id, (1, 1))),
-        Pairing::Reverse,
-        "the reverse pairing"
+        Pairing::Unserved,
+        "a scaled target over an unscaled surface"
     );
     assert_eq!(
         pairing(&targets(id, THREE_QUARTERS, (4, 1))),
@@ -68,6 +68,61 @@ fn only_an_unscaled_target_over_a_scaled_surface_is_mixed() {
         pairing(&null),
         Pairing::Shared,
         "a NULL render target 0 follows the depth surface"
+    );
+}
+
+/// Two different scales pair only when they are equal, whichever kind made them.
+#[test]
+fn two_different_scales_are_unserved() {
+    let half = RenderScale::from_percent(50);
+    // The panel fit of a 16-inch "More Space" screen, a per-axis ratio.
+    let fit =
+        crate::render_scale::panel_fit(true, (4112, 2658), Some((3456, 2234)), Some((4112, 2658)));
+    assert_eq!(
+        pairing(&targets(THREE_QUARTERS, half, (1, 1))),
+        Pairing::Unserved
+    );
+    assert_eq!(
+        pairing(&targets(half, THREE_QUARTERS, (1, 1))),
+        Pairing::Unserved
+    );
+    assert_eq!(
+        pairing(&targets(fit, THREE_QUARTERS, (1, 1))),
+        Pairing::Unserved
+    );
+    assert_eq!(
+        pairing(&targets(THREE_QUARTERS, fit, (4, 4))),
+        Pairing::Unserved,
+        "a scaled target is unserved whatever the samples"
+    );
+    assert_eq!(
+        pairing(&targets(fit, fit, (1, 1))),
+        Pairing::Shared,
+        "one per-axis scale"
+    );
+    assert_eq!(
+        pairing(&targets(RenderScale::IDENTITY, fit, (1, 1))),
+        Pairing::Mixed,
+        "an unscaled target over the fitted surface"
+    );
+    // A ratio reduces, so the same scale built two ways pairs as one.
+    let three_quarters = RenderScale::from_wire(&mtld3d_shared::render_size::RenderScaleWire {
+        width_num: 75,
+        width_den: 100,
+        height_num: 3,
+        height_den: 4,
+    });
+    assert_eq!(
+        pairing(&targets(three_quarters, THREE_QUARTERS, (1, 1))),
+        Pairing::Shared
+    );
+    let mut null = targets(THREE_QUARTERS, half, (1, 1));
+    null.rt0_is_null = true;
+    assert_eq!(pairing(&null), Pairing::Shared, "a NULL render target 0");
+    assert_eq!(
+        pairing(&targets(THREE_QUARTERS, half, (1, 4))),
+        Pairing::Shared,
+        "samples that disagree leave the depth surface out"
     );
 }
 

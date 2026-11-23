@@ -188,9 +188,10 @@ impl DeviceInner {
     ///
     /// `None` for every pairing on one grid. A texture-backed depth surface
     /// has no Metal handle on this side, the transfer cannot write a
-    /// multisampled one, and a scaled render target 0 over an unscaled depth
-    /// surface has no plane at all, so each keeps the pass on the surface's
-    /// grid, warned once.
+    /// multisampled one, and a scaled render target 0 over a depth surface at
+    /// another scale (unscaled, or scaled for another back-buffer size) has no
+    /// plane at all, so each keeps the pass on one grid, warned once. Only a
+    /// device with `DeviceFlags::SCALED_SURFACES` set reaches this.
     fn mixed_depth_surface(&self) -> Option<DepthSurface> {
         let rt0 = self.bound_rt.render_target(0);
         let (rt0_scale, rt0_is_null, rt0_samples) = if rt0.is_null() {
@@ -267,12 +268,12 @@ impl DeviceInner {
                 );
                 None
             }
-            Pairing::Reverse => {
+            Pairing::Unserved => {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
-                    "a pass through a scaled render target over an unscaled depth surface of \
-                     another size draws into the surface on the target's scaled grid: its depth \
-                     lands off the reported pixels"
+                    "a pass through a scaled render target over a depth surface at another scale \
+                     (unscaled, or scaled for another back-buffer size) draws into the surface on \
+                     the target's grid: its depth lands off the reported pixels"
                 );
                 None
             }

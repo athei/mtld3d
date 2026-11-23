@@ -17,6 +17,12 @@
 //! glow or interface pass draws, needs no plane and opens none. Nearest up
 //! then nearest down is the identity at any scale up to one, so depth the
 //! passes do not touch survives the round trip unchanged.
+//!
+//! The plane serves only that shape. A scaled render target 0 over a depth
+//! surface at another scale, unscaled or scaled otherwise, keeps the target's
+//! grid (`Pairing::Unserved`): the back buffer's scale follows its size under
+//! `render.panelFit`, so a target and a surface created at two sizes can keep
+//! two scales. The device warns once when a pass pairs them.
 
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
@@ -31,8 +37,13 @@ pub enum Pairing {
     Mixed,
     /// The mixed shape over a multisampled depth surface, which the transfer cannot write.
     MixedMultisampled,
-    /// Render target 0 scaled over an unscaled depth surface, which keeps the scaled grid.
-    Reverse,
+    /// Render target 0 scaled at another scale than the depth surface: no plane serves it.
+    ///
+    /// A scaled target over an unscaled surface, or the two at two different
+    /// scales, which a target and a surface kept across a change of the back
+    /// buffer's scale (`render.panelFit` follows its size) can be. The pass
+    /// keeps the target's grid, and its depth lands off the reported pixels.
+    Unserved,
 }
 
 /// The attachments a pass would open with, as far as their grids go.
@@ -54,18 +65,17 @@ pub struct PassTargets {
 /// A `NULL` render target 0 is shaped after the depth surface, scale
 /// included, so it never pairs with one of another grid. A pass whose
 /// render target 0 and depth surface disagree on samples leaves the depth
-/// surface out, so it pairs with nothing either.
+/// surface out, so it pairs with nothing either. Otherwise the two share a
+/// grid only at equal scales, which compare as reduced ratios per axis.
 #[must_use]
-pub const fn pairing(targets: &PassTargets) -> Pairing {
-    let rt0_scaled = !targets.rt0_scale.is_identity();
-    let depth_scaled = !targets.depth_scale.is_identity();
+pub fn pairing(targets: &PassTargets) -> Pairing {
     if targets.rt0_is_null
         || targets.rt0_samples != targets.depth_samples
-        || rt0_scaled == depth_scaled
+        || targets.rt0_scale == targets.depth_scale
     {
         Pairing::Shared
-    } else if rt0_scaled {
-        Pairing::Reverse
+    } else if !targets.rt0_scale.is_identity() {
+        Pairing::Unserved
     } else if targets.depth_samples > 1 {
         Pairing::MixedMultisampled
     } else {
