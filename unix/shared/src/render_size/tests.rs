@@ -7,8 +7,35 @@
 //! source-fit condition on both sides of the cap, every input that leaves the
 //! layer's own size, and the extreme inputs. `scaled_down_to_panel` is the
 //! condition both the magnification filter and `render.panelFit` key on.
+//! `ScreenSizes` round-trips through its one word.
 
-use super::{panel_drawable_size, scale_rounded, scaled_down_to_panel};
+use super::{ScreenSizes, panel_drawable_size, scale_rounded, scaled_down_to_panel};
+
+#[test]
+fn screen_sizes_survive_the_round_trip_through_one_word() {
+    let sizes = ScreenSizes {
+        panel: Some((3456, 2234)),
+        backing: Some((4112, 2658)),
+    };
+    assert_eq!(ScreenSizes::unpack(sizes.pack()), sizes);
+    let backing_only = ScreenSizes {
+        panel: None,
+        backing: Some((2048, 1536)),
+    };
+    assert_eq!(ScreenSizes::unpack(backing_only.pack()), backing_only);
+    assert_eq!(
+        ScreenSizes::UNKNOWN.pack(),
+        0,
+        "nothing published reads zero"
+    );
+    assert_eq!(ScreenSizes::unpack(0), ScreenSizes::UNKNOWN);
+    // A dimension past 16 bits, or a zero one, is unknown rather than truncated.
+    let wide = ScreenSizes {
+        panel: Some((70_000, 2234)),
+        backing: Some((0, 2658)),
+    };
+    assert_eq!(ScreenSizes::unpack(wide.pack()), ScreenSizes::UNKNOWN);
+}
 
 /// A 1470x956 "looks like" mode on a 2560x1664 panel, in retina mode.
 const AIR_BACKING: (u32, u32) = (2940, 1912);

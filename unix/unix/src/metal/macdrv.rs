@@ -11,7 +11,7 @@ use mtld3d_shared::{
     MetalHandle,
     mtl::ColorSpacePolicy,
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
-    render_size::scaled_down_to_panel,
+    render_size::{ScreenSizes, scaled_down_to_panel},
 };
 use objc2::{
     MainThreadMarker, MainThreadOnly, extern_class, extern_methods,
@@ -1014,6 +1014,7 @@ pub fn attach_metal_layer(
         backing_scale_sink_ptr,
         cursor_kick_sink_ptr,
         client_surface_request_sink_ptr,
+        screen_sizes_sink_ptr,
         software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
@@ -1157,6 +1158,8 @@ pub fn attach_metal_layer(
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface_request_sink: usize::try_from(client_surface_request_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            screen_sizes_sink: usize::try_from(screen_sizes_sink_ptr)
+                .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface: surface,
         },
     );
@@ -1171,6 +1174,16 @@ pub fn attach_metal_layer(
     }
     attachment::request_first_frame_present(view as usize);
     attachment::publish_backing_scale(&att, backing_scale);
+    // The screen attach found, so the device's word holds it before the
+    // first resize; the display-follow pass republishes it on the main
+    // thread when the window reaches another screen.
+    attachment::publish_screen_sizes(
+        &att,
+        &ScreenSizes {
+            panel: hint.panel,
+            backing,
+        },
+    );
     // `Auto` turns the software cursor on under HDR, where the hardware
     // cursor reads dim. The overlay window costs the game window its
     // direct-to-display path in either mode.
@@ -2973,10 +2986,19 @@ fn follow_screen_pixels(
             pixels.frame,
         );
     }
-    let scaled_down = scaled_down_to_panel(
-        backing_pixels(pixels.frame, layer.contentsScale()),
-        pixels.panel,
+    let backing = backing_pixels(pixels.frame, layer.contentsScale());
+    // The device sizes its next back buffer against these (`render.panelFit`);
+    // published from this main-thread pass whenever it runs, so a window that
+    // reached another screen is sized against that screen at its next resize
+    // or `Reset`.
+    attachment::publish_screen_sizes(
+        att,
+        &ScreenSizes {
+            panel: pixels.panel,
+            backing,
+        },
     );
+    let scaled_down = scaled_down_to_panel(backing, pixels.panel);
     let filter = if scaled_down {
         // SAFETY: a CoreAnimation string constant with static storage duration.
         unsafe { kCAFilterLinear }

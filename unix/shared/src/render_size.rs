@@ -37,6 +37,60 @@ impl RenderScaleWire {
     };
 }
 
+/// The panel and backing pixel sizes of a window's screen, `None` for a size not known.
+///
+/// The unix side publishes them into a word the device owns
+/// (`AttachMetalLayerParams::screen_sizes_ptr`) at attach and whenever the
+/// window's screen changes; the device reads the word when it sizes its back
+/// buffer again. [`Self::pack`] folds both into that word.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScreenSizes {
+    /// The native pixel size of the screen's panel.
+    pub panel: Option<(u32, u32)>,
+    /// The screen's frame in the window layer's pixels.
+    pub backing: Option<(u32, u32)>,
+}
+
+impl ScreenSizes {
+    /// Nothing known: the word reads zero.
+    pub const UNKNOWN: Self = Self {
+        panel: None,
+        backing: None,
+    };
+
+    /// Fold both sizes into one word, 16 bits per dimension, the panel high.
+    ///
+    /// A size that does not fit 16 bits, or has a zero dimension, packs as
+    /// unknown, so a word of zero is nothing published.
+    #[must_use]
+    pub fn pack(&self) -> u64 {
+        let half = |size: Option<(u32, u32)>| {
+            size.and_then(|(width, height)| {
+                let width = u16::try_from(width).ok().filter(|&w| w != 0)?;
+                let height = u16::try_from(height).ok().filter(|&h| h != 0)?;
+                Some((u64::from(width) << 16) | u64::from(height))
+            })
+            .unwrap_or(0)
+        };
+        (half(self.panel) << 32) | half(self.backing)
+    }
+
+    /// Read back what [`Self::pack`] wrote.
+    #[must_use]
+    pub fn unpack(bits: u64) -> Self {
+        let half = |half: u64| {
+            let [_, _, _, _, w1, w0, h1, h0] = half.to_be_bytes();
+            let width = u32::from(u16::from_be_bytes([w1, w0]));
+            let height = u32::from(u16::from_be_bytes([h1, h0]));
+            (width != 0 && height != 0).then_some((width, height))
+        };
+        Self {
+            panel: half(bits >> 32),
+            backing: half(bits & 0xffff_ffff),
+        }
+    }
+}
+
 /// `size × num / den`, rounded to nearest with halves up, exact in integers.
 ///
 /// `den` is non-zero. The product of two `u32`s fits a `u64`, and so does

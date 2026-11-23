@@ -18,8 +18,10 @@
 //! explicit-unbind flag is written only beside one of its calls), the setters
 //! of the implicit depth surface's handle and format and of the back buffer's
 //! size and sample count, `Reset` and release (which take the plane) and a
-//! dropped frame (which abandons the span). A surface's own extent, scale,
-//! format and sample count are fixed while it is bound.
+//! dropped frame (which abandons the span). The back buffer's scale, which
+//! the implicit surfaces share, changes only where its size is set
+//! (`set_backbuffer_dims`), so that setter covers it. A surface's own extent,
+//! scale, format and sample count are fixed while it is bound.
 
 use mtld3d_core::{
     depth_plane::{DepthSurface, Pairing, PassTargets, pairing},
@@ -37,12 +39,15 @@ use crate::unix_call::unix_call;
 impl DeviceInner {
     /// Open a span ahead of a draw whose targets or render states changed, if the draw needs one.
     ///
-    /// At the identity scale no pass is mixed, and below it a draw over
-    /// targets on one grid stops at the kept classification, so either pays
-    /// the tests here and no call.
+    /// A device whose back buffer was never scaled has no scaled surface, so
+    /// no pass is mixed; once one was, a surface may keep a scale the back
+    /// buffer no longer has (`DeviceFlags::SCALED_SURFACES`), so the gate is
+    /// that flag rather than the current scale. A draw over targets on one
+    /// grid stops at the kept classification, so either pays the tests here
+    /// and no call.
     #[inline]
     pub fn open_depth_span_for_draw(&mut self) {
-        if self.render_scale.is_identity() || self.depth_plane.rules_out_span() {
+        if !self.flags.contains(DeviceFlags::SCALED_SURFACES) || self.depth_plane.rules_out_span() {
             return;
         }
         self.open_depth_span_for_mixed_draw();
@@ -51,9 +56,10 @@ impl DeviceInner {
     /// Open a span ahead of a depth or stencil clear, if its pass is mixed.
     ///
     /// The transfer into the plane and the plane's bind go into the frame
-    /// before the clear, so its pass opens on the plane.
+    /// before the clear, so its pass opens on the plane. Gated like
+    /// [`Self::open_depth_span_for_draw`].
     pub fn open_depth_span(&mut self) {
-        if self.render_scale.is_identity()
+        if !self.flags.contains(DeviceFlags::SCALED_SURFACES)
             || self.depth_plane.rules_out_span()
             || self.classified_mixed_targets().is_none()
         {
@@ -67,8 +73,8 @@ impl DeviceInner {
     /// Over mixed targets a draw that neither reads nor writes depth or
     /// stencil leaves the depth surface as it is, so it opens nothing; the
     /// draw after it that does opens the span. Kept out of line, so the draw
-    /// path carries only the tests of its caller; the identity scale and
-    /// targets on one grid never reach it.
+    /// path carries only the tests of its caller; a device with no scaled
+    /// surface and targets on one grid never reach it.
     #[inline(never)]
     fn open_depth_span_for_mixed_draw(&mut self) {
         let Some(has_stencil) = self.classified_mixed_targets() else {

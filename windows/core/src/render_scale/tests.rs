@@ -493,6 +493,52 @@ fn a_back_buffer_scale_follows_the_size_and_the_screen() {
     );
 }
 
+/// A resize, or a `Reset` on the same window, re-resolves against the screen last published.
+///
+/// The device reads its screen word whenever it sizes the back buffer again;
+/// this is the scale that read gives.
+#[test]
+fn a_published_screen_re_resolves_the_scale() {
+    use mtld3d_shared::render_size::ScreenSizes;
+
+    let mut scale = BackBufferScale::new(RenderScale::IDENTITY, true);
+    scale.set_screen(Some(PANEL_16), Some(MORE_SPACE));
+    let maximized = (3840, 2100);
+    assert!(
+        !scale.for_back_buffer(maximized).is_identity(),
+        "on the scaled panel"
+    );
+    // The window moved to an unscaled 4K display, which published its sizes.
+    let external = ScreenSizes {
+        panel: Some((3840, 2160)),
+        backing: Some((3840, 2160)),
+    };
+    assert!(scale.follow_published(external.pack()));
+    assert!(
+        scale.for_back_buffer(maximized).is_identity(),
+        "the resize on the unscaled screen renders at full size"
+    );
+    assert!(
+        !scale.follow_published(external.pack()),
+        "the same screen again"
+    );
+    // Back on the scaled panel.
+    let panel = ScreenSizes {
+        panel: Some(PANEL_16),
+        backing: Some(MORE_SPACE),
+    };
+    assert!(scale.follow_published(panel.pack()));
+    assert_eq!(scale.for_back_buffer(MORE_SPACE).size(MORE_SPACE), PANEL_16);
+    // Nothing published, or no backing, keeps the sizes held.
+    assert!(!scale.follow_published(0));
+    let no_backing = ScreenSizes {
+        panel: Some((3840, 2160)),
+        backing: None,
+    };
+    assert!(!scale.follow_published(no_backing.pack()));
+    assert_eq!(scale.for_back_buffer(MORE_SPACE).size(MORE_SPACE), PANEL_16);
+}
+
 #[test]
 fn a_scale_survives_the_wire() {
     for s in [

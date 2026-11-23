@@ -70,6 +70,7 @@ fn latches(
         backing_scale_sink,
         cursor_kick_sink,
         client_surface_request_sink: 0,
+        screen_sizes_sink: 0,
         client_surface: 0,
     }
 }
@@ -215,6 +216,7 @@ fn each_record_seeds_its_own_defaults() {
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
             client_surface_request_sink: 0,
+            screen_sizes_sink: 0,
             client_surface: 0,
         },
     );
@@ -857,6 +859,7 @@ fn a_record_displays_nothing_from_the_limit_until_a_displayed_present() {
 fn request_latches(hwnd: u64, client_surface: usize, sink: &AtomicU32) -> AttachLatches {
     AttachLatches {
         client_surface_request_sink: core::ptr::from_ref(sink) as usize,
+        screen_sizes_sink: 0,
         ..surface_latches(hwnd, client_surface)
     }
 }

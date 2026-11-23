@@ -37,7 +37,8 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
     assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 112);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 120);
+    assert!(core::mem::offset_of!(AttachMetalLayerParams, screen_sizes_ptr) == 112);
     assert!(core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr) == 88);
     assert!(core::mem::offset_of!(AttachMetalLayerParams, panel_width) == 96);
     assert!(core::mem::offset_of!(AttachMetalLayerParams, backing_height) == 108);
@@ -323,6 +324,17 @@ pub struct AttachMetalLayerParams {
     /// scales every composited frame down to the panel.
     pub backing_width: u32,
     pub backing_height: u32, // out
+    /// Address of a PE-side `AtomicU64` that receives the window's screen sizes.
+    ///
+    /// Packed by `render_size::ScreenSizes::pack`, zero for nothing
+    /// published. The four fields above answer for the screen attach found. The unix
+    /// side stores the window's screen sizes here at attach and again from
+    /// the main thread whenever its display-follow pass sees the window's
+    /// screen (a move to another display, a reconfiguration), so the device
+    /// sizes a back buffer against the screen the window is on when it is
+    /// resized or `Reset`. Same backing contract as `backing_scale_ptr`. `0`
+    /// disables it.
+    pub screen_sizes_ptr: u64, // in: *const AtomicU64 (device-owned box, stable address)
 }
 
 impl Thunk for AttachMetalLayerParams {

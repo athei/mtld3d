@@ -318,6 +318,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         backing_scale_sink_ptr: params.backing_scale_ptr,
         cursor_kick_sink_ptr: params.cursor_kick_ptr,
         client_surface_request_sink_ptr: params.client_surface_request_ptr,
+        screen_sizes_sink_ptr: params.screen_sizes_ptr,
         software_cursor: params.software_cursor,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {

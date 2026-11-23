@@ -2149,6 +2149,7 @@ pub fn attach_metal_layer(
         panel_height: 0,
         backing_width: 0,
         backing_height: 0,
+        screen_sizes_ptr: sinks.screen_sizes_ptr(),
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);

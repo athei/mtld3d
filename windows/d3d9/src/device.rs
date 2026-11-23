@@ -310,7 +310,7 @@ const CLIP_PLANE_SLOTS: usize = mtld3d_core::vs_draw::MAX_CLIP_PLANES;
 bitflags::bitflags! {
     /// Assorted per-device boolean state.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct DeviceFlags: u8 {
+    pub struct DeviceFlags: u16 {
         /// Set after the app called `SetDepthStencilSurface(NULL)` — depth is explicitly absent.
         ///
         /// Distinguishes "no override, use the auto depth" from "explicitly
@@ -365,6 +365,15 @@ bitflags::bitflags! {
         /// before the first chain still resizes it, off the API lock like any
         /// other (`ARCHITECTURE.md`, "Application multithreading").
         const MADE_SWAP_CHAIN = 1 << 7;
+        /// Set once the back buffer's render scale is not the identity, and never cleared.
+        ///
+        /// A render target or depth surface the game creates at the back
+        /// buffer's size takes that scale and keeps it after the back buffer
+        /// is sized again at another scale (an auto-resize, an extended
+        /// device's `Reset`). So once set, a scaled surface may exist whatever
+        /// the scale is now, and the depth plane classifies the bound targets;
+        /// while clear no surface is scaled and no pass can be mixed.
+        const SCALED_SURFACES = 1 << 8;
     }
 }
 
@@ -3175,11 +3184,17 @@ impl DeviceInner {
     /// Every other consumer reads dims off `DeviceInner` (viewport
     /// defaults, `GetBackBuffer`, `GetRenderTarget`, `fresh_frame`), so
     /// this single setter propagates everywhere. The render scale follows
-    /// the size, since the panel fit applies only to a back buffer larger
-    /// than the panel; a change is logged at debug.
+    /// the size and the window's screen, since the panel fit applies only to
+    /// a back buffer larger than the panel of a scaled screen: the screen
+    /// sizes are read from the word the unix side publishes into
+    /// (`DisplaySinks::screen_sizes`, written at attach and by the main
+    /// thread's display-follow pass). A change is logged at debug.
     pub fn set_backbuffer_dims(&mut self, width: u32, height: u32) {
         self.backbuffer_width = width;
         self.backbuffer_height = height;
+        // The screen the window is on now, as the unix side last published it.
+        self.back_buffer_scale
+            .follow_published(self.cursor.sinks().screen_sizes());
         let scale = self.back_buffer_scale.for_back_buffer((width, height));
         if scale != self.render_scale {
             let (render_width, render_height) = scale.size((width, height));
@@ -3191,6 +3206,9 @@ impl DeviceInner {
                 self.back_buffer_scale.backing(),
             );
         }
+        if !scale.is_identity() {
+            self.flags.insert(DeviceFlags::SCALED_SURFACES);
+        }
         self.render_scale = scale;
         self.depth_plane.forget_targets();
     }
@@ -3201,6 +3219,20 @@ impl DeviceInner {
     /// `Reset` answers by recreating the back buffer at its size.
     pub fn follow_screen(&mut self, layer_params: &mtld3d_shared::AttachMetalLayerParams) -> bool {
         crate::direct3d9::adopt_attached_screen(&mut self.back_buffer_scale, layer_params);
+        self.back_buffer_scale
+            .for_back_buffer((self.backbuffer_width, self.backbuffer_height))
+            != self.render_scale
+    }
+
+    /// Adopt the screen sizes the unix side last published for the device's window.
+    ///
+    /// `true` when the back buffer's render scale changes with them at its
+    /// current size, which a `Reset` on the same window answers by
+    /// recreating the back buffer: the window may have moved to another
+    /// screen since the back buffer was sized.
+    pub fn follow_published_screen(&mut self) -> bool {
+        self.back_buffer_scale
+            .follow_published(self.cursor.sinks().screen_sizes());
         self.back_buffer_scale
             .for_back_buffer((self.backbuffer_width, self.backbuffer_height))
             != self.render_scale
@@ -3704,7 +3736,11 @@ impl Direct3DDevice9 {
             backbuffer_sample_count: info.backbuffer_sample_count,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
-            flags: info.initial_flags,
+            flags: if info.render_scale.is_identity() {
+                info.initial_flags
+            } else {
+                info.initial_flags | DeviceFlags::SCALED_SURFACES
+            },
             frame_latency: mtld3d_core::frame_latency::FrameLatency::new(
                 info.config.present_max_frame_latency,
             ),
@@ -5645,8 +5681,9 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
     // and the window subclass both live on the window the device attached, so
     // they move across before anything is recreated against the new one.
     // A back buffer sized against another screen's panel and backing is made
-    // again at its size when the new window's screen changes its scale.
-    let mut rescaled = false;
+    // again at its size when the window's screen now changes its scale: the
+    // new window's after a retarget, else the one the window moved to.
+    let mut rescaled = !retargeted && dev.follow_published_screen();
     if retargeted {
         // A pending change from an earlier Reset would otherwise ride the
         // frame the retarget flush below sends, which still names the layer
@@ -5996,6 +6033,9 @@ fn retarget_device_window(
         unix_call(&mut detach);
     }
     let config = Arc::clone(&dev.config);
+    // The word names the old window's screen until the attach publishes the
+    // new one's; an attach that publishes nothing leaves the first reading.
+    dev.cursor.sinks().clear_screen_sizes();
     let layer_params = crate::direct3d9::attach_metal_layer(
         hwnd as u64,
         dev.device_handle,

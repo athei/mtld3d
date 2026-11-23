@@ -99,6 +99,8 @@ pub struct LayerAttachRequest {
     pub cursor_kick_sink_ptr: u64,
     /// Where a client surface present request is written on the PE side, `0` = nowhere.
     pub client_surface_request_sink_ptr: u64,
+    /// Where the window's screen sizes are published on the PE side, `0` = nowhere.
+    pub screen_sizes_sink_ptr: u64,
     /// `cursor.software`, resolved by attach against the layer mode it picks.
     pub software_cursor: SoftwareCursorPolicy,
 }

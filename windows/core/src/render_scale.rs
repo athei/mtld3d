@@ -30,7 +30,9 @@
 //! The identity is an exact identity on every conversion here, so the
 //! default configuration on an unscaled screen cannot perturb a single pixel.
 
-use mtld3d_shared::render_size::{RenderScaleWire, scale_rounded, scaled_down_to_panel};
+use mtld3d_shared::render_size::{
+    RenderScaleWire, ScreenSizes, scale_rounded, scaled_down_to_panel,
+};
 
 /// The largest screen dimension [`panel_fit`] takes a ratio from.
 ///
@@ -413,6 +415,20 @@ impl BackBufferScale {
         self.panel = panel;
         self.backing = backing;
         changed
+    }
+
+    /// Adopt the sizes the unix side last published for the window's screen; `true` when changed.
+    ///
+    /// `published` is the device's screen word (`ScreenSizes::pack`). A word
+    /// that names no backing (nothing published yet, or a screen the window
+    /// was between) keeps the sizes held, which the attach or the first
+    /// reading gave.
+    pub fn follow_published(&mut self, published: u64) -> bool {
+        let sizes = ScreenSizes::unpack(published);
+        if sizes.backing.is_none() {
+            return false;
+        }
+        self.set_screen(sizes.panel, sizes.backing)
     }
 
     /// The panel size the scale was taken against, `None` when unknown.
