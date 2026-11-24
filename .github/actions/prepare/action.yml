@@ -52,9 +52,11 @@ runs:
     # The tools key is built from the pinned versions themselves rather than from
     # a hash of the file that carries them: editing a comment in ci.yml must not
     # throw away half a gigabyte of cache and recompile the tools from source.
-    # The Rust target list is hashed with them, since the toolchain directory
-    # holds those targets: `setup-rust`'s `rustup target add` command and the
-    # PE_*/UNIX_TARGET_* triples it names, and nothing else of the Makefile.
+    # The nightly is the value of the Makefile's RUST_NIGHTLY line, the one place
+    # it is pinned. The Rust target list is hashed with them, since the toolchain
+    # directory holds those targets: `setup-rust`'s `rustup target add` command
+    # and the PE_*/UNIX_TARGET_* triples it names, and nothing else of the
+    # Makefile.
     #
     # The MSVC SDK splat's key is built the same way, from the only inputs
     # that decide what `setup-xwin` writes: the three XWIN_* pins of the
@@ -65,9 +67,10 @@ runs:
     # re-splats and none saves.
     #
     # Each extraction is checked, since a pin rewritten to another assignment
-    # form would drop out of its hash without a word: every triple the
-    # `rustup target add` line names has its definition, and all three XWIN_*
-    # pins, the command line and the recipe are found.
+    # form would drop out of its hash without a word: the RUST_NIGHTLY pin is
+    # found once, every triple the `rustup target add` line names has its
+    # definition, and all three XWIN_* pins, the command line and the recipe are
+    # found.
     - name: Compute the tools and MSVC SDK cache keys
       id: keys
       shell: bash
@@ -80,7 +83,12 @@ runs:
           exit 1
         fi
         targets=$(printf '%s\n%s\n' "$triples" "$command" | shasum | cut -c1-16)
-        pins=$(printf '%s|%s|%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" "$NEXTEST_VERSION" "$targets" | shasum | cut -c1-16)
+        nightly=$(sed -n -e 's/^RUST_NIGHTLY *:= *//p' Makefile)
+        if [ "$(printf '%s\n' "$nightly" | grep -c .)" -ne 1 ]; then
+          echo "::error::the Makefile's RUST_NIGHTLY pin no longer matches the tools key's pattern"
+          exit 1
+        fi
+        pins=$(printf '%s|%s|%s|%s|%s' "$RUST_STABLE" "$nightly" "$CARGO_TOOLS" "$NEXTEST_VERSION" "$targets" | shasum | cut -c1-16)
         echo "tools=tools-${{ runner.os }}-${{ runner.arch }}-$pins" >> "$GITHUB_OUTPUT"
         xwin_pins=$(sed -n -e '/^XWIN_CRT_VERSION *:=/p' -e '/^XWIN_SDK_VERSION *:=/p' -e '/^XWIN_ARCH *:=/p' Makefile)
         xwin_command=$(sed -n -e '/^XWIN *:=/,/[^\\]$/p' Makefile)

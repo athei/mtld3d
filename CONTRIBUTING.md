@@ -56,7 +56,8 @@ The environment variables the targets read are listed in
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
 touched, that churn is its own pull request, not a hand-revert and not a passenger
-in yours.
+in yours. After a bump of the nightly pin, run `make setup-rust` once: `make fmt`
+fails until the pinned toolchain is installed.
 
 Every test leg installs the build into the Wine tree `WINE_SDK` names (and
 into `WINE_INSTALL_DIR` when set) before it runs, so two checkouts testing at once
