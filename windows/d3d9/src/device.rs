@@ -9624,12 +9624,13 @@ extern "system" fn device_stretch_rect(
                 return D3DERR_INVALIDCALL;
             };
             let transfer = crate::encoder::DepthTransfer {
-                source: *src_handle,
+                source: StretchKind::DepthStencil(*src_handle),
                 source_level: 0,
                 source_size: src_info.texture_size,
                 source_format,
                 source_samples: src_info.sample_count,
-                destination: *dst_handle,
+                destination: StretchKind::DepthStencil(*dst_handle),
+                destination_level: 0,
                 destination_size: dst_info.texture_size,
                 destination_format,
             };

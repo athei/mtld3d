@@ -742,6 +742,16 @@ fn emit_draw_view(
                 enc.get_texture_sample_handle_by_id(b.texture_id)
             };
     }
+    // A draw that samples the depth texture whose level the bound depth plane
+    // stands in for reads the plane's depth: the plane goes back into the
+    // level first whenever depth was written since it last did.
+    if let Some(texture) = enc.depth_stand_in_texture()
+        && stage_bindings
+            .into_iter()
+            .any(|(stage, b)| ps_sampled_mask & (1u16 << stage) != 0 && b.texture_id == texture)
+    {
+        enc.write_back_depth_stand_in();
+    }
     // A draw that samples the bound depth attachment reads a copy of it: Metal
     // forbids reading an attachment of the running pass. D3D9 permits the
     // bind (scene depth as both depth test and position source) with the

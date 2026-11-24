@@ -18,6 +18,13 @@
 //! then nearest down is the identity at any scale up to one, so depth the
 //! passes do not touch survives the round trip unchanged.
 //!
+//! The surface is a standalone or implicit depth surface, whose Metal handle
+//! the API thread holds, or a level of a sampleable depth texture, which the
+//! transfers name by the texture's info and level for the encoder to resolve.
+//! A draw that samples that texture while its plane is bound reads the
+//! plane's depth: the encoder carries the plane back into the level before
+//! such a draw whenever depth was written since it last did.
+//!
 //! The plane serves only that shape. A scaled render target 0 over a depth
 //! surface at another scale, unscaled or scaled otherwise, keeps the target's
 //! grid (`Pairing::Unserved`): the back buffer's scale follows its size under
@@ -26,7 +33,10 @@
 
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
-use crate::{encoder_data::DepthTransfer, render_scale::RenderScale};
+use crate::{
+    encoder_data::{DepthBinding, DepthTransfer, StretchKind, TextureInfo},
+    render_scale::RenderScale,
+};
 
 /// How render target 0 and the depth surface share a raster grid.
 #[derive(Debug, PartialEq, Eq)]
@@ -83,11 +93,40 @@ pub fn pairing(targets: &PassTargets) -> Pairing {
     }
 }
 
+/// The texture behind a depth surface, as the API thread can name it.
+pub enum DepthTexture {
+    /// A standalone or implicit depth surface's Metal texture, held on the API thread.
+    Surface(MetalHandle<MTLTextureKind>),
+    /// A level of a sampleable depth texture (INTZ, DF16, DF24): its info and the reported level.
+    ///
+    /// The API thread holds no Metal handle for it; the encoder resolves the
+    /// texture from its info, as it does for the depth binding.
+    Level(TextureInfo, u32),
+}
+
+impl DepthTexture {
+    /// The transfer end that names this texture.
+    fn end(&self) -> StretchKind {
+        match self {
+            Self::Surface(handle) => StretchKind::DepthStencil(*handle),
+            Self::Level(info, _) => StretchKind::Texture(info.clone()),
+        }
+    }
+
+    /// The Metal level a transfer reads or writes: 0 for a surface, the level's for a texture.
+    const fn metal_level(&self) -> u32 {
+        match self {
+            Self::Surface(_) => 0,
+            Self::Level(info, level) => info.rasterized_level(*level),
+        }
+    }
+}
+
 /// The scaled depth surface a span carries into the plane and back.
 pub struct DepthSurface {
-    /// The surface's Metal texture.
-    pub handle: MetalHandle<MTLTextureKind>,
-    /// The texture's extent, the reported one under `scale`.
+    /// The surface's Metal texture, or the depth texture whose level it is.
+    pub texture: DepthTexture,
+    /// The extent of the Metal texture level, the reported one under `scale`.
     pub texture_size: (u32, u32),
     /// The extent D3D9 reports for the surface, which the plane takes.
     pub logical_size: (u32, u32),
@@ -102,6 +141,27 @@ impl DepthSurface {
     #[must_use]
     pub fn has_stencil(&self) -> bool {
         self.format == PixelFormat::Depth32FloatStencil8
+    }
+
+    /// Whether a sampler can read the surface: a level of a depth texture.
+    #[must_use]
+    pub const fn is_sampleable(&self) -> bool {
+        matches!(self.texture, DepthTexture::Level(..))
+    }
+
+    /// The depth binding that puts the surface back in place of the plane when a span closes.
+    ///
+    /// What `SetDepthStencilSurface` binds for the same surface: its handle
+    /// with the texture's extent, or the texture's info with the reported
+    /// level, each at the surface's scale.
+    #[must_use]
+    pub const fn binding(self) -> DepthBinding {
+        match self.texture {
+            DepthTexture::Surface(handle) => {
+                DepthBinding::Eager(handle, self.texture_size, self.scale)
+            }
+            DepthTexture::Level(info, level) => DepthBinding::Lazy(info, level, self.scale),
+        }
     }
 }
 
@@ -226,18 +286,19 @@ impl DepthPlane {
     ///
     /// `None` when no plane of the surface's size and format is allocated or a
     /// span is already open; nothing changes then.
-    pub fn open(&mut self, surface: DepthSurface) -> Option<DepthTransfer> {
+    pub fn open(&mut self, surface: DepthSurface) -> Option<DepthTransfer<StretchKind>> {
         if self.span.is_some() {
             return None;
         }
         let plane = self.plane_for(&surface)?;
         let transfer = DepthTransfer {
-            source: surface.handle,
-            source_level: 0,
+            source: surface.texture.end(),
+            source_level: surface.texture.metal_level(),
             source_size: surface.texture_size,
             source_format: surface.format,
             source_samples: 1,
-            destination: plane,
+            destination: StretchKind::DepthStencil(plane),
+            destination_level: 0,
             destination_size: surface.logical_size,
             destination_format: surface.format,
         };
@@ -250,7 +311,7 @@ impl DepthPlane {
     /// # Panics
     /// Panics if the open span has no plane, which [`Self::open`] and
     /// [`Self::replace_plane`] rule out.
-    pub fn close(&mut self) -> Option<(DepthTransfer, DepthSurface)> {
+    pub fn close(&mut self) -> Option<(DepthTransfer<StretchKind>, DepthSurface)> {
         let surface = self.span.take()?;
         let plane = self
             .plane
@@ -258,12 +319,13 @@ impl DepthPlane {
             .expect("an open span has its plane")
             .handle;
         let transfer = DepthTransfer {
-            source: plane,
+            source: StretchKind::DepthStencil(plane),
             source_level: 0,
             source_size: surface.logical_size,
             source_format: surface.format,
             source_samples: 1,
-            destination: surface.handle,
+            destination: surface.texture.end(),
+            destination_level: surface.texture.metal_level(),
             destination_size: surface.texture_size,
             destination_format: surface.format,
         };

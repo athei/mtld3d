@@ -87,16 +87,18 @@ record!(TextureRecord {
     swizzle: [u32; 4]
 });
 record!(DepthTransferRecord {
-    source: u64,
-    destination: u64,
+    source: SurfaceIdentityRecord,
+    destination: SurfaceIdentityRecord,
     source_level: u32,
+    destination_level: u32,
     source_width: u32,
     source_height: u32,
     source_format: u32,
     source_samples: u32,
     destination_width: u32,
     destination_height: u32,
-    destination_format: u32
+    destination_format: u32,
+    reserved: u32
 });
 record!(SetViewportRecord {
     x: u32,
@@ -451,6 +453,18 @@ impl TextureRecord {
             Swizzle::from_repr(self.swizzle[2]).ok_or(WireError::InvalidValue)?,
             Swizzle::from_repr(self.swizzle[3]).ok_or(WireError::InvalidValue)?,
         ])
+    }
+}
+
+impl SurfaceIdentityRecord {
+    /// The texture this identity names, `None` for a back buffer or a standalone depth surface.
+    #[must_use]
+    pub const fn texture_id(&self) -> Option<crate::ids::TextureId> {
+        if self.kind == 0 {
+            Some(self.texture.texture_id())
+        } else {
+            None
+        }
     }
 }
 

@@ -140,6 +140,11 @@ pub enum DepthBinding {
     Lazy(TextureInfo, u32, crate::render_scale::RenderScale),
 }
 
+/// A surface the API thread names for the encoder: a texture by its info, or a Metal handle.
+///
+/// Names the two ends of a `StretchRect` and of a depth transfer
+/// (`ResolveDepthSurfaceOp`). A texture is resolved through the encoder's
+/// texture cache, since the API thread holds no handle for it.
 pub enum StretchKind {
     Texture(TextureInfo),
     Backbuffer(MetalHandle<MTLTextureKind>),
@@ -502,19 +507,24 @@ pub struct RetiredColorTarget {
 
 /// One whole-level depth transfer between two depth textures.
 ///
-/// `source_size` is the extent of the source level and `destination_size` that
-/// of the destination's level 0. The two may differ, in which case each
+/// `source_size` is the extent of the source level and `destination_size`
+/// that of the destination level. The two may differ, in which case each
 /// destination texel takes the nearest source texel. A multisampled source
 /// contributes sample zero, which is what the D3D9 RESZ hack and a
 /// depth-to-depth `StretchRect` resolve deliver. The stencil plane travels
 /// when both ends carry one.
-pub struct DepthTransfer {
-    pub source: MetalHandle<MTLTextureKind>,
+///
+/// The encoder works on Metal handles, the default `E`. The API thread
+/// names each end as a [`StretchKind`], since it holds no handle for a level
+/// of a sampleable depth texture.
+pub struct DepthTransfer<E = MetalHandle<MTLTextureKind>> {
+    pub source: E,
     pub source_level: u32,
     pub source_size: (u32, u32),
     pub source_format: PixelFormat,
     pub source_samples: u8,
-    pub destination: MetalHandle<MTLTextureKind>,
+    pub destination: E,
+    pub destination_level: u32,
     pub destination_size: (u32, u32),
     pub destination_format: PixelFormat,
 }
@@ -586,7 +596,7 @@ pub struct NoteColorReadOp {
 }
 
 pub struct ResolveDepthSurfaceOp {
-    pub transfer: DepthTransfer,
+    pub transfer: DepthTransfer<StretchKind>,
 }
 
 pub struct StretchBlitOp {

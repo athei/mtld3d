@@ -165,16 +165,18 @@ fn execute_control(
         }
         EncoderOpcode::ResolveDepthSurface => {
             let r = borrow::<records::DepthTransferRecord>(payload)?;
-            enc.resolve_depth_surface(&DepthTransfer {
-                source: texture_handle(r.source),
-                destination: texture_handle(r.destination),
+            let transfer = DepthTransfer {
+                source: texture_handle(surface_handle(enc, &r.source)?),
+                destination: texture_handle(surface_handle(enc, &r.destination)?),
                 source_level: r.source_level,
                 source_size: (r.source_width, r.source_height),
                 source_format: pixel_format(r.source_format)?,
                 source_samples: byte(r.source_samples)?,
+                destination_level: r.destination_level,
                 destination_size: (r.destination_width, r.destination_height),
                 destination_format: pixel_format(r.destination_format)?,
-            });
+            };
+            enc.resolve_depth_surface(&transfer, r.source.texture_id());
         }
         EncoderOpcode::StretchBlit => {
             let r = borrow::<records::StretchBlitRecord>(payload)?;
