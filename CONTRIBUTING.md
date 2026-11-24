@@ -265,10 +265,17 @@ some of the later one's growth, which one process a round cannot avoid.
 The two runs of one benchmark in a round are therefore a whole round
 process apart, about 33 s with the `wow` set, rather than back to back, and
 with an odd `RUNS` one leg goes first in one round more than the other (3
-to 2 with the default five). Before each round's process the run measures
-for half a second the CPU its busiest other processes take, and the report
-warns about every round that started on a busy machine (one other process
-at a quarter of a core, all of them at half, or macOS throttling for heat);
+to 2 with the default five). Before round 0 both legs run one more round,
+the base first, that no comparison judges: the run's first end-to-end
+process reads 3 to 5 % faster on `texture_streaming`'s frame and API times
+than the same leg's later ones, and before it only the candidate's prefix
+has run the benchmark binary (to list the benchmarks); without that round
+both would fall on the base's round 0. Its files stay in `<leg>/warmup/`
+of the run's directory, and the report's header says it ran. Before each
+round's process the run measures for half a second the CPU its busiest
+other processes take, and the report warns about every round that started
+on a busy machine (one other process at a quarter of a core, all of them at
+half, or macOS throttling for heat);
 run those again. `BENCH_WAIT_IDLE=120` optionally waits up to 120 seconds
 before each timed process for three consecutive quiet half-second CPU
 samples, using those same thresholds. The default `0` keeps advisory
@@ -456,13 +463,14 @@ on a device of its own: about a second for Wine's start, then per benchmark
 about 4.5 s for its device, the warm-up, untimed frames until its second perf
 window opens two seconds after its first frame, and that one window
 measured. So a round of one leg takes about 33 s and the default five rounds
-of both legs about 5.5 minutes, the four shape runs under half a minute and
-the host emitter's rounds about 20 s. Before the first run the two legs build at the same time
-and their prefixes boot while the benchmark binary builds: about a minute and
+of both legs about 5.5 minutes, the unmeasured round of both legs before
+them about another minute, the four shape runs under half a minute and the
+host emitter's rounds about 20 s. Before the first run the two legs build
+at the same time and their prefixes boot while the benchmark binary builds: about a minute and
 a half with a new base worktree and a changed candidate, well under a minute
 when neither needs a build, longer when a change rebuilds the production
 layer in both legs. An A/A run of one commit against itself should take
-about 8 minutes in all, down from the 20 an earlier layout of the run took
+about 9 minutes in all, down from the 20 an earlier layout of the run took
 (an estimate from that run's timestamps and the new spans; the first run's
 timestamps say what it is on your machine). `BENCH_SET=full` runs every
 benchmark, the shader-stutter and cold-start ones included, and takes about

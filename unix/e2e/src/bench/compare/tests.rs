@@ -391,6 +391,50 @@ fn a_neutral_directory_exits_zero_and_writes_its_report() {
 }
 
 #[test]
+fn the_unmeasured_round_is_named_in_the_header_and_never_judged() {
+    let fixture = Fixture::new("warmup");
+    fixture.standard(3, 1.0);
+    let plain = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(
+        !plain.header.iter().any(|line| line.contains("unmeasured")),
+        "{:?}",
+        plain.header
+    );
+    // A candidate twice as slow in the unmeasured round alone.
+    for (leg, image, frame) in [("base", "AAAA", 10.0), ("cand", "BBBB", 20.0)] {
+        let dir = fixture.root.join(leg).join(WARMUP_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let mut text = String::new();
+        for (key, value) in meta("v0.11.0-3-g66e4114", image) {
+            let _ = writeln!(text, "meta frame_shape {key} {value}");
+        }
+        let _ = writeln!(text, "metric frame_shape frame.p50 {frame} ms lower time");
+        let _ = writeln!(
+            text,
+            "metric frame_shape perf.draws_pf 500 count lower exact"
+        );
+        fs::write(dir.join("bench-frame_shape.metrics"), text).unwrap();
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    assert!(
+        comparison.header.iter().any(|line| line
+            == "an unmeasured round of both legs ran before round 0, kept in <leg>/warmup and \
+                not judged"),
+        "{:?}",
+        comparison.header
+    );
+    assert!(
+        comparison
+            .header
+            .iter()
+            .any(|line| line.ends_with("; 3 round pairs")),
+        "{:?}",
+        comparison.header
+    );
+}
+
+#[test]
 fn different_profiles_cannot_be_compared() {
     let fixture = Fixture::new("profile");
     fixture.standard(3, 1.0);

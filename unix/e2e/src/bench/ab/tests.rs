@@ -16,7 +16,8 @@ fn file(text: &str) -> MetricsFile {
 }
 
 #[test]
-fn the_host_rounds_come_first_then_each_round_runs_each_binary_in_both_legs() {
+fn the_host_rounds_come_first_then_an_unmeasured_round_then_each_round_in_both_legs() {
+    let warmup = |group, leg| Step::Warmup { group, leg };
     let round = |group, round, leg| Step::Round { group, round, leg };
     let shape = |bench, leg| Step::Shape { bench, leg };
     let host = |round, leg| Step::Host { round, leg };
@@ -29,6 +30,10 @@ fn the_host_rounds_come_first_then_each_round_runs_each_binary_in_both_legs() {
         host(2, Leg::Cand),
     ];
     let rest = [
+        warmup(0, Leg::Base),
+        warmup(0, Leg::Cand),
+        warmup(1, Leg::Base),
+        warmup(1, Leg::Cand),
         round(0, 0, Leg::Base),
         round(0, 0, Leg::Cand),
         round(1, 0, Leg::Base),
