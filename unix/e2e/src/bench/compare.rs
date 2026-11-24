@@ -73,7 +73,7 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE, machine,
+    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WARMUP_DIR, WINE_FILE, machine,
     metrics::{self, Class, Direction, Metric, MetricsFile, Unit},
     shape::{self, ShapeReport},
     stats::{MAD_SIGMA, mad, median},
@@ -608,6 +608,15 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
             ));
         }
     }
+    if [Leg::Base, Leg::Cand]
+        .iter()
+        .any(|leg| dir.join(leg.dir()).join(WARMUP_DIR).is_dir())
+    {
+        header.push(format!(
+            "an unmeasured round of both legs ran before round 0, kept in <leg>/{WARMUP_DIR} and \
+             not judged"
+        ));
+    }
     comparison.header = header;
     comparison.header.extend([
         format!(
@@ -633,7 +642,8 @@ pub struct Loaded {
 ///
 /// What it returns holds, per round, each benchmark's file by benchmark name.
 /// The `shape` directory beside the rounds holds the untimed shape runs,
-/// whose numbers are no round's.
+/// and the `warmup` directory the unmeasured round run before round 0;
+/// the numbers of neither are a round's.
 ///
 /// # Errors
 ///
@@ -650,7 +660,7 @@ pub fn load_leg(dir: &Path) -> Result<Vec<BTreeMap<String, Loaded>>, String> {
             continue;
         }
         let name = entry.file_name();
-        if name == SHAPE_DIR {
+        if name == SHAPE_DIR || name == WARMUP_DIR {
             continue;
         }
         let round = name

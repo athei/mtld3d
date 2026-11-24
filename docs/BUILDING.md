@@ -261,8 +261,9 @@ The Makefile header describes each path.
 
 `make bench` runs the synthetic benchmarks once against this checkout.
 `make bench-ab BASE=<ref>` builds `BASE` and this checkout and runs the
-benchmarks against both in alternating rounds, which is how a change is
-checked for a slowdown. Both measure the i686 build by default and the
+benchmarks against both in alternating rounds, after one unmeasured round
+of both that the comparison leaves out, which is how a change is checked
+for a slowdown. Both measure the i686 build by default and the
 ARM64X build with `ARCH=arm64x`. Both build the production profile, and
 `bench-ab` adds the perf telemetry.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#benchmarks) explains how to run them

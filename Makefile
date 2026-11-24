@@ -1722,7 +1722,9 @@ bench: install-windows-$(ARCH) install-unix-arm64
 # verdict per metric. RUNS (default 5) is how many rounds each benchmark gets,
 # a round being one run of either build back to back, the one that goes first
 # alternating, and each build's run one process running every benchmark in
-# libtest's order, the same in both.
+# libtest's order, the same in both. One more round of both builds runs
+# before the first, into `<leg>/warmup/`, and is not judged: the run's first
+# benchmark process reads faster than the later ones.
 # BENCH_SET picks the benchmarks: `wow` (the default) the ones that stand for
 # the game this layer serves first, `full` every benchmark, and anything else
 # a space-separated list of test-name filters, each selecting the benchmarks

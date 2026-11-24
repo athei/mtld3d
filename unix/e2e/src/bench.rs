@@ -18,9 +18,11 @@
 //! A finished A/B directory holds `<leg>/<round>/bench-<name>.metrics`, the
 //! leg `base` or `cand` and the round `0..N`. `bench-compare` reads that
 //! directory back and pairs the two legs round by round, and `bench-ab` ends
-//! by doing the same. A run of one clean commit against itself also leaves
-//! a `same-image-allowed` file there (see `compare::check_builds`), so a later
-//! `bench-compare` judges it the way `bench-ab` did, and a `wine.txt` naming
+//! by doing the same. The unmeasured round both legs run before round 0
+//! writes into `<leg>/warmup/`, which no comparison reads. A run of one
+//! clean commit against itself also leaves a `same-image-allowed` file
+//! there (see `compare::check_builds`), so a later `bench-compare` judges
+//! it the way `bench-ab` did, and a `wine.txt` naming
 //! the one Wine both legs ran, which the report quotes. After its timed
 //! rounds every benchmark whose metrics declare `shape` lines also runs once
 //! per leg with the layer's pass trace on, into `<leg>/shape/<test>/`; that
@@ -58,6 +60,9 @@ pub const SHAPE: &str = "bench-shape";
 
 /// The directory of a leg that holds its untimed pass-trace runs, beside its rounds.
 const SHAPE_DIR: &str = "shape";
+
+/// The directory of a leg that holds its unmeasured round, beside its judged rounds.
+const WARMUP_DIR: &str = "warmup";
 
 /// The file in an A/B directory that allows both legs one `d3d9.dll` image.
 const SAME_IMAGE_FILE: &str = "same-image-allowed";
