@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use mtld3d_shared::{
-    AttachMetalLayerParams, BlitTextureToBufferParams, CreateBackbufferParams,
+    AttachMetalLayerParams, AwaitReadbackParams, BlitTextureToBufferParams, CreateBackbufferParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
     GetDeviceInfoParams, InPtr, InPtrMut, LogLineKind, MetalHandle, OpenLogParams,
-    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams, WriteLogParams,
-    identity,
+    PresentClientSurfaceParams, QueueReadbackParams, SetCursorOverlayParams,
+    SetPresentWaitPolicyParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind},
     mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
@@ -644,11 +644,53 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
     let Some(record) = device_record(params.record_handle, "BlitTextureToBuffer") else {
         return STATUS_UNSUCCESSFUL;
     };
-    let blit_args = metal::BlitArgs {
+    if metal::blit_texture_to_buffer(&blit_args(&params, &record)) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
+}
+
+pub extern "C" fn queue_readback_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut QueueReadbackParams.
+    let Some(mut params) = (unsafe { InPtrMut::<QueueReadbackParams>::opt(args) }) else {
+        return -1;
+    };
+    let Some(record) = device_record(params.blit.record_handle, "QueueReadback") else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Some(ticket) = metal::queue_texture_to_buffer(&blit_args(&params.blit, &record)) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    params.ticket = ticket;
+    STATUS_SUCCESS
+}
+
+pub extern "C" fn await_readback_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const AwaitReadbackParams.
+    let Some(params) = (unsafe { InPtr::<AwaitReadbackParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    let Some(record) = device_record(params.record_handle, "AwaitReadback") else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if record.readbacks().await_through(params.ticket) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
+}
+
+/// The blit a `BlitTextureToBuffer` or `QueueReadback` asks for, on `record`.
+const fn blit_args<'a>(
+    params: &BlitTextureToBufferParams,
+    record: &'a Arc<metal::DeviceRecord>,
+) -> metal::BlitArgs<'a> {
+    metal::BlitArgs {
         planes: params.planes,
         stencil_bytes_per_row: params.stencil_bytes_per_row,
         stencil_offset: params.stencil_offset,
-        record: &record,
+        record,
         device_handle: params.device_handle,
         tex_handle: params.tex_handle,
         dst_ptr: params.dst_ptr,
@@ -663,11 +705,6 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
         source_width: params.source_width,
         source_height: params.source_height,
         block_height: params.block_height,
-    };
-    if metal::blit_texture_to_buffer(&blit_args) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
     }
 }
 

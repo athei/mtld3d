@@ -47,6 +47,9 @@ const _: () = {
     assert!(core::mem::offset_of!(GetDeviceInfoParams, panel_height) == 40);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<PresentClientSurfaceParams>() == 16);
+    assert!(core::mem::size_of::<QueueReadbackParams>() == 104);
+    assert!(core::mem::offset_of!(QueueReadbackParams, ticket) == 96);
+    assert!(core::mem::size_of::<AwaitReadbackParams>() == 16);
     assert!(core::mem::offset_of!(PresentClientSurfaceParams, reasons) == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
@@ -859,6 +862,38 @@ pub struct BlitTextureToBufferParams {
 
 impl Thunk for BlitTextureToBufferParams {
     const CODE: u32 = Thunks::BlitTextureToBuffer as u32;
+}
+
+/// A `BlitTextureToBuffer` committed without a wait, for a readback the PE side reads later.
+///
+/// `GetRenderTargetData` into a system-memory surface: D3D9 promises its
+/// pixels only once the surface is locked or otherwise read, and a game that
+/// reads one surface back each frame while it locks the one it read the frame
+/// before keeps the GPU busy that way. The unix side encodes the same blit
+/// and commits it, and answers the readback's `ticket`; until the PE side
+/// awaits that ticket (`AwaitReadback`), the destination memory is the GPU's.
+#[repr(C, align(8))]
+pub struct QueueReadbackParams {
+    pub blit: BlitTextureToBufferParams, // in
+    pub ticket: u64,                     // out: the readback's place in the device's order
+}
+
+impl Thunk for QueueReadbackParams {
+    const CODE: u32 = Thunks::QueueReadback as u32;
+}
+
+/// Wait for a device's queued readbacks up to `ticket` (every earlier one completes first).
+///
+/// The status is unsuccessful when one of them failed on the GPU, whose
+/// destination then holds what it held before or a partial copy.
+#[repr(C, align(8))]
+pub struct AwaitReadbackParams {
+    pub record_handle: DeviceRecordHandle, // in
+    pub ticket: u64,                       // in
+}
+
+impl Thunk for AwaitReadbackParams {
+    const CODE: u32 = Thunks::AwaitReadback as u32;
 }
 
 #[cfg(test)]

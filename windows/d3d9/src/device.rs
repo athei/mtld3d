@@ -68,8 +68,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
-    DestroyCommandQueueParams, InPtr, InPtrMut, MetalHandle, OutPtr, SetPresentWaitPolicyParams,
-    ValueIn, VtableThis,
+    DestroyCommandQueueParams, InPtr, InPtrMut, MetalHandle, OutPtr, QueueReadbackParams,
+    SetPresentWaitPolicyParams, ValueIn, VtableThis,
     mtl::PresentWaitPolicy,
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
@@ -9194,7 +9194,7 @@ extern "system" fn device_get_render_target_data(
     // at all.
     let src_handle = src.metal_color_handle();
     let hr = if src_handle.is_null() {
-        readback_from_texture_rt(&obj, &src, &dst_desc)
+        readback_from_texture_rt(&obj, &src, &dst_desc, &dst_surf)
     } else {
         if map_d3d_format(src.standalone_format()).is_none() {
             warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
@@ -9208,16 +9208,17 @@ extern "system" fn device_get_render_target_data(
         if reject_readback("GetRenderTargetData", &source, &dst_desc).is_some() {
             return D3DERR_INVALIDCALL;
         }
-        blit_texture_to_systemmem(
-            obj.inner(),
-            &SystemMemReadback::for_readback(
-                src_handle,
-                // A standalone colour surface is one image: mip 0, slice 0.
-                (0, 0),
-                (source.width, source.height),
-                &dst_desc,
-            ),
-        )
+        let read = SystemMemReadback::for_readback(
+            src_handle,
+            // A standalone colour surface is one image: mip 0, slice 0.
+            (0, 0),
+            (source.width, source.height),
+            &dst_desc,
+        );
+        if let Err(hr) = flush_for_readback(obj.inner(), &read) {
+            return hr;
+        }
+        read_into(obj.inner(), &read, &dst_surf)
     };
     if hr == D3D_OK {
         dst_surf.note_system_memory_written();
@@ -9237,6 +9238,7 @@ fn readback_from_texture_rt(
     dev: &Direct3DDevice9,
     src: &Direct3DSurface9,
     dst: &SystemMemoryDst,
+    dst_surf: &Direct3DSurface9,
 ) -> i32 {
     let parent = src.parent_texture();
     if parent.is_null() {
@@ -9306,7 +9308,7 @@ fn readback_from_texture_rt(
             "GetRenderTargetData: texture-RT handle unresolved → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
-    blit_handle_to_systemmem(
+    read_into(
         dev.inner(),
         &SystemMemReadback::for_readback(
             // SAFETY: `h` is non-zero (checked above) and a live retained
@@ -9316,6 +9318,7 @@ fn readback_from_texture_rt(
             full_extent,
             dst,
         ),
+        dst_surf,
     )
 }
 
@@ -9349,15 +9352,62 @@ extern "system" fn device_get_front_buffer_data(
 /// per-`LockRect` backbuffer readback in `surface.rs`. The destination has
 /// already been checked against the source by `reject_readback`.
 fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemReadback) -> i32 {
-    let src = read.tex_handle;
-    // This blit reads the RT right after the flush. Mark it read-back BEFORE
-    // the flush so the store-action rules treat it as live and never discard
-    // its colour store.
-    device_inner.push_control(crate::device::NoteColorReadOp { src });
-    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+    if let Err(hr) = flush_for_readback(device_inner, read) {
         return hr;
     }
     blit_handle_to_systemmem(device_inner, read)
+}
+
+/// Read `read` into `dst` once the frame that drew its source is submitted.
+///
+/// D3D9 promises the pixels when the surface is next read, not when
+/// `GetRenderTargetData` returns: a standalone system-memory surface takes the
+/// readback queued and awaits it at that read, so the GPU keeps working
+/// meanwhile and a game that locks last frame's copy while this one is made
+/// never waits. Every other destination is read back synchronously.
+fn read_into(device_inner: &DeviceInner, read: &SystemMemReadback, dst: &Direct3DSurface9) -> i32 {
+    if !dst.takes_queued_readback() {
+        return blit_handle_to_systemmem(device_inner, read);
+    }
+    match queue_texture_to_systemmem(device_inner, read) {
+        Ok(ticket) => {
+            dst.queue_readback(device_inner.record_handle(), ticket);
+            D3D_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+/// The readback [`blit_handle_to_systemmem`] makes, committed without a wait: its ticket.
+///
+/// The caller hands the ticket to the destination surface, which awaits it
+/// before its memory is read (`SurfaceInner::settle_readback`).
+fn queue_texture_to_systemmem(
+    device_inner: &DeviceInner,
+    read: &SystemMemReadback,
+) -> Result<u64, i32> {
+    let mut params = QueueReadbackParams {
+        blit: readback_params(device_inner, read),
+        ticket: 0,
+    };
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "readback QueueReadback failed status={status:#x} → INVALIDCALL");
+        return Err(D3DERR_INVALIDCALL);
+    }
+    Ok(params.ticket)
+}
+
+/// Submit the frame so far, its render target marked read back.
+///
+/// The readback reads the RT right after the flush. Marked read-back BEFORE
+/// the flush so the store-action rules treat it as live and never discard its
+/// colour store.
+fn flush_for_readback(device_inner: &mut DeviceInner, read: &SystemMemReadback) -> Result<(), i32> {
+    let src = read.tex_handle;
+    device_inner.push_control(crate::device::NoteColorReadOp { src });
+    device_inner.flush_current_frame_blocking()
 }
 
 /// Parameters for one synchronous read of a Metal texture into system memory.
@@ -9429,7 +9479,22 @@ impl SystemMemReadback {
 /// is the bare data-movement step shared by the standalone-colour-handle path,
 /// the texture-RT path and the released-staging refill.
 pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemReadback) -> i32 {
-    let mut params = BlitTextureToBufferParams {
+    let mut params = readback_params(device_inner, read);
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "readback BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    D3D_OK
+}
+
+/// The colour blit a [`SystemMemReadback`] asks the unix side for.
+const fn readback_params(
+    device_inner: &DeviceInner,
+    read: &SystemMemReadback,
+) -> BlitTextureToBufferParams {
+    BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
@@ -9450,14 +9515,7 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         // Render-target colour formats are all uncompressed, so a block row is
         // a pixel row.
         block_height: 1,
-    };
-    let status = unix_call(&mut params);
-    if status != 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "readback BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
     }
-    D3D_OK
 }
 
 extern "system" fn device_stretch_rect(

@@ -8084,3 +8084,104 @@ fn a_bound_additional_swap_chain_back_buffer_survives_the_application_releases()
         );
     }
 }
+
+/// The pixel at `(x, y)` of a locked 32-bit system-memory surface.
+fn sysmem_pixel(surface: &Surface, x: u32, y: u32) -> u32 {
+    let locked = surface.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_px + x) as usize;
+    locked.as_u32(idx + 1)[idx]
+}
+
+#[test]
+fn alternating_readbacks_each_lock_the_frame_read_back_into_it() {
+    // A game that reads each frame back without stalling copies frame n into
+    // one of two system-memory surfaces and locks the other, which frame
+    // n - 1 was copied into. The copy is queued,
+    // so `GetRenderTargetData` returns before the GPU has run it; each lock
+    // still reads the frame copied into that surface, never a stale or
+    // half-written one.
+    const FRAMES: [u32; 6] = [RED, GREEN, BLUE, MAGENTA, WHITE, BLACK];
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let surfaces = [0, 1].map(|_| {
+        h.create_offscreen_plain_surface(
+            desc.width,
+            desc.height,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM,
+        )
+    });
+    for (n, colour) in FRAMES.iter().enumerate() {
+        assert_eq!(h.clear_target(*colour), 0, "clear frame {n}");
+        assert_eq!(
+            h.get_render_target_data_hr(&bb, &surfaces[n % 2]),
+            0,
+            "GetRenderTargetData frame {n}"
+        );
+        if n > 0 {
+            assert_eq!(
+                sysmem_pixel(&surfaces[(n - 1) % 2], 8, 8),
+                FRAMES[n - 1],
+                "frame {n} locks frame {}'s copy",
+                n - 1
+            );
+        }
+        assert_eq!(h.present(), 0, "present frame {n}");
+    }
+}
+
+#[test]
+fn a_second_readback_into_a_surface_wins_over_the_first() {
+    // Two copies into one surface with no lock between them: the lock reads
+    // the later one, whatever order the GPU would have finished them in.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(h.clear_target(RED), 0, "clear red");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "first readback"
+    );
+    assert_eq!(h.clear_target(BLUE), 0, "clear blue");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "second readback"
+    );
+    assert_eq!(sysmem_pixel(&sysmem, 8, 8), BLUE, "the later copy");
+}
+
+#[test]
+fn a_surface_released_with_its_readback_queued_frees_after_it() {
+    // A surface may be released before anything reads the copy queued into
+    // it. The release waits for the copy, so the GPU never writes freed
+    // memory, and the device goes on drawing and reading back.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    for n in 0..8 {
+        let sysmem = h.create_offscreen_plain_surface(
+            desc.width,
+            desc.height,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM,
+        );
+        assert_eq!(h.clear_target(GREEN), 0, "clear {n}");
+        assert_eq!(h.get_render_target_data_hr(&bb, &sysmem), 0, "readback {n}");
+        drop(sysmem);
+    }
+    assert_eq!(h.clear_target(MAGENTA), 0, "clear after the releases");
+    assert_eq!(h.read_pixel(8, 8), MAGENTA, "the device still reads back");
+}

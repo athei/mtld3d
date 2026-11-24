@@ -40,12 +40,13 @@ pub use ffi_boundary::{
 pub use log_filter::{init_logger, init_logger_to, init_logger_to_filter};
 pub use mtl_handle::MetalHandle;
 pub use params::{
-    AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc, CreateBackbufferParams,
-    CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
-    DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams, ExtraColorDesc,
-    GetDeviceInfoParams, InitLoggerParams, LogLineKind, OpenLogParams, PassDescriptor,
-    PresentClientSurfaceParams, SetCursorOverlayParams, SetPresentWaitPolicyParams,
-    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WriteLogParams,
+    AttachMetalLayerParams, AwaitReadbackParams, BlitTextureToBufferParams, BufferCreateDesc,
+    CreateBackbufferParams, CreateColorTargetParams, CreateCommandQueueParams,
+    CreateDepthTextureParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
+    DetachMetalLayerParams, ExtraColorDesc, GetDeviceInfoParams, InitLoggerParams, LogLineKind,
+    OpenLogParams, PassDescriptor, PresentClientSurfaceParams, QueueReadbackParams,
+    SetCursorOverlayParams, SetPresentWaitPolicyParams, TextureCreateDesc, VertexAttrDesc,
+    VertexBufferLayoutDesc, WriteLogParams,
 };
 pub use record_handle::DeviceRecordHandle;
 
@@ -74,6 +75,8 @@ pub enum Thunks {
     CreateShaderProgram,
     CancelShaderProgram,
     PresentClientSurface,
+    QueueReadback,
+    AwaitReadback,
 }
 
 pub trait Thunk {

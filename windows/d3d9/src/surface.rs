@@ -11,8 +11,8 @@ use mtld3d_core::{
     surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
 };
 use mtld3d_shared::{
-    BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn, VtableThis,
-    mtl_handle::MTLTextureKind,
+    AwaitReadbackParams, BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn,
+    VtableThis, mtl_handle::MTLTextureKind, record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
     D3DFMT_A1R5G5B5, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5,
@@ -263,6 +263,7 @@ impl Direct3DSurface9 {
             multi_sample,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -320,6 +321,7 @@ impl Direct3DSurface9 {
             multi_sample,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -366,6 +368,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -432,6 +435,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -481,6 +485,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -534,6 +539,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -581,6 +587,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
+            queued_readback: None,
             flags: SurfaceFlags::OWNS_PARENT_TEXTURE,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -631,6 +638,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: Some(HeldPages::new(backing, PageHolder::Surface)),
+            queued_readback: None,
             flags: if unwritten {
                 SurfaceFlags::SYSTEM_MEMORY_UNWRITTEN
             } else {
@@ -1048,6 +1056,9 @@ impl Direct3DSurface9 {
         if !inner.metal_color_handle.is_null() {
             return None;
         }
+        // Two readbacks into one memory through two Metal buffers are not
+        // ordered against each other: the earlier one finishes first.
+        inner.settle_readback();
         if inner.system_memory.is_some() {
             let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
             let width = inner.standalone_width;
@@ -1088,6 +1099,25 @@ impl Direct3DSurface9 {
             bytes_per_row,
             format: texture.d3d_format(),
         })
+    }
+
+    /// Whether a `GetRenderTargetData` into this surface may be queued rather than waited for.
+    ///
+    /// A standalone `D3DPOOL_SYSTEMMEM` or `D3DPOOL_SCRATCH` offscreen
+    /// surface: its memory is its own, and every read of it settles a queued
+    /// readback first. A texture level's staging is read along other paths
+    /// and stays synchronous.
+    pub fn takes_queued_readback(&self) -> bool {
+        let inner = self.inner();
+        inner.system_memory.is_some() && inner.parent_texture.is_null()
+    }
+
+    /// Note a readback queued into this surface's memory (see [`Self::takes_queued_readback`]).
+    pub fn queue_readback(&self, record_handle: DeviceRecordHandle, ticket: u64) {
+        // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
+        // access is exclusive (D3D9 objects are single-threaded, or serialised
+        // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`).
+        unsafe { &mut *self.inner }.queue_readback(record_handle, ticket);
     }
 
     /// Record that a read-back rewrote this surface's system-memory bytes.
@@ -1136,8 +1166,11 @@ impl Direct3DSurface9 {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
         // access is exclusive (D3D9 objects are single-threaded, or serialised
         // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
-        // transient exclusive borrow taken to zero the backing is sound.
-        unsafe { &mut *self.inner }.expose_system_memory();
+        // transient exclusive borrow taken to settle a queued readback and zero the
+        // backing is sound.
+        let inner = unsafe { &mut *self.inner };
+        inner.settle_readback();
+        inner.expose_system_memory();
         let inner = self.inner();
         let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
         let pitch = mtld3d_core::format::block_row_pitch(
@@ -1301,6 +1334,12 @@ struct SurfaceInner {
     /// into it, and `LockRect` hands back a pointer into it. `None` for every
     /// GPU-backed surface kind.
     system_memory: Option<HeldPages>,
+    /// A `GetRenderTargetData` the GPU may still be writing into `system_memory`: device, ticket.
+    ///
+    /// Set by a queued readback (`QueueReadback`) and awaited, then cleared,
+    /// by [`SurfaceInner::settle_readback`] before anything reads the memory,
+    /// writes it, reads it back again or frees it.
+    queued_readback: Option<(DeviceRecordHandle, u64)>,
     /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
     ///
     /// Any stored `IUnknown` is released when this `SurfaceInner` drops.
@@ -1348,7 +1387,40 @@ struct SurfaceInner {
     state_owner_texture: *mut Direct3DTexture9,
 }
 
+impl Drop for SurfaceInner {
+    /// A queued readback is awaited before the memory it writes is freed.
+    fn drop(&mut self) {
+        self.settle_readback();
+    }
+}
+
 impl SurfaceInner {
+    /// Wait for a readback queued into this surface's system memory, if one is.
+    ///
+    /// A readback the GPU failed leaves the memory as it was or half written,
+    /// as a failed synchronous one would; it is logged once and the caller
+    /// goes on, since the D3D call that queued it already answered `D3D_OK`.
+    pub fn settle_readback(&mut self) {
+        let Some((record_handle, ticket)) = self.queued_readback.take() else {
+            return;
+        };
+        let mut params = AwaitReadbackParams {
+            record_handle,
+            ticket,
+        };
+        let status = unix_call(&mut params);
+        if status != 0 {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "GetRenderTargetData: the queued readback failed (status {status:#x}); the \
+                 surface keeps what it held");
+        }
+    }
+
+    /// Hand this surface's system memory to a readback the GPU runs after this returns.
+    pub const fn queue_readback(&mut self, record_handle: DeviceRecordHandle, ticket: u64) {
+        self.queued_readback = Some((record_handle, ticket));
+    }
+
     /// Raw pointer to the effective resource-wide `DcLockState` for this surface.
     ///
     /// The owning texture's shared state for a level or face shell, else this
@@ -3081,6 +3153,8 @@ fn systemmem_lock_rect(
     if inner.system_memory.is_none() {
         return D3DERR_INVALIDCALL;
     }
+    // The caller reads what a queued `GetRenderTargetData` writes.
+    inner.settle_readback();
     // Re-locking an already-mapped surface, or locking one while a `GetDC` is
     // outstanding on the resource, returns INVALIDCALL with the caller's
     // `D3DLOCKED_RECT` untouched — checked + committed before any out-param
@@ -3753,6 +3827,8 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
     // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
+    // The DC shows what a queued `GetRenderTargetData` writes.
+    inner.settle_readback();
 
     // A failed `GetDC` must leave the caller's out-`HDC` slot untouched, so
     // every reject below returns before writing through `hdc`.

@@ -1,6 +1,6 @@
 use core::{ffi::c_void, hash::BuildHasher as _};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -3702,16 +3702,14 @@ fn encode_readback_resolve(
     })
 }
 
-/// Synchronous texture→buffer readback into PE-addressable memory.
+/// Encode a texture→buffer readback into PE-addressable memory, ready to commit.
 ///
 /// Wraps the caller's page-aligned `dst_ptr / dst_len` via
-/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
-/// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
-/// stride, commits, and waits for completion. Only a true return guarantees
-/// the caller's memory holds the requested pixels. Metal orders this command
-/// buffer after every previously committed buffer on the same `queue_handle`.
-/// A failed readback may have written part of the destination.
-pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared) and blits the
+/// source texture sub-rect at `mip_level` into it at `bytes_per_row` stride,
+/// on a command buffer of the device's queue that is returned uncommitted.
+/// `None` when the arguments are refused or Metal declines a step, logged.
+fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     use core::{ffi::c_void, ptr::NonNull};
 
     let to_usize =
@@ -3739,24 +3737,24 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
 
     if dst_ptr == 0 || dst_len == 0 || width == 0 || height == 0 {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: invalid args");
-        return false;
+        return None;
     }
     let Some(queue) = record.queue().into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: queue retain failed");
-        return false;
+        return None;
     };
     let Some(device) = device_handle.into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: device retain failed");
-        return false;
+        return None;
     };
     let Some(texture) = tex_handle.into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: texture retain failed");
-        return false;
+        return None;
     };
 
     let Some(ptr) = NonNull::new(dst_ptr as *mut c_void) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: null dst_ptr");
-        return false;
+        return None;
     };
     // `Shared`: the blit writes straight into the wrapped PE pages, which
     // the caller reads once `waitUntilCompleted` returns.
@@ -3772,7 +3770,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         )
     }) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: newBufferWithBytesNoCopy failed");
-        return false;
+        return None;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback");
@@ -3781,7 +3779,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
 
     let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: commandBuffer() nil");
-        return false;
+        return None;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback");
@@ -3844,7 +3842,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
                 MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
             ) {
                 error!(target: LOG_TARGET, "depth readback: source is not a depth format");
-                return false;
+                return None;
             }
             (
                 PixelFormat::R32Float.block_layout(),
@@ -3874,7 +3872,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
             .is_some())
     {
         error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
-        return false;
+        return None;
     }
     // Checked before the encoder exists so a rejection leaves no encoder to
     // close. A declined `MetalFX` resolve lands here: the caller asked for
@@ -3888,12 +3886,12 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
             "blit_texture_to_buffer: {reason_text}, readback skipped. \
              src {src_endpoint}, dst {destination}, region {region}"
         );
-        return false;
+        return None;
     }
 
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
-        return false;
+        return None;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback-blit");
@@ -3959,6 +3957,22 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         }
     }
     blit.endEncoding();
+    Some(cmd_buf)
+}
+
+/// Synchronous texture→buffer readback into PE-addressable memory.
+///
+/// Wraps the caller's page-aligned `dst_ptr / dst_len` via
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
+/// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
+/// stride, commits, and waits for completion. Only a true return guarantees
+/// the caller's memory holds the requested pixels. Metal orders this command
+/// buffer after every previously committed buffer on the same `queue_handle`.
+/// A failed readback may have written part of the destination.
+pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
+    let Some(cmd_buf) = encode_readback(args) else {
+        return false;
+    };
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     let status = cmd_buf.status();
@@ -3969,6 +3983,89 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         diagnostics::failure(&cmd_buf, None, "readback-wait", error.as_deref());
         error
     })
+}
+
+/// The same readback committed without a wait: its ticket in the device's [`QueuedReadbacks`].
+///
+/// The destination memory is the caller's to leave alone until it has
+/// awaited the ticket. The command buffer retains the wrapper buffer and the
+/// source texture, so both outlive this call until the GPU is done.
+pub fn queue_texture_to_buffer(args: &BlitArgs<'_>) -> Option<u64> {
+    let cmd_buf = encode_readback(args)?;
+    cmd_buf.commit();
+    Some(args.record.readbacks().push(cmd_buf))
+}
+
+/// Read-backs committed without a wait, each awaited when the PE side first reads what it fills.
+///
+/// `QueueReadback` commits the blit and hands back a ticket, the readback's
+/// place in this device's order; `AwaitReadback` waits for every queued
+/// readback up to a ticket. All of them run on the device's one queue, so they
+/// complete in ticket order and an await settles the earlier ones too. The PE
+/// side awaits a readback before the memory it fills is read, written again
+/// or freed, which bounds the queue by the surfaces with one in flight.
+pub struct QueuedReadbacks(Mutex<QueuedReadbackState>);
+
+struct QueuedReadbackState {
+    /// The ticket the newest queued readback got; tickets start at 1.
+    last: u64,
+    /// The readbacks not yet awaited, oldest first.
+    pending: VecDeque<(u64, PendingCmdBuf)>,
+}
+
+impl Default for QueuedReadbacks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueuedReadbacks {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Mutex::new(QueuedReadbackState {
+            last: 0,
+            pending: VecDeque::new(),
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueuedReadbackState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep a committed readback until it is awaited; its ticket.
+    fn push(&self, cmd_buf: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> u64 {
+        let mut state = self.lock();
+        state.last += 1;
+        let ticket = state.last;
+        state.pending.push_back((ticket, PendingCmdBuf(cmd_buf)));
+        ticket
+    }
+
+    /// Wait for every readback up to `ticket`; false when one of them failed.
+    ///
+    /// The waits run outside the lock, so another thread may queue meanwhile.
+    pub fn await_through(&self, ticket: u64) -> bool {
+        let due: Vec<(u64, PendingCmdBuf)> = {
+            let mut state = self.lock();
+            let count = state
+                .pending
+                .iter()
+                .take_while(|(queued, _)| *queued <= ticket)
+                .count();
+            state.pending.drain(..count).collect()
+        };
+        due.iter().fold(true, |all, (_, cmd_buf)| {
+            cmd_buf.0.waitUntilCompleted();
+            let status = cmd_buf.0.status();
+            diagnostics::completion(&cmd_buf.0, status, None, "readback-await");
+            let done = readback_completed(status, || {
+                let error = cmd_buf.0.error();
+                diagnostics::failure(&cmd_buf.0, None, "readback-await", error.as_deref());
+                error
+            });
+            all && done
+        })
+    }
 }
 
 /// Accept a readback only after Metal reports successful completion.

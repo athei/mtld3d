@@ -219,6 +219,16 @@ explicit thunks. `SetCursorOverlay` retains its coalesced main-queue update;
 flush waits behind the encoder. These controls do not justify per-draw
 crossings or moving native translation back onto the API thread.
 
+One readback is split across two thunks instead of waited for. A
+`GetRenderTargetData` into a standalone system-memory surface commits its blit
+(`QueueReadback`) and keeps the returned ticket on the surface;
+`AwaitReadback` waits for it the first time the surface's memory is read,
+written, read back into again or freed (`SurfaceInner::settle_readback`).
+D3D9 promises those pixels only then, and a game that reads one surface back
+each frame while locking the one it read the frame before keeps the GPU
+working instead of draining it every frame. Every other readback stays
+synchronous.
+
 Thunks describe the work crossing the runtime boundary, including batched D3D9 work and lifecycle or synchronization controls. Name them after that work rather than mechanically mirroring COM methods. Internal native calls do not need a thunk. Keep COM identities and application-visible reference counting on the PE side; D3D9 translation and native resource ownership may live on Unix.
 
 ## Upload order and retirement
