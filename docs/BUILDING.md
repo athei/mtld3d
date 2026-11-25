@@ -47,21 +47,22 @@ The variables of the earlier two-Wine layout, `WINE_X86_64`, `WINE_ARM64` and
 message naming `WINE_SDK` when one of them is in the environment or on the
 command line.
 
-The versions CI pins (the Rust toolchains, the cargo tools, nextest, the
-Mach9 release whose arm64 Wine macos-26 runs, and llvm-mingw) are in the
-`env` block of [`ci.yml`](../.github/workflows/ci.yml). The MSVC CRT and
-Windows SDK versions are pinned in the Makefile, and the macOS deployment
+The versions CI pins (the stable Rust toolchain, the cargo tools, nextest,
+the Mach9 release whose arm64 Wine macos-26 runs, and llvm-mingw) are in the
+`env` block of [`ci.yml`](../.github/workflows/ci.yml). The nightly that runs
+rustfmt is pinned in the Makefile (`RUST_NIGHTLY`) for local runs and CI
+alike, as are the MSVC CRT and Windows SDK versions, and the macOS deployment
 target, 26.0, is in [`unix/.cargo/config.toml`](../unix/.cargo/config.toml).
 Users need macOS 26.4 or later, the arm64 Wine's own floor.
 
 ## Setup
 
-`make setup` bootstraps a machine once: the pinned Rust toolchains and
-targets (among them `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`,
-the two halves of the ARM64X build), the PE linker symlinks, xwin and the
-MSVC SDK in `/opt/xwin` (about 3 GB, needs `sudo`), nextest and cargo-edit.
-It installs neither Wine, llvm-mingw nor LLD. Each piece is also a `setup-*`
-target of its own.
+`make setup` bootstraps a machine once: the Rust toolchains (stable and
+the pinned nightly) and targets (among them `aarch64-pc-windows-msvc` and
+`arm64ec-pc-windows-msvc`, the two halves of the ARM64X build), the PE
+linker symlinks, xwin and the MSVC SDK in `/opt/xwin` (about 3 GB, needs
+`sudo`), nextest and cargo-edit. It installs neither Wine, llvm-mingw nor
+LLD. Each piece is also a `setup-*` target of its own.
 
 ## Build
 

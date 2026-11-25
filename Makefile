@@ -297,11 +297,14 @@ $(info ==> FP=1: frame pointers forced (guest stack walks for the sampling profi
 FRAME_POINTERS := --config 'target."cfg(all())".rustflags=["-C","force-frame-pointers=yes"]'
 endif
 
-# Which toolchains to use. Both float for a developer, who tracks stable and
-# nightly and whose `rustc -V` is allowed to differ from anyone else's, and CI
-# pins both to exact versions (see .github/workflows/ci.yml), because clippy runs
-# nursery + pedantic with warnings denied, so a new release landing on a runner
-# image would otherwise redden a run nobody here touched.
+# Which toolchains to use. Stable floats for a developer, who tracks it and
+# whose `rustc -V` is allowed to differ from anyone else's, and CI pins it to an
+# exact version (see .github/workflows/ci.yml), because clippy runs nursery +
+# pedantic with warnings denied, so a new release landing on a runner image
+# would otherwise redden a run nobody here touched. Nightly runs only rustfmt
+# and is pinned here for everyone, CI included, because formatting must come
+# out identical for a developer and for CI. Its `:=` ignores a RUST_NIGHTLY in
+# the environment; only one given on the make command line overrides it.
 #
 # Every cargo and rustc line below names its toolchain with rustup's `+` syntax,
 # so the choice is visible where it is used and lives in no environment variable.
@@ -309,13 +312,13 @@ endif
 # that pins one cannot silently redirect a build here. The cost is that a cargo
 # line added later has to carry the prefix too.
 RUST_STABLE  ?= stable
-RUST_NIGHTLY ?= nightly
+RUST_NIGHTLY := nightly-2026-10-11
 
 # The cargo-installed tools a build needs: `xwin` splats the MSVC SDK. Floating
-# here and pinned by ci.yml, same split as the toolchains, because until this
-# was a variable they were the one input a run took from whatever the registry
-# happened to hold that day. Developer-only tooling is deliberately not in here,
-# see `setup-dev`.
+# here and pinned by ci.yml, same split as the stable toolchain, because until
+# this was a variable they were the one input a run took from whatever the
+# registry happened to hold that day. Developer-only tooling is deliberately not
+# in here, see `setup-dev`.
 CARGO_TOOLS ?= xwin
 # nextest runs the host-native unit tests and comes as a prebuilt universal
 # binary (`setup-nextest`) rather than through `cargo install`, which saves a
