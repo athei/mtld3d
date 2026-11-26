@@ -290,6 +290,30 @@ unless its entry says otherwise.
   has no equivalent. DXVK detects the bind and resolves it; it is not built
   here because no known title needs it.
 
+### The native build
+
+`libd3d9.dylib` for a macOS host (`docs/BUILDING.md`) presents into the
+`NSView` the application names. It does less than the build Wine loads:
+
+- `Windowed = FALSE` returns `D3DERR_INVALIDCALL` from `CreateDevice` and
+  `Reset`, with a log line. The host owns fullscreen.
+- No window procedure is installed. The back buffer follows the view's size
+  at the next `Present`.
+- The cursor methods keep their D3D9 state and leave the host's cursor alone.
+- A device window that is no `NSView` returns `D3DERR_INVALIDCALL` from
+  `CreateDevice`, `Reset` and `CreateAdditionalSwapChain`, with a log line.
+- `GetDC` returns `D3DERR_INVALIDCALL`, with a log line.
+- The capture hotkey is not read, which is logged once.
+- No app profile applies: every profile pins a Windows `.exe` name, and all
+  but `csgo` a field of the PE version resource, which a host has none of.
+- `GetAdapterMonitor` answers NULL and the adapter LUID is zero.
+- Only `Direct3DCreate9` and `Direct3DCreate9Ex` are exported.
+- The unix side's latency-critical activity is declared in the host process.
+- No crash handler is installed: the process's signals are the host's.
+- `CreateDevice`, `Reset`, `CreateAdditionalSwapChain` and the device's last
+  `Release` wait for the main thread when another thread calls them
+  (`docs/ARCHITECTURE.md`).
+
 ## Deliberately not implemented
 
 - D3D9On12: `Direct3DCreate9On12` and `Direct3DCreate9On12Ex` are not
