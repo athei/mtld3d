@@ -1,0 +1,519 @@
+//! Unit tests for the Wine host: the park of kept views, the macdrv table and the Wine hop.
+//!
+//! `MetalViewPark` is the bookkeeping behind keeping a retired device's metal
+//! view for the next device on its window, or for the next window when that
+//! one is gone. The tests pin that a window's view is kept and taken back by
+//! that window alone, that a second view for the same window displaces the
+//! first, that views of several windows are kept beside each other up to the
+//! park's size, that a full park displaces its oldest view, that the kept
+//! views are listed newest first and one is taken only by the parking its
+//! taker saw, and that among them the newest whose window is gone is the one
+//! picked for a window with none of its own.
+//!
+//! `MacdrvFuncs::load` is pinned for the one case a test process can
+//! produce: no `macdrv_functions` table in the symbol space, which is every
+//! process that is not Wine's. The table is the only door, so the load
+//! resolves nothing and the attach above it fails rather than reading a
+//! window record through a layout the process does not have.
+//!
+//! What that load does with a table it did get is pinned on tables built
+//! here: `first_null_required_entry` names the first entry the layer calls
+//! that a table leaves null, which is what turns a null entry into a warn
+//! and a clean failure instead of a transmuted null called as a function,
+//! and it passes a table whose only null is `macdrv_get_cocoa_window`,
+//! which the layer treats as optional. The layout the table is read
+//! through is pinned beside them, field offset by field offset, since
+//! nothing at run time compares it against the fork's.
+//!
+//! The record that table's `get_win_data` answers with is pinned the same
+//! way. The layer declares the four pointers it reads out of the fork's
+//! `struct d3dmetal_macdrv_win_data` and takes the client view out of the
+//! fourth, so those four offsets are asserted here beside the table's.
+//!
+//! `run_through_wine` is the synchronous main-thread hop through that
+//! table's `on_main_thread`. A test process has no Wine main thread, so the
+//! entry is stood in for by one that does what Wine's does with the block:
+//! copies it, runs it once, and lets the copy go. The test pins that the work
+//! has run exactly once by the time the hop returns. Two more stand-ins are
+//! stubs: one drops the block, as `CrossOver`'s arm64 build does, and one keeps
+//! a copy and runs it after the hop has returned; the hop answers that the
+//! work did not run, and the late run leaves the work alone.
+//!
+//! `screen_params_filter_step` decides what one attempt to take
+//! `NSApplicationDidChangeScreenParametersNotification` over from Wine does.
+//! The tests pin all three outcomes, and in particular that an attempt made
+//! before `NSApp` has a delegate resolves to a retry rather than to a filter
+//! marked installed, which is what keeps a process whose first `CreateDevice`
+//! beats Wine's application delegate from running unfiltered for its lifetime.
+//!
+//! `rect_covers` decides whether the metal view covers its window's frame
+//! view, which is what lets the window's own layers under it be cleared. The
+//! tests pin an exact cover, a cover off by float noise on every edge, and a
+//! view that leaves a title bar's strip, a side of the window, or a single
+//! Retina pixel uncovered.
+
+use core::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+};
+
+use block2::{Block, RcBlock};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+use super::{
+    KEPT_METAL_VIEWS, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
+    ScreenParamsFilterStep, first_null_required_entry, pick_orphan, rect_covers, run_through_wine,
+    screen_params_filter_step,
+};
+
+/// A rectangle at `x`, `y` of `width` by `height` points.
+const fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
+#[test]
+fn an_empty_park_keeps_the_first_view_and_displaces_nothing() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.take_for(0x40), Some((0x1000, 0x2000)));
+    assert_eq!(
+        park.take_for(0x40),
+        None,
+        "taken once; the slot is empty again"
+    );
+}
+
+#[test]
+fn a_second_view_for_the_same_window_displaces_the_first() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.park(0x40, 0x3000, 0x4000), Some(0x1000));
+    assert_eq!(park.take_for(0x40), Some((0x3000, 0x4000)));
+}
+
+#[test]
+fn parking_the_kept_view_again_displaces_nothing() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.take_for(0x40), Some((0x1000, 0x2000)));
+}
+
+/// One kept view per window, as many as the park holds.
+const KEPT: [(u64, usize); KEPT_METAL_VIEWS] = [(1, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x4000)];
+
+#[test]
+fn views_of_other_windows_are_kept_beside_each_other() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    assert_eq!(
+        park.take_for(0x99),
+        None,
+        "no view for a window that had none"
+    );
+    for (window, view) in KEPT.iter().rev() {
+        assert_eq!(
+            park.take_for(*window),
+            Some((*view, 0x20)),
+            "still kept for a device that comes back"
+        );
+    }
+}
+
+#[test]
+fn a_full_park_displaces_the_oldest_view() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    assert_eq!(park.park(0x99, 0x9000, 0x20), Some(0x1000));
+    assert_eq!(park.take_for(1), None, "the oldest went");
+    assert_eq!(
+        park.take_for(2),
+        Some((0x2000, 0x20)),
+        "the next oldest stays"
+    );
+    assert_eq!(park.take_for(0x99), Some((0x9000, 0x20)));
+}
+
+#[test]
+fn the_kept_views_are_listed_newest_first() {
+    let mut park = MetalViewPark::new();
+    assert!(
+        park.slots_newest_first().is_empty(),
+        "an empty park lists nothing"
+    );
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    let listed: Vec<(u64, usize)> = park
+        .slots_newest_first()
+        .iter()
+        .map(|kept| (kept.hwnd, kept.view))
+        .collect();
+    let mut expected = KEPT.to_vec();
+    expected.reverse();
+    assert_eq!(listed, expected, "the last parked comes first");
+}
+
+#[test]
+fn a_kept_view_is_taken_by_the_parking_it_was_seen_in() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    assert_eq!(park.park(2, 0x2000, 0x30), None);
+    let seen = park.slots_newest_first();
+    let first = seen
+        .iter()
+        .find(|kept| kept.view == 0x1000)
+        .expect("the first view is listed");
+    assert!(
+        park.take_kept(0x1000, first.seq + 1).is_none(),
+        "a parking the taker did not see is not taken"
+    );
+    let taken = park
+        .take_kept(0x1000, first.seq)
+        .expect("the parking the taker saw is taken");
+    assert_eq!((taken.hwnd, taken.view, taken.layer), (1, 0x1000, 0x20));
+    assert!(
+        park.take_kept(0x1000, first.seq).is_none(),
+        "taken once; the slot is empty again"
+    );
+    assert_eq!(
+        park.take_for(2),
+        Some((0x2000, 0x30)),
+        "the other window's view is untouched"
+    );
+}
+
+#[test]
+fn a_view_parked_again_is_not_taken_by_its_earlier_parking() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    let earlier = park.slots_newest_first()[0].seq;
+    assert_eq!(park.take_for(1), Some((0x1000, 0x20)));
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    assert!(
+        park.take_kept(0x1000, earlier).is_none(),
+        "the earlier parking is over"
+    );
+    let later = park.slots_newest_first()[0].seq;
+    assert!(
+        park.take_kept(0x1000, later).is_some(),
+        "the parking that stands is taken"
+    );
+}
+
+#[test]
+fn the_newest_kept_view_whose_window_is_gone_is_picked() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    let newest_first = park.slots_newest_first();
+    assert!(
+        pick_orphan(&newest_first, |_| false).is_none(),
+        "every window still there: nothing is picked"
+    );
+    let picked = pick_orphan(&newest_first, |kept| kept.hwnd != 4)
+        .expect("a view whose window is gone is picked");
+    assert_eq!(
+        (picked.hwnd, picked.view),
+        (3, 0x3000),
+        "the newest such view, not the newest kept"
+    );
+    let picked = pick_orphan(&newest_first, |_| true).expect("every window gone: one is picked");
+    assert_eq!(picked.hwnd, 4, "the newest kept");
+}
+
+#[test]
+fn a_process_without_the_macdrv_table_loads_nothing() {
+    assert!(
+        MacdrvFuncs::load().is_none(),
+        "a process with no macdrv_functions table resolves no macdrv entry point",
+    );
+}
+
+/// A table with every entry the layer declares filled, as the fork publishes one.
+///
+/// The addresses are not functions and are never called: what reads them
+/// here reads them as pointers, and only asks whether one is null.
+fn filled_table() -> MacdrvFunctionsTable {
+    let entry = core::ptr::NonNull::<c_void>::dangling().as_ptr();
+    MacdrvFunctionsTable {
+        macdrv_init_display_devices: entry,
+        get_win_data: entry,
+        release_win_data: entry,
+        macdrv_get_cocoa_window: entry,
+        macdrv_create_metal_device: entry,
+        macdrv_release_metal_device: entry,
+        macdrv_view_create_metal_view: entry,
+        macdrv_view_get_metal_layer: entry,
+        macdrv_view_release_metal_view: entry,
+        on_main_thread: entry,
+    }
+}
+
+#[test]
+fn a_table_the_fork_filled_is_taken_as_it_is() {
+    assert_eq!(first_null_required_entry(&filled_table()), None);
+}
+
+#[test]
+fn the_first_null_entry_the_layer_calls_is_named() {
+    let mut table = filled_table();
+    table.get_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("get_win_data"));
+
+    let mut table = filled_table();
+    table.release_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("release_win_data"));
+
+    let mut table = filled_table();
+    table.macdrv_view_create_metal_view = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_create_metal_view")
+    );
+
+    let mut table = filled_table();
+    table.macdrv_view_get_metal_layer = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_get_metal_layer")
+    );
+
+    // The release path holds this entry as a typed pointer, so a table
+    // missing it is refused here rather than at a release that has a view
+    // in hand and nothing to release it with.
+    let mut table = filled_table();
+    table.macdrv_view_release_metal_view = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_release_metal_view")
+    );
+}
+
+#[test]
+fn a_null_cocoa_window_entry_leaves_the_table_usable() {
+    let mut table = filled_table();
+    table.macdrv_get_cocoa_window = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        None,
+        "the entry is optional: without it a kept view is not reused",
+    );
+    // The entries that are not optional are unaffected by it.
+    table.get_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("get_win_data"));
+}
+
+#[test]
+fn the_table_is_read_through_the_layout_the_fork_publishes() {
+    // Wine's `struct macdrv_functions_t` is 24 function pointers, pinned
+    // there by a `C_ASSERT` that its size is 192 bytes. The layer declares
+    // the first ten of them and reads that prefix alone, so every entry it
+    // reads has to sit at the offset the fork's field order gives it, and
+    // the prefix has to be the ten pointers and nothing else. The table
+    // carries no version or size word, so nothing at run time can check
+    // this; the assertions below are the check, and they fail here rather
+    // than in a game if the declaration drifts.
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_init_display_devices),
+        0
+    );
+    assert_eq!(core::mem::offset_of!(MacdrvFunctionsTable, get_win_data), 8);
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, release_win_data),
+        16
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_get_cocoa_window),
+        24
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_create_metal_device),
+        32
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_release_metal_device),
+        40
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_create_metal_view),
+        48
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_get_metal_layer),
+        56
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_release_metal_view),
+        64
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, on_main_thread),
+        72
+    );
+    assert_eq!(size_of::<MacdrvFunctionsTable>(), 80);
+}
+
+#[test]
+fn the_win_data_record_is_read_through_the_prefix_the_fork_publishes() {
+    // The fork's `struct d3dmetal_macdrv_win_data` opens with four
+    // pointers and carries rects, flags and padding behind them, pinned
+    // there by a `C_ASSERT` that its size is 120 bytes. The layer declares
+    // those four and reads that prefix alone, taking the client view out
+    // of the fourth, so each field has to sit at the offset the fork's
+    // field order gives it and the prefix has to be the four pointers and
+    // nothing else. The record carries no version or size word either, so
+    // nothing at run time can check this; the assertions below are the
+    // check, and they fail here rather than in a game if the declaration
+    // drifts.
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, hwnd), 0);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, cocoa_window), 8);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, cocoa_view), 16);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, client_cocoa_view), 24);
+    assert_eq!(size_of::<MacdrvWinData>(), 32);
+}
+
+/// Stands in for Wine's `OnMainThread`: copies the block, runs the copy once, lets it go.
+extern "C" fn run_block_in_place(block: &Block<dyn Fn()>) {
+    let copy = block.copy();
+    copy.call(());
+}
+
+/// Counts one run of the hop's work in the `Cell<u32>` its context names.
+extern "C" fn count_run(ctx: *mut c_void) {
+    // SAFETY: the test below hands the hop the address of a live `Cell<u32>`.
+    let runs = unsafe { &*ctx.cast::<Cell<u32>>() };
+    runs.set(runs.get() + 1);
+}
+
+#[test]
+fn the_wine_hop_runs_its_work_once_before_it_returns() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        run_block_in_place,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(ran, "the hop answers that the work ran");
+    assert_eq!(
+        runs.get(),
+        1,
+        "the work ran exactly once, before the hop returned"
+    );
+}
+
+/// Stands in for a stub `OnMainThread`: returns without running the block.
+extern "C" fn drop_block(_block: &Block<dyn Fn()>) {}
+
+#[test]
+fn a_stub_entry_that_drops_the_block_hands_the_work_back() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        drop_block,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(!ran, "the hop answers that the work did not run");
+    assert_eq!(runs.get(), 0, "the work did not run");
+}
+
+thread_local! {
+    /// The copy `keep_block` keeps for the test to run after the hop returns.
+    static KEPT_BLOCK: RefCell<Option<RcBlock<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Stands in for an entry that keeps a copy of the block and runs it later.
+extern "C" fn keep_block(block: &Block<dyn Fn()>) {
+    KEPT_BLOCK.with_borrow_mut(|kept| *kept = Some(block.copy()));
+}
+
+#[test]
+fn a_block_run_after_the_hop_gave_up_leaves_the_work_alone() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        keep_block,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(!ran, "the hop answers that the work did not run");
+    let kept = KEPT_BLOCK
+        .with_borrow_mut(Option::take)
+        .expect("the entry kept a copy of the block");
+    kept.call(());
+    assert_eq!(
+        runs.get(),
+        0,
+        "the late run found the run taken and did not reach the work"
+    );
+}
+
+#[test]
+fn a_view_covers_a_frame_it_matches_to_within_a_sixty_fourth_of_a_point() {
+    let frame = rect(0.0, 0.0, 1512.0, 982.0);
+    assert!(rect_covers(frame, frame));
+    assert!(rect_covers(rect(0.01, 0.01, 1511.98, 981.98), frame));
+    assert!(rect_covers(rect(-10.0, -10.0, 1600.0, 1000.0), frame));
+}
+
+#[test]
+fn a_view_that_leaves_part_of_the_frame_uncovered_does_not_cover_it() {
+    let frame = rect(0.0, 0.0, 1512.0, 982.0);
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1512.0, 954.0), frame),
+        "a title bar's strip"
+    );
+    assert!(
+        !rect_covers(rect(1.0, 0.0, 1511.0, 982.0), frame),
+        "the left edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 1.0, 1512.0, 981.0), frame),
+        "the bottom edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1511.0, 982.0), frame),
+        "the right edge"
+    );
+    assert!(
+        !rect_covers(rect(0.0, 0.0, 1512.0, 981.5), frame),
+        "one Retina pixel at the top edge"
+    );
+}
+
+#[test]
+fn an_attempt_without_a_delegate_installs_nothing_and_retries() {
+    assert_eq!(
+        screen_params_filter_step(false, false),
+        ScreenParamsFilterStep::AwaitDelegate
+    );
+}
+
+#[test]
+fn the_first_attempt_that_finds_a_delegate_takes_the_notification_over() {
+    assert_eq!(
+        screen_params_filter_step(false, true),
+        ScreenParamsFilterStep::TakeOver
+    );
+}
+
+#[test]
+fn an_installed_filter_is_never_installed_twice() {
+    assert_eq!(
+        screen_params_filter_step(true, true),
+        ScreenParamsFilterStep::AlreadyOurs
+    );
+    // A delegate that went away after the take-over does not reopen the
+    // decision: the observer is registered with the center, not with it.
+    assert_eq!(
+        screen_params_filter_step(true, false),
+        ScreenParamsFilterStep::AlreadyOurs
+    );
+}

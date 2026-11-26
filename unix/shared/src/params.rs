@@ -301,16 +301,18 @@ pub struct AttachMetalLayerParams {
     /// and the pointer's return concerns each of them. Same backing contract
     /// as `backing_scale_ptr`. `0` disables it.
     pub cursor_kick_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
-    /// Address of a PE-side `AtomicU32` the unix side ORs a `ClientSurfaceRequest` into.
+    /// Address of a PE-side `AtomicU64` the unix side writes a `ClientSurfaceRequest` into.
     ///
     /// Set by the attach itself, and from the main thread when the client view
     /// the device's metal view sits in is hidden, which a Wine that hides it
     /// on every window surface flush does. The PE side takes the word back to
     /// zero at the next `Present` that submits a frame and answers a non-zero
     /// one with `PresentClientSurface`, since win32u's surface calls need a
-    /// Wine thread. Same backing contract as `backing_scale_ptr`. `0` disables
-    /// it.
-    pub client_surface_request_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
+    /// Wine thread. A host without a window procedure also sets it when the
+    /// view's size in pixels changes, with that size in the word's high half
+    /// (`ClientSurfaceRequest::pack`). Same backing contract as
+    /// `backing_scale_ptr`. `0` disables it.
+    pub client_surface_request_ptr: u64, // in: *const AtomicU64 (device-owned box, stable address)
     /// The native pixel size of the panel under the window's screen, 0 by 0 when unknown.
     ///
     /// With `backing_width` and `backing_height` it decides whether a back

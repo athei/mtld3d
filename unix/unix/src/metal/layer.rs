@@ -1,14 +1,21 @@
 //! The `CAMetalLayer` code that does not depend on how the layer was obtained.
 //!
-//! It holds the attach request and answer, present pacing, host-time
-//! conversion and drawable sizing; the panel cap itself is
-//! `mtld3d_shared::render_size`'s, which the API side sizes a back buffer
-//! with too. None of it depends on Wine or `AppKit`.
+//! It holds the attach request and answer, the layer settings both attach
+//! paths apply, present pacing, host-time conversion and drawable sizing; the
+//! panel cap itself is `mtld3d_shared::render_size`'s, which the API side
+//! sizes a back buffer with too. None of it depends on Wine or `AppKit`.
 
 use log::debug;
 use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
 
 use super::bounded_cast;
+
+/// Drawables the layer hands out before one has to come back from the display.
+///
+/// Three explicit drawables; two starves at 120 Hz under jitter. The
+/// presenter's snapshot ring is sized from it: a present queued deeper than
+/// this reaches the screen no sooner for a slot of its own.
+pub const DRAWABLE_POOL_DEPTH: usize = 3;
 
 /// Present-throttle request resolved PE-side.
 ///
@@ -287,6 +294,72 @@ fn points_to_pixels(width: f64, height: f64, scale: f64) -> (u32, u32) {
         bounded_cast::f64_to_u32_saturating((width * scale).round()),
         bounded_cast::f64_to_u32_saturating((height * scale).round()),
     )
+}
+
+/// Apply the layer settings that do not depend on how the layer was obtained.
+///
+/// Both attach paths apply them on the main thread.
+pub fn apply_shared_settings(layer: &objc2_quartz_core::CAMetalLayer) {
+    use objc2_core_graphics::CGColor;
+    use objc2_quartz_core::kCAGravityResize;
+
+    // Games are fullscreen-style: no alpha blending with desktop.
+    layer.setOpaque(true);
+    // Gravity decides how Core Animation fits a drawable that is not the size
+    // of the layer's backing store. In a scaled display mode the drawable is
+    // capped at the panel's pixels (`sync_drawable_size`), which keeps the
+    // panel's aspect, and that differs from the layer's by up to about 0.1 %:
+    // aspect-fit would leave a 1 px bar, so the drawable is stretched over the
+    // whole layer. An uncapped drawable is the backing store's size, and
+    // gravity is inert. During a live resize the previous drawable is
+    // stretched over the new bounds until the next present resizes it. The
+    // magnification filter follows the screen in the main-thread refresh
+    // (`follow_screen_pixels`).
+    //
+    // SAFETY: `kCAGravityResize` is a CoreAnimation string constant with
+    // static storage duration, an immutable global the framework
+    // initialised before `main`.
+    let gravity = unsafe { kCAGravityResize };
+    layer.setContentsGravity(gravity);
+    let backdrop = CGColor::new_generic_gray(0.0, 1.0);
+    layer.setBackgroundColor(Some(&backdrop));
+    // Nothing reads the drawable. Every guest read of the frame (a lock,
+    // `GetRenderTargetData`, `StretchRect`, `GetFrontBufferData`) goes to the
+    // persistent back-buffer texture, and present only writes the drawable,
+    // through render passes. A framebuffer-only drawable stays compressible
+    // and eligible for direct-to-display; one that is not keeps an EDR layer
+    // in the compositor.
+    layer.setFramebufferOnly(true);
+    // We always disable Metal-side vsync and instead throttle presents
+    // via `presentDrawable:afterMinimumDuration:` set to `1/panel_max_hz`
+    // when the guest asked for vsync. On a fixed-Hz panel that matches
+    // the old "snap to vblank" cadence; on a ProMotion panel the system
+    // adapts the panel rate down to whatever sub-max cadence the API
+    // thread sustains under the cap (transparent VRR): fractional
+    // production rates land at their actual rate instead of being
+    // rounded down to the next vsync divisor. PE-side
+    // `D3DPRESENT_INTERVAL_*` mapping (`display_sync_for`): every
+    // interval but IMMEDIATE → vsync requested, IMMEDIATE → free-run.
+    // A divided interval (TWO/THREE/FOUR) arrives as a frame-rate
+    // ceiling, folded PE-side with the user's `present.maxFps` into
+    // the one ceiling that rides the same throttle: the lower rate
+    // wins, and it also bounds the IMMEDIATE free-run. The duration
+    // itself is derived by the caller and kept on the attachment record.
+    layer.setDisplaySyncEnabled(false);
+    layer.setMaximumDrawableCount(DRAWABLE_POOL_DEPTH);
+    // Default true; surface stalls surface as errors, not hangs.
+    layer.setAllowsNextDrawableTimeout(true);
+    // Default false; no AppKit surface sync needed.
+    layer.setPresentsWithTransaction(false);
+    // The drawable is the layer's own backing store, never the guest's
+    // back-buffer size: a drawable the layer has to rescale into its
+    // backing store is a second resample, after whatever present already
+    // did, with a phase we do not control. Owning the resample ourselves is
+    // what keeps the frame on the pixel grid the screen actually has.
+    // Present re-syncs this before every `nextDrawable`, capped at the panel
+    // once the screen's sizes are known; the push here is so the first frame
+    // does not have to.
+    sync_drawable_size(layer, &ScreenPixels::UNKNOWN, None);
 }
 
 #[cfg(test)]

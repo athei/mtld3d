@@ -53,14 +53,17 @@ pub extern "C" fn init_logger_handler(args: *mut c_void) -> i32 {
         mtld3d_shared::init_logger_to_filter(Box::new(crate::log_file::FileSink), filter);
         log_identity();
         // Latch the unix-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
-        // from `RUST_LOG`. Per-cdylib because each cdylib has its own
-        // `log` statics; d3d9.dll latches its own copy in `init_logger`.
+        // from `RUST_LOG`. Under Wine each image has its own `log` statics
+        // and d3d9.dll latches its own copy in `init_logger`; the native
+        // dylib has one copy, latched by both.
         metal::init_tracking_enabled();
-        // Map the shared crash crumb (cfg-gated no-op in production) and
-        // install the always-on signal handler.
+        // Map the shared crash crumb (cfg-gated no-op in production) and,
+        // in a host whose faults it can hand back, install the signal handler.
         mtld3d_shared::crumb::init();
         mtld3d_shared::crumb::set_write_sink(crate::log_file::write_bytes);
-        crate::crash::install();
+        if metal::INSTALLS_CRASH_HANDLER {
+            crate::crash::install();
+        }
         // Declare to macOS that we're a latency-critical game, not idle UI, so
         // it keeps the process out of App Nap / display throttling and the
         // compositor keeps cycling the layer even when the on-screen scene is
@@ -321,7 +324,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         screen_sizes_sink_ptr: params.screen_sizes_ptr,
         software_cursor: params.software_cursor,
     };
-    if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
+    if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, &request) {
         params.view_handle = view;
         params.layer_handle = layer;
         params.backing_scale = caps.backing_scale;

@@ -8,6 +8,7 @@
 ///
 /// NaN/negative → 0, ≥ `u32::MAX` → `u32::MAX`; all other inputs land in
 /// `(0.0, u32::MAX)` where the cast is exact.
+#[must_use]
 pub fn f64_to_u32_saturating(v: f64) -> u32 {
     if !v.is_finite() || v <= 0.0 {
         return 0;

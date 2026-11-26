@@ -114,7 +114,7 @@ pub struct AttachLatches {
     pub backing_scale_sink: usize,
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
-    /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
+    /// Address of the PE-side `AtomicU64` a client surface present is asked through, `0` = none.
     pub client_surface_request_sink: usize,
     /// Address of the PE-side `AtomicU64` the screen's sizes are published into, `0` = none.
     pub screen_sizes_sink: usize,
@@ -776,49 +776,37 @@ pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) 
     }
 }
 
-/// Ask the device that owns `view` to have Wine show its window's client surface again.
+/// Ask the device that owns `view` to present its client surface again.
 ///
 /// ORs `reason` into the record's PE-side request word, which the device
 /// takes at its next `Present` that submits a frame and answers with
-/// `PresentClientSurface`. Only the newest record on its window that holds a
-/// surface asks: Wine shows one client surface per window, the newest
-/// device's, so an older device's view is hidden on purpose and asking for
-/// it would change nothing. `false`, and nothing written, for a view no live
-/// record names, a record without a surface or a request word, or one a
-/// newer device on its window outranks.
-pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool {
+/// `PresentClientSurface`. A `ranked` request is made only by the newest
+/// record on its window that holds a surface: Wine shows one client surface
+/// per window, the newest device's, so an older device's view is hidden on
+/// purpose and asking for it would change nothing. An unranked one is made
+/// by the record itself. `pixels` replaces the view size the word carries
+/// ([`ClientSurfaceRequest::pack`]), `None` with none, so the device sizes its
+/// back buffer from it without asking the main thread. `false`, and nothing
+/// written, for a view no live record names, a record without a request
+/// word, or one the rank leaves out.
+pub fn request_client_surface(
+    view: usize,
+    reason: ClientSurfaceRequest,
+    ranked: bool,
+    pixels: Option<(u32, u32)>,
+) -> bool {
     let map = lock();
     let Some(att) = map.get(&view) else {
         return false;
     };
-    if !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att)) {
+    if ranked
+        && !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att))
+    {
         return false;
     }
-    let asked = write_request(att, reason);
+    let asked = write_request(att, reason, pixels);
     // The write is what the lock guards: the record's teardown unregisters
     // it under the same lock before the PE side drops the word.
-    drop(map);
-    asked
-}
-
-/// Ask the device that owns `view` to send `PresentClientSurface` after its first submitted frame.
-///
-/// Attach calls this once it registered the record, whatever the record's
-/// rank on its window, so every device with a surface and a request word
-/// tells the unix side when it has drawn ([`Attachment::note_frame_submitted`]),
-/// and the newest device's first frame presents its surface. `false`, and
-/// nothing written, for a view no live record names or a record without a
-/// surface or a request word.
-pub fn request_first_frame_present(view: usize) -> bool {
-    let map = lock();
-    let Some(att) = map.get(&view) else {
-        return false;
-    };
-    if att.client_surface == 0 {
-        return false;
-    }
-    let asked = write_request(att, ClientSurfaceRequest::ATTACHED);
-    // Held across the write, for the reason `request_client_surface` gives.
     drop(map);
     asked
 }
@@ -828,16 +816,25 @@ pub fn request_first_frame_present(view: usize) -> bool {
 /// The caller found `att` in the locked registry and holds the lock across
 /// this call: the record's teardown unregisters it under the same lock before
 /// the PE side drops the word.
-fn write_request(att: &Attachment, reason: ClientSurfaceRequest) -> bool {
+fn write_request(
+    att: &Attachment,
+    reason: ClientSurfaceRequest,
+    pixels: Option<(u32, u32)>,
+) -> bool {
     if att.client_surface_request_sink == 0 {
         return false;
     }
     // SAFETY: as in `publish_backing_scale`: the PE side backs this address
-    // with an `AtomicU32` in a box it keeps until after the teardown thunk
+    // with an `AtomicU64` in a box it keeps until after the teardown thunk
     // that unregisters the record has returned, and the caller found the
     // record live under the registry lock it still holds.
-    let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU32) };
-    sink.fetch_or(reason.bits(), Ordering::Release);
+    let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU64) };
+    // The size, zero for none, replaces the one a request not yet taken
+    // carried: a view that collapsed since must not resize to its old size.
+    let bits = reason.pack(pixels);
+    sink.update(Ordering::Release, Ordering::Relaxed, |word| {
+        (word & !ClientSurfaceRequest::PIXELS) | bits
+    });
     true
 }
 
@@ -891,7 +888,7 @@ pub fn retain_layer(
     if !is_live(&map, att) {
         return None;
     }
-    // SAFETY: wine retains the layer for the metal view's lifetime, the
+    // SAFETY: the host retains the layer for the metal view's lifetime, the
     // record is live under the registry lock, and teardown unregisters it
     // under the same lock before releasing that view, so the address names a
     // live layer here.

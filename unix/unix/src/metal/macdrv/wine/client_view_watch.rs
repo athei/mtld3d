@@ -32,8 +32,13 @@ use objc2_foundation::{
     NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSString,
 };
 
-use super::attachment::{self, Attachment};
-use crate::LOG_TARGET;
+use crate::{
+    LOG_TARGET,
+    metal::macdrv::{
+        attachment::{self, Attachment},
+        run_on_main_thread_async,
+    },
+};
 
 /// The key path the observer watches.
 const HIDDEN_KEY: &str = "hidden";
@@ -129,8 +134,12 @@ pub fn watch(att: &Arc<Attachment>, view: &NSView, mtm: MainThreadMarker) {
     // Wine may have hidden the view between the attach's present and the
     // registration above, and no notification announces that one.
     if hidden_at_install {
-        let asked =
-            attachment::request_client_surface(att.view(), ClientSurfaceRequest::VIEW_HIDDEN);
+        let asked = attachment::request_client_surface(
+            att.view(),
+            ClientSurfaceRequest::VIEW_HIDDEN,
+            true,
+            None,
+        );
         debug!(
             target: LOG_TARGET,
             "present: client view of view {:#x} was already hidden at install; asked={asked}",
@@ -150,7 +159,7 @@ pub fn unwatch(att: &Attachment) {
     if address == 0 {
         return;
     }
-    super::run_on_main_thread_async(move || {
+    run_on_main_thread_async(move || {
         let mtm =
             MainThreadMarker::new().expect("a client view watch is removed on the main thread");
         remove(address, mtm);
@@ -188,7 +197,7 @@ fn client_view_changed(object: Option<&AnyObject>, view: usize) {
             "present: a client view was hidden or shown off the main thread; the device is asked \
              to show its client surface without reading which",
         );
-        attachment::request_client_surface(view, ClientSurfaceRequest::VIEW_HIDDEN);
+        attachment::request_client_surface(view, ClientSurfaceRequest::VIEW_HIDDEN, true, None);
         return;
     }
     let Some(client_view) = object.and_then(AnyObject::downcast_ref::<NSView>) else {
@@ -199,8 +208,8 @@ fn client_view_changed(object: Option<&AnyObject>, view: usize) {
         return;
     };
     let hidden = client_view.isHidden();
-    let asked =
-        hidden && attachment::request_client_surface(view, ClientSurfaceRequest::VIEW_HIDDEN);
+    let asked = hidden
+        && attachment::request_client_surface(view, ClientSurfaceRequest::VIEW_HIDDEN, true, None);
     debug!(
         target: LOG_TARGET,
         "present: client view {:#x} of view {view:#x} hidden={hidden}{}",

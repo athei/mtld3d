@@ -29,6 +29,7 @@ Most of this document is enforced by `make check`: `cargo fmt --check` on the ni
 | `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
 | In an `extern "system" fn` under `windows/d3d9/src`, a pointer parameter turned into a reference, read or written through `*p`, `p.read()` or `p.write()`, or made a typed slice = 0, and `InPtr` / `InPtrMut` over a `D3D*`, `Guid` or `LUID` type = 0 | §An application's pointer promises no alignment |
 | Under `windows/d3d9/src`, outside `platform.rs` and `platform/`: an `unsafe extern` block, `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key = 0 | §Win32 stays behind `platform.rs` |
+| Under `unix/unix/src`, outside `metal/macdrv.rs` and `lib.rs`: a `cfg`, `cfg!` or `cfg_attr` naming `native_d3d` = 0 | §The unix crate picks its host in `macdrv.rs` |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -44,7 +45,7 @@ Two traps worth knowing, since both were live in the tree:
 - **Square brackets in prose are link syntax.** `palette[0]`, `saturate to [0,1]` — rustdoc reads each as an intra-doc link and warns. Backtick them.
 - **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_filtered`]`` is broken; it needs ``[`Self::restore_filtered`]``.
 
-The windows workspace is documented for the **i686 PE target**, not the host: `d3d9` and `mtld3d` are `cdylib`s with raw-dylib imports and don't build for the host, so a host-only run would silently skip them.
+The windows workspace is documented for the **i686 PE target**, not the host: `mtld3d` is a `cdylib` with raw-dylib imports that doesn't build for the host, and `d3d9` builds for it only as the native build, under `MTLD3D_NATIVE_D3D`, so a host-only run would skip the one and fail on the other.
 
 ## Release hygiene
 
@@ -90,7 +91,7 @@ policy in [`ARCHITECTURE.md`](ARCHITECTURE.md#runtime-placement-policy).
 `mtld3d-shared` owns fixed-layout transport definitions and cross-runtime pure
 helpers, not native workers or Win32 integration.
 
-`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --features disk-cache --target aarch64-apple-darwin` runs natively in ~0 s. The `disk-cache` feature builds the on-disk shader cache and its zstd dependency, which only the Unix dylib and the tests enable, so the PE DLLs link no zstd. `make test` already invokes it with that feature, auto-detecting the host triple so tests run on the native arch.
+`windows/d3d9` is a `cdylib` with `raw-dylib` imports on `*-pc-windows-msvc`, and builds for the macOS host only as the native build (`make native-d3d`). `d3d9` has no `#[test]`: `make test-native-d3d` drives the native dylib from outside, and the end-to-end suite the PE build under Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --features disk-cache --target aarch64-apple-darwin` runs natively in ~0 s. The `disk-cache` feature builds the on-disk shader cache and its zstd dependency, which only the Unix dylib and the tests enable, so the PE DLLs link no zstd. `make test` already invokes it with that feature, auto-detecting the host triple so tests run on the native arch.
 
 How to apply:
 
@@ -103,7 +104,11 @@ Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;
 
 ## Win32 stays behind `platform.rs`
 
-`d3d9` reaches the system it runs on through `windows/d3d9/src/platform.rs`. The Win32 implementation lives under `platform/`. Win32 imports stay in `platform.rs` and `platform/`. So do the cfgs that tell the Win32 build from a native one. Every other file of the crate is shared by both builds. `make audit` fails on an `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key anywhere else in `windows/d3d9/src`.
+`d3d9` reaches the system it runs on through `windows/d3d9/src/platform.rs`. The Win32 implementation lives in `platform/win32.rs` and `platform/win32/`, the native one in `platform/native.rs` and `platform/native/`. Win32 imports stay in `platform.rs` and `platform/`. So do the cfgs that tell the Win32 build from a native one. Every other file of the crate is shared by both builds. `make audit` fails on an `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or `cfg_attr` naming `windows`, `unix` or a `target_*` key anywhere else in `windows/d3d9/src`.
+
+## The unix crate picks its host in `macdrv.rs`
+
+`mtld3d-unix` runs under Wine or linked into the native `libd3d9.dylib`, and `MTLD3D_NATIVE_D3D` sets the `cfg(native_d3d)` that tells them apart. `unix/unix/src/metal/macdrv.rs` picks the host module with it, `macdrv/wine.rs` or `macdrv/native.rs`, and `lib.rs` leaves out the Wine exports with it. Every other file of the crate is shared by both hosts. `make audit` fails on a `cfg`, `cfg!` or `cfg_attr` naming `native_d3d` anywhere else in `unix/unix/src`.
 
 ## End every edit cycle with `make fmt` + `make install`
 
@@ -431,13 +436,13 @@ Format: `"stub IDirect3DDevice9::Foo → ReturnCode"`, `"IDirect3D<Type>9::<Meth
 
 Every Obj-C selector goes through a typed method on an `objc2-*` framework crate (`objc2-metal`, `objc2-quartz-core`, `objc2-foundation`, `objc2-core-foundation`, `objc2-core-graphics`, `objc2-app-kit`). Selector name and return type become compile errors instead of runtime `unrecognized selector` crashes, and the per-call `unsafe { … }` wrapping disappears for safe selectors.
 
-Untyped `msg_send!` is a silent-drift risk. A selector typo (`setDisplaySyncEnabld:`) compiles, ships, and fires the first time the user resizes a window. Return-type mismatches are equally undetectable until a corrupted value shows up downstream. The objc2 framework crates are already wired in `unix/Cargo.toml`, so reaching for `msg_send!` is leaving free type-checking on the table.
+Untyped `msg_send!` is a silent-drift risk. A selector typo (`setDisplaySyncEnabld:`) compiles, ships, and fires the first time the user resizes a window. Return-type mismatches are equally undetectable until a corrupted value shows up downstream. The objc2 framework crates are already wired in `unix/Cargo.toml`, and those the native `d3d9` uses in `windows/Cargo.toml`, so reaching for `msg_send!` is leaving free type-checking on the table.
 
 This is one instance of the general rule in §"Unsafe is a last resort": prefer typed safe wrappers over raw unsafe. `msg_send!` is an untyped unsafe surface that already has typed alternatives.
 
 How to apply:
 
-- New selector → use the typed method from the right `objc2-*` crate. If the feature isn't enabled yet, add it to the right entry under `[workspace.dependencies]` in `unix/Cargo.toml`.
+- New selector → use the typed method from the right `objc2-*` crate. If the feature isn't enabled yet, add it to the right entry under `[workspace.dependencies]` in `unix/Cargo.toml`, or in `windows/Cargo.toml` for the native `d3d9`.
 - Need a class from an `objc2-*` framework crate not yet wired? Add it with `default-features = false` + an explicit feature list — these crates default to "everything on" (`objc2-app-kit` alone has hundreds of default features), which inflates compile time.
 - Feature dependencies are not transitive: enabling `NSView` requires `NSResponder`; methods returning `CGFloat`/`NSRect` need the `objc2-core-foundation` feature on `objc2-app-kit`. The compile error names the missing item; the crate's `Cargo.toml` `[features]` section names the gate.
 - `*mut c_void` from FFI → `Retained::retain(ptr.cast::<TypedClass>())`, then call typed methods. Pattern used throughout `macdrv.rs`.
@@ -450,7 +455,7 @@ This is one instance of the general rule in §"Unsafe is a last resort": prefer 
 
 ## AppKit work runs on the main thread
 
-Every `AppKit` object the layer touches (a view, its window, the screen under it, `NSApp`, the notification center and the observers it hands back) is created, read and released on the main thread, and so is the Core Animation layer configuration that has to land in a main-thread `CATransaction`. The API, encoder and submit threads never reach one directly: main-thread-only work is dispatched through `run_on_main_thread_sync` or `run_on_main_thread_async` in `unix/unix/src/metal/macdrv.rs`, the only two doors, and the dispatched closure runs in an autorelease pool of its own, so what it autoreleases drains when it returns rather than in whatever pool the main thread's caller holds open. The synchronous door goes through Wine's `OnMainThread` where the `macdrv_functions` table publishes it, which answers winemac's queries to the waiting thread while it waits, and through `dispatch_sync` on the main queue otherwise, or when the entry returns without running the work (CrossOver's arm64 build publishes it as a stub). A thread that another thread may be waiting on takes the asynchronous door: winemac's main thread waits on Wine threads in a run-loop mode that does not drain the main queue, and the thread it waits on can be the API thread blocked on the encoder, so a synchronous hop from the encoder thread closes a cycle.
+Every `AppKit` object the layer touches (a view, its window, the screen under it, `NSApp`, the notification center and the observers it hands back) is created, read and released on the main thread, and so is the Core Animation layer configuration that has to land in a main-thread `CATransaction`. The API, encoder and submit threads never reach one directly: main-thread-only work is dispatched through `run_on_main_thread_sync` or `run_on_main_thread_async` in `unix/unix/src/metal/macdrv.rs`, the only two doors, and the dispatched closure runs in an autorelease pool of its own, so what it autoreleases drains when it returns rather than in whatever pool the main thread's caller holds open. The synchronous door runs the closure in place when its caller is already the main thread, and the native `d3d9` reaches it through `mtld3d_unix::run_on_main_thread` for its own `AppKit` queries. Otherwise it goes through Wine's `OnMainThread` where the `macdrv_functions` table publishes it, which answers winemac's queries to the waiting thread while it waits, and through `dispatch_sync` on the main queue otherwise, or when the entry returns without running the work (CrossOver's arm64 build publishes it as a stub). A thread that another thread may be waiting on takes the asynchronous door: winemac's main thread waits on Wine threads in a run-loop mode that does not drain the main queue, and the thread it waits on can be the API thread blocked on the encoder, so a synchronous hop from the encoder thread closes a cycle.
 
 Inside the dispatch, the marker is the checked `MainThreadMarker::new().expect("<function> runs on the main thread")`. The check is one `pthread_main_np` call on a path that is already a main-queue block, and an off-main use aborts with a named site instead of corrupting `AppKit`'s per-thread state. `unsafe { MainThreadMarker::new_unchecked() }` is banned by `make audit`; a property documented as readable from any thread is no exception, because the walk to the object that has the property is the part that is not.
 

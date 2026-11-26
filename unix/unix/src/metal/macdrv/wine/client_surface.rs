@@ -384,4 +384,5 @@ fn surface_fn(name: &CStr) -> Option<SurfaceFn> {
 }
 
 #[cfg(test)]
+#[path = "client_surface/tests.rs"]
 mod tests;
