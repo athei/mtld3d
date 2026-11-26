@@ -1,5 +1,5 @@
 [workspace]
-members = ["unix", "shared", "conformance", "e2e"]
+members = ["unix", "shared", "conformance", "e2e", "native-tests"]
 resolver = "2"
 
 [workspace.package]
