@@ -250,6 +250,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtld3d-native-tests"
+version = "0.15.5"
+dependencies = [
+ "libloading",
+ "mtld3d-types",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "mtld3d-shared"
 version = "0.15.5"
 dependencies = [

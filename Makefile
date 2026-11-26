@@ -207,7 +207,7 @@ WINE_SERVER := $(WINE_SDK)/bin/wineserver
 # measure. The default holds for every goal of the invocation, so each runs
 # alone: beside `test` it would build the suite's layer without debug
 # assertions.
-ifneq ($(filter bundle,$(MAKECMDGOALS)),)
+ifneq ($(filter bundle bundle-native-d3d,$(MAKECMDGOALS)),)
 PROD ?= 1
 endif
 ifneq ($(filter bench,$(MAKECMDGOALS)),)
@@ -511,7 +511,9 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 # The arch suffix is the target's own spelling, i686 / arm64x for PE and
 # arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
 # suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
-# `test-unit-perf`.
+# `test-unit-perf`. A `-native-d3d` suffix names a leg of the native build,
+# `d3d9` and the unix side linked into one dylib for this machine's arch:
+# `clippy-native-d3d`, `test-native-d3d`, `bundle-native-d3d`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
@@ -527,7 +529,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-scale conformance-scale-i686 conformance-scale-arm64x \
 	conformance-baseline-scale-i686 conformance-baseline-scale-arm64x \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-arm64x \
-	clippy-native clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
+	clippy-native clippy-native-d3d native-d3d test-native-d3d bundle-native-d3d clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	xwin-dir fetch
 
@@ -1294,7 +1296,7 @@ configure-test-prefix-session:
 	-$(WINE_SERVER) -p >/dev/null 2>&1
 	-$(WINE_LOADER) wineboot >/dev/null 2>&1
 
-test: test-unit test-e2e-i686 test-e2e-arm64x test-e2e-arm64
+test: test-unit test-native-d3d test-e2e-i686 test-e2e-arm64x test-e2e-arm64
 
 # Host-native unit tests, built for this machine's native arch. Needs no
 # install and no wine at all, which is why it is its own leg: the windows
@@ -2003,9 +2005,9 @@ fmt-check:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt --check
 	cd unix && cargo +$(RUST_NIGHTLY) fmt --check
 
-clippy: clippy-pe-i686 clippy-pe-arm64x clippy-native
+clippy: clippy-pe-i686 clippy-pe-arm64x clippy-native clippy-native-d3d
 
-# Three independent clippy legs, split by the target they lint for so each is
+# Four independent clippy legs, split by the target they lint for so each is
 # one job. No --all-targets on the whole-workspace PE runs: that
 # would build every member's test targets for PE, including mtld3d-core's
 # apple-only objc2 dev-deps (the Metal compile checks in `dxso/emit/tests.rs`),
@@ -2054,7 +2056,8 @@ clippy-native:
 # compiled by nothing until a benchmark builds them. These two run the same legs
 # again with MTLD3D_PERF=1, which the build scripts of those four crates read:
 # `clippy-perf` the native leg and the i686 PE one (mtld3d-d3d9's perf code
-# builds only for a PE target, and none of it differs by PE arch),
+# is linted for the i686 PE target alone: the native-d3d legs unset
+# MTLD3D_PERF, and none of it differs by arch),
 # `test-unit-perf` the host unit tests. `make check` runs both.
 #
 # Each workspace builds them into its `target/perf` (a relative
@@ -2070,6 +2073,54 @@ clippy-perf:
 
 test-unit-perf:
 	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= test-unit
+
+# The native build: `d3d9` and the unix side linked into one `libd3d9.dylib`
+# for a macOS host, without Wine. No other leg compiles what
+# `clippy-native-d3d` lints. The legs get their own target dir for the reason
+# `target/perf` does. Every leg unsets MTLD3D_PERF, so `make check PERF=1` and
+# `make test PERF=1` build no perf code into that dir, which no leg would lint.
+NATIVE_D3D_ENV := env -u MTLD3D_PERF MTLD3D_NATIVE_D3D=1 CARGO_TARGET_DIR=target/native
+# Relative for the production assert gate, whose loop splits a path with spaces.
+NATIVE_D3D_DYLIB_REL = windows/target/native/$(UNIX_NATIVE_TARGET)/$(PROFILE)/libd3d9.dylib
+NATIVE_D3D_DYLIB = $(CURDIR)/$(NATIVE_D3D_DYLIB_REL)
+# Where the layer logs while `test-native-d3d` runs, which CI keeps. Each run
+# writes and reads a file of its own, named by its process id.
+NATIVE_D3D_LOG_DIR = $(CURDIR)/target/native-d3d-logs
+
+clippy-native-d3d:
+	cd windows && $(NATIVE_D3D_ENV) cargo +$(RUST_STABLE) clippy -p d3d9 --target $(UNIX_NATIVE_TARGET) $(DENY_WARNINGS)
+	cd unix && $(NATIVE_D3D_ENV) cargo +$(RUST_STABLE) clippy -p mtld3d-unix --all-targets $(DENY_WARNINGS)
+
+# The install name is `@rpath/libd3d9.dylib`, as `unix-arm64` gives the `.so`
+# one, rather than the path of the file in the build directory.
+native-d3d:
+	cd windows && $(NATIVE_D3D_ENV) cargo +$(RUST_STABLE) rustc --profile $(PROFILE) -p d3d9 --target $(UNIX_NATIVE_TARGET) \
+		-- -C link-arg=-Wl,-install_name,@rpath/libd3d9.dylib
+
+# The dylib driven in a hidden `NSWindow`, logging into NATIVE_D3D_LOG_DIR.
+# Needs a Metal device and no Wine.
+test-native-d3d: native-d3d
+	cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-native-tests -- '$(NATIVE_D3D_DYLIB)' '$(NATIVE_D3D_LOG_DIR)'
+
+# The native build's archive, apart from `bundle`: the production
+# `libd3d9.dylib` and its `.dSYM`, with `LICENSE` and `mtld3d.conf` beside
+# them, under PROD=1 by default and with the checks `bundle` runs, the
+# production assert gate and the build-identity stamp. `dsymutil` runs on the
+# file under its final name, as `unix-arm64` does. The release job keeps the
+# archive as a workflow artifact; it is not a release asset yet.
+NATIVE_D3D_BUNDLE_OUT   := $(CURDIR)/windows/target/mtld3d-native-d3d.tar.xz
+NATIVE_D3D_BUNDLE_STAGE := $(CURDIR)/windows/target/bundle-native-d3d
+
+bundle-native-d3d: native-d3d
+	$(call PRODUCTION_ASSERT_CHECK,$(NATIVE_D3D_DYLIB_REL))
+	rm -rf '$(NATIVE_D3D_BUNDLE_STAGE)' '$(NATIVE_D3D_BUNDLE_OUT)'
+	mkdir -p '$(NATIVE_D3D_BUNDLE_STAGE)'
+	cp -c '$(NATIVE_D3D_DYLIB)' '$(NATIVE_D3D_BUNDLE_STAGE)/libd3d9.dylib'
+	dsymutil '$(NATIVE_D3D_BUNDLE_STAGE)/libd3d9.dylib'
+	cp -c '$(CURDIR)/mtld3d.conf' '$(CURDIR)/LICENSE' '$(NATIVE_D3D_BUNDLE_STAGE)/'
+	test -n "$(BUILD_ID)" || { echo "bundle-native-d3d: this build has no identity to check the binary against" >&2; exit 1; }
+	LC_ALL=C grep -a -q -F "$(BUILD_ID)" '$(NATIVE_D3D_BUNDLE_STAGE)/libd3d9.dylib' || { echo "bundle-native-d3d: libd3d9.dylib is not stamped $(BUILD_ID); it was built at another commit, rebuild it" >&2; exit 1; }
+	tar -cJf '$(NATIVE_D3D_BUNDLE_OUT)' -C '$(NATIVE_D3D_BUNDLE_STAGE)' libd3d9.dylib libd3d9.dylib.dSYM mtld3d.conf LICENSE
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
@@ -2089,9 +2140,10 @@ test-e2e-discovery:
 # `build.warnings` covers rustdoc warnings too, so no RUSTDOCFLAGS needed.
 doc: doc-windows doc-unix
 
-# The windows workspace is documented for a PE target, not the host: d3d9 and the
-# shim are `cdylib`s with raw-dylib imports and only build for *-pc-windows-msvc,
-# so a host run would silently skip them. i686 covers every member. The first run
+# The windows workspace is documented for a PE target, not the host: the shim is
+# a `cdylib` with raw-dylib imports that only builds for *-pc-windows-msvc, and
+# d3d9 builds for the host only as the native build, under MTLD3D_NATIVE_D3D,
+# so a host run would skip the one and fail on the other. i686 covers every member. The first run
 # builds mtld3d-core as the DLLs do, without `disk-cache`; the second documents
 # it again with the feature on, since the unix workspace's `--no-deps` run does
 # not document the path dependency and nothing else would check the shader
@@ -2109,8 +2161,8 @@ doc-unix:
 # regressions, and the doc build. fmt-check first (fast, fails early on drift);
 # clippy reuses the targets above; audit and the Makefile regressions are fast;
 # doc stays last. Each leg is also its own target, so CI runs each as a step of
-# its own instead of this sequence: the `PERF=1` legs in the check-perf job, the
-# rest in the check job.
+# its own instead of this sequence: the `PERF=1` legs in the check-perf job,
+# `clippy-native-d3d` in the native job, the rest in the check job.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy

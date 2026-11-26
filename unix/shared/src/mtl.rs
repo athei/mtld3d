@@ -909,11 +909,12 @@ bitflags! {
 bitflags! {
     /// Why a device asks Wine to show its window's client surface again.
     ///
-    /// Written into the PE-side word `AttachMetalLayerParams::client_surface_request_ptr`
-    /// names, by the attach, from the unix side's main thread and from the
-    /// window procedure, and carried by `PresentClientSurfaceParams` when the
-    /// next `Present` that submits a frame takes it. A `u32` because it is that
-    /// `AtomicU32` word's value and a 4-byte field of the thunk.
+    /// Written into the low half of the PE-side word
+    /// `AttachMetalLayerParams::client_surface_request_ptr` names, by the
+    /// attach, from the unix side's main thread and from the window
+    /// procedure, and carried by `PresentClientSurfaceParams` when the next
+    /// `Present` that submits a frame takes it. A `u32` because it is a 4-byte
+    /// field of the thunk; [`Self::pack`] gives the whole word.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ClientSurfaceRequest: u32 {
         /// The client view the device's metal view sits in was hidden.
@@ -927,6 +928,33 @@ bitflags! {
         /// the device has drawn, and it is the present after which Wine keeps
         /// the client view shown across window surface flushes.
         const ATTACHED = 1 << 2;
+    }
+}
+
+impl ClientSurfaceRequest {
+    /// The high half of the request word: the view's size in pixels, 16 bits each.
+    pub const PIXELS: u64 = !0 << 32;
+    /// A pending resize in the request word: its bit and the size it carries.
+    pub const RESIZE: u64 = Self::PIXELS | Self::CLIENT_AREA_CHANGED.bits() as u64;
+
+    /// The request word for `self` and the view's size in pixels, which saturates at 65535.
+    ///
+    /// The size rides with the request so the device reads it with the bits
+    /// that ask for it, without asking the main thread. `None` packs zero.
+    #[must_use]
+    pub fn pack(self, pixels: Option<(u32, u32)>) -> u64 {
+        let (width, height) = pixels.unwrap_or((0, 0));
+        let half = |v: u32| u64::from(v.min(0xffff));
+        (half(height) << 48) | (half(width) << 32) | u64::from(self.bits())
+    }
+
+    /// The reasons and the view's size in pixels a request word holds, the size `None` for zero.
+    #[must_use]
+    pub fn unpack(word: u64) -> (Self, Option<(u32, u32)>) {
+        let half = |shift: u32| u32::try_from((word >> shift) & 0xffff).unwrap_or(0);
+        let pixels = (half(32), half(48));
+        let reasons = Self::from_bits_truncate(u32::try_from(word & 0xffff_ffff).unwrap_or(0));
+        (reasons, Some(pixels).filter(|&(w, h)| w != 0 && h != 0))
     }
 }
 

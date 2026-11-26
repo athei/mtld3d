@@ -236,3 +236,25 @@ fn enum_layout_is_u32() {
     assert_eq!(core::mem::size_of::<ColorSpacePolicy>(), 4);
     assert_eq!(core::mem::align_of::<ColorSpacePolicy>(), 4);
 }
+
+#[test]
+fn a_client_surface_request_word_carries_the_reasons_and_the_view_size() {
+    use super::ClientSurfaceRequest as R;
+    let word = R::CLIENT_AREA_CHANGED.pack(Some((2560, 1440)));
+    assert_eq!(
+        R::unpack(word),
+        (R::CLIENT_AREA_CHANGED, Some((2560, 1440)))
+    );
+    assert_eq!(word & !R::PIXELS, u64::from(R::CLIENT_AREA_CHANGED.bits()));
+    assert_eq!(R::unpack(R::ATTACHED.pack(None)), (R::ATTACHED, None));
+    assert_eq!(
+        R::unpack(R::empty().pack(Some((70_000, 9)))),
+        (R::empty(), Some((0xffff, 9))),
+        "a size past 16 bits saturates"
+    );
+    assert_eq!(
+        R::unpack(R::empty().pack(Some((0, 9)))).1,
+        None,
+        "an empty size reads none"
+    );
+}

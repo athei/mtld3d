@@ -2276,7 +2276,14 @@ impl DeviceInner {
         // frame and on one after the client view was hidden or the window's
         // client area moved: Wine shows the surface again, sized to it. A
         // `Present` that submits nothing leaves the request for the next one.
-        self.cursor().present_client_surface_if_asked();
+        // A platform with no window procedure names the view's new size here,
+        // and the resize takes the path a `WM_SIZE` takes.
+        if let Some((width, height)) = self.cursor().present_client_surface_if_asked() {
+            self.cursor_mut()
+                .enter_resize(mtld3d_core::cursor::SIZE_RESTORED);
+            self.apply_auto_resize(width, height);
+            self.cursor_mut().end_resize_dispatch();
+        }
         #[cfg(perf_tracking)]
         {
             let retired = self.coherent_seq.load(Ordering::Acquire);
@@ -3329,32 +3336,16 @@ impl DeviceInner {
     /// No-op for a device that is not fullscreen: the caller decides the
     /// transition, this only carries it out.
     pub fn update_fullscreen(&mut self, mode: Option<mtld3d_core::display_mode::ModeRequest>) {
-        if let Some(saved) = self.fullscreen.as_mut() {
+        if let Some(saved) = self.fullscreen_session_mut() {
             crate::platform::fullscreen::update(saved, mode);
         }
     }
 
-    /// Re-assert the mode and re-cover the monitor after the app is activated.
-    ///
-    /// The deferred half of the cursor subclass's `WM_ACTIVATEAPP TRUE`
-    /// handling, run when the posted message is processed; a no-op when the
-    /// device is no longer fullscreen.
-    pub fn reactivate_fullscreen(&mut self) {
-        if let Some(saved) = self.fullscreen.as_mut() {
-            crate::platform::fullscreen::reactivate(saved);
-        }
-    }
-
-    /// Re-cover the monitor after an external resize of the fullscreen window.
-    ///
-    /// The deferred half of the cursor subclass's `WM_SIZE` handling: runs
-    /// when the posted re-assert message is processed, which is native
-    /// D3D9's cadence. Bounded by the guard in `platform::fullscreen::reassert_cover`;
-    /// a no-op when the device is no longer fullscreen.
-    pub fn reassert_fullscreen_cover(&mut self, new_width: u32, new_height: u32) {
-        if let Some(saved) = self.fullscreen.as_mut() {
-            crate::platform::fullscreen::reassert_cover(saved, (new_width, new_height));
-        }
+    /// The fullscreen session, `None` when the device is windowed.
+    pub const fn fullscreen_session_mut(
+        &mut self,
+    ) -> Option<&mut crate::platform::fullscreen::SavedWindow> {
+        self.fullscreen.as_mut()
     }
 
     /// Give the window back. No-op unless the device is fullscreen.
@@ -5241,7 +5232,10 @@ extern "system" fn device_create_additional_swap_chain(
     } else {
         dev.window()
     };
-    crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
+    if !crate::platform::is_device_window(target_window as *mut c_void) {
+        return D3DERR_INVALIDCALL;
+    }
+    crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp, None);
     // A window with no client area leaves a zero here.
     if pp.back_buffer_width == 0 {
         pp.back_buffer_width = mtld3d_core::present::EMPTY_CLIENT_BACK_BUFFER_EXTENT;
@@ -5507,6 +5501,20 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
         );
         return D3DERR_INVALIDCALL;
     }
+    // A platform without exclusive fullscreen refuses the request as a
+    // malformed one, leaving the device as it was.
+    if pp.windowed == 0 && !crate::platform::exclusive_fullscreen() {
+        log_failed_reset(
+            dev,
+            &log,
+            &pp,
+            format_args!(
+                "rejected, Windowed = FALSE and this build offers no exclusive fullscreen"
+            ),
+            ResetFailureEffect::Unchanged,
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // A Reset with well-formed parameters ends an open `BeginStateBlock`
     // recording whether or not it goes on to succeed, before it looks for
     // outstanding references: the recording dies with the state it was
@@ -5622,6 +5630,16 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -
         pp.device_window
     };
     let retargeted = target_window != dev.window();
+    if !crate::platform::is_device_window(target_window as *mut c_void) {
+        log_failed_reset(
+            dev,
+            &log,
+            &pp,
+            format_args!("rejected, the device window is no view"),
+            ResetFailureEffect::Unchanged,
+        );
+        return reject_reset(dev);
+    }
     if !resolve_reset_window_mode(dev, target_window, &mut pp) {
         log_failed_reset(
             dev,
@@ -5944,8 +5962,9 @@ fn resolve_reset_window_mode(
         && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0)
         && let Some(saved) = dev.fullscreen.as_ref()
     {
+        let resize = dev.cursor.sinks().client_surface_request();
         let accepted = crate::platform::fullscreen::try_leave(saved, dev.leave_kind(), || {
-            crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
+            crate::direct3d9::resolve_backbuffer_dims(target as u64, pp, Some(resize));
             pp.back_buffer_width != 0 && pp.back_buffer_height != 0
         });
         if accepted {
@@ -5954,7 +5973,9 @@ fn resolve_reset_window_mode(
         return accepted;
     }
     apply_reset_window_mode(dev, pp);
-    crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
+    // The read drops the pending resize, so one after it stays pending.
+    let resize = dev.cursor.sinks().client_surface_request();
+    crate::direct3d9::resolve_backbuffer_dims(target as u64, pp, Some(resize));
     pp.back_buffer_width != 0 && pp.back_buffer_height != 0
 }
 
@@ -6032,6 +6053,8 @@ fn retarget_device_window(
         };
         unix_call(&mut detach);
     }
+    // The old view can no longer ask; a resize it asked for is not the new one's.
+    dev.cursor.drop_pending_resize();
     let config = Arc::clone(&dev.config);
     // The word names the old window's screen until the attach publishes the
     // new one's; an attach that publishes nothing leaves the first reading.

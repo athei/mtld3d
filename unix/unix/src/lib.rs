@@ -15,6 +15,8 @@ mod metal;
 mod shader_prewarm;
 mod shader_programs;
 
+pub use metal::{f64_to_u32_saturating, run_on_main_thread, view_pixels};
+
 /// `log` target used by every call inside this crate.
 ///
 /// d3d9.dll fires a one-shot `InitLogger` thunk on load — see

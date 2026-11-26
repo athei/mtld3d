@@ -23,6 +23,10 @@ xxhash-rust = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 mtld3d-unix = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
 
 [lints]
 workspace = true

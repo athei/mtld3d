@@ -1,0 +1,26 @@
+[package]
+name = "mtld3d-native-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+publish = false
+
+# One binary that loads the native `libd3d9.dylib` it is handed and drives it
+# in a hidden `NSWindow`.
+[[bin]]
+name = "native-d3d9-test"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+libloading = { workspace = true }
+mtld3d-types = { path = "../../windows/types" }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-core-foundation = { workspace = true }
+
+[lints]
+workspace = true

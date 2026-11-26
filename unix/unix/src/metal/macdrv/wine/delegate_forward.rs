@@ -91,4 +91,5 @@ fn describe_exception(thrown: Retained<AnyObject>) -> String {
 }
 
 #[cfg(test)]
+#[path = "delegate_forward/tests.rs"]
 mod tests;

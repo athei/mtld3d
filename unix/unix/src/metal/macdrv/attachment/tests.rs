@@ -43,8 +43,8 @@ use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, NewestSurface,
     UNDISPLAYED_PACED_LIMIT, find, find_by_layer, live, next_unshown_release,
     publish_backing_scale, publish_screen_sizes, register, request_client_surface,
-    request_cursor_kick_all, request_first_frame_present, retain_newest_surface_on,
-    test_address_block, undisplayed_run_edge, unregister,
+    request_cursor_kick_all, retain_newest_surface_on, test_address_block, undisplayed_run_edge,
+    unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -700,48 +700,45 @@ fn a_newest_record_that_has_not_drawn_is_not_retained() {
     unregister(view_b);
 }
 
-/// The first-frame request reaches every record with a surface and a word, whatever its rank.
+/// An unranked request reaches its own record, whatever the record's rank or surface.
 #[test]
-fn every_attached_record_with_a_surface_asks_after_its_first_frame() {
+fn an_unranked_request_asks_for_its_own_record() {
     let view_a = test_address_block();
     let view_b = view_a + 0x1000;
     let view_c = view_a + 0x2000;
     let view_d = view_a + 0x3000;
     let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
 
-    let sink_a = AtomicU32::new(0);
-    let sink_b = AtomicU32::new(0);
-    let sink_c = AtomicU32::new(0);
+    let sink_a = AtomicU64::new(0);
+    let sink_b = AtomicU64::new(0);
+    let sink_c = AtomicU64::new(0);
     register(view_a, view_a + 8, &request_latches(hwnd, 0xa000, &sink_a));
     std::thread::sleep(std::time::Duration::from_millis(2));
     register(view_b, view_b + 8, &request_latches(hwnd, 0xb000, &sink_b));
     register(view_c, view_c + 8, &request_latches(hwnd, 0, &sink_c));
     register(view_d, view_d + 8, &surface_latches(hwnd, 0xd000));
 
+    let attached = ClientSurfaceRequest::ATTACHED;
     assert!(
-        request_first_frame_present(view_a),
+        request_client_surface(view_a, attached, false, None),
         "a record a newer one outranks still asks"
     );
-    assert!(request_first_frame_present(view_b));
+    assert!(request_client_surface(view_b, attached, false, None));
     assert!(
-        !request_first_frame_present(view_c),
-        "a record without a surface has nothing to present"
+        request_client_surface(view_c, attached, false, None),
+        "a record without a surface asks for itself"
     );
     assert!(
-        !request_first_frame_present(view_d),
+        !request_client_surface(view_d, attached, false, None),
         "a record without a request word asks nothing"
     );
-    for (sink, expected) in [
-        (&sink_a, ClientSurfaceRequest::ATTACHED.bits()),
-        (&sink_b, ClientSurfaceRequest::ATTACHED.bits()),
-        (&sink_c, 0),
-    ] {
-        assert_eq!(sink.load(Ordering::Acquire), expected);
+    for sink in [&sink_a, &sink_b, &sink_c] {
+        assert_eq!(sink.load(Ordering::Acquire), attached.pack(None));
     }
 
     unregister(view_a);
     assert!(
-        !request_first_frame_present(view_a),
+        !request_client_surface(view_a, attached, false, None),
         "an unregistered record asks nothing"
     );
     unregister(view_b);
@@ -908,7 +905,7 @@ fn a_record_displays_nothing_from_the_limit_until_a_displayed_present() {
 }
 
 /// Latches for a record on `hwnd` holding `client_surface`, asking through `sink`.
-fn request_latches(hwnd: u64, client_surface: usize, sink: &AtomicU32) -> AttachLatches {
+fn request_latches(hwnd: u64, client_surface: usize, sink: &AtomicU64) -> AttachLatches {
     AttachLatches {
         client_surface_request_sink: core::ptr::from_ref(sink) as usize,
         screen_sizes_sink: 0,
@@ -923,21 +920,26 @@ fn only_the_newest_record_with_a_surface_asks_for_it_again() {
     let view_c = view_a + 0x2000;
     let hwnd = u64::try_from(view_a + 0x40).expect("a test address fits a u64");
 
-    let sink_a = AtomicU32::new(0);
-    let sink_b = AtomicU32::new(0);
-    let sink_c = AtomicU32::new(0);
+    let sink_a = AtomicU64::new(0);
+    let sink_b = AtomicU64::new(0);
+    let sink_c = AtomicU64::new(0);
     register(view_a, view_a + 8, &request_latches(hwnd, 0xa000, &sink_a));
     assert!(
-        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN, true, None),
         "the only device on the window asks"
     );
     assert!(
-        request_client_surface(view_a, ClientSurfaceRequest::CLIENT_AREA_CHANGED),
+        request_client_surface(
+            view_a,
+            ClientSurfaceRequest::CLIENT_AREA_CHANGED,
+            true,
+            None
+        ),
         "and asks again for another reason"
     );
     assert_eq!(
         sink_a.swap(0, Ordering::Acquire),
-        (ClientSurfaceRequest::VIEW_HIDDEN | ClientSurfaceRequest::CLIENT_AREA_CHANGED).bits(),
+        (ClientSurfaceRequest::VIEW_HIDDEN | ClientSurfaceRequest::CLIENT_AREA_CHANGED).pack(None),
         "the reasons accumulate until the device takes them"
     );
 
@@ -946,37 +948,79 @@ fn only_the_newest_record_with_a_surface_asks_for_it_again() {
     std::thread::sleep(std::time::Duration::from_millis(2));
     register(view_c, view_c + 8, &request_latches(hwnd, 0, &sink_c));
     assert!(
-        !request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        !request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN, true, None),
         "a device a newer one on its window outranks is hidden on purpose"
     );
     assert!(
-        !request_client_surface(view_c, ClientSurfaceRequest::VIEW_HIDDEN),
+        !request_client_surface(view_c, ClientSurfaceRequest::VIEW_HIDDEN, true, None),
         "a record without a surface has nothing to show"
     );
     assert!(request_client_surface(
         view_b,
-        ClientSurfaceRequest::VIEW_HIDDEN
+        ClientSurfaceRequest::VIEW_HIDDEN,
+        true,
+        None
     ));
     assert_eq!(sink_a.load(Ordering::Acquire), 0);
     assert_eq!(sink_c.load(Ordering::Acquire), 0);
     assert_eq!(
         sink_b.swap(0, Ordering::Acquire),
-        ClientSurfaceRequest::VIEW_HIDDEN.bits()
+        ClientSurfaceRequest::VIEW_HIDDEN.pack(None)
     );
 
     unregister(view_b);
     assert!(
-        !request_client_surface(view_b, ClientSurfaceRequest::VIEW_HIDDEN),
+        !request_client_surface(view_b, ClientSurfaceRequest::VIEW_HIDDEN, true, None),
         "an unregistered record asks nothing"
     );
     assert_eq!(sink_b.load(Ordering::Acquire), 0);
     assert!(
-        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN),
+        request_client_surface(view_a, ClientSurfaceRequest::VIEW_HIDDEN, true, None),
         "the window's newest device again once the later one left"
     );
 
     unregister(view_a);
     unregister(view_c);
+}
+
+/// A request replaces the pending size, with none for none, and keeps the pending reasons.
+#[test]
+fn a_request_with_a_size_replaces_the_pending_size() {
+    let view = test_address_block();
+    let hwnd = u64::try_from(view + 0x40).expect("a test address fits a u64");
+    let sink = AtomicU64::new(0);
+    register(view, view + 8, &request_latches(hwnd, 0, &sink));
+
+    let resized = ClientSurfaceRequest::CLIENT_AREA_CHANGED;
+    assert!(request_client_surface(
+        view,
+        ClientSurfaceRequest::ATTACHED,
+        false,
+        None
+    ));
+    assert!(request_client_surface(
+        view,
+        resized,
+        false,
+        Some((800, 600))
+    ));
+    assert!(request_client_surface(
+        view,
+        resized,
+        false,
+        Some((1024, 768))
+    ));
+    assert_eq!(
+        ClientSurfaceRequest::unpack(sink.load(Ordering::Acquire)),
+        (ClientSurfaceRequest::ATTACHED | resized, Some((1024, 768))),
+    );
+    assert!(request_client_surface(view, resized, false, None));
+    assert_eq!(
+        ClientSurfaceRequest::unpack(sink.load(Ordering::Acquire)),
+        (ClientSurfaceRequest::ATTACHED | resized, None),
+        "a view that collapsed drops the size it had"
+    );
+    unregister(view);
 }
 
 #[test]
@@ -987,7 +1031,9 @@ fn a_record_without_a_request_word_asks_nothing() {
     register(view, view + 8, &surface_latches(hwnd, 0xf000));
     assert!(!request_client_surface(
         view,
-        ClientSurfaceRequest::VIEW_HIDDEN
+        ClientSurfaceRequest::VIEW_HIDDEN,
+        true,
+        None
     ));
     unregister(view);
 }

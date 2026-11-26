@@ -53,7 +53,8 @@ static IMPORTS: PatchedImports<HOOKS> = PatchedImports::empty();
 /// configuration resolves to at that moment, the one an interface created
 /// then would get.
 static SERVED_INDICES: LazyLock<Vec<u32>> = LazyLock::new(|| {
-    let max = crate::config::max_resolutions();
+    // Resolved without the per-option lines: the redirect can run before any `IDirect3D9`.
+    let max = crate::config::resolve().max_resolutions;
     let modes = super::fullscreen::enumerate_display_modes();
     let indices = served_mode_indices(
         modes.iter().map(|mode| (mode.width, mode.height)),

@@ -21,6 +21,21 @@ mtld3d-types = { path = "types" }
 mtld3d-unix = { path = "../unix/unix" }
 bitflags = "2"
 log = "0.4"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSResponder",
+    "NSView",
+    "objc2-core-foundation",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFCGTypes",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGDirectDisplay",
+] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary"] }
 rustc-hash = "2"

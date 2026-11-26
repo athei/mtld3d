@@ -33,7 +33,8 @@ Two commands, both green before you commit:
 
 - `make check` is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
   `make audit`, the Makefile's own tests (`test-isolation` and
-  `test-e2e-discovery`), and `make doc`. It also runs the native and i686
+  `test-e2e-discovery`), and `make doc`. Its clippy legs include
+  `clippy-native-d3d`, the native build. It also runs the native and i686
   clippy legs again, and the host-native unit tests that `make test` runs, on
   a `PERF=1` build (`clippy-perf` and `test-unit-perf`), since no other gate
   compiles the perf telemetry or the tests behind `cfg(perf_tracking)`. Only
@@ -41,7 +42,8 @@ Two commands, both green before you commit:
   without failing. Each audit finding names the section of
   `docs/CONVENTIONS.md` behind it; read that section rather than
   pattern-matching your way past the grep.
-- `make test` is the host-native unit tests plus the end-to-end suite under
+- `make test` is the host-native unit tests, `test-native-d3d` (the native
+  build driven in a hidden window, without Wine) and the end-to-end suite under
   the arm64 Wine `WINE_SDK` names, one leg per build a game loads there:
   `test-e2e-i686`, the 32-bit suite against the i686 build, and
   `test-e2e-arm64x`, the x64 suite against the ARM64X build. A third leg,
@@ -632,18 +634,20 @@ and runs on one image, macos-26: the e2e legs `i686`, `x86_64` (the matrix
 name of the leg that runs `test-e2e-arm64x`, the x64 suite against the
 ARM64X build) and the native ARM64 `aarch64`, the conformance legs `i686` and
 `arm64x`, and one scaled leg of each suite. Every conformance leg runs that
-release's `d3d9_test.exe`. CI compiles on three machines and replays everywhere
+release's `d3d9_test.exe`. CI compiles on four machines and replays everywhere
 else. One job builds the stage (`make stage`: the i686 and ARM64X builds, the
 arm64 unix `.so`, the e2e test binaries of every leg, the e2e and conformance
 runners), which serves every leg. `check` runs formatting and audit first, then
 documentation, Clippy (the ARM64X halves included) and unit tests, as steps of
 one job, and `check-perf` runs the `PERF=1` Clippy and unit-test legs of
 `make check` in parallel with it, since those build into a target directory of
-their own. A cache is saved only when its key missed, so a pull request's
-run saves only what main's caches lack, and `cache-cleanup.yml` deletes a
-pull request's caches when it closes. Production bundles are built by the
-release job only, also on macos-26, so they carry the ARM64X pair beside the
-i686 build. Every run on `main` has its own concurrency group so pending
+their own. `native` lints the native build and runs `make test-native-d3d`,
+in a third, and keeps the layer's log. A cache is saved only when its key
+missed, so a pull request's run saves only what main's caches lack, and
+`cache-cleanup.yml` deletes a pull request's caches when it closes.
+Production bundles are built by the release job only, also on macos-26, so
+they carry the ARM64X pair beside the i686 build; the job keeps the native
+build's archive as a workflow artifact. Every run on `main` has its own concurrency group so pending
 runs survive later pushes and every commit keeps its CI result. PR updates
 cancel the superseded run. The test machines carry no toolchain: they
 install the stage (`STAGE=<dir>`) and run the end-to-end and conformance

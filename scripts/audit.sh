@@ -90,6 +90,12 @@ APP_POINTER_INPTR_MESSAGE='InPtr/InPtrMut over an application struct: read it wi
 PLATFORM_DIR=windows/d3d9/src
 PLATFORM_HOME='^windows/d3d9/src/platform(\.rs$|/)'
 
+# The unix crate picks its host once, in `metal/macdrv.rs`, and `lib.rs` names
+# the Wine exports a native build leaves out. No other file of the crate tells
+# the two builds apart.
+HOST_DIR=unix/unix/src
+HOST_HOME='^unix/unix/src/(lib\.rs|metal/macdrv\.rs)$'
+
 status=0
 
 # Report a finding and name the section of docs/CONVENTIONS.md it comes from,
@@ -267,11 +273,24 @@ app_pointer_derefs() {
 
 # A Win32 import or a platform cfg outside `platform.rs` and `platform/`: an
 # `unsafe extern` block, a `#[link(`, `os::windows`, or a `cfg`, `cfg!` or
-# `cfg_attr` that names `windows`, `unix` or a `target_*` key. A cfg is read up
-# to its closing parenthesis, which may be lines later. One still open at the
-# end of its file is a finding. Each line is cut at its first `//` first.
+# `cfg_attr` that names `windows`, `unix` or a `target_*` key.
 platform_split() {
-    awk '
+    cfg_split '(windows|unix|target_[a-z0-9_]+)' 'platform cfg' 1 "$@"
+}
+
+# A `cfg`, `cfg!` or `cfg_attr` naming `native_d3d` outside `metal/macdrv.rs` and `lib.rs`.
+host_split() {
+    cfg_split 'native_d3d' 'native_d3d cfg' 0 "$@"
+}
+
+# Every `cfg`, `cfg!` or `cfg_attr` that names one of `$1`, reported as `$2`,
+# and with `$3` set the Win32 imports too. A cfg is read up to its closing
+# parenthesis, which may be lines later. One still open at the end of its
+# file is a finding. Each line is cut at its first `//` first.
+cfg_split() {
+    names=$1 what=$2 imports=$3
+    shift 3
+    awk -v names="$names" -v what="$what" -v imports="$imports" '
         function depth(s,   t, o, c) {
             t = s; o = gsub(/\(/, "", t)
             t = s; c = gsub(/\)/, "", t)
@@ -288,7 +307,7 @@ platform_split() {
             return s
         }
         function names_platform(s) {
-            return closed(s) ~ /(^|[^A-Za-z0-9_])(windows|unix|target_[a-z0-9_]+)([^A-Za-z0-9_]|$)/
+            return closed(s) ~ ("(^|[^A-Za-z0-9_])" names "([^A-Za-z0-9_]|$)")
         }
         function finding(line, what) {
             printf "%s:%d: %s in %s\n", FILENAME, line, what, text
@@ -299,7 +318,7 @@ platform_split() {
                 cfg = substr(s, RSTART)
                 start = FNR
                 if (depth(closed(cfg)) != 0) { nest = 1; open_file = FILENAME; open_text = $0; return }
-                if (names_platform(cfg)) finding(start, "platform cfg")
+                if (names_platform(cfg)) finding(start, what)
                 s = substr(cfg, length(closed(cfg)) + 1)
             }
         }
@@ -316,16 +335,16 @@ platform_split() {
             cfg = cfg " " code
             if (depth(closed(cfg)) == 0) {
                 nest = 0
-                if (names_platform(cfg)) finding(start, "platform cfg")
+                if (names_platform(cfg)) finding(start, what)
                 scan(substr(cfg, length(closed(cfg)) + 1))
             }
             next
         }
         {
             text = $0
-            if (code ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
-            if (code ~ /#\[link\(/) finding(FNR, "#[link(")
-            if (code ~ /os::windows/) finding(FNR, "os::windows")
+            if (imports && code ~ /unsafe[ \t]+extern([ \t]+"[^"]*")?[ \t]*\{/) finding(FNR, "unsafe extern block")
+            if (imports && code ~ /#\[link\(/) finding(FNR, "#[link(")
+            if (imports && code ~ /os::windows/) finding(FNR, "os::windows")
             scan(code)
         }
     ' "$@"
@@ -481,6 +500,15 @@ case "${1:-}" in
         ;;
     esac
     case $file in
+    "$HOST_DIR"/*.rs)
+        if ! printf '%s\n' "$file" | grep -qE "$HOST_HOME"; then
+            findings=$(host_split "$file")
+            [ -z "$findings" ] || report 'The unix crate picks its host in macdrv.rs' \
+                'native_d3d cfg outside metal/macdrv.rs and lib.rs' "$findings"
+        fi
+        ;;
+    esac
+    case $file in
     windows/*.rs)
         if ! printf '%s\n' "$file" | grep -qE "$PE_JOIN_EXEMPT"; then
             banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
@@ -584,6 +612,17 @@ if [ -n "$shared_sources" ]; then
     if [ -n "$findings" ]; then
         report 'Win32 stays behind platform.rs' \
             'Win32 import or platform cfg outside platform.rs and platform/' \
+            "$findings"
+    fi
+fi
+
+host_sources=$(git ls-files "$HOST_DIR/*.rs" | grep -vE "$HOST_HOME" || true)
+if [ -n "$host_sources" ]; then
+    # shellcheck disable=SC2086
+    findings=$(host_split $host_sources)
+    if [ -n "$findings" ]; then
+        report 'The unix crate picks its host in macdrv.rs' \
+            'native_d3d cfg outside metal/macdrv.rs and lib.rs' \
             "$findings"
     fi
 fi

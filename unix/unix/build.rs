@@ -1,4 +1,4 @@
-const DELEGATE_FORWARD: &str = "src/metal/macdrv/delegate_forward.m";
+const DELEGATE_FORWARD: &str = "src/metal/macdrv/wine/delegate_forward.m";
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(perf_tracking)");
@@ -8,12 +8,14 @@ fn main() {
     }
     println!("cargo::rustc-check-cfg=cfg(native_d3d)");
     println!("cargo:rerun-if-env-changed=MTLD3D_NATIVE_D3D");
-    if std::env::var("MTLD3D_NATIVE_D3D").is_ok_and(|v| !v.is_empty() && v != "0") {
+    let native_d3d = std::env::var("MTLD3D_NATIVE_D3D").is_ok_and(|v| !v.is_empty() && v != "0");
+    if native_d3d {
         println!("cargo:rustc-cfg=native_d3d");
     }
 
+    // The delegate forward is the Wine host's, so a native build skips it.
     let target = std::env::var("TARGET").unwrap();
-    if !target.contains("apple") {
+    if !target.contains("apple") || native_d3d {
         return;
     }
 

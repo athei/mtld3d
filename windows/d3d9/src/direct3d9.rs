@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::{ffi::c_void, sync::atomic::AtomicU64};
 use std::{
     path::Path,
     sync::{
@@ -1545,12 +1545,19 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 /// dimension still zero afterwards is the caller's to answer: `CreateDevice`
 /// and `Reset` reject it, and `CreateAdditionalSwapChain` makes it
 /// `EMPTY_CLIENT_BACK_BUFFER_EXTENT`.
-pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
+///
+/// `resize` is the request word of the device being `Reset`, whose pending
+/// resize the platform drops where it reads the size.
+pub fn resolve_backbuffer_dims(
+    hwnd: u64,
+    pp: &mut D3DPRESENT_PARAMETERS,
+    resize: Option<&AtomicU64>,
+) {
     if pp.windowed == 0 {
         crate::platform::warn_if_dpi_scaled(hwnd as *mut c_void);
         // Callers reject a zero-dimension fullscreen request before the window
         // moves, so the request is always concrete here.
-        let client = crate::platform::client_size(hwnd as *mut c_void);
+        let client = crate::platform::client_size(hwnd as *mut c_void, resize);
         if is_settable_mode(pp.back_buffer_width, pp.back_buffer_height) {
             // With the mode set the client rect is the request. It reads
             // otherwise when user32 refused the mode and the window covers
@@ -1588,7 +1595,8 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
         pp.back_buffer_height = client_h;
         return;
     }
-    let Some((client_w, client_h)) = crate::platform::client_size(hwnd as *mut c_void) else {
+    let Some((client_w, client_h)) = crate::platform::client_size(hwnd as *mut c_void, resize)
+    else {
         return;
     };
     if crate::platform::is_maximized(hwnd as *mut c_void) {
@@ -1778,6 +1786,16 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         return D3DERR_NOTAVAILABLE;
     }
 
+    // A platform without exclusive fullscreen refuses the request before
+    // anything is created, so nothing has to be undone.
+    if pp.windowed == 0 && !crate::platform::exclusive_fullscreen() {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice: Windowed = FALSE, this build offers no exclusive fullscreen",
+        );
+        return D3DERR_INVALIDCALL;
+    }
+
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
     let mut present_debug = PresentDebugFlags::empty();
@@ -1820,6 +1838,11 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     }
 
+    if !crate::platform::is_device_window(hwnd as *mut c_void) {
+        destroy_partial_device(&cq_params, MetalHandle::NULL, None);
+        return D3DERR_INVALIDCALL;
+    }
+
     // A fullscreen device sets the requested mode and owns its window unless
     // the app kept it (`D3DCREATE_NOWINDOWCHANGES`). Both come first: the
     // back-buffer size is resolved from the resulting client rect, and the
@@ -1841,7 +1864,7 @@ fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
 
     // Resolve the logical backbuffer size against the window now that its
     // geometry is final, before any Metal resource is sized from it.
-    resolve_backbuffer_dims(hwnd, &mut pp);
+    resolve_backbuffer_dims(hwnd, &mut pp, None);
     // Resolve D3DFMT_UNKNOWN to the display format and a zero back-buffer count
     // to one, so the geometry written back to the caller's present params is
     // concrete.

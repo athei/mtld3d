@@ -1,6 +1,6 @@
 //! The client area of a device window.
 
-use core::ffi::c_void;
+use core::{ffi::c_void, sync::atomic::AtomicU64};
 
 use super::fullscreen::Rect;
 use crate::LOG_TARGET;
@@ -18,7 +18,10 @@ unsafe extern "system" {
 /// cannot read and a window with no client area, are warned about once per
 /// window, since either leaves the requested size standing where the caller
 /// expected the window's.
-pub fn client_size(hwnd: *mut c_void) -> Option<(u32, u32)> {
+///
+/// A pending resize request is left as it is: under Wine its bit asks for
+/// the client surface to be shown again.
+pub fn client_size(hwnd: *mut c_void, _resize: Option<&AtomicU64>) -> Option<(u32, u32)> {
     if hwnd.is_null() {
         return None;
     }

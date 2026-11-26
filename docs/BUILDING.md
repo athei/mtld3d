@@ -139,7 +139,8 @@ mechanism.
 ## Gates and tests
 
 `make check` is the lint and documentation gate, and `make test` runs the
-unit tests and the end-to-end suite; both are green before every commit.
+unit tests, the native build's test and the end-to-end suite; both are green
+before every commit.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gates) lists what each one runs.
 `make check` lints both PE builds, the two halves of the ARM64X one and the
 x64 end-to-end tests included.
@@ -168,10 +169,14 @@ first `make check` in a checkout builds it from scratch, which takes a few
 minutes and about 5.6 GB of disk (3.3 GB under `windows`, 2.3 GB under
 `unix`). The Makefile says which legs it runs beside `clippy-perf`.
 
-`MTLD3D_NATIVE_D3D=1` sets `cfg(native_d3d)`, which `mtld3d-unix` reads to
-leave out its two Wine export names and `mtld3d-core` does not read yet, for
-the build that links the unix side into `d3d9` without Wine. No gate builds
-it until `d3d9` builds for the host.
+`make native-d3d` builds `d3d9` and the unix side into one `libd3d9.dylib`
+for a macOS host, without Wine, in `windows/target/native`.
+`MTLD3D_NATIVE_D3D=1` sets the `cfg(native_d3d)` that selects the unix side's
+native host; a non-Windows `d3d9` without it fails to build.
+`make test-native-d3d` drives the dylib in a hidden window, and
+`docs/STATUS.md` lists what the build does not cover. `make bundle-native-d3d`
+packs the production dylib, its `.dSYM`, `LICENSE` and `mtld3d.conf` into
+`windows/target/mtld3d-native-d3d.tar.xz`.
 
 The test legs run with Apple's Metal validation layer on and the Metal HUD
 off; the Makefile says why beside `MTL_HUD_ENABLED`. Setting

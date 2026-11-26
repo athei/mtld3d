@@ -1,17 +1,12 @@
 use std::fmt::Write;
 
 fn main() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let def = format!("{manifest_dir}/d3d9.def");
-    println!("cargo:rerun-if-changed={def}");
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86") {
-        let out_dir = std::env::var("OUT_DIR").unwrap();
-        let i686_def = format!("{out_dir}/d3d9.i686.def");
-        let text = std::fs::read_to_string(&def).expect("read d3d9.def");
-        std::fs::write(&i686_def, decorate_def(&text)).expect("write the i686 d3d9.def");
-        println!("cargo:rustc-cdylib-link-arg=/DEF:{i686_def}");
+    // The export list is the PE link's; a native build exports its two
+    // factories by name.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        pe_link_args();
     } else {
-        println!("cargo:rustc-cdylib-link-arg=/DEF:{def}");
+        native_d3d_set();
     }
 
     // Diagnostic-only: `MTLD3D_CRUMB=1` enables the mmap breadcrumb in
@@ -29,6 +24,35 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MTLD3D_PERF");
     if std::env::var("MTLD3D_PERF").is_ok_and(|v| !v.is_empty() && v != "0") {
         println!("cargo:rustc-cfg=perf_tracking");
+    }
+}
+
+/// Fails a native build of `d3d9` whose `mtld3d-unix` would take the Wine host.
+///
+/// `d3d9` picks its native side by target and `mtld3d-unix` its host by
+/// `MTLD3D_NATIVE_D3D`, so a native target needs the variable too.
+fn native_d3d_set() {
+    println!("cargo:rerun-if-env-changed=MTLD3D_NATIVE_D3D");
+    let set = std::env::var("MTLD3D_NATIVE_D3D").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        set,
+        "a non-Windows d3d9 is the native build: set MTLD3D_NATIVE_D3D=1 (see `make native-d3d`)"
+    );
+}
+
+/// The PE link's export list, from `d3d9.def`.
+fn pe_link_args() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let def = format!("{manifest_dir}/d3d9.def");
+    println!("cargo:rerun-if-changed={def}");
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86") {
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let i686_def = format!("{out_dir}/d3d9.i686.def");
+        let text = std::fs::read_to_string(&def).expect("read d3d9.def");
+        std::fs::write(&i686_def, decorate_def(&text)).expect("write the i686 d3d9.def");
+        println!("cargo:rustc-cdylib-link-arg=/DEF:{i686_def}");
+    } else {
+        println!("cargo:rustc-cdylib-link-arg=/DEF:{def}");
     }
 }
 
