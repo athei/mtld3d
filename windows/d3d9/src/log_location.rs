@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use log::warn;
-use mtld3d_shared::OpenLogParams;
+use mtld3d_shared::{InitLoggerParams, OpenLogParams};
 
 use crate::{LOG_TARGET, unix_call::unix_call};
 
@@ -42,6 +42,35 @@ pub fn open(cfg: &mtld3d_core::config::Mtld3dConfig) {
         pad0: 0,
     };
     unix_call(&mut params);
+}
+
+/// Install the unix side's logger, filtered by `RUST_LOG`, once per process.
+///
+/// The thunk also names where a crash report goes if one comes before
+/// `Direct3DCreate9` names the log location ([`early_location`]); empty when
+/// that cannot be derived, which is warned once the logger is up.
+pub fn init_logger() {
+    let filter = std::env::var("RUST_LOG").unwrap_or_default();
+    let early = early_location();
+    let (early_dir, early_stem) = early
+        .as_ref()
+        .map_or(("", ""), |(dir, stem)| (dir.as_str(), stem.as_str()));
+    let mut params = InitLoggerParams {
+        filter_ptr: filter.as_ptr() as u64,
+        early_dir_ptr: early_dir.as_ptr() as u64,
+        early_stem_ptr: early_stem.as_ptr() as u64,
+        filter_len: u32::try_from(filter.len()).unwrap_or(0),
+        early_dir_len: u32::try_from(early_dir.len()).unwrap_or(0),
+        early_stem_len: u32::try_from(early_stem.len()).unwrap_or(0),
+        pad0: 0,
+    };
+    unix_call(&mut params);
+    if early.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "log file: no default location at load, a crash before Direct3DCreate9 reports to stderr"
+        );
+    }
 }
 
 /// The default log location as a unix path, plus the executable's stem, or `None`.

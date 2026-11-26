@@ -24,7 +24,7 @@ use mtld3d_core::{
     perf::DeviceSubCategory,
 };
 use mtld3d_shared::{
-    InPtr, MetalHandle, PresentClientSurfaceParams, SetCursorOverlayParams,
+    InPtr, MetalHandle, SetCursorOverlayParams,
     bounded_cache::BoundedCache,
     mtl::{CURSOR_SPRITE_CACHE_ENTRIES, ClientSurfaceRequest, CursorOverlayFlags},
     mtl_handle::NSViewKind,
@@ -35,7 +35,7 @@ use xxhash_rust::xxh3::Xxh3;
 use super::{DeviceInner, Direct3DDevice9, device_api_lock, device_timer};
 use crate::{
     D3D_OK, D3DERR_INVALIDCALL,
-    platform::cursor::{CursorImage, SystemCursor, current_thread_id},
+    platform::cursor::{CursorImage, SystemCursor, SystemCursorOps, current_thread_id},
     unix_call::unix_call,
 };
 
@@ -85,7 +85,12 @@ pub struct DisplaySinks {
     /// it has drawn. The next `Present` that submits a frame takes the bits
     /// and sends `PresentClientSurface`, which has Wine show the surface
     /// again, sized to the client area.
-    client_surface_request: AtomicU32,
+    ///
+    /// The bits are the word's low half. A host without a window procedure
+    /// puts the view's size in pixels in its high half with the bit that asks
+    /// for it (`ClientSurfaceRequest::pack`), so the `Present` that takes the
+    /// bits reads the size without asking the main thread.
+    client_surface_request: AtomicU64,
     /// The window's screen sizes, `ScreenSizes::pack`; `0` until published.
     ///
     /// The unix side stores them at attach and again from its main-thread
@@ -101,7 +106,7 @@ impl DisplaySinks {
         Self {
             backing_scale: AtomicU32::new(0),
             cursor_kick: AtomicU32::new(0),
-            client_surface_request: AtomicU32::new(0),
+            client_surface_request: AtomicU64::new(0),
             screen_sizes: AtomicU64::new(0),
         }
     }
@@ -126,25 +131,22 @@ impl DisplaySinks {
         (&raw const self.client_surface_request) as u64
     }
 
-    /// Ask the next `Present` to have Wine show the client surface again, for `reason`.
-    pub fn request_client_surface(&self, reason: ClientSurfaceRequest) {
-        self.client_surface_request
-            .fetch_or(reason.bits(), Ordering::Release);
+    /// The request word, for the platform that writes it from this side.
+    pub const fn client_surface_request(&self) -> &AtomicU64 {
+        &self.client_surface_request
     }
 
-    /// Take the client surface request, empty when nothing asked since the last take.
+    /// Take the client surface request and the view size it carries; empty when nothing asked.
     ///
     /// One relaxed load on a frame nothing asked on, which is every frame but
     /// the first after an attach and the ones after a resize or a hidden
     /// client view; the swap that takes the bits pairs its `Acquire` with the
     /// writers' `Release`.
-    pub fn take_client_surface_request(&self) -> ClientSurfaceRequest {
+    pub fn take_client_surface_request(&self) -> (ClientSurfaceRequest, Option<(u32, u32)>) {
         if self.client_surface_request.load(Ordering::Relaxed) == 0 {
-            return ClientSurfaceRequest::empty();
+            return (ClientSurfaceRequest::empty(), None);
         }
-        ClientSurfaceRequest::from_bits_truncate(
-            self.client_surface_request.swap(0, Ordering::AcqRel),
-        )
+        ClientSurfaceRequest::unpack(self.client_surface_request.swap(0, Ordering::AcqRel))
     }
 
     /// The address `AttachMetalLayerParams::backing_scale_ptr` carries.
@@ -183,8 +185,7 @@ impl Default for DisplaySinks {
 /// Cursor state owned by `DeviceInner` as a single field.
 ///
 /// It holds the D3D9 cursor rules and the overlay sync. What the platform
-/// realizes is the one [`SystemCursor`] field, reached through
-/// [`Self::system`] / [`Self::system_mut`].
+/// realizes is the one [`SystemCursor`] field, [`Self::system`].
 pub struct CursorState {
     /// The metal view the device attached, naming its unix-side attachment record.
     ///
@@ -217,8 +218,8 @@ pub struct CursorState {
     /// display on the game's next cursor change, which for a title that sets
     /// its pointer once is never. `None` until the first accepted call.
     source: Option<CursorSource>,
-    /// The cursor the platform realizes for this device's window.
-    system: SystemCursor,
+    /// The cursor the platform realizes for this device's window; its window procedure reads it.
+    pub system: SystemCursor,
 }
 
 impl CursorState {
@@ -248,16 +249,6 @@ impl CursorState {
         }
     }
 
-    /// The cursor the platform realizes, for its window procedure.
-    pub const fn system(&self) -> &SystemCursor {
-        &self.system
-    }
-
-    /// The cursor the platform realizes, for its window procedure.
-    pub const fn system_mut(&mut self) -> &mut SystemCursor {
-        &mut self.system
-    }
-
     /// Follow the backing scale the unix side last published for this device's window.
     ///
     /// Called once per `Present`: one relaxed load and a compare on an
@@ -277,42 +268,27 @@ impl CursorState {
         self.sinks.take_cursor_kick()
     }
 
-    /// Have Wine show this device's client surface again, sized to the client area, if asked.
+    /// Answer the client surface request of a `Present` that submitted a frame.
     ///
-    /// Called once per `Present`, after the frame was handed to the encoder,
-    /// on the API thread, a Wine thread, which win32u's surface calls need. So
-    /// a request is taken only by a `Present` that submits a frame, and the
-    /// unix side reads the call as the device having drawn. A frame nothing
-    /// asked on pays one relaxed load; the device's first frame, and one
-    /// after the client view was hidden or the window's client area moved,
-    /// sends `PresentClientSurface`.
-    pub fn present_client_surface_if_asked(&self) {
+    /// Called once per such `Present`, after the frame was handed to the
+    /// encoder, on the API thread. A frame nothing asked on pays one relaxed
+    /// load. The answer is the size the back buffer follows, on a platform
+    /// with no window procedure to report it: the view's size in pixels the
+    /// request carried.
+    pub fn present_client_surface_if_asked(&self) -> Option<(u32, u32)> {
         if self.view_handle.is_null() {
-            return;
+            return None;
         }
-        let reasons = self.sinks.take_client_surface_request();
+        let (reasons, pixels) = self.sinks.take_client_surface_request();
         if reasons.is_empty() {
-            return;
+            return None;
         }
-        let mut params = PresentClientSurfaceParams {
-            view_handle: self.view_handle,
-            reasons,
-            pad0: 0,
-        };
-        let status = unix_call(&mut params);
-        if status != 0 {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "PresentClientSurface ({reasons:?}) failed (status={status:#x}); the client surface \
-                 stays as Wine left it",
-            );
-        }
+        SystemCursor::present_client_surface(self.view_handle, reasons, pixels)
     }
 
-    /// Ask the next `Present` to show the client surface again: the client area may have moved.
-    pub fn request_client_surface(&self) {
-        self.sinks
-            .request_client_surface(ClientSurfaceRequest::CLIENT_AREA_CHANGED);
+    /// Forget a resize the device window asked for; see [`SystemCursor::drop_pending_resize`].
+    pub fn drop_pending_resize(&self) {
+        SystemCursor::drop_pending_resize(&self.sinks);
     }
 
     /// Re-scale the pointer after the window moved to a display of another backing scale.
@@ -1199,6 +1175,9 @@ fn send_overlay_state(
     flags: CursorOverlayFlags,
     sprite: Option<&SpriteUpload>,
 ) -> bool {
+    if !SystemCursor::HAS_OVERLAY {
+        return false;
+    }
     if view_handle.is_null() {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,

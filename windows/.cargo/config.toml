@@ -133,3 +133,6 @@ AR_arm64ec-pc-windows-msvc      = "llvm-lib"
 # `llvm-lib` infers an archive's machine from its first member and takes an
 # ARM64EC object for a plain ARM64 one, so it is told which it is writing.
 ARFLAGS_arm64ec-pc-windows-msvc = "-machine:arm64ec"
+# The native `libd3d9.dylib` and its `mtld3d-unix` build from this workspace,
+# so they take the macOS floor of `unix/.cargo/config.toml` here too.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

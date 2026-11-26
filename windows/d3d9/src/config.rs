@@ -35,17 +35,8 @@ pub fn load() -> Mtld3dConfig {
     cfg
 }
 
-/// The `display.maxResolutions` the process's configuration resolves to now.
-///
-/// For the `EnumDisplaySettings` redirect, which serves the main module
-/// before or without any `IDirect3D9`. Resolves the same three layers an
-/// interface would, without logging every option again.
-pub fn max_resolutions() -> u32 {
-    resolve().max_resolutions
-}
-
 /// The profile, the file and the environment, combined.
-fn resolve() -> Mtld3dConfig {
+pub fn resolve() -> Mtld3dConfig {
     let env_override = std::env::var("MTLD3D_CONFIG")
         .ok()
         .filter(|s| !s.trim().is_empty());

@@ -10,16 +10,13 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use mtld3d_shared::{InitLoggerParams, identity};
+use mtld3d_shared::identity;
 
 use self::crash::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA,
 };
 // The modules below name these crate-root items through `super::`.
-use crate::{
-    D3D_OK, E_NOINTERFACE, LOG_TARGET, create9, create9_ex, null_out,
-    unix_call::{self, unix_call},
-};
+use crate::{D3D_OK, E_NOINTERFACE, LOG_TARGET, create9, create9_ex, null_out, unix_call};
 
 #[macro_use]
 #[path = "win32/hookable.rs"]
@@ -152,6 +149,21 @@ pub use wine_path::unix_path;
 pub unsafe fn dispatch_unix_call(code: u32, args: *mut c_void) -> i32 {
     // SAFETY: the caller's contract is the dispatcher's.
     unsafe { mtld3d_unix_call(code, args) }
+}
+
+/// Exclusive fullscreen is offered: a fullscreen device sets the mode and takes its window.
+pub const fn exclusive_fullscreen() -> bool {
+    true
+}
+
+/// Any window handle is a device window here; the window calls answer a dead one.
+pub const fn is_device_window(_window: *mut c_void) -> bool {
+    true
+}
+
+/// `GetDC` wraps a surface's pixels in a GDI device context.
+pub const fn surface_dcs() -> bool {
+    true
 }
 
 /// Note that the game reached for a device, pinning this image the first time.
@@ -450,26 +462,7 @@ fn init_logger(instance: *mut c_void) {
     mtld3d_shared::crumb::init();
     crash::install(instance);
     mtld3d_shared::crumb::set_write_sink(log_sink::write_fault);
-    let filter = std::env::var("RUST_LOG").unwrap_or_default();
-    // Where a crash report goes if one comes before `Direct3DCreate9`
-    // names the log location; empty when it cannot be derived.
-    let (early_dir, early_stem) = crate::log_location::early_location().unwrap_or_else(|| {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "log file: no default location at load, a crash before Direct3DCreate9 reports to stderr"
-        );
-        (String::new(), String::new())
-    });
-    let mut params = InitLoggerParams {
-        filter_ptr: filter.as_ptr() as u64,
-        early_dir_ptr: early_dir.as_ptr() as u64,
-        early_stem_ptr: early_stem.as_ptr() as u64,
-        filter_len: u32::try_from(filter.len()).unwrap_or(0),
-        early_dir_len: u32::try_from(early_dir.len()).unwrap_or(0),
-        early_stem_len: u32::try_from(early_stem.len()).unwrap_or(0),
-        pad0: 0,
-    };
-    unix_call(&mut params);
+    crate::log_location::init_logger();
 }
 
 /// Name this build in the log, as the first line the logger emits.

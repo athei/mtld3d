@@ -25,13 +25,22 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{cursor::BitmapLayout, window_subclass::WindowSubclasses};
-use mtld3d_shared::{bounded_cache::BoundedCache, mtl::CURSOR_SPRITE_CACHE_ENTRIES};
+use mtld3d_shared::{
+    MetalHandle, PresentClientSurfaceParams,
+    bounded_cache::BoundedCache,
+    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, ClientSurfaceRequest},
+    mtl_handle::NSViewKind,
+};
 use mtld3d_types::{CURSOR_SHOWING, CURSORINFO, ICONINFO, POINT};
 
 use super::fullscreen::set_window_long_ptr;
-use crate::device::{
-    DeviceInner,
-    cursor::{LOG_TARGET, elapsed_us, scale_cursor_pixels},
+use crate::{
+    device::{
+        DeviceInner,
+        cursor::{DisplaySinks, LOG_TARGET, elapsed_us, scale_cursor_pixels},
+    },
+    platform::cursor::SystemCursorOps,
+    unix_call::unix_call,
 };
 
 // ── Win32 FFI ──
@@ -394,6 +403,9 @@ pub struct SystemCursor {
 }
 
 impl SystemCursor {
+    /// The unix side's overlay window can draw this platform's cursor.
+    pub const HAS_OVERLAY: bool = true;
+
     /// The system cursor of a device on `hwnd`, with no image yet.
     pub const fn new(hwnd: *mut c_void) -> Self {
         Self {
@@ -416,10 +428,71 @@ impl SystemCursor {
         self.hwnd = hwnd;
     }
 
+    /// Have Wine show the client surface again, sized to the client area.
+    ///
+    /// The call runs on a Wine thread, which win32u's surface calls need, and
+    /// the unix side reads it as the device having drawn. Names no size: the
+    /// window procedure answers `WM_SIZE` itself, and Wine puts none in the request.
+    pub fn present_client_surface(
+        view_handle: MetalHandle<NSViewKind>,
+        reasons: ClientSurfaceRequest,
+        _pixels: Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
+        let mut params = PresentClientSurfaceParams {
+            view_handle,
+            reasons,
+            pad0: 0,
+        };
+        let status = unix_call(&mut params);
+        if status != 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "PresentClientSurface ({reasons:?}) failed (status={status:#x}); the client surface \
+                 stays as Wine left it",
+            );
+        }
+        None
+    }
+
+    /// Keep the request across a retarget: its bits ask Wine to show the client surface.
+    pub const fn drop_pending_resize(_sinks: &DisplaySinks) {}
+
+    /// Keep a built HCURSOR under its hash, destroying what the bound pushes out.
+    ///
+    /// An evicted handle that is the realized cursor or the thread's current
+    /// cursor is not freed under it (user32 frees a cursor even while it is
+    /// current, leaving the thread pointing at a freed handle); it waits in
+    /// `retired` for a later eviction or the release path.
+    fn remember_handle(&mut self, hash: u64, handle: *mut c_void) {
+        if let Some((_, evicted)) = self.cache.insert(hash, handle) {
+            self.retired.push(evicted);
+        }
+        let in_use = [self.handle, get_cursor()];
+        self.retired.retain(|&retired| {
+            if in_use.contains(&retired) {
+                return true;
+            }
+            if !destroy_cursor(retired) {
+                error!(
+                    target: LOG_TARGET,
+                    "remember_handle: DestroyCursor({retired:p}) failed for an evicted cursor",
+                );
+            }
+            false
+        });
+    }
+
+    /// Charge `us` of Win32 cursor-call wall time to the current frame.
+    const fn charge_call_us(&mut self, us: u64) {
+        self.probe.calls_us_since_present = self.probe.calls_us_since_present.saturating_add(us);
+    }
+}
+
+impl SystemCursorOps for SystemCursor {
     /// Whether the foreground window's own cursor is hidden; `None` when it cannot be read.
     ///
     /// `false` while the device window is not the foreground window.
-    pub fn native_hidden(&self) -> Option<bool> {
+    fn native_hidden(&self) -> Option<bool> {
         // SAFETY: GetForegroundWindow takes no arguments and returns an opaque HWND.
         let foreground = unsafe { GetForegroundWindow() };
         let hidden = if !self.hwnd.is_null() && foreground == self.hwnd {
@@ -446,7 +519,7 @@ impl SystemCursor {
     ///
     /// `None` when GDI refused to build it, which the caller reports the way a
     /// failed `build_hcursor` is reported.
-    pub fn blank(&mut self) -> Option<CursorImage> {
+    fn blank(&mut self) -> Option<CursorImage> {
         if self.handle.is_null() {
             self.handle = build_blank_hcursor()?;
         }
@@ -462,7 +535,7 @@ impl SystemCursor {
     ///
     /// `src` points at `layout.height` rows `pitch` bytes apart, each holding
     /// `layout.width` 4-byte pixels, readable for the duration of the call.
-    pub unsafe fn select(
+    unsafe fn select(
         &mut self,
         hash: u64,
         unchanged: bool,
@@ -499,7 +572,7 @@ impl SystemCursor {
     ///
     /// Reuses the image cached under `hash`. `false` when the build fails,
     /// which leaves the current image in place.
-    pub fn rebuild(
+    fn rebuild(
         &mut self,
         hash: u64,
         layout: &BitmapLayout,
@@ -535,24 +608,24 @@ impl SystemCursor {
     }
 
     /// Make `image` the current one, without realizing it.
-    pub const fn set_image(&mut self, image: &CursorImage) {
+    fn set_image(&mut self, image: &CursorImage) {
         self.handle = image.0;
     }
 
     /// The current image when `shown`, no cursor otherwise.
-    pub const fn image(&self, shown: bool) -> CursorImage {
+    fn image(&self, shown: bool) -> CursorImage {
         CursorImage(if shown { self.handle } else { null_mut() })
     }
 
     /// Realize `image` on screen, returning the microseconds the call took.
-    pub fn apply(&mut self, image: &CursorImage) -> u64 {
+    fn apply(&mut self, image: &CursorImage) -> u64 {
         let us = timed_set_cursor(image.0);
         self.charge_call_us(us);
         us
     }
 
     /// Realize no cursor, so the next realize reaches the display as a change.
-    pub fn kick() {
+    fn kick() {
         set_cursor(null_mut());
     }
 
@@ -564,7 +637,7 @@ impl SystemCursor {
     /// hidden hardware cursor is not re-asserted: while it is hidden the game
     /// owns the Win32 cursor. The software blank is, as `ShowCursor` keeps it
     /// selected in both states.
-    pub fn note_resize(&mut self, reassert: bool) {
+    fn note_resize(&mut self, reassert: bool) {
         self.dirty = true;
         if !self.handle.is_null() && reassert {
             set_cursor(self.handle);
@@ -572,37 +645,12 @@ impl SystemCursor {
     }
 
     /// The number of images the cache holds.
-    pub const fn cache_len(&self) -> usize {
+    fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
-    /// Keep a built HCURSOR under its hash, destroying what the bound pushes out.
-    ///
-    /// An evicted handle that is the realized cursor or the thread's current
-    /// cursor is not freed under it (user32 frees a cursor even while it is
-    /// current, leaving the thread pointing at a freed handle); it waits in
-    /// `retired` for a later eviction or the release path.
-    fn remember_handle(&mut self, hash: u64, handle: *mut c_void) {
-        if let Some((_, evicted)) = self.cache.insert(hash, handle) {
-            self.retired.push(evicted);
-        }
-        let in_use = [self.handle, get_cursor()];
-        self.retired.retain(|&retired| {
-            if in_use.contains(&retired) {
-                return true;
-            }
-            if !destroy_cursor(retired) {
-                error!(
-                    target: LOG_TARGET,
-                    "remember_handle: DestroyCursor({retired:p}) failed for an evicted cursor",
-                );
-            }
-            false
-        });
-    }
-
     /// Record a `ShowCursor` transition to `shown` for the hitch probe.
-    pub fn note_transition(&mut self, shown: bool) {
+    fn note_transition(&mut self, shown: bool) {
         self.probe.last_transition = Some((Instant::now(), shown));
     }
 
@@ -612,7 +660,7 @@ impl SystemCursor {
     /// produces is a debug or trace line, so with the cursor target below
     /// debug the whole body is one level check; with it on, two `Instant`
     /// reads per frame and the log line only on a hitched frame.
-    pub fn note_present(&mut self) {
+    fn note_present(&mut self) {
         let probe = &mut self.probe;
         let calls_us = core::mem::take(&mut probe.calls_us_since_present);
         let msgs = core::mem::take(&mut probe.setcursor_msgs_since_present);
@@ -663,11 +711,6 @@ impl SystemCursor {
         );
     }
 
-    /// Charge `us` of Win32 cursor-call wall time to the current frame.
-    const fn charge_call_us(&mut self, us: u64) {
-        self.probe.calls_us_since_present = self.probe.calls_us_since_present.saturating_add(us);
-    }
-
     /// Subclass the game's hwnd so `WM_SETCURSOR` / `WM_ACTIVATE` route through `cursor_wnd_proc`.
     ///
     /// `scale` only reaches the log line.
@@ -678,7 +721,7 @@ impl SystemCursor {
     /// joining a window another live device already subclasses shares that
     /// hook, and messages keep going to the first device until it leaves.
     /// No-op if `hwnd` was never captured or `dev_ptr` is null.
-    pub fn attach(&self, dev_ptr: *mut DeviceInner, scale: u32) {
+    fn attach(&self, dev_ptr: *mut DeviceInner, scale: u32) {
         if self.hwnd.is_null() || dev_ptr.is_null() {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -720,7 +763,7 @@ impl SystemCursor {
     ///
     /// Call from the device-release path before freeing `DeviceInner`, and
     /// before a retarget moves the device to another window.
-    pub fn detach(&self, dev_ptr: *mut DeviceInner) {
+    fn detach(&self, dev_ptr: *mut DeviceInner) {
         let restored = DEVICE_INSTANCES
             .lock()
             .expect("device-instances mutex poisoned")
@@ -751,7 +794,7 @@ impl SystemCursor {
     /// the window is already gone.
     /// Once the replacement has happened every refused `DestroyCursor` is a
     /// real failure, and is reported as one.
-    pub fn destroy_images(&mut self, keep_hidden: bool) {
+    fn destroy_images(&mut self, keep_hidden: bool) {
         let mut handles: Vec<*mut c_void> = self
             .cache
             .drain()
@@ -802,7 +845,7 @@ impl SystemCursor {
     }
 
     /// `SetCursorPosition`: move the pointer to `(x, y)` unless it is already there.
-    pub fn set_position(&mut self, x: i32, y: i32) {
+    fn set_position(&mut self, x: i32, y: i32) {
         // The pre-check earns its keep: a `SetCursorPos` to the current position
         // still queues a `WM_MOUSEMOVE`, so skipping it keeps the game's message
         // queue quiet. Its cost is the idle `GetCursorPos` main-thread hop
@@ -913,7 +956,10 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
                 // release unregisters it under that lock before it frees
                 // anything, so the device is alive for the atomic OR below.
                 let device = unsafe { &*(device as *const DeviceInner) };
-                device.cursor().request_client_surface();
+                device.cursor().sinks().client_surface_request().fetch_or(
+                    ClientSurfaceRequest::CLIENT_AREA_CHANGED.pack(None),
+                    core::sync::atomic::Ordering::Release,
+                );
             }
         }
     }
@@ -934,7 +980,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // by `uninstall_subclass`, which runs before the device is freed.
         let cur = unsafe { (*dev_ptr).cursor_mut() };
         let hit_test = lp.cast_unsigned() & 0xFFFF;
-        if hit_test == HTCLIENT && !cur.system().handle.is_null() && cur.visible() {
+        if hit_test == HTCLIENT && !cur.system.handle.is_null() && cur.visible() {
             // We own the win32 cursor ONLY while the D3D cursor is
             // visible. Consuming then takes over DefWindowProc's duty: the
             // displayed cursor is whatever the last SetCursor call pushed, and
@@ -949,7 +995,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // Taken unconditionally: a kick left behind an already dirty
             // pass would fire again on the next, correct pass.
             let kicked = cur.take_cursor_kick();
-            let sys = cur.system_mut();
+            let sys = &mut cur.system;
             let was_dirty = sys.dirty || kicked;
             let started = Instant::now();
             if was_dirty {
@@ -984,7 +1030,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             trace!(
                 target: LOG_TARGET,
                 "wndproc WM_SETCURSOR: hit_test={hit_test:#x} visible={} handle={:p} tid={} → forwarded",
-                cur.visible(), cur.system().handle, current_thread_id(),
+                cur.visible(), cur.system.handle, current_thread_id(),
             );
         }
     } else if msg == WM_ACTIVATE {
@@ -994,12 +1040,12 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         let activate_state = u32::try_from(wp & 0xFFFF).expect("16-bit value fits u32");
         let activating = activate_state != WA_INACTIVE;
         if activating {
-            cur.system_mut().dirty = true;
+            cur.system.dirty = true;
         }
         debug!(
             target: LOG_TARGET,
             "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={} tid={}",
-            cur.system().dirty, current_thread_id(),
+            cur.system.dirty, current_thread_id(),
         );
     } else if msg == WM_ACTIVATEAPP {
         // The D3D9 fullscreen mode contract, both halves. Deactivation puts
@@ -1073,7 +1119,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             target: LOG_TARGET,
             "wndproc WM_SIZE: type={wp} {new_width}x{new_height} → game hides suppressed until \
              this dispatch returns={suppress} visible={} handle={:p} tid={}",
-            cur.visible(), cur.system().handle, current_thread_id(),
+            cur.visible(), cur.system.handle, current_thread_id(),
         );
     } else if msg == WM_APP_REASSERT_FULLSCREEN {
         // Deferred half of the WM_SIZE branch above. Our own message, so it
@@ -1087,7 +1133,9 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
         // lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
-        dev.reassert_fullscreen_cover(new_width, new_height);
+        if let Some(saved) = dev.fullscreen_session_mut() {
+            super::fullscreen::reassert_cover(saved, (new_width, new_height));
+        }
         return 0;
     } else if msg == WM_APP_REACTIVATE_FULLSCREEN {
         // Deferred half of the WM_ACTIVATEAPP branch above. Our own message,
@@ -1096,7 +1144,9 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
         // lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
-        dev.reactivate_fullscreen();
+        if let Some(saved) = dev.fullscreen_session_mut() {
+            super::fullscreen::reactivate(saved);
+        }
         return 0;
     }
 

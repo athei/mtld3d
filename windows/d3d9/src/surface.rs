@@ -3773,6 +3773,10 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     if (unsafe { &*inner.dc_lock_ptr() }).map_count != 0 {
         return D3DERR_INVALIDCALL;
     }
+    // Before the read-backs below, which would only be thrown away.
+    if !crate::platform::surface_dcs() {
+        return D3DERR_INVALIDCALL;
+    }
     // A LOCKABLE implicit backbuffer is GPU-only: snapshot it via a full
     // read-back into `readback` so `dc_pixels` (and the DIB it seeds) have host
     // pixels. A NON-lockable backbuffer rejects GetDC: the
