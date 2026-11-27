@@ -26,6 +26,7 @@ mod bench_crossing;
 mod bench_frame_shape;
 mod bench_perf_rules;
 mod bench_query;
+mod bench_readback;
 mod bench_shader_stutter;
 mod bench_sprite_scratch;
 mod bench_streaming;

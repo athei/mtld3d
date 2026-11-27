@@ -1,9 +1,9 @@
 use core::{ffi::c_void, hash::BuildHasher as _};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -504,6 +504,8 @@ const RING_INDEX_ALIGN: usize = 16;
 /// with, the upload or the render one.
 struct EncodeContext<'a> {
     device: &'a ProtocolObject<dyn MTLDevice>,
+    /// The device's resolve scratch, for a readback of a target rasterized smaller.
+    upscale: &'a UpscaleCache,
     stamp: SubmitStamp,
     ring: &'a mut UploadRing,
     planes: &'a mut PlanePool,
@@ -654,6 +656,7 @@ fn encode_frame(
     };
     let mut ctx = EncodeContext {
         device: &device,
+        upscale: record.upscale(),
         stamp: stamp.upload(),
         ring,
         planes,
@@ -2278,6 +2281,28 @@ fn encode_leading_blits(
     for (i, cmd) in blits.iter().enumerate() {
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
         match BlitCommandType::from_repr(cmd.cmd) {
+            Some(BlitCommandType::ReadColorToBuffer) => {
+                // A resolve opens a render pass, so the copy encodes outside
+                // the shared blit encoder, as a depth transfer does. A copy that
+                // cannot encode fails alone: its surface learns it at its next
+                // read, and the frame goes on.
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                if !encode_color_readback(cmd_buf, cmd, ctx) {
+                    store_readback_outcome(cmd.src_offset, false);
+                }
+                if i + 1 < blits.len() {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "readback: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-readback-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
             Some(BlitCommandType::TransferDepth) => {
                 if let Some(encoder) = blit.take() {
                     encoder.endEncoding();
@@ -3518,6 +3543,176 @@ pub struct BlitArgs<'a> {
     pub block_height: u32,
 }
 
+/// The extent a readback of `level` resolves the source up to.
+///
+/// `None` when it reads the level as it is.
+///
+/// `logical` is the source texture's logical extent. Under `render.scale` the
+/// texture is rasterized smaller than that, and a readback owes the caller
+/// pixels at the logical size; at the default scale the sizes match.
+fn readback_resolve_extent(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    level: u32,
+    (logical_width, logical_height): (u32, u32),
+) -> Option<(u32, u32)> {
+    if logical_width == 0 || logical_height == 0 {
+        return None;
+    }
+    let level_extent = |full: u32| (full >> level).max(1);
+    let (out_w, out_h) = (level_extent(logical_width), level_extent(logical_height));
+    let mip_extent = |full: usize| (full >> level).max(1);
+    let (tex_w, tex_h) = (mip_extent(texture.width()), mip_extent(texture.height()));
+    (tex_w != out_w as usize || tex_h != out_h as usize).then_some((out_w, out_h))
+}
+
+/// Store a queued readback's outcome where its surface reads it when it settles.
+fn store_readback_outcome(address: u64, ok: bool) {
+    if address == 0 {
+        return;
+    }
+    // SAFETY: the address is the `AtomicU32` the destination surface holds
+    // until the submission carrying the copy has retired, which is after this
+    // encode (`SurfaceInner::settle_readback`).
+    let outcome = unsafe { &*(address as *const AtomicU32) };
+    outcome.store(u32::from(ok), Ordering::Release);
+}
+
+/// Encode a queued `GetRenderTargetData` (`BlitCommandType::ReadColorToBuffer`) onto `cmd_buf`.
+///
+/// Resolves a source rasterized smaller under `render.scale` up to its logical
+/// size first, as the synchronous readback does, then copies the level into
+/// the wrapped destination. `false`, logged, when a handle does not resolve,
+/// the resolve is declined or the copy's geometry is refused; nothing is
+/// encoded then.
+fn encode_color_readback(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    cmd: &BlitCommand,
+    ctx: &EncodeContext<'_>,
+) -> bool {
+    // SAFETY: `src_handle` is a retained MTLTexture address, kept until this
+    // submission retires through the seq-gated retention queue every frame
+    // resource leaves by.
+    let texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) };
+    // SAFETY: `dst_handle` is the destination's wrapper, kept until this
+    // submission retires through its own entry in that queue.
+    let buffer_handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.dst_handle) };
+    // SAFETY: as above.
+    let Some(texture) = (unsafe { texture_handle.borrow_retained() }) else {
+        error!(target: LOG_TARGET, "readback: source texture handle is null");
+        return false;
+    };
+    // SAFETY: as above.
+    let Some(buffer) = (unsafe { buffer_handle.borrow_retained() }) else {
+        error!(target: LOG_TARGET, "readback: destination buffer handle is null");
+        return false;
+    };
+    let logical = (
+        u32::try_from(cmd.dst_offset >> 32).expect("the high half fits u32"),
+        u32::try_from(cmd.dst_offset & u64::from(u32::MAX)).expect("the low half fits u32"),
+    );
+    let resolved = match readback_resolve_extent(texture, cmd.mip_level, logical) {
+        None => None,
+        Some((out_w, out_h)) => {
+            let Some(target) = encode_readback_resolve(
+                cmd_buf,
+                ctx.upscale,
+                ctx.device,
+                texture,
+                (cmd.mip_level, cmd.src_slice),
+                out_w,
+                out_h,
+            ) else {
+                return false;
+            };
+            Some(target)
+        }
+    };
+    // A resolved level is a one-level, one-slice texture of its own.
+    let (level, slice) = if resolved.is_some() {
+        (0, 0)
+    } else {
+        (cmd.mip_level, cmd.src_slice)
+    };
+    let source = resolved.as_deref().unwrap_or(texture);
+    let region = CopyRegion {
+        width: cmd.region_w as usize,
+        height: cmd.region_h as usize,
+        depth: 1,
+    };
+    let src_endpoint = CopyEndpoint {
+        pixel_format: source.pixelFormat(),
+        sample_count: source.sampleCount(),
+        width: source.width(),
+        height: source.height(),
+        depth: source.depth(),
+        level: level as usize,
+        levels: source.mipmapLevelCount(),
+        origin_x: 0,
+        origin_y: 0,
+    };
+    let bytes_per_row = usize::try_from(cmd.bytes_per_row).expect("a row stride fits usize");
+    let destination = CopyBufferEndpoint {
+        length: buffer.length(),
+        offset: 0,
+        bytes_per_row,
+        bytes_per_image: bytes_per_row * region.height,
+    };
+    if let Some(reason) = copy_texture_to_buffer_reject(
+        &src_endpoint,
+        &destination,
+        &region,
+        copy_block_layout(src_endpoint.pixel_format),
+    ) {
+        let reason_text = reason.as_str();
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: reason.key(),
+            "readback: {reason_text}, copy skipped. src {src_endpoint}, dst {destination}, \
+             region {region}"
+        );
+        return false;
+    }
+    let Some(blit) = cmd_buf.blitCommandEncoder() else {
+        error!(target: LOG_TARGET, "readback: blitCommandEncoder() nil");
+        return false;
+    };
+    diagnostics::readback(
+        cmd_buf,
+        &diagnostics::ReadbackSite::Queued,
+        &diagnostics::TextureCopy {
+            texture: source,
+            endpoint: &src_endpoint,
+            slice: slice as usize,
+        },
+        buffer,
+        &destination,
+        &region,
+        (buffer.contents().as_ptr() as u64, cmd.byte_size),
+    );
+    blit.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-readback",
+    )));
+    // SAFETY: objc2 typed binding; `source` and `buffer` are retained Metal
+    // objects live for the call; the geometry cleared
+    // `copy_texture_to_buffer_reject` above.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+            source,
+            slice as usize,
+            level as usize,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize { width: region.width, height: region.height, depth: 1 },
+            buffer,
+            0,
+            bytes_per_row,
+            destination.bytes_per_image,
+            MTLBlitOption::empty(),
+        );
+    }
+    blit.endEncoding();
+    true
+}
+
 /// Resolve a render-resolution source level up to the size the caller's coordinates assume.
 ///
 /// `source_width` / `source_height` are the logical extent of level 0; the
@@ -3538,16 +3733,7 @@ fn resolve_readback_source(
     source_width: u32,
     source_height: u32,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
-    if source_width == 0 || source_height == 0 {
-        return None;
-    }
-    let level_extent = |full: u32| (full >> level).max(1);
-    let (out_w, out_h) = (level_extent(source_width), level_extent(source_height));
-    let mip_extent = |full: usize| (full >> level).max(1);
-    let (tex_w, tex_h) = (mip_extent(texture.width()), mip_extent(texture.height()));
-    if tex_w == out_w as usize && tex_h == out_h as usize {
-        return None;
-    }
+    let (out_w, out_h) = readback_resolve_extent(texture, level, (source_width, source_height))?;
     let resolved = encode_readback_resolve(
         cmd_buf,
         upscale,
@@ -3560,8 +3746,10 @@ fn resolve_readback_source(
     if resolved.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "readback: could not resolve a {tex_w}x{tex_h} level up to {out_w}x{out_h}; the \
-             caller gets render-resolution pixels"
+            "readback: could not resolve a {}x{} level up to {out_w}x{out_h}; the \
+             caller gets render-resolution pixels",
+            (texture.width() >> level).max(1),
+            (texture.height() >> level).max(1)
         );
     }
     resolved
@@ -3702,14 +3890,16 @@ fn encode_readback_resolve(
     })
 }
 
-/// Encode a texture→buffer readback into PE-addressable memory, ready to commit.
+/// Synchronous texture→buffer readback into PE-addressable memory.
 ///
 /// Wraps the caller's page-aligned `dst_ptr / dst_len` via
-/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared) and blits the
-/// source texture sub-rect at `mip_level` into it at `bytes_per_row` stride,
-/// on a command buffer of the device's queue that is returned uncommitted.
-/// `None` when the arguments are refused or Metal declines a step, logged.
-fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
+/// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
+/// stride, commits, and waits for completion. Only a true return guarantees
+/// the caller's memory holds the requested pixels. Metal orders this command
+/// buffer after every previously committed buffer on the same `queue_handle`.
+/// A failed readback may have written part of the destination.
+pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     use core::{ffi::c_void, ptr::NonNull};
 
     let to_usize =
@@ -3737,24 +3927,24 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
 
     if dst_ptr == 0 || dst_len == 0 || width == 0 || height == 0 {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: invalid args");
-        return None;
+        return false;
     }
     let Some(queue) = record.queue().into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: queue retain failed");
-        return None;
+        return false;
     };
     let Some(device) = device_handle.into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: device retain failed");
-        return None;
+        return false;
     };
     let Some(texture) = tex_handle.into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: texture retain failed");
-        return None;
+        return false;
     };
 
     let Some(ptr) = NonNull::new(dst_ptr as *mut c_void) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: null dst_ptr");
-        return None;
+        return false;
     };
     // `Shared`: the blit writes straight into the wrapped PE pages, which
     // the caller reads once `waitUntilCompleted` returns.
@@ -3770,7 +3960,7 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
         )
     }) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: newBufferWithBytesNoCopy failed");
-        return None;
+        return false;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback");
@@ -3779,7 +3969,7 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
 
     let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: commandBuffer() nil");
-        return None;
+        return false;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback");
@@ -3842,7 +4032,7 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
                 MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
             ) {
                 error!(target: LOG_TARGET, "depth readback: source is not a depth format");
-                return None;
+                return false;
             }
             (
                 PixelFormat::R32Float.block_layout(),
@@ -3872,7 +4062,7 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
             .is_some())
     {
         error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
-        return None;
+        return false;
     }
     // Checked before the encoder exists so a rejection leaves no encoder to
     // close. A declined `MetalFX` resolve lands here: the caller asked for
@@ -3886,12 +4076,12 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
             "blit_texture_to_buffer: {reason_text}, readback skipped. \
              src {src_endpoint}, dst {destination}, region {region}"
         );
-        return None;
+        return false;
     }
 
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
-        return None;
+        return false;
     };
     {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback-blit");
@@ -3905,6 +4095,7 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
         mtld3d_shared::blit_geometry::bytes_per_image(bytes_per_row, height, block_height) as usize;
     diagnostics::readback(
         &cmd_buf,
+        &diagnostics::ReadbackSite::Blit,
         &diagnostics::TextureCopy {
             texture,
             endpoint: &src_endpoint,
@@ -3957,22 +4148,6 @@ fn encode_readback(args: &BlitArgs<'_>) -> Option<Retained<ProtocolObject<dyn MT
         }
     }
     blit.endEncoding();
-    Some(cmd_buf)
-}
-
-/// Synchronous texture→buffer readback into PE-addressable memory.
-///
-/// Wraps the caller's page-aligned `dst_ptr / dst_len` via
-/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
-/// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
-/// stride, commits, and waits for completion. Only a true return guarantees
-/// the caller's memory holds the requested pixels. Metal orders this command
-/// buffer after every previously committed buffer on the same `queue_handle`.
-/// A failed readback may have written part of the destination.
-pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
-    let Some(cmd_buf) = encode_readback(args) else {
-        return false;
-    };
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     let status = cmd_buf.status();
@@ -3983,89 +4158,6 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         diagnostics::failure(&cmd_buf, None, "readback-wait", error.as_deref());
         error
     })
-}
-
-/// The same readback committed without a wait: its ticket in the device's [`QueuedReadbacks`].
-///
-/// The destination memory is the caller's to leave alone until it has
-/// awaited the ticket. The command buffer retains the wrapper buffer and the
-/// source texture, so both outlive this call until the GPU is done.
-pub fn queue_texture_to_buffer(args: &BlitArgs<'_>) -> Option<u64> {
-    let cmd_buf = encode_readback(args)?;
-    cmd_buf.commit();
-    Some(args.record.readbacks().push(cmd_buf))
-}
-
-/// Read-backs committed without a wait, each awaited when the PE side first reads what it fills.
-///
-/// `QueueReadback` commits the blit and hands back a ticket, the readback's
-/// place in this device's order; `AwaitReadback` waits for every queued
-/// readback up to a ticket. All of them run on the device's one queue, so they
-/// complete in ticket order and an await settles the earlier ones too. The PE
-/// side awaits a readback before the memory it fills is read, written again
-/// or freed, which bounds the queue by the surfaces with one in flight.
-pub struct QueuedReadbacks(Mutex<QueuedReadbackState>);
-
-struct QueuedReadbackState {
-    /// The ticket the newest queued readback got; tickets start at 1.
-    last: u64,
-    /// The readbacks not yet awaited, oldest first.
-    pending: VecDeque<(u64, PendingCmdBuf)>,
-}
-
-impl Default for QueuedReadbacks {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl QueuedReadbacks {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self(Mutex::new(QueuedReadbackState {
-            last: 0,
-            pending: VecDeque::new(),
-        }))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, QueuedReadbackState> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Keep a committed readback until it is awaited; its ticket.
-    fn push(&self, cmd_buf: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> u64 {
-        let mut state = self.lock();
-        state.last += 1;
-        let ticket = state.last;
-        state.pending.push_back((ticket, PendingCmdBuf(cmd_buf)));
-        ticket
-    }
-
-    /// Wait for every readback up to `ticket`; false when one of them failed.
-    ///
-    /// The waits run outside the lock, so another thread may queue meanwhile.
-    pub fn await_through(&self, ticket: u64) -> bool {
-        let due: Vec<(u64, PendingCmdBuf)> = {
-            let mut state = self.lock();
-            let count = state
-                .pending
-                .iter()
-                .take_while(|(queued, _)| *queued <= ticket)
-                .count();
-            state.pending.drain(..count).collect()
-        };
-        due.iter().fold(true, |all, (_, cmd_buf)| {
-            cmd_buf.0.waitUntilCompleted();
-            let status = cmd_buf.0.status();
-            diagnostics::completion(&cmd_buf.0, status, None, "readback-await");
-            let done = readback_completed(status, || {
-                let error = cmd_buf.0.error();
-                diagnostics::failure(&cmd_buf.0, None, "readback-await", error.as_deref());
-                error
-            });
-            all && done
-        })
-    }
 }
 
 /// Accept a readback only after Metal reports successful completion.

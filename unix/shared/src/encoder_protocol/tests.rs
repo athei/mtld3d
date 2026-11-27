@@ -51,6 +51,7 @@ fn operation_tags_keep_the_existing_wire_numbers() {
         (47, EncoderOpcode::SetGamma),
         (48, EncoderOpcode::UpdateColorRegion),
         (49, EncoderOpcode::DestroyBuffer),
+        (50, EncoderOpcode::ReadColorToMemory),
     ];
     for (raw, operation) in operations {
         assert_eq!(u16::from(operation), raw);
@@ -61,7 +62,7 @@ fn operation_tags_keep_the_existing_wire_numbers() {
 #[test]
 fn every_unknown_operation_tag_is_rejected_before_construction() {
     for raw in u16::MIN..=u16::MAX {
-        let valid = (1..=49).contains(&raw) && !matches!(raw, 5 | 44);
+        let valid = (1..=50).contains(&raw) && !matches!(raw, 5 | 44);
         if valid {
             assert!(EncoderOpcode::try_from(raw).is_ok());
         } else {

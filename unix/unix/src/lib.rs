@@ -97,8 +97,6 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
         Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
         Thunks::PresentClientSurface => arp!(handlers::present_client_surface_handler),
-        Thunks::QueueReadback => arp!(handlers::queue_readback_handler),
-        Thunks::AwaitReadback => arp!(handlers::await_readback_handler),
     }
 }
 

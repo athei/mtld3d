@@ -90,8 +90,17 @@ pub(super) fn texture_copy(
     );
 }
 
+/// Where a readback's copy was encoded, as its `readback-copy` record names it.
+pub(super) enum ReadbackSite {
+    /// On a command buffer of its own, waited for before the call returns.
+    Blit,
+    /// In a frame's ordered blit stream, settled at the destination's next read.
+    Queued,
+}
+
 pub(super) fn readback(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    site: &ReadbackSite,
     source: &TextureCopy<'_>,
     buffer: &ProtocolObject<dyn MTLBuffer>,
     destination: &CopyBufferEndpoint,
@@ -103,10 +112,14 @@ pub(super) fn readback(
     }
     debug!(
         target: LOG_TARGET,
-        "readback-copy {} site=readback-blit src={{{} {} slice={} z=0}} \
+        "readback-copy {} site={} src={{{} {} slice={} z=0}} \
          dst={{{} {destination}}} \
          pe_destination={:#x} pe_length={} region={region}",
         buffer_identity(cb),
+        match site {
+            ReadbackSite::Blit => "readback-blit",
+            ReadbackSite::Queued => "queued-readback",
+        },
         texture_identity(source.texture),
         source.endpoint,
         source.slice,

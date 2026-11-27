@@ -668,6 +668,29 @@ pub struct ReadDeviceBufferOp {
     pub dst_len: u64,
 }
 
+/// A `GetRenderTargetData` into a system-memory surface's memory, in frame order.
+///
+/// The encoder resolves the source (`color_handle`, or the texture `texture_id`
+/// names when that is zero), wraps `dst_ptr` / `dst_len` in a Metal buffer and
+/// queues the copy in the ordered blit stream after the current pass. `done`
+/// reads 1 once the copy is queued and 0 when it was refused; the submission
+/// stores 0 into it if it cannot encode the copy.
+pub struct ReadColorToMemoryOp {
+    pub done: ReplyBool,
+    pub color_handle: u64,
+    pub texture_id: TextureId,
+    pub level: u32,
+    pub slice: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    /// The source texture's logical extent, which `level` is measured against.
+    pub logical_width: u32,
+    pub logical_height: u32,
+    pub dst_ptr: u64,
+    pub dst_len: u64,
+}
+
 pub struct AdoptProgramOp {
     pub registration: u64,
 }
@@ -810,6 +833,7 @@ pub enum Op {
     ResolveDynamicDepth(ResolveDynamicDepthOp),
     ResolveDepthTexture(ResolveDepthTextureOp),
     ReadDeviceBuffer(ReadDeviceBufferOp),
+    ReadColorToMemory(ReadColorToMemoryOp),
     AdoptProgram(AdoptProgramOp),
     BeginVisibility(BeginVisibilityOp),
     EndVisibility(EndVisibilityOp),

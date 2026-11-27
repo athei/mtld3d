@@ -1602,7 +1602,9 @@ conformance-isolate: install-windows-$(ARCH) install-unix-arm64
 # throttle under the `wow` profile's query keys and under the D3D9 defaults
 # (`query_poll_wow`, `query_poll_spec`), the API thread's cost of one call
 # of each kind (`api_call_cost`), buffer locks and texture streaming at a
-# game's rates (`dynamic_buffer_churn`, `texture_streaming`), and fresh
+# game's rates (`dynamic_buffer_churn`, `texture_streaming`), a render target
+# read back every frame and locked two frames later (`readback_every_frame`),
+# and fresh
 # processes from launch to their first frame on a populated shader cache
 # (`cold_start`). They are `#[ignore]`d tests of the e2e
 # binary, so the suite reports them ignored; this runs them alone, one at a

@@ -287,6 +287,23 @@ fn execute_control(
                 )),
             )?;
         }
+        EncoderOpcode::ReadColorToMemory => {
+            let r = borrow::<records::ReadColorToMemoryRecord>(payload)?;
+            let queued = enc.queue_color_readback(&crate::encoder::ColorReadback {
+                color_handle: r.color_handle,
+                texture_id: TextureId::from_raw(r.texture_id),
+                level: r.level,
+                slice: r.slice,
+                width: r.width,
+                height: r.height,
+                bytes_per_row: r.bytes_per_row,
+                logical_size: (r.logical_width, r.logical_height),
+                dst_ptr: r.destination,
+                dst_len: r.length,
+                outcome: r.reply,
+            });
+            store_reply_u32(r.reply, u32::from(queued))?;
+        }
         EncoderOpcode::BeginVisibility | EncoderOpcode::EndVisibility => {
             let r = borrow::<records::QueryRecord>(payload)?;
             // SAFETY: the frame publishes this descriptor exactly once and retains its mailbox.

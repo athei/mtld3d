@@ -624,6 +624,17 @@ pub enum BlitCommandType {
     /// pipeline's raw handle. Mip fields select endpoints. Region fields carry
     /// destination extent. Other fields are zero.
     TransferDepth = 8,
+    /// A colour level copied into a system-memory buffer: a `GetRenderTargetData`.
+    ///
+    /// `src_handle` = `MTLTexture`, `dst_handle` = the `MTLBuffer` wrapping the
+    /// destination surface's memory, `mip_level` / `src_slice` select the
+    /// source, `region_w` / `region_h` the extent read from the origin,
+    /// `bytes_per_row` the destination stride, `byte_size` the buffer length.
+    /// `dst_offset` packs the source texture's logical extent as `(width as u64)
+    /// << 32 | height`; a texture rasterized smaller under `render.scale` is
+    /// resolved up to it first. `src_offset` is the address of the `AtomicU32`
+    /// the copy's outcome is stored into: 0 when it could not be encoded.
+    ReadColorToBuffer = 9,
 }
 
 /// Fixed-size blit command struct.
@@ -875,6 +886,32 @@ impl BlitCommand {
         }
     }
 
+    /// A colour level read into a system-memory buffer.
+    ///
+    /// See [`BlitCommandType::ReadColorToBuffer`].
+    #[must_use]
+    pub const fn read_color_to_buffer(info: &ReadColorToBufferInfo) -> Self {
+        Self {
+            cmd: BlitCommandType::ReadColorToBuffer as u32,
+            mip_level: info.level,
+            src_handle: info.src_texture,
+            dst_handle: info.dst_buffer,
+            src_offset: info.outcome,
+            bytes_per_row: info.bytes_per_row as u64,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: info.width,
+            region_h: info.height,
+            dst_offset: ((info.logical_size.0 as u64) << 32) | info.logical_size.1 as u64,
+            byte_size: info.dst_len,
+            depth: 0,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            dst_slice: 0,
+            src_slice: info.slice,
+        }
+    }
+
     /// `blit.generateMipmapsForTexture(tex)`.
     ///
     /// Encoded into the shared frame-leading blit encoder so an
@@ -904,6 +941,22 @@ impl BlitCommand {
             src_slice: 0,
         }
     }
+}
+
+/// Inputs for `BlitCommand::read_color_to_buffer`.
+pub struct ReadColorToBufferInfo {
+    pub src_texture: u64,
+    pub dst_buffer: u64,
+    pub dst_len: u64,
+    pub level: u32,
+    pub slice: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    /// The source texture's logical extent, which `level` is measured against.
+    pub logical_size: (u32, u32),
+    /// Address of the `AtomicU32` the copy's outcome is stored into.
+    pub outcome: u64,
 }
 
 /// Inputs for `BlitCommand::copy_buffer_to_buffer`.

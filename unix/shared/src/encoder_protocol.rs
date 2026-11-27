@@ -62,6 +62,7 @@ pub enum EncoderOpcode {
     SetGamma = 47,
     UpdateColorRegion = 48,
     DestroyBuffer = 49,
+    ReadColorToMemory = 50,
 }
 
 /// How far a frame submission waits on the native pipeline.

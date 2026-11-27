@@ -26,7 +26,7 @@ use mtld3d_shared::{
 };
 
 use super::{
-    command::{PendingCmdBufs, QueuedReadbacks},
+    command::PendingCmdBufs,
     depth_transfer::PlanePool,
     gpu_time::GpuTime,
     handle::ReleaseRetain,
@@ -48,8 +48,6 @@ pub struct DeviceRecord {
     presented: Presented,
     upscale: UpscaleCache,
     pending: PendingCmdBufs,
-    /// The read-backs committed without a wait, until the PE side awaits them.
-    readbacks: QueuedReadbacks,
     /// The chunks inline indices and oversized inline vertices ride to the GPU.
     ///
     /// Only a submission touches it, and submissions of one device never run
@@ -84,7 +82,6 @@ impl DeviceRecord {
             presented: Presented::new(),
             upscale: UpscaleCache::new(),
             pending: PendingCmdBufs::new(),
-            readbacks: QueuedReadbacks::new(),
             upload_ring: Mutex::new(UploadRing::default()),
             depth_planes: Mutex::new(PlanePool::default()),
             gpu_time: GpuTime::new(),
@@ -114,11 +111,6 @@ impl DeviceRecord {
     /// The device's in-flight command buffers, by counter and sequence.
     pub const fn pending(&self) -> &PendingCmdBufs {
         &self.pending
-    }
-
-    /// The device's read-backs committed without a wait.
-    pub const fn readbacks(&self) -> &QueuedReadbacks {
-        &self.readbacks
     }
 
     /// The GPU time the device's completion handlers add and its submissions drain.

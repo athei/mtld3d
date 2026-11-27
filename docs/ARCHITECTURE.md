@@ -219,17 +219,46 @@ explicit thunks. `SetCursorOverlay` retains its coalesced main-queue update;
 flush waits behind the encoder. These controls do not justify per-draw
 crossings or moving native translation back onto the API thread.
 
-One readback is split across two thunks instead of waited for. A
-`GetRenderTargetData` into a standalone system-memory surface commits its blit
-(`QueueReadback`) and keeps the returned ticket on the surface;
-`AwaitReadback` waits for it the first time the surface's memory is read,
-written, read back into again or freed (`SurfaceInner::settle_readback`).
-D3D9 promises those pixels only then, and a game that reads one surface back
-each frame while locking the one it read the frame before keeps the GPU
-working instead of draining it every frame. Every other readback stays
-synchronous.
-
 Thunks describe the work crossing the runtime boundary, including batched D3D9 work and lifecycle or synchronization controls. Name them after that work rather than mechanically mirroring COM methods. Internal native calls do not need a thunk. Keep COM identities and application-visible reference counting on the PE side; D3D9 translation and native resource ownership may live on Unix.
+
+## A readback into system memory rides the frame
+
+D3D9 owes the pixels of a `GetRenderTargetData` when the destination is next
+read, not when the call returns. A copy into a standalone `D3DPOOL_SYSTEMMEM`
+or `D3DPOOL_SCRATCH` offscreen surface is therefore recorded in the frame
+packet (`ReadColorToMemoryOp`) instead of flushing the frame and waiting for
+the GPU. The encoder resolves the source (a standalone colour handle, or the
+texture a render-target level belongs to), wraps the surface's memory in a
+`Shared` buffer that retires with the submission, and queues a
+`ReadColorToBuffer` blit in the ordered blit stream after the current pass, so
+the copy reads every draw recorded before the call and none after. The
+submission encodes it on the frame's command buffer, resolving a source
+rasterized smaller under `render.scale` up to its logical size first, as the
+synchronous readback does.
+
+The surface keeps the seq of the frame that carries the copy and settles the
+way an EVENT query polls (`SurfaceInner::settle_readback`) before its memory is
+locked, handed to `GetDC`, used as a copy source, read back into again or
+freed: one atomic load once `coherent_seq` has reached that seq, a submit only
+while the copy is still in the open frame, and a wait through
+`retire_uploads_through`, which hurries a submission held behind a pending
+present, only while the GPU has not finished it. The hurry matters under
+display-synced presents, where the frame that carries the copy can otherwise
+sit behind the previous present until the display takes it. The wait is for
+the whole frame that carries the copy, since retirement is counted per frame. A
+game whose frame outlasts the GPU's turnaround, or that reads a copy two frames
+after it was made, finds it done and never waits.
+Every other readback (a texture level's staging, the front buffer, a
+back-buffer `LockRect`) stays synchronous.
+
+The call refuses a destination of another device, and a locked or DC-held
+destination, with `D3DERR_INVALIDCALL`. A copy that fails after the call has
+returned changes mtld3d's answer: a source the encoder cannot resolve, a resolve
+the submission declines, a copy whose geometry it refuses, or a submission that
+fails on the GPU used to make the call return `D3DERR_INVALIDCALL`; the call
+now returns `D3D_OK`, and the surface reads what its memory held before, with
+one log line when it settles. A surface nothing had written reads zeros then,
+since it is marked written only by a copy that settled.
 
 ## Upload order and retirement
 
@@ -950,7 +979,10 @@ records accepted texture-to-texture endpoints, slices and validated region.
 `readback-copy` records the final selected source after any readback resolve or
 fallback, the actual destination Metal buffer, PE destination address/length,
 and encoded offset, row pitch and image pitch. Image pitch counts block rows
-for compressed textures. The existing `readback-wait` record supplies completion.
+for compressed textures. Its `site` is `readback-blit` for a copy on a command
+buffer of its own, which the existing `readback-wait` record completes, and
+`queued-readback` for a `GetRenderTargetData` copy in a frame's ordered blit
+stream, which completes with its frame.
 Texture extents in these records are base-level extents; `level` selects the mip.
 
 The depth transfer behind RESZ is one of those copies. It records its two ends

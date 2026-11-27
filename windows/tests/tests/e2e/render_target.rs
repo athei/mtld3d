@@ -24,6 +24,8 @@ use mtld3d_types::{
     IID_IDIRECT3DSWAPCHAIN9,
 };
 
+use super::device::{await_logged_lines, logged_lines, run_in_private_log_child, running_as};
+
 const RED: u32 = 0xFFFF_0000;
 const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
@@ -8184,4 +8186,169 @@ fn a_surface_released_with_its_readback_queued_frees_after_it() {
     }
     assert_eq!(h.clear_target(MAGENTA), 0, "clear after the releases");
     assert_eq!(h.read_pixel(8, 8), MAGENTA, "the device still reads back");
+}
+
+/// A system-memory surface the size and format of `h`'s back buffer.
+fn back_buffer_sysmem(h: &Harness) -> Surface<'_> {
+    let (hr, desc) = h.render_target(0).desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    h.create_offscreen_plain_surface(desc.width, desc.height, desc.format, D3DPOOL_SYSTEMMEM)
+}
+
+/// The name the workload child of the queued-copy test runs under.
+const QUEUED_READBACK_CHILD_NAME: &str = "queued-readback.exe";
+
+#[test]
+fn a_readback_into_system_memory_rides_the_frame() {
+    if running_as(QUEUED_READBACK_CHILD_NAME) {
+        queued_readback_workload();
+        return;
+    }
+    // The copies are counted out of the process log, so the workload runs in
+    // a process of its own, alone in its log directory.
+    run_in_private_log_child(
+        QUEUED_READBACK_CHILD_NAME,
+        "render_target::a_readback_into_system_memory_rides_the_frame",
+        "warn,mtld3d::unix::command=debug",
+    );
+}
+
+/// One `GetRenderTargetData` into a system-memory surface, then its lock.
+///
+/// The copy rides the frame: the submission the lock sends encodes it in its
+/// ordered blit stream (`site=queued-readback`), and no copy on a command
+/// buffer of its own (`site=readback-blit`) is made and waited for.
+fn queued_readback_workload() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let sysmem = back_buffer_sysmem(&h);
+    assert_eq!(h.clear_target(GREEN), 0, "clear green");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "GetRenderTargetData"
+    );
+    assert_eq!(
+        sysmem_pixel(&sysmem, 8, 8) & 0x00FF_FFFF,
+        GREEN & 0x00FF_FFFF,
+        "the lock reads the copy"
+    );
+    assert_eq!(
+        await_logged_lines("site=queued-readback", 1).len(),
+        1,
+        "the copy is encoded in the frame"
+    );
+    assert_eq!(
+        logged_lines("site=readback-blit"),
+        Vec::<String>::new(),
+        "no copy is made and waited for on its own command buffer"
+    );
+}
+
+#[test]
+fn a_device_context_reads_the_queued_copy() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let sysmem = back_buffer_sysmem(&h);
+    assert_eq!(h.clear_target(GREEN), 0, "clear green");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "GetRenderTargetData"
+    );
+    let dc = sysmem.dc();
+    assert_eq!(
+        dc.get_pixel(8, 8),
+        GREEN & 0x00FF_FFFF,
+        "GetDC shows the copy"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+}
+
+#[test]
+fn an_update_surface_source_carries_the_queued_copy() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let sysmem = back_buffer_sysmem(&h);
+    let device_copy =
+        h.create_offscreen_plain_surface(desc.width, desc.height, desc.format, D3DPOOL_DEFAULT);
+    assert_eq!(h.clear_target(GREEN), 0, "clear green");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "GetRenderTargetData"
+    );
+    assert_eq!(
+        h.update_surface_hr(&sysmem, &device_copy),
+        0,
+        "UpdateSurface from the copy"
+    );
+    assert_eq!(h.clear_target(RED), 0, "clear red");
+    assert_eq!(
+        h.stretch_rect(&device_copy, &bb, D3DTEXF_NONE),
+        0,
+        "StretchRect it back"
+    );
+    assert_eq!(
+        h.read_pixel(8, 8) & 0x00FF_FFFF,
+        GREEN & 0x00FF_FFFF,
+        "the copy went through"
+    );
+}
+
+#[test]
+fn a_locked_readback_destination_is_refused() {
+    // The application holds a pointer into the destination, which a copy
+    // landing after the call would write under it.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let sysmem = back_buffer_sysmem(&h);
+    {
+        let _locked = sysmem.lock_rect(0);
+        assert_eq!(
+            h.get_render_target_data_hr(&bb, &sysmem),
+            D3DERR_INVALIDCALL,
+            "a locked destination"
+        );
+    }
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "unlocked, it is taken"
+    );
+}
+
+#[test]
+fn a_dc_held_readback_destination_is_refused() {
+    // A held device context maps the destination as a lock does.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let sysmem = back_buffer_sysmem(&h);
+    let dc = sysmem.dc();
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        D3DERR_INVALIDCALL,
+        "a DC-held destination"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "released, it is taken"
+    );
+}
+
+#[test]
+fn a_readback_destination_of_another_device_is_refused() {
+    let h = Harness::new();
+    let other = Harness::new();
+    let bb = h.render_target(0);
+    let foreign = back_buffer_sysmem(&other);
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &foreign),
+        D3DERR_INVALIDCALL,
+        "a surface of another device"
+    );
 }

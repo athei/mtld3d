@@ -462,10 +462,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   had before the display mode was restored when anything but the window's
   own procedure moved it during the restore, so a move the application makes
   from another thread in that span is undone, where D3D9 keeps it. No knob.
-- `GetRenderTargetData` into a standalone system-memory surface returns before
-  the copy is done; the surface waits for it when it is next locked, used as a
-  copy source, read back into again or released, which is when D3D9 promises
-  the pixels. Into a texture level it waits at once. No knob.
 - `GetRenderTargetData` from an X render target into a system-memory
   surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
   A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,
