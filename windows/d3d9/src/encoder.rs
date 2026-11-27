@@ -435,6 +435,28 @@ impl EncoderThread {
         self.control(EncoderControl::AwaitFrame, target, &[])
     }
 
+    /// Wait until the draw work submitted at `target` retired, or the encoder failed.
+    ///
+    /// Returns at once on a device with no frame signal; the caller checks
+    /// the draw counter after.
+    ///
+    /// # Errors
+    ///
+    /// Returns the latched HRESULT when the device has failed, before or
+    /// during the wait.
+    pub fn await_draw(&self, target: u64) -> Result<(), i32> {
+        self.control(EncoderControl::AwaitDraw, target, &[])
+    }
+
+    /// Commit every frame sent before this request, hurrying a present held for the display.
+    ///
+    /// # Errors
+    ///
+    /// Returns the latched HRESULT when the device has failed.
+    pub fn commit_submitted(&self) -> Result<(), i32> {
+        self.control(EncoderControl::CommitSubmitted, 0, &[])
+    }
+
     pub fn drain_retired_now(&self) -> Result<(), i32> {
         self.control(EncoderControl::DrainRetention, 0, &[])
     }

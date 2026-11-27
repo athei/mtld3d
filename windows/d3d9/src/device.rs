@@ -1721,6 +1721,19 @@ impl DeviceInner {
         &self.coherent_seq
     }
 
+    /// Commit every frame sent so far, hurrying a present one of them waits behind.
+    pub fn commit_submitted(&self) -> Result<(), i32> {
+        self.encoder.commit_submitted()
+    }
+
+    /// Wait until the draw work submitted at `seq` retired, without going through the encoder.
+    ///
+    /// Returns at once on a device with no frame signal: the caller checks
+    /// `coherent_seq` after and waits another way.
+    pub fn await_draw(&self, seq: u64) -> Result<(), i32> {
+        self.encoder.await_draw(seq)
+    }
+
     /// The highest seq whose submission failed on the GPU, 0 when none has.
     pub fn latest_failed_submit(&self) -> u64 {
         self.failed_submit_seq.load(Ordering::Acquire)

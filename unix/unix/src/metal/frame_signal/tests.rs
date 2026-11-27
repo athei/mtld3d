@@ -308,3 +308,31 @@ fn a_slow_display_pace_stretches_the_cap() {
     );
     drop(mark);
 }
+
+/// A draw-only wait finishes with its draw buffer, not waiting for the frame's paced present.
+#[test]
+fn a_draw_wait_finishes_with_its_buffer_alone() {
+    let draw = shared_counter();
+    let floor = AtomicU64::new(0);
+    let signal = attached(&floor);
+    assert!(signal.note_submission(1, Some(PACING)).is_some());
+    let (sender, receiver) = mpsc::channel();
+    {
+        let signal = Arc::clone(&signal);
+        let draw = Arc::clone(&draw);
+        thread::spawn(move || {
+            let _ = sender.send(signal.wait_draw(counter(&draw), 1));
+        });
+    }
+    assert!(
+        receiver.recv_timeout(PARKED).is_err(),
+        "the waiter parks while the buffer is unfinished"
+    );
+    draw.store(1, Ordering::Release);
+    signal.retired();
+    assert_eq!(
+        receiver.recv_timeout(WOKEN),
+        Ok(FrameWait::Finished),
+        "the buffer retiring finishes it, the present still owed"
+    );
+}

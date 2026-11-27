@@ -240,11 +240,17 @@ The surface keeps the seq of the frame that carries the copy and settles the
 way an EVENT query polls (`SurfaceInner::settle_readback`) before its memory is
 locked, handed to `GetDC`, used as a copy source, read back into again or
 freed: one atomic load once `coherent_seq` has reached that seq, a submit only
-while the copy is still in the open frame, and a wait through
-`retire_uploads_through`, which hurries a submission held behind a pending
-present, only while the GPU has not finished it. The hurry matters under
-display-synced presents, where the frame that carries the copy can otherwise
-sit behind the previous present until the display takes it. The wait is for
+while the copy is still in the open frame, and, while the GPU has not finished
+it, a `CommitSubmitted` request and then a wait on the API thread on the
+device's frame signal (`AwaitDraw`, the GPU half of the frame-latency wait,
+which a draw buffer retiring wakes). The request queues behind the frames
+already sent and drains the encoder's submit thread, which hurries a submission
+held behind a pending present: under display-synced presents the frame that
+carries the copy can otherwise sit there until the display takes it. The wait
+is for the copy's own frame alone; `retire_uploads_through`, which a device
+without the signal falls back to, also waits for the uploads and for the
+first command buffer still pending at or after that frame, which in an
+unthrottled loop can be a later one. The wait is for
 the whole frame that carries the copy, since retirement is counted per frame. A
 game whose frame outlasts the GPU's turnaround, or that reads a copy two frames
 after it was made, finds it done and never waits.

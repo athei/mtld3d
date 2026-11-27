@@ -1408,7 +1408,12 @@ struct QueuedReadback {
 
 /// Wait until the GPU has finished the frame submitted as `seq`.
 ///
-/// The frame is submitted first if it is still the one being recorded.
+/// The frame is submitted first if it is still the one being recorded. Then
+/// the encoder commits every frame sent so far, which hurries a frame held
+/// behind a pending present until the display takes it, and the wait for the
+/// copy's own frame runs on this thread on the device's frame signal, which a
+/// draw buffer retiring wakes. A device without the signal waits through
+/// `retire_uploads_through`.
 fn await_frame_seq(dev: &mut DeviceInner, seq: u64) -> Result<(), i32> {
     dev.encoder_status()?;
     let finished = |dev: &DeviceInner| {
@@ -1422,6 +1427,10 @@ fn await_frame_seq(dev: &mut DeviceInner, seq: u64) -> Result<(), i32> {
     }
     if mtld3d_core::query_fence::event_needs_submit(seq, dev.current_seq()) {
         dev.flush_current_frame_async()?;
+    }
+    if !finished(dev) {
+        dev.commit_submitted()?;
+        dev.await_draw(seq)?;
     }
     if !finished(dev) {
         dev.retire_uploads_through(seq)?;

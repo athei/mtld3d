@@ -9466,6 +9466,17 @@ impl EncoderThread {
     /// # Errors
     ///
     /// Returns an error when admission or acknowledgment disconnects.
+    /// Commit every frame sent before this request, and acknowledge once they are committed.
+    pub fn commit_submitted(&self) -> std::io::Result<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        self.sender
+            .send(EncoderMessage::CommitSubmitted(done_tx))
+            .map_err(|_| std::io::Error::other("encoder control admission failed"))?;
+        done_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
+    }
+
     pub fn retire_uploads_through(&self, target_seq: u64) -> std::io::Result<()> {
         let (done_tx, done_rx) = mpsc::sync_channel(0);
         self.sender
@@ -9544,6 +9555,11 @@ enum EncoderMessage {
         target_seq: u64,
         done: mpsc::SyncSender<()>,
     },
+    /// Commit every frame sent before this message (`EncoderControl::CommitSubmitted`).
+    ///
+    /// Drains the submit thread, which hurries a present the next submit
+    /// would otherwise wait for the display behind.
+    CommitSubmitted(mpsc::SyncSender<()>),
     /// Retire the uploads through `target_seq` and release the reads they hold.
     ///
     /// Waits for the draw and upload command buffers up to `target_seq` when
@@ -9777,6 +9793,15 @@ fn encoder_thread_main(
                         }
                     }
                     enc.intake_visibility();
+                    let _ = done.send(());
+                }
+                Ok(EncoderMessage::CommitSubmitted(done)) => {
+                    if enc.failed_replay.is_some() {
+                        drop(done);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvCommit");
+                    enc.drain_submit_thread();
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::RetireUploadsThrough { target_seq, done }) => {

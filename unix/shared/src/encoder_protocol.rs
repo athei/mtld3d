@@ -92,6 +92,20 @@ pub enum EncoderControl {
     /// pass through the encoder thread, whose queue holds the frames it waits
     /// behind.
     AwaitFrame = 4,
+    /// Wait on the calling thread until the draw work submitted at the argument's sequence retired.
+    ///
+    /// The GPU half of `AwaitFrame` without its present: what a read of a
+    /// `GetRenderTargetData` copy that frame carries waits for. It does not
+    /// pass through the encoder thread either.
+    AwaitDraw = 5,
+    /// Commit every frame handed to the encoder before this request, hurrying a held present.
+    ///
+    /// Queued behind those frames on the encoder's channel, so it is handled
+    /// once the encoder has taken them; the encoder then drains its submit
+    /// thread, which copies a present still waiting for the display aside
+    /// rather than wait for it. What a `GetRenderTargetData` copy's settle asks
+    /// before it waits for its frame on the frame signal.
+    CommitSubmitted = 6,
 }
 
 impl TryFrom<u16> for EncoderOpcode {

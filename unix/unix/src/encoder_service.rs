@@ -111,6 +111,18 @@ impl EncoderService {
         Some(FrameLatencyGate { signal, draw })
     }
 
+    /// Wait until the draw work submitted at `target` retired, or the encoder ended.
+    ///
+    /// A `GetRenderTargetData` copy's settle, run on the API thread: the GPU
+    /// half of [`Self::await_frame`], without waiting for the frame's present
+    /// to be shown. A device with no frame signal answers at once, and the
+    /// caller, finding the draw counter short, waits another way.
+    pub fn await_draw(&self, target: u64) -> FrameWait {
+        self.latency.as_ref().map_or(FrameWait::Ended, |latency| {
+            latency.signal.wait_draw(latency.draw, target)
+        })
+    }
+
     /// Wait until the frame submitted at `target` finished, or the encoder ended.
     ///
     /// The `Present` half of the frame-latency bound, run on the API thread.
@@ -529,6 +541,7 @@ pub extern "C" fn control_handler(args: *mut core::ffi::c_void) -> i32 {
         EncoderControl::DrainRetention => service.encoder.drain_retired_now(),
         EncoderControl::IntakeVisibility => service.encoder.intake_visibility_for(params.argument),
         EncoderControl::RetireUploads => service.encoder.retire_uploads_through(params.argument),
+        EncoderControl::CommitSubmitted => service.encoder.commit_submitted(),
         EncoderControl::Reset => {
             if params.textures_len != 0
                 && (params.textures_ptr == 0
@@ -560,6 +573,12 @@ pub extern "C" fn control_handler(args: *mut core::ffi::c_void) -> i32 {
                 // The encoder failed: its mailbox holds the failure, which the
                 // PE side reports as the device's state after this call.
                 log::debug!(target: LOG_TARGET, "encoder: frame-latency wait ended by an encoder failure");
+            }
+            Ok(())
+        }
+        EncoderControl::AwaitDraw => {
+            if service.await_draw(params.argument) == FrameWait::Ended {
+                log::debug!(target: LOG_TARGET, "encoder: draw wait ended by an encoder failure or no frame signal");
             }
             Ok(())
         }
