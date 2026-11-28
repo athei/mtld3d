@@ -8190,9 +8190,14 @@ fn a_surface_released_with_its_readback_queued_frees_after_it() {
 
 /// A system-memory surface the size and format of `h`'s back buffer.
 fn back_buffer_sysmem(h: &Harness) -> Surface<'_> {
+    back_buffer_copy_in(h, D3DPOOL_SYSTEMMEM)
+}
+
+/// An offscreen plain surface in `pool` the size and format of `h`'s back buffer.
+fn back_buffer_copy_in(h: &Harness, pool: u32) -> Surface<'_> {
     let (hr, desc) = h.render_target(0).desc();
     assert_eq!(hr, 0, "backbuffer GetDesc");
-    h.create_offscreen_plain_surface(desc.width, desc.height, desc.format, D3DPOOL_SYSTEMMEM)
+    h.create_offscreen_plain_surface(desc.width, desc.height, desc.format, pool)
 }
 
 /// The name the workload child of the queued-copy test runs under.
@@ -8213,31 +8218,36 @@ fn a_readback_into_system_memory_rides_the_frame() {
     );
 }
 
-/// One `GetRenderTargetData` into a system-memory surface, then its lock.
+/// A `GetRenderTargetData` into a `D3DPOOL_SYSTEMMEM` and a `D3DPOOL_SCRATCH` surface, each locked.
 ///
-/// The copy rides the frame: the submission the lock sends encodes it in its
+/// Each copy rides the frame: the submission the lock sends encodes it in its
 /// ordered blit stream (`site=queued-readback`), and no copy on a command
 /// buffer of its own (`site=readback-blit`) is made and waited for.
 fn queued_readback_workload() {
     let h = Harness::new();
     let bb = h.render_target(0);
-    let sysmem = back_buffer_sysmem(&h);
-    assert_eq!(h.clear_target(GREEN), 0, "clear green");
-    assert_eq!(
-        h.get_render_target_data_hr(&bb, &sysmem),
-        0,
-        "GetRenderTargetData"
-    );
-    assert_eq!(
-        sysmem_pixel(&sysmem, 8, 8) & 0x00FF_FFFF,
-        GREEN & 0x00FF_FFFF,
-        "the lock reads the copy"
-    );
-    assert_eq!(
-        await_logged_lines("site=queued-readback", 1).len(),
-        1,
-        "the copy is encoded in the frame"
-    );
+    for (n, (pool, colour)) in [(D3DPOOL_SYSTEMMEM, GREEN), (D3DPOOL_SCRATCH, BLUE)]
+        .into_iter()
+        .enumerate()
+    {
+        let copy = back_buffer_copy_in(&h, pool);
+        assert_eq!(h.clear_target(colour), 0, "clear, pool {pool}");
+        assert_eq!(
+            h.get_render_target_data_hr(&bb, &copy),
+            0,
+            "GetRenderTargetData, pool {pool}"
+        );
+        assert_eq!(
+            sysmem_pixel(&copy, 8, 8) & 0x00FF_FFFF,
+            colour & 0x00FF_FFFF,
+            "the lock reads the copy, pool {pool}"
+        );
+        assert_eq!(
+            await_logged_lines("site=queued-readback", n + 1).len(),
+            n + 1,
+            "the copy is encoded in the frame, pool {pool}"
+        );
+    }
     assert_eq!(
         logged_lines("site=readback-blit"),
         Vec::<String>::new(),

@@ -239,32 +239,46 @@ synchronous readback does.
 The surface keeps the seq of the frame that carries the copy and settles the
 way an EVENT query polls (`SurfaceInner::settle_readback`) before its memory is
 locked, handed to `GetDC`, used as a copy source, read back into again or
-freed: one atomic load once `coherent_seq` has reached that seq, a submit only
-while the copy is still in the open frame, and, while the GPU has not finished
-it, a `CommitSubmitted` request and then a wait on the API thread on the
-device's frame signal (`AwaitDraw`, the GPU half of the frame-latency wait,
-which a draw buffer retiring wakes). The request queues behind the frames
-already sent and drains the encoder's submit thread, which hurries a submission
-held behind a pending present: under display-synced presents the frame that
-carries the copy can otherwise sit there until the display takes it. The wait
-is for the copy's own frame alone; `retire_uploads_through`, which a device
-without the signal falls back to, also waits for the uploads and for the
-first command buffer still pending at or after that frame, which in an
-unthrottled loop can be a later one. The wait is for
-the whole frame that carries the copy, since retirement is counted per frame. A
+freed: one atomic load once `coherent_seq` has reached that seq. While the GPU
+has not finished it, the settle hurries presentation, submits the open frame
+if the copy is still in it, sends a `CommitSubmitted` request, and then waits
+on the API thread on the device's frame signal (`AwaitDraw`, the GPU half of
+the frame-latency wait, which a draw buffer retiring wakes). Under
+display-synced presents the encoder can be blocked on a submit that waits for
+the previous present to commit, so the hurry goes out before the submit and
+the request, as it does for `retire_uploads_through`; the request queues
+behind the frames already sent, drains the encoder's submit thread and puts
+the present-wait policy back however it ends, and it is sent whenever the
+hurry was, even when the copy finished meanwhile. The wait is for the copy's
+own frame alone, which is the whole frame since retirement is counted per
+frame; `retire_uploads_through`, which a device without the signal falls back
+to, also waits for the uploads and for the first command buffer still pending
+at or after that frame, which in an unthrottled loop can be a later one. A
 game whose frame outlasts the GPU's turnaround, or that reads a copy two frames
-after it was made, finds it done and never waits.
-Every other readback (a texture level's staging, the front buffer, a
-back-buffer `LockRect`) stays synchronous.
+after it was made, finds it done and never waits. Every other readback (a
+texture level's staging, the front buffer, a back-buffer `LockRect`) stays
+synchronous.
+
+The settle borrows the surface's own device. `GetFrontBufferData` and
+`UpdateSurface` read a system-memory surface with a device borrowed, so they
+settle it at their entry point, before taking that borrow. A settle that
+cannot see the copy finish because the device failed marks the surface, and
+its drop leaks the pages rather than free them under a copy the GPU may still
+make: the `bytesNoCopy` buffer the copy writes through keeps the buffer, not
+the memory.
 
 The call refuses a destination of another device, and a locked or DC-held
-destination, with `D3DERR_INVALIDCALL`. A copy that fails after the call has
+destination, with `D3DERR_INVALIDCALL`, and a failed device answers with its
+error, as the synchronous flush did. A copy that fails after the call has
 returned changes mtld3d's answer: a source the encoder cannot resolve, a resolve
 the submission declines, a copy whose geometry it refuses, or a submission that
 fails on the GPU used to make the call return `D3DERR_INVALIDCALL`; the call
 now returns `D3D_OK`, and the surface reads what its memory held before, with
-one log line when it settles. A surface nothing had written reads zeros then,
-since it is marked written only by a copy that settled.
+one log line: the settle's for a refused copy, the frame's own failure line for
+a submission the GPU failed. A surface nothing had written is zeroed when the
+copy is queued, so it reads zeros then. `failed_submit_seq` is not consulted:
+it is a running maximum, so a later frame's failure would count against a copy
+that finished.
 
 ## Upload order and retirement
 

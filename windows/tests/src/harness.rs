@@ -1161,8 +1161,9 @@ impl Harness {
     ///
     /// The same chain the Wine conformance suite uses: `GetRenderTarget(0)` →
     /// `CreateOffscreenPlainSurface(D3DPOOL_SYSTEMMEM)` → `GetRenderTargetData`
-    /// (which flushes pending GPU work) → `LockRect(READONLY)`. The returned
-    /// value reflects every submitted frame. The system-memory surface is
+    /// (which queues the copy in the open frame) → `LockRect(READONLY)` (which
+    /// waits for the frame carrying the copy). The returned value reflects
+    /// every draw recorded before the call. The system-memory surface is
     /// always `D3DFMT_A8R8G8B8`, so a locked row is `pitch / 4` `u32` pixels in
     /// `0xAARRGGBB` order.
     ///

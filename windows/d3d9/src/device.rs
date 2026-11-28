@@ -1027,7 +1027,9 @@ impl DeviceInner {
     /// Read the implicit front buffer into a validated caller-owned surface.
     ///
     /// Both front-buffer entry points use the persistent backbuffer and the
-    /// same extent/format policy. The caller holds this device's API lock.
+    /// same extent/format policy. The caller holds this device's API lock and
+    /// has settled a readback queued into `dst_surf` before borrowing the
+    /// device (`Direct3DSurface9::settle_readback`).
     pub fn read_front_buffer(&mut self, dst_surf: &Direct3DSurface9) -> i32 {
         let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
             warn_readback_rejected("GetFrontBufferData", ReadbackReject::NotSystemMemory);
@@ -1721,7 +1723,12 @@ impl DeviceInner {
         &self.coherent_seq
     }
 
-    /// Commit every frame sent so far, hurrying a present one of them waits behind.
+    /// Commit every frame sent so far, and end the hurry the caller set first.
+    ///
+    /// The caller has hurried presentation ([`Self::hurry_presentation`]), so
+    /// the encoder reaches this request even when a submit ahead of it waits
+    /// for the display; the encoder puts the policy back however the request
+    /// ends.
     pub fn commit_submitted(&self) -> Result<(), i32> {
         self.encoder.commit_submitted()
     }
@@ -1732,11 +1739,6 @@ impl DeviceInner {
     /// `coherent_seq` after and waits another way.
     pub fn await_draw(&self, seq: u64) -> Result<(), i32> {
         self.encoder.await_draw(seq)
-    }
-
-    /// The highest seq whose submission failed on the GPU, 0 when none has.
-    pub fn latest_failed_submit(&self) -> u64 {
-        self.failed_submit_seq.load(Ordering::Acquire)
     }
 
     /// The texture-upload retirement atomic.
@@ -8592,6 +8594,10 @@ extern "system" fn device_update_surface(
         );
         return D3DERR_INVALIDCALL;
     }
+    // The copy reads what a queued `GetRenderTargetData` writes into the
+    // source. The settle borrows the surface's device, so it runs here,
+    // before any path below borrows one.
+    src_surf.settle_readback();
     let src_parent = src_surf.parent_texture();
     let dst_parent = dst_surf.parent_texture();
     // A planar YUV surface is a `StretchRect` source and nothing else. Its
@@ -9222,6 +9228,9 @@ extern "system" fn device_get_render_target_data(
         );
         return D3DERR_INVALIDCALL;
     }
+    // Two readbacks into one memory through two Metal buffers are not ordered
+    // against each other, so an earlier one settles first.
+    dst_surf.settle_readback();
     let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
         warn_readback_rejected("GetRenderTargetData", ReadbackReject::NotSystemMemory);
         return D3DERR_INVALIDCALL;
@@ -9396,6 +9405,8 @@ extern "system" fn device_get_front_buffer_data(
     let Some(dst_surf) = (unsafe { InPtr::<Direct3DSurface9>::opt(dst_surface) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // The settle borrows the surface's device; done before this borrows one.
+    dst_surf.settle_readback();
     obj.inner().read_front_buffer(&dst_surf)
 }
 
@@ -9434,6 +9445,11 @@ fn queue_readback(
     texture_id: TextureId,
     dst: &Direct3DSurface9,
 ) -> i32 {
+    // A failed device answers with its error, as the synchronous path's flush
+    // does, rather than queue a copy nothing will run.
+    if let Err(hr) = device_inner.encoder_status() {
+        return hr;
+    }
     let outcome = Arc::new(AtomicU32::new(0));
     device_inner.push_control(ReadColorToMemoryOp {
         done: Arc::clone(&outcome).into(),

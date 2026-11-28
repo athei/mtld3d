@@ -3610,59 +3610,149 @@ fn encode_color_readback(
         u32::try_from(cmd.dst_offset >> 32).expect("the high half fits u32"),
         u32::try_from(cmd.dst_offset & u64::from(u32::MAX)).expect("the low half fits u32"),
     );
-    let resolved = match readback_resolve_extent(texture, cmd.mip_level, logical) {
-        None => None,
-        Some((out_w, out_h)) => {
-            let Some(target) = encode_readback_resolve(
-                cmd_buf,
-                ctx.upscale,
-                ctx.device,
-                texture,
-                (cmd.mip_level, cmd.src_slice),
-                out_w,
-                out_h,
-            ) else {
-                return false;
-            };
-            Some(target)
-        }
-    };
+    let resolved = resolve_readback_source(
+        cmd_buf,
+        ctx.upscale,
+        ctx.device,
+        texture,
+        (cmd.mip_level, cmd.src_slice),
+        logical.0,
+        logical.1,
+    );
     // A resolved level is a one-level, one-slice texture of its own.
     let (level, slice) = if resolved.is_some() {
         (0, 0)
     } else {
         (cmd.mip_level, cmd.src_slice)
     };
-    let source = resolved.as_deref().unwrap_or(texture);
-    let region = CopyRegion {
-        width: cmd.region_w as usize,
-        height: cmd.region_h as usize,
-        depth: 1,
-    };
+    encode_level_to_buffer(
+        cmd_buf,
+        &LevelToBuffer {
+            texture: resolved.as_deref().unwrap_or(texture),
+            level,
+            slice,
+            origin: (0, 0),
+            region: CopyRegion {
+                width: cmd.region_w as usize,
+                height: cmd.region_h as usize,
+                depth: 1,
+            },
+            buffer,
+            bytes_per_row: u32::try_from(cmd.bytes_per_row)
+                .expect("a readback row stride fits u32"),
+            block_height: 1,
+            planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+            stencil: (0, 0),
+            site: diagnostics::ReadbackSite::Queued,
+            label: "mtld3d-readback",
+            pe_destination: (buffer.contents().as_ptr() as u64, cmd.byte_size),
+        },
+    )
+}
+
+/// One level of a texture copied into a buffer: what both readbacks encode.
+///
+/// `region` starts at `origin` in `slice` of `level`. `block_height` is the
+/// format's block height, which `bytes_per_row` strides one row of. `planes`
+/// says what is copied: the colour, the depth, or the depth and then the
+/// stencil, which lands at `stencil.0` with a stride of `stencil.1`.
+struct LevelToBuffer<'a> {
+    texture: &'a ProtocolObject<dyn MTLTexture>,
+    level: u32,
+    slice: u32,
+    origin: (u32, u32),
+    region: CopyRegion,
+    buffer: &'a ProtocolObject<dyn MTLBuffer>,
+    bytes_per_row: u32,
+    block_height: u32,
+    planes: mtld3d_shared::mtl::ReadbackPlanes,
+    stencil: (usize, usize),
+    /// Where the copy is encoded, as its `readback-copy` record names it.
+    site: diagnostics::ReadbackSite,
+    /// The blit encoder's label.
+    label: &'static str,
+    /// The PE address and length the buffer wraps, for the record.
+    pe_destination: (u64, u64),
+}
+
+/// Check `copy` against the texture and the buffer, then encode it onto `cmd_buf`.
+///
+/// The queued `GetRenderTargetData` copy and the synchronous readback both
+/// end here. `false`, logged, when the geometry is refused, a depth copy
+/// names a source that is not depth, or no blit encoder could be made;
+/// nothing is encoded then. The checks run before the encoder exists, so a
+/// refusal leaves no encoder to close. A declined `render.scale` resolve
+/// lands in the geometry check: the caller asked for more pixels than the
+/// render-resolution source holds.
+fn encode_level_to_buffer(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    copy: &LevelToBuffer<'_>,
+) -> bool {
+    use mtld3d_shared::mtl::ReadbackPlanes;
+    let texture = copy.texture;
+    let region = &copy.region;
     let src_endpoint = CopyEndpoint {
-        pixel_format: source.pixelFormat(),
-        sample_count: source.sampleCount(),
-        width: source.width(),
-        height: source.height(),
-        depth: source.depth(),
-        level: level as usize,
-        levels: source.mipmapLevelCount(),
-        origin_x: 0,
-        origin_y: 0,
+        pixel_format: texture.pixelFormat(),
+        sample_count: texture.sampleCount(),
+        width: texture.width(),
+        height: texture.height(),
+        depth: texture.depth(),
+        level: copy.level as usize,
+        levels: texture.mipmapLevelCount(),
+        origin_x: copy.origin.0 as usize,
+        origin_y: copy.origin.1 as usize,
     };
-    let bytes_per_row = usize::try_from(cmd.bytes_per_row).expect("a row stride fits usize");
     let destination = CopyBufferEndpoint {
-        length: buffer.length(),
+        length: copy.buffer.length(),
         offset: 0,
-        bytes_per_row,
-        bytes_per_image: bytes_per_row * region.height,
+        bytes_per_row: copy.bytes_per_row as usize,
+        bytes_per_image: copy.bytes_per_row as usize * region.height,
     };
-    if let Some(reason) = copy_texture_to_buffer_reject(
-        &src_endpoint,
-        &destination,
-        &region,
-        copy_block_layout(src_endpoint.pixel_format),
-    ) {
+    let (block, options) = match copy.planes {
+        ReadbackPlanes::Color => (
+            copy_block_layout(src_endpoint.pixel_format),
+            MTLBlitOption::empty(),
+        ),
+        ReadbackPlanes::Depth | ReadbackPlanes::DepthStencil => {
+            if !matches!(
+                src_endpoint.pixel_format,
+                MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
+            ) {
+                error!(target: LOG_TARGET, "depth readback: source is not a depth format");
+                return false;
+            }
+            (
+                PixelFormat::R32Float.block_layout(),
+                if src_endpoint.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
+                    MTLBlitOption::DepthFromDepthStencil
+                } else {
+                    MTLBlitOption::empty()
+                },
+            )
+        }
+    };
+    let stencil_destination = CopyBufferEndpoint {
+        length: copy.buffer.length(),
+        offset: copy.stencil.0,
+        bytes_per_row: copy.stencil.1,
+        bytes_per_image: 0,
+    };
+    if copy.planes == ReadbackPlanes::DepthStencil
+        && (src_endpoint.pixel_format != MTLPixelFormat::Depth32Float_Stencil8
+            || stencil_destination.offset < destination.bytes_per_row * region.height
+            || copy_texture_to_buffer_reject(
+                &src_endpoint,
+                &stencil_destination,
+                region,
+                PixelFormat::R8Unorm.block_layout(),
+            )
+            .is_some())
+    {
+        error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
+        return false;
+    }
+    if let Some(reason) = copy_texture_to_buffer_reject(&src_endpoint, &destination, region, block)
+    {
         let reason_text = reason.as_str();
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
@@ -3676,38 +3766,75 @@ fn encode_color_readback(
         error!(target: LOG_TARGET, "readback: blitCommandEncoder() nil");
         return false;
     };
+    blit.setLabel(Some(&objc2_foundation::NSString::from_str(copy.label)));
+    // `region.height` is in pixels but `bytes_per_row` strides one block row,
+    // so the slice size counts block rows. The two agree only for an
+    // uncompressed format, where the block height is 1.
+    let bytes_per_image = mtld3d_shared::blit_geometry::bytes_per_image(
+        copy.bytes_per_row,
+        u32::try_from(region.height).expect("a readback height fits u32"),
+        copy.block_height,
+    ) as usize;
     diagnostics::readback(
         cmd_buf,
-        &diagnostics::ReadbackSite::Queued,
+        &copy.site,
         &diagnostics::TextureCopy {
-            texture: source,
+            texture,
             endpoint: &src_endpoint,
-            slice: slice as usize,
+            slice: copy.slice as usize,
         },
-        buffer,
-        &destination,
-        &region,
-        (buffer.contents().as_ptr() as u64, cmd.byte_size),
+        copy.buffer,
+        &CopyBufferEndpoint {
+            bytes_per_image,
+            ..destination
+        },
+        region,
+        copy.pe_destination,
     );
-    blit.setLabel(Some(&objc2_foundation::NSString::from_str(
-        "mtld3d-readback",
-    )));
-    // SAFETY: objc2 typed binding; `source` and `buffer` are retained Metal
+    let origin = MTLOrigin {
+        x: src_endpoint.origin_x,
+        y: src_endpoint.origin_y,
+        z: 0,
+    };
+    let size = MTLSize {
+        width: region.width,
+        height: region.height,
+        depth: 1,
+    };
+    // SAFETY: objc2 typed binding; `texture` and `buffer` are retained Metal
     // objects live for the call; the geometry cleared
     // `copy_texture_to_buffer_reject` above.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
-            source,
-            slice as usize,
-            level as usize,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize { width: region.width, height: region.height, depth: 1 },
-            buffer,
+            texture,
+            copy.slice as usize,
+            copy.level as usize,
+            origin,
+            size,
+            copy.buffer,
             0,
-            bytes_per_row,
-            destination.bytes_per_image,
-            MTLBlitOption::empty(),
+            destination.bytes_per_row,
+            bytes_per_image,
+            options,
         );
+    }
+    if copy.planes == ReadbackPlanes::DepthStencil {
+        // SAFETY: the stencil format and byte region were validated before
+        // encoding; the retained buffer and texture outlive the submission.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                texture,
+                copy.slice as usize,
+                copy.level as usize,
+                origin,
+                size,
+                copy.buffer,
+                stencil_destination.offset,
+                stencil_destination.bytes_per_row,
+                0,
+                MTLBlitOption::StencilFromDepthStencil,
+            );
+        }
     }
     blit.endEncoding();
     true
@@ -3995,159 +4122,31 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     } else {
         (mip_level, slice)
     };
-    let texture = source.as_deref().unwrap_or(&*texture);
-
-    let bytes_per_image = (bytes_per_row as usize) * (height as usize);
-    let region = CopyRegion {
-        width: width as usize,
-        height: height as usize,
-        depth: 1,
-    };
-    let src_endpoint = CopyEndpoint {
-        pixel_format: texture.pixelFormat(),
-        sample_count: texture.sampleCount(),
-        width: texture.width(),
-        height: texture.height(),
-        depth: texture.depth(),
-        level: mip_level as usize,
-        levels: texture.mipmapLevelCount(),
-        origin_x: origin_x as usize,
-        origin_y: origin_y as usize,
-    };
-    let destination = CopyBufferEndpoint {
-        length: dst_buffer.length(),
-        offset: 0,
-        bytes_per_row: bytes_per_row as usize,
-        bytes_per_image,
-    };
-    let (block, options) = match planes {
-        mtld3d_shared::mtl::ReadbackPlanes::Color => (
-            copy_block_layout(src_endpoint.pixel_format),
-            MTLBlitOption::empty(),
-        ),
-        mtld3d_shared::mtl::ReadbackPlanes::Depth
-        | mtld3d_shared::mtl::ReadbackPlanes::DepthStencil => {
-            if !matches!(
-                src_endpoint.pixel_format,
-                MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
-            ) {
-                error!(target: LOG_TARGET, "depth readback: source is not a depth format");
-                return false;
-            }
-            (
-                PixelFormat::R32Float.block_layout(),
-                if src_endpoint.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
-                    MTLBlitOption::DepthFromDepthStencil
-                } else {
-                    MTLBlitOption::empty()
-                },
-            )
-        }
-    };
-    let stencil_destination = CopyBufferEndpoint {
-        length: dst_buffer.length(),
-        offset: to_usize(stencil_offset),
-        bytes_per_row: stencil_bytes_per_row as usize,
-        bytes_per_image: 0,
-    };
-    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil
-        && (src_endpoint.pixel_format != MTLPixelFormat::Depth32Float_Stencil8
-            || stencil_destination.offset < destination.bytes_per_row * region.height
-            || copy_texture_to_buffer_reject(
-                &src_endpoint,
-                &stencil_destination,
-                &region,
-                PixelFormat::R8Unorm.block_layout(),
-            )
-            .is_some())
-    {
-        error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
-        return false;
-    }
-    // Checked before the encoder exists so a rejection leaves no encoder to
-    // close. A declined `MetalFX` resolve lands here: the caller asked for
-    // more pixels than the render-resolution source holds.
-    if let Some(reason) = copy_texture_to_buffer_reject(&src_endpoint, &destination, &region, block)
-    {
-        let reason_text = reason.as_str();
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: reason.key(),
-            "blit_texture_to_buffer: {reason_text}, readback skipped. \
-             src {src_endpoint}, dst {destination}, region {region}"
-        );
-        return false;
-    }
-
-    let Some(blit) = cmd_buf.blitCommandEncoder() else {
-        error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
-        return false;
-    };
-    {
-        let label = objc2_foundation::NSString::from_str("mtld3d-readback-blit");
-        blit.setLabel(Some(&label));
-    }
-
-    // `height` is in pixels but `bytes_per_row` strides one block row, so the
-    // slice size counts block rows. The two agree only for an uncompressed
-    // format, where the block height is 1.
-    let bytes_per_image =
-        mtld3d_shared::blit_geometry::bytes_per_image(bytes_per_row, height, block_height) as usize;
-    diagnostics::readback(
+    let copied = encode_level_to_buffer(
         &cmd_buf,
-        &diagnostics::ReadbackSite::Blit,
-        &diagnostics::TextureCopy {
-            texture,
-            endpoint: &src_endpoint,
-            slice: slice as usize,
-        },
-        &dst_buffer,
-        &CopyBufferEndpoint {
-            bytes_per_image,
-            ..destination
-        },
-        &region,
-        (dst_ptr, dst_len),
-    );
-    // SAFETY: objc2 typed binding; `texture`/`dst_buffer` are retained Metal
-    // objects live for the call; the geometry cleared
-    // `copy_texture_to_buffer_reject` above.
-    unsafe {
-        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
-            texture,
-            slice as usize,
-            mip_level as usize,
-            MTLOrigin {
-                x: origin_x as usize,
-                y: origin_y as usize,
-                z: 0,
-            },
-            MTLSize {
+        &LevelToBuffer {
+            texture: source.as_deref().unwrap_or(&*texture),
+            level: mip_level,
+            slice,
+            origin: (origin_x, origin_y),
+            region: CopyRegion {
                 width: width as usize,
                 height: height as usize,
                 depth: 1,
             },
-            &dst_buffer,
-            0,
-            bytes_per_row as usize,
-            bytes_per_image,
-            options,
-        );
+            buffer: &dst_buffer,
+            bytes_per_row,
+            block_height,
+            planes,
+            stencil: (to_usize(stencil_offset), stencil_bytes_per_row as usize),
+            site: diagnostics::ReadbackSite::Blit,
+            label: "mtld3d-readback-blit",
+            pe_destination: (dst_ptr, dst_len),
+        },
+    );
+    if !copied {
+        return false;
     }
-    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil {
-        // SAFETY: the stencil format and byte region were validated before encoding;
-        // the retained buffer and texture outlive this synchronous submission.
-        unsafe {
-            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
-                texture, slice as usize, mip_level as usize,
-                MTLOrigin { x: origin_x as usize, y: origin_y as usize, z: 0 },
-                MTLSize { width: width as usize, height: height as usize, depth: 1 },
-                &dst_buffer, to_usize(stencil_offset), stencil_bytes_per_row as usize, 0,
-                MTLBlitOption::StencilFromDepthStencil,
-            );
-        }
-    }
-    blit.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     let status = cmd_buf.status();

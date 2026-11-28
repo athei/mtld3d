@@ -101,10 +101,11 @@ pub enum EncoderControl {
     /// Commit every frame handed to the encoder before this request, hurrying a held present.
     ///
     /// Queued behind those frames on the encoder's channel, so it is handled
-    /// once the encoder has taken them; the encoder then drains its submit
-    /// thread, which copies a present still waiting for the display aside
-    /// rather than wait for it. What a `GetRenderTargetData` copy's settle asks
-    /// before it waits for its frame on the frame signal.
+    /// once the encoder has taken them. The caller hurries presentation before
+    /// sending it, so an encoder blocked on a submit that waits for the display
+    /// goes on at once; the encoder then drains its submit thread and puts the
+    /// present-wait policy back on every exit. What a `GetRenderTargetData`
+    /// copy's settle asks before it waits for its frame on the frame signal.
     CommitSubmitted = 6,
 }
 

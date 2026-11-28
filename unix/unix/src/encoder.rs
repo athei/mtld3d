@@ -9456,17 +9456,14 @@ impl EncoderThread {
             .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
     }
 
-    /// Drive the encoder thread to retire the uploads through `target_seq` and drop their reads.
+    /// Commit every frame sent before this request, and acknowledge once they are committed.
     ///
-    /// For a full texture upload-snapshot arena whose oldest chunk the
-    /// frames up to `target_seq` read. Routed through the encoder like
-    /// [`Self::intake_visibility_for`], so channel order puts the frame
-    /// `target_seq` names ahead of the wait.
+    /// The API thread hurried presentation ahead of this request, and the
+    /// request ends the hurry on every exit.
     ///
     /// # Errors
     ///
     /// Returns an error when admission or acknowledgment disconnects.
-    /// Commit every frame sent before this request, and acknowledge once they are committed.
     pub fn commit_submitted(&self) -> std::io::Result<()> {
         let (done_tx, done_rx) = mpsc::sync_channel(0);
         self.sender
@@ -9477,6 +9474,16 @@ impl EncoderThread {
             .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
     }
 
+    /// Drive the encoder thread to retire the uploads through `target_seq` and drop their reads.
+    ///
+    /// For a full texture upload-snapshot arena whose oldest chunk the
+    /// frames up to `target_seq` read. Routed through the encoder like
+    /// [`Self::intake_visibility_for`], so channel order puts the frame
+    /// `target_seq` names ahead of the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission or acknowledgment disconnects.
     pub fn retire_uploads_through(&self, target_seq: u64) -> std::io::Result<()> {
         let (done_tx, done_rx) = mpsc::sync_channel(0);
         self.sender
@@ -9557,8 +9564,8 @@ enum EncoderMessage {
     },
     /// Commit every frame sent before this message (`EncoderControl::CommitSubmitted`).
     ///
-    /// Drains the submit thread, which hurries a present the next submit
-    /// would otherwise wait for the display behind.
+    /// Drains the submit thread, then ends the hurry the API thread set ahead
+    /// of the request, whichever way the request ends.
     CommitSubmitted(mpsc::SyncSender<()>),
     /// Retire the uploads through `target_seq` and release the reads they hold.
     ///
@@ -9796,12 +9803,17 @@ fn encoder_thread_main(
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::CommitSubmitted(done)) => {
+                    // The API thread hurried presentation ahead of this request,
+                    // and the request ends the hurry itself on every exit, as
+                    // the upload retirement does.
                     if enc.failed_replay.is_some() {
+                        enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                         drop(done);
                         return false;
                     }
                     mtld3d_shared::crumb!("phase:RecvCommit");
                     enc.drain_submit_thread();
+                    enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::RetireUploadsThrough { target_seq, done }) => {

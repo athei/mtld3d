@@ -1051,6 +1051,11 @@ impl Direct3DSurface9 {
     /// `D3DPOOL_DEFAULT` render target (it keeps its renderable colour handle),
     /// which D3D9 rejects as a destination, so this returns `None` for it, as
     /// it does for a level of a `D3DPOOL_DEFAULT` or `D3DPOOL_MANAGED` texture.
+    ///
+    /// The caller has settled a readback queued into the surface
+    /// ([`Self::settle_readback`]) before it borrowed the device: two
+    /// readbacks into one memory through two Metal buffers are not ordered
+    /// against each other.
     pub fn system_memory_blit_dst(&self) -> Option<SystemMemoryDst> {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
         // access is exclusive (D3D9 objects are single-threaded, or serialised
@@ -1060,9 +1065,10 @@ impl Direct3DSurface9 {
         if !inner.metal_color_handle.is_null() {
             return None;
         }
-        // Two readbacks into one memory through two Metal buffers are not
-        // ordered against each other: the earlier one finishes first.
-        inner.settle_readback();
+        debug_assert!(
+            inner.queued_readback.is_none(),
+            "the caller settles a queued readback first"
+        );
         if inner.system_memory.is_some() {
             let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
             let width = inner.standalone_width;
@@ -1124,11 +1130,31 @@ impl Direct3DSurface9 {
     /// `seq` is the seq of the frame that carries the copy; `outcome` reads 1
     /// once the encoder queued it and drops to 0 if it was refused or could not
     /// be encoded.
+    ///
+    /// A surface nothing has written yet is zeroed here, before the frame that
+    /// carries the copy is submitted: the copy can still fail, and a lock
+    /// after a failed copy then reads zeros, as it would have before it.
     pub fn queue_readback(&self, seq: u64, outcome: Arc<AtomicU32>) {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
         // access is exclusive (D3D9 objects are single-threaded, or serialised
         // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`).
-        unsafe { &mut *self.inner }.queued_readback = Some(QueuedReadback { seq, outcome });
+        let inner = unsafe { &mut *self.inner };
+        inner.expose_system_memory();
+        inner.queued_readback = Some(QueuedReadback { seq, outcome });
+    }
+
+    /// Wait for a readback queued into this surface's memory, if one is.
+    ///
+    /// The settle borrows the surface's own device, so a caller that reads the
+    /// memory with a device borrowed, `GetFrontBufferData` or `UpdateSurface`,
+    /// settles here first, before it takes that borrow (see
+    /// [`SurfaceInner::settle_readback`]).
+    pub fn settle_readback(&self) {
+        // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
+        // access is exclusive (D3D9 objects are single-threaded, or serialised
+        // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), and the
+        // caller holds no borrow of the device the settle borrows.
+        unsafe { &mut *self.inner }.settle_readback();
     }
 
     /// Record that a read-back rewrote this surface's system-memory bytes.
@@ -1169,7 +1195,8 @@ impl Direct3DSurface9 {
     /// whose lock pitch is a quarter of the stored block row.
     ///
     /// The read is the backing's exposure, so a backing nothing has written
-    /// yet is zeroed first.
+    /// yet is zeroed first. The caller has settled a readback queued into the
+    /// surface ([`Self::settle_readback`]) before it borrowed the device.
     pub fn system_memory_source(&self) -> Option<(*const u8, usize, usize, u32, u32, u32)> {
         if !self.inner().parent_texture.is_null() {
             return None;
@@ -1177,10 +1204,12 @@ impl Direct3DSurface9 {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
         // access is exclusive (D3D9 objects are single-threaded, or serialised
         // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
-        // transient exclusive borrow taken to settle a queued readback and zero the
-        // backing is sound.
+        // transient exclusive borrow taken to zero the backing is sound.
         let inner = unsafe { &mut *self.inner };
-        inner.settle_readback();
+        debug_assert!(
+            inner.queued_readback.is_none(),
+            "the caller settles a queued readback first"
+        );
         inner.expose_system_memory();
         let inner = self.inner();
         let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
@@ -1242,9 +1271,18 @@ bitflags::bitflags! {
         /// Set at creation for a system-memory surface the create did not fill.
         /// D3D9 hands such a surface out zeroed, so its first exposure, a
         /// lock, a device context or a read as an `UpdateSurface` source,
-        /// zeroes the bytes and clears the flag; a read back into the surface
-        /// writes every byte and clears it without the memset.
+        /// zeroes the bytes and clears the flag; a synchronous read back into
+        /// the surface writes every byte and clears it without the memset. A
+        /// queued one zeroes the bytes when it is queued, since it can still
+        /// fail on the GPU.
         const SYSTEM_MEMORY_UNWRITTEN = 1 << 4;
+        /// A queued readback's settle did not see its copy finish.
+        ///
+        /// The device failed while the copy was queued or in flight, so the
+        /// GPU may still write `system_memory`: the `bytesNoCopy` buffer the
+        /// copy writes through keeps the buffer, not the memory. The surface's
+        /// drop leaks the pages rather than free them under that write.
+        const READBACK_UNSETTLED = 1 << 5;
     }
 }
 
@@ -1408,12 +1446,14 @@ struct QueuedReadback {
 
 /// Wait until the GPU has finished the frame submitted as `seq`.
 ///
-/// The frame is submitted first if it is still the one being recorded. Then
-/// the encoder commits every frame sent so far, which hurries a frame held
-/// behind a pending present until the display takes it, and the wait for the
-/// copy's own frame runs on this thread on the device's frame signal, which a
-/// draw buffer retiring wakes. A device without the signal waits through
-/// `retire_uploads_through`.
+/// Once the frame is found unfinished, presentation is hurried, so a submit
+/// that waits for the display behind a pending present copies that present
+/// aside instead. The frame is then submitted if it is still the one being
+/// recorded, and the encoder commits every frame sent so far and ends the
+/// hurry; that request goes out whenever the hurry did, even when the frame
+/// finished meanwhile. The wait for the frame itself runs on this thread on
+/// the device's frame signal, which a draw buffer retiring wakes. A device
+/// without the signal waits through `retire_uploads_through`.
 fn await_frame_seq(dev: &mut DeviceInner, seq: u64) -> Result<(), i32> {
     dev.encoder_status()?;
     let finished = |dev: &DeviceInner| {
@@ -1425,11 +1465,16 @@ fn await_frame_seq(dev: &mut DeviceInner, seq: u64) -> Result<(), i32> {
     if finished(dev) {
         return Ok(());
     }
-    if mtld3d_core::query_fence::event_needs_submit(seq, dev.current_seq()) {
-        dev.flush_current_frame_async()?;
-    }
+    dev.hurry_presentation()?;
+    let flushed = if mtld3d_core::query_fence::event_needs_submit(seq, dev.current_seq()) {
+        dev.flush_current_frame_async()
+    } else {
+        Ok(())
+    };
+    let committed = dev.commit_submitted();
+    flushed?;
+    committed?;
     if !finished(dev) {
-        dev.commit_submitted()?;
         dev.await_draw(seq)?;
     }
     if !finished(dev) {
@@ -1440,8 +1485,16 @@ fn await_frame_seq(dev: &mut DeviceInner, seq: u64) -> Result<(), i32> {
 
 impl Drop for SurfaceInner {
     /// A queued readback is awaited before the memory it writes is freed.
+    ///
+    /// When the settle could not see the copy finish, the pages are leaked
+    /// instead (see [`SurfaceFlags::READBACK_UNSETTLED`]).
     fn drop(&mut self) {
         self.settle_readback();
+        if self.flags.contains(SurfaceFlags::READBACK_UNSETTLED)
+            && let Some(pages) = self.system_memory.take()
+        {
+            core::mem::forget(pages.into_page());
+        }
     }
 }
 
@@ -1453,28 +1506,35 @@ impl SurfaceInner {
     /// frame being recorded; a wait, which hurries a submission held behind a
     /// pending present, while the GPU has not reached it. A copy the encoder
     /// refused, that could not be encoded, or whose submission failed on the
-    /// GPU leaves the memory as it was, as a failed synchronous one would; it is
-    /// logged once and the caller goes on, since the `GetRenderTargetData` that
-    /// queued it already answered `D3D_OK`.
+    /// GPU leaves the memory as it was, as a failed synchronous one would: what
+    /// it held, or the zeros an unwritten surface got when the copy was
+    /// queued. A refusal is logged once here, a failed submission by the
+    /// command buffer's own failure record, and the caller goes on, since the
+    /// `GetRenderTargetData` that queued it already answered `D3D_OK`.
+    ///
+    /// Takes the surface's own device; the caller holds no borrow of it.
     pub fn settle_readback(&mut self) {
         let Some(QueuedReadback { seq, outcome }) = self.queued_readback.take() else {
             return;
         };
         // SAFETY: `device_inner` was stamped at creation from the live
         // `DeviceInner` that owns this surface, which outlives it;
-        // `GetRenderTargetData` queues only into a surface of its own device.
+        // `GetRenderTargetData` queues only into a surface of its own device,
+        // and every caller settles before it borrows that device.
         let dev = unsafe { &mut *self.device_inner };
-        let settled = await_frame_seq(dev, seq);
-        let written = settled.is_ok()
-            && outcome.load(Ordering::Acquire) != 0
-            && dev.latest_failed_submit() < seq;
-        if written {
-            self.readback_overwrote_system_memory();
-        } else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
-                "GetRenderTargetData: the queued copy failed ({}); the surface keeps what it \
-                 held", settled.err().map_or_else(|| "refused, or failed on the GPU".to_owned(),
-                     |hr| format!("device error {hr:#x}")));
+        match await_frame_seq(dev, seq) {
+            Err(hr) => {
+                self.flags.insert(SurfaceFlags::READBACK_UNSETTLED);
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                    "GetRenderTargetData: the device failed ({hr:#x}) before the queued copy \
+                     settled; the surface keeps what it held");
+            }
+            Ok(()) if outcome.load(Ordering::Acquire) == 0 => {
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                    "GetRenderTargetData: the queued copy was refused; the surface keeps what \
+                     it held");
+            }
+            Ok(()) => {}
         }
     }
 

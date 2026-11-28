@@ -342,8 +342,9 @@ fn a_parked_presenter_leaves_another_device_presenting() {
         "the free device read back its own colour every frame"
     );
 
-    // The gated device's own read-back completes while parked: the flush
-    // behind `GetRenderTargetData` commits its frame without the presenter.
+    // The gated device's own read-back completes while parked: the lock that
+    // settles the queued `GetRenderTargetData` hurries presentation, so the
+    // frame carrying the copy commits without the presenter.
     assert_eq!(
         gated.clear_target(BLUE),
         D3D_OK,
