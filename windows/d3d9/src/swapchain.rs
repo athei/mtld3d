@@ -427,6 +427,8 @@ extern "system" fn swapchain_get_front_buffer_data(this: *mut c_void, surface: *
             "reject swapchain GetFrontBufferData: null destination → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     };
+    // The settle borrows the surface's device; done before this borrows one.
+    dst.settle_readback();
     // SAFETY: a referenced implicit swapchain pins its owning device. The API
     // lock above serializes access; an unset owner is rejected below.
     let Some(dev) = (unsafe { obj.inner().device_inner.as_mut() }) else {

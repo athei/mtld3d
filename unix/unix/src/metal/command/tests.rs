@@ -880,6 +880,7 @@ fn encode_test_upload(
     let mut planes = PlanePool::default();
     let mut ctx = EncodeContext {
         device: &device,
+        upscale: record.upscale(),
         stamp: SubmitStamp::new(params).upload(),
         ring: &mut ring,
         planes: &mut planes,
@@ -1441,8 +1442,10 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
         let params = test_submit_params(&coherent, &upload, &failed);
         let mut ring = UploadRing::default();
         let mut planes = PlanePool::default();
+        let upscale = crate::metal::upscale::UpscaleCache::default();
         let mut ctx = EncodeContext {
             device: &device,
+            upscale: &upscale,
             stamp: SubmitStamp::new(&params),
             ring: &mut ring,
             planes: &mut planes,

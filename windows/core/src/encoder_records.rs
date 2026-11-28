@@ -192,6 +192,21 @@ record!(ReadDeviceBufferRecord {
     length: u64,
     reply: u64
 });
+record!(ReadColorToMemoryRecord {
+    color_handle: u64,
+    texture_id: u64,
+    destination: u64,
+    length: u64,
+    reply: u64,
+    level: u32,
+    slice: u32,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    logical_width: u32,
+    logical_height: u32,
+    reserved: u32
+});
 record!(QueryRecord {
     generation: u64,
     descriptor: GuestQueryDescriptor

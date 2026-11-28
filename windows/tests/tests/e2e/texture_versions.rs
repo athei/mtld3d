@@ -139,7 +139,7 @@ struct Readback {
 }
 
 impl Readback {
-    /// `GetRenderTargetData` into a system-memory copy, which waits for the frame.
+    /// `GetRenderTargetData` into a system-memory copy, read once the lock waited for the frame.
     fn of(h: &Harness) -> Self {
         let target = h.render_target(0);
         let (hr, desc) = target.desc();

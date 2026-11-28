@@ -12,12 +12,12 @@ use crate::{
         BindColorBackbufferRecord, BindColorStandaloneRecord, BindColorTextureRecord,
         BindDepthEagerRecord, BindDepthLazyRecord, BindDepthNoneRecord, ByteSpan, CarryDepthRecord,
         ClearColorRecord, ClearDepthStencilRecord, ColorFillRecord, CommandRecord,
-        DepthTransferRecord, IdRecord, QueryRecord, ReadDeviceBufferRecord, ReadHandleRecord,
-        RectRecord, ResampledTargetRecord, ResolveDepthTextureRecord, ResolveDynamicDepthRecord,
-        RetireColorRecord, SetVertexSamplerRecord, SetVertexTextureRecord, SetViewportRecord,
-        SlotRecord, StageUploadRecord, StretchBlitRecord, SurfaceIdentityRecord, SurfaceRecord,
-        TextureRecord, TextureUploadRecord, UpdateColorRegionRecord, UploadColorRecord,
-        UploadResampledRecord,
+        DepthTransferRecord, IdRecord, QueryRecord, ReadColorToMemoryRecord,
+        ReadDeviceBufferRecord, ReadHandleRecord, RectRecord, ResampledTargetRecord,
+        ResolveDepthTextureRecord, ResolveDynamicDepthRecord, RetireColorRecord,
+        SetVertexSamplerRecord, SetVertexTextureRecord, SetViewportRecord, SlotRecord,
+        StageUploadRecord, StretchBlitRecord, SurfaceIdentityRecord, SurfaceRecord, TextureRecord,
+        TextureUploadRecord, UpdateColorRegionRecord, UploadColorRecord, UploadResampledRecord,
     },
     encoder_reply::{ReplyBool, ReplyU64},
     guest_pages::{GuestOwnedPageLease, GuestPageLease},
@@ -968,6 +968,36 @@ capture_resource!(
                 destination: v.dst_ptr,
                 length: v.dst_len,
                 reply,
+            },
+        )
+    }
+);
+capture_resource!(
+    ReadColorToMemoryOp,
+    ReadColorToMemory,
+    ReadColorToMemoryRecord,
+    v,
+    destination,
+    owners,
+    {
+        let reply = v.done.address();
+        owners.replies_bool.push(v.done);
+        crate::encoder_records::write(
+            destination,
+            ReadColorToMemoryRecord {
+                color_handle: v.color_handle,
+                texture_id: v.texture_id.raw(),
+                destination: v.dst_ptr,
+                length: v.dst_len,
+                reply,
+                level: v.level,
+                slice: v.slice,
+                width: v.width,
+                height: v.height,
+                bytes_per_row: v.bytes_per_row,
+                logical_width: v.logical_width,
+                logical_height: v.logical_height,
+                reserved: 0,
             },
         )
     }

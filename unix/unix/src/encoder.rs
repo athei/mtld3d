@@ -6363,6 +6363,86 @@ impl FrameEncoder {
         (handle.raw(), false)
     }
 
+    /// Queue a `GetRenderTargetData` copy of a colour level into system memory, in frame order.
+    ///
+    /// The copy joins the ordered blit stream after the current pass, so it
+    /// reads every draw recorded before it and none after, and runs when the
+    /// frame is submitted: the API thread does not wait for it. The source is
+    /// `color_handle`, or the texture `texture_id` names when that is zero; the
+    /// destination is `read.dst_ptr` / `read.dst_len`, wrapped here and kept
+    /// until the submission that carries the copy retires.
+    ///
+    /// `false` when the source does not resolve or the destination cannot be
+    /// wrapped: nothing is queued.
+    pub fn queue_color_readback(&mut self, read: &ColorReadback) -> bool {
+        let source = if read.color_handle != 0 {
+            read.color_handle
+        } else {
+            self.get_texture_handle_by_id(read.texture_id)
+        };
+        if source == 0 {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "GetRenderTargetData: texture {:#x} has no Metal texture, nothing to read",
+                read.texture_id.raw());
+            return false;
+        }
+        let desc = BufferCreateDesc {
+            backing_ptr: read.dst_ptr,
+            length: read.dst_len,
+            id: 0,
+            storage_mode: StorageMode::Shared,
+            kind: BufferKind::VbIb,
+        };
+        let mut handle = MetalHandle::<MTLBufferKind>::NULL;
+        let status = self.batch_create_buffers(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut handle),
+        );
+        if status != 0 || handle.is_null() {
+            error!(
+                target: LOG_TARGET,
+                "GetRenderTargetData: wrapping the destination failed (len={}, status={status:#x})",
+                read.dst_len,
+            );
+            return false;
+        }
+        // SAFETY: `source` came from the encoder's texture cache or from a
+        // surface's retained colour handle, both `MTLTexture` handles.
+        let texture = unsafe { MetalHandle::<MTLTextureKind>::new(source) };
+        // Read back, so the store-action rules keep its colour store.
+        self.note_color_read_back(texture);
+        // A `Clear` still waiting for a pass was ordered before this read.
+        self.flush_pending_clears();
+        self.pass_state.note_texture_read(texture);
+        self.end_current_pass("readback");
+        self.push_stretch_rect_blit(BlitCommand::read_color_to_buffer(
+            &mtld3d_shared::ReadColorToBufferInfo {
+                src_texture: source,
+                dst_buffer: handle.raw(),
+                dst_len: read.dst_len,
+                level: read.level,
+                slice: read.slice,
+                width: read.width,
+                height: read.height,
+                bytes_per_row: read.bytes_per_row,
+                logical_size: read.logical_size,
+                outcome: read.outcome,
+            },
+        ));
+        // The wrapper is this frame's alone, destroyed once the submission
+        // that carries the copy retires.
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Buffer,
+                handle: handle.raw(),
+                page_box: None,
+                staging_arc: None,
+                seq: self.current_submit_seq,
+                from_texture: false,
+            });
+        true
+    }
+
     /// Copy a `Staged` VB/IB's device buffer into caller-owned PE memory.
     ///
     /// The device buffer is `StorageModePrivate` at an address Metal chose,
@@ -9376,6 +9456,24 @@ impl EncoderThread {
             .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
     }
 
+    /// Commit every frame sent before this request, and acknowledge once they are committed.
+    ///
+    /// The API thread hurried presentation ahead of this request, and the
+    /// request ends the hurry on every exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission or acknowledgment disconnects.
+    pub fn commit_submitted(&self) -> std::io::Result<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        self.sender
+            .send(EncoderMessage::CommitSubmitted(done_tx))
+            .map_err(|_| std::io::Error::other("encoder control admission failed"))?;
+        done_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("encoder control acknowledgment failed"))
+    }
+
     /// Drive the encoder thread to retire the uploads through `target_seq` and drop their reads.
     ///
     /// For a full texture upload-snapshot arena whose oldest chunk the
@@ -9464,6 +9562,11 @@ enum EncoderMessage {
         target_seq: u64,
         done: mpsc::SyncSender<()>,
     },
+    /// Commit every frame sent before this message (`EncoderControl::CommitSubmitted`).
+    ///
+    /// Drains the submit thread, then ends the hurry the API thread set ahead
+    /// of the request, whichever way the request ends.
+    CommitSubmitted(mpsc::SyncSender<()>),
     /// Retire the uploads through `target_seq` and release the reads they hold.
     ///
     /// Waits for the draw and upload command buffers up to `target_seq` when
@@ -9697,6 +9800,20 @@ fn encoder_thread_main(
                         }
                     }
                     enc.intake_visibility();
+                    let _ = done.send(());
+                }
+                Ok(EncoderMessage::CommitSubmitted(done)) => {
+                    // The API thread hurried presentation ahead of this request,
+                    // and the request ends the hurry itself on every exit, as
+                    // the upload retirement does.
+                    if enc.failed_replay.is_some() {
+                        enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                        drop(done);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvCommit");
+                    enc.drain_submit_thread();
+                    enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::RetireUploadsThrough { target_seq, done }) => {
@@ -10577,4 +10694,21 @@ fn open_or_create_cache_file(
         return Err(std::io::Error::other("shader_cache_path unavailable"));
     };
     shader_cache::CacheWriter::open(path)
+}
+
+/// A `GetRenderTargetData` the encoder queues (see `FrameEncoder::queue_color_readback`).
+pub struct ColorReadback {
+    pub color_handle: u64,
+    pub texture_id: TextureId,
+    pub level: u32,
+    pub slice: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    /// The source texture's logical extent, which `level` is measured against.
+    pub logical_size: (u32, u32),
+    pub dst_ptr: u64,
+    pub dst_len: u64,
+    /// Address of the API thread's `AtomicU32` the submission stores 0 into on a failed encode.
+    pub outcome: u64,
 }

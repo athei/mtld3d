@@ -252,6 +252,29 @@ impl FrameSignal {
         outcome
     }
 
+    /// Wait until the draw counter `draw` reached `target`, or the signal ended.
+    ///
+    /// [`Self::wait`] without its paced-present half: a draw buffer retiring
+    /// wakes it like any other wait on this signal.
+    pub fn wait_draw(&self, draw: RetirementCounter, target: u64) -> FrameWait {
+        let mut state = self.lock();
+        state.waiters += 1;
+        let outcome = loop {
+            if state.ended {
+                break FrameWait::Ended;
+            }
+            if draw.load() >= target {
+                break FrameWait::Finished;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        };
+        state.waiters -= 1;
+        outcome
+    }
+
     /// Resolve the paced present of `seq`; a sequence no longer listed changes nothing.
     fn resolve(&self, seq: u64) {
         let mut state = self.lock();

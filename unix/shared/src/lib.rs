@@ -32,7 +32,7 @@ pub mod upload_feedback;
 
 pub use commands::{
     BlitCommand, BlitCommandType, Command, CommandType, CopyBufferToBufferInfo,
-    CopyBufferToTextureInfo, CopyTextureSubRectInfo, NullTextureKind,
+    CopyBufferToTextureInfo, CopyTextureSubRectInfo, NullTextureKind, ReadColorToBufferInfo,
 };
 pub use ffi_boundary::{
     InPtr, InPtrMut, OutPtr, ValueIn, VtableThis, slice_from_caller, slice_to_caller,

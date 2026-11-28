@@ -221,6 +221,65 @@ crossings or moving native translation back onto the API thread.
 
 Thunks describe the work crossing the runtime boundary, including batched D3D9 work and lifecycle or synchronization controls. Name them after that work rather than mechanically mirroring COM methods. Internal native calls do not need a thunk. Keep COM identities and application-visible reference counting on the PE side; D3D9 translation and native resource ownership may live on Unix.
 
+## A readback into system memory rides the frame
+
+D3D9 owes the pixels of a `GetRenderTargetData` when the destination is next
+read, not when the call returns. A copy into a standalone `D3DPOOL_SYSTEMMEM`
+or `D3DPOOL_SCRATCH` offscreen surface is therefore recorded in the frame
+packet (`ReadColorToMemoryOp`) instead of flushing the frame and waiting for
+the GPU. The encoder resolves the source (a standalone colour handle, or the
+texture a render-target level belongs to), wraps the surface's memory in a
+`Shared` buffer that retires with the submission, and queues a
+`ReadColorToBuffer` blit in the ordered blit stream after the current pass, so
+the copy reads every draw recorded before the call and none after. The
+submission encodes it on the frame's command buffer, resolving a source
+rasterized smaller under `render.scale` up to its logical size first, as the
+synchronous readback does.
+
+The surface keeps the seq of the frame that carries the copy and settles the
+way an EVENT query polls (`SurfaceInner::settle_readback`) before its memory is
+locked, handed to `GetDC`, used as a copy source, read back into again or
+freed: one atomic load once `coherent_seq` has reached that seq. While the GPU
+has not finished it, the settle hurries presentation, submits the open frame
+if the copy is still in it, sends a `CommitSubmitted` request, and then waits
+on the API thread on the device's frame signal (`AwaitDraw`, the GPU half of
+the frame-latency wait, which a draw buffer retiring wakes). Under
+display-synced presents the encoder can be blocked on a submit that waits for
+the previous present to commit, so the hurry goes out before the submit and
+the request, as it does for `retire_uploads_through`; the request queues
+behind the frames already sent, drains the encoder's submit thread and puts
+the present-wait policy back however it ends, and it is sent whenever the
+hurry was, even when the copy finished meanwhile. The wait is for the copy's
+own frame alone, which is the whole frame since retirement is counted per
+frame; `retire_uploads_through`, which a device without the signal falls back
+to, also waits for the uploads and for the first command buffer still pending
+at or after that frame, which in an unthrottled loop can be a later one. A
+game whose frame outlasts the GPU's turnaround, or that reads a copy two frames
+after it was made, finds it done and never waits. Every other readback (a
+texture level's staging, the front buffer, a back-buffer `LockRect`) stays
+synchronous.
+
+The settle borrows the surface's own device. `GetFrontBufferData` and
+`UpdateSurface` read a system-memory surface with a device borrowed, so they
+settle it at their entry point, before taking that borrow. A settle that
+cannot see the copy finish because the device failed marks the surface, and
+its drop leaks the pages rather than free them under a copy the GPU may still
+make: the `bytesNoCopy` buffer the copy writes through keeps the buffer, not
+the memory.
+
+The call refuses a destination of another device, and a locked or DC-held
+destination, with `D3DERR_INVALIDCALL`, and a failed device answers with its
+error, as the synchronous flush did. A copy that fails after the call has
+returned changes mtld3d's answer: a source the encoder cannot resolve, a resolve
+the submission declines, a copy whose geometry it refuses, or a submission that
+fails on the GPU used to make the call return `D3DERR_INVALIDCALL`; the call
+now returns `D3D_OK`, and the surface reads what its memory held before, with
+one log line: the settle's for a refused copy, the frame's own failure line for
+a submission the GPU failed. A surface nothing had written is zeroed when the
+copy is queued, so it reads zeros then. `failed_submit_seq` is not consulted:
+it is a running maximum, so a later frame's failure would count against a copy
+that finished.
+
 ## Upload order and retirement
 
 Texture and buffer uploads form an ordered prefix before the application's render passes.
@@ -940,7 +999,10 @@ records accepted texture-to-texture endpoints, slices and validated region.
 `readback-copy` records the final selected source after any readback resolve or
 fallback, the actual destination Metal buffer, PE destination address/length,
 and encoded offset, row pitch and image pitch. Image pitch counts block rows
-for compressed textures. The existing `readback-wait` record supplies completion.
+for compressed textures. Its `site` is `readback-blit` for a copy on a command
+buffer of its own, which the existing `readback-wait` record completes, and
+`queued-readback` for a `GetRenderTargetData` copy in a frame's ordered blit
+stream, which completes with its frame.
 Texture extents in these records are base-level extents; `level` selects the mip.
 
 The depth transfer behind RESZ is one of those copies. It records its two ends
